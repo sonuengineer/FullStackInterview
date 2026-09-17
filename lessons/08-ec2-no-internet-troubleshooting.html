@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EC2 No Internet Troubleshooting</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# EC2 Has a Public IP But No Internet Access
+
+## 1. Story
+
+You launch an EC2 instance, the AWS console proudly shows a public IP address next to it, and you SSH in and run `curl google.com`. It hangs, then times out. No internet. But... it has a public IP. What's going on?
+
+## 2. The Problem — A Public IP Is Just an Address, Not a Path
+
+Having a public IP means the internet *could* find your instance if traffic reached it correctly. It says nothing about whether the surrounding network configuration actually lets traffic flow in either direction. There are multiple independent layers between "has an IP" and "can talk to the internet," and a block at *any single one* produces the exact same symptom: nothing.
+
+## 3. The Solution — Check Every Layer, Top-Down
+
+Think of the path as layers, from the outside in:
+
+```mermaid
+flowchart LR
+  Internet((Internet)) --> IGW[Internet Gateway]
+  IGW --> RT[Route Table: 0.0.0.0/0 -> IGW?]
+  RT --> NACL["Network ACL (stateless,<br/>subnet-level)"]
+  NACL --> SG["Security Group (stateful,<br/>instance-level)"]
+  SG --> OS["OS firewall<br/>(iptables/firewalld)"]
+  OS --> APP[Your Application]
+```
+
+Walk it top-down, checking each:
+
+1. **Internet Gateway (IGW)** — is one actually attached to the VPC? Without it, nothing in the VPC can reach the public internet no matter what else is configured.
+2. **Route table** — does the subnet's route table have a route for `0.0.0.0/0` pointing to the IGW? This is the single most common miss: a public IP with no corresponding route is a dead end. (This is what actually defines a subnet as "public" — not the instance having a public IP.)
+3. **Network ACL (NACL)** — subnet-level, **stateless**, meaning it evaluates inbound and outbound rules independently. A NACL that allows outbound but blocks the inbound *return* traffic will silently break connections even though the outbound packet leaves fine.
+4. **Security Group (SG)** — instance-level, **stateful** (return traffic for an allowed outbound connection is automatically allowed back in). Check outbound rules aren't locked down (default SGs allow all outbound, but this is often tightened later) and inbound rules allow what's needed.
+5. **OS-level firewall** — `iptables`/`firewalld` running inside the instance itself can independently block traffic regardless of what AWS-level config says.
+6. **DNS resolution** — sometimes "no internet" is actually "no DNS": check VPC DNS settings and whether `curl <an IP directly>` works even when `curl google.com` doesn't.
+7. **Elastic IP association** — confirm the public IP shown is actually correctly associated and not stale/detached.
+
+## 4. Mental Model
+
+> Think of it as a chain of bouncers between your instance and the internet: the Internet Gateway (front door of the building), the route table (the signpost telling your floor how to reach that door), the NACL (a stateless bouncer at the building entrance who checks both directions separately), the Security Group (a stateful bouncer at your apartment door who remembers who you let out), and the OS firewall (a lock on the room itself). A "no" from *any* of them looks identical from inside the room.
+
+## 5. How I'd Answer This In An Interview
+
+"I'd check top-down: does the route table send `0.0.0.0/0` to an attached Internet Gateway; do the NACL rules allow the traffic in *both* directions since NACLs are stateless; does the Security Group allow the outbound (and inbound, if relevant) traffic since SGs are stateful; and finally whether the instance's own OS firewall is blocking it. I'd also check DNS resolution separately, since 'no internet' sometimes really means 'no DNS.'" — walking through layers methodically, rather than guessing, is what interviewers are actually listening for.
+
+## 6. Production Reality
+
+For instances that need **outbound-only** internet access (e.g., pulling OS updates or packages) without being publicly reachable from the internet, the correct pattern is a **private subnet + NAT Gateway**, not giving the instance a public IP at all. A public IP + IGW route is for instances that genuinely need to be reachable *from* the internet.
+
+## 7. Trade-offs
+
+Public subnet + IGW is simple but exposes the instance to direct internet-facing risk (must be locked down carefully at the SG/NACL/OS level). Private subnet + NAT Gateway costs a bit more and adds a hop, but keeps the instance itself unreachable from outside while still allowing it to reach out.
+
+## 8. Common Mistakes
+
+- Assuming "has a public IP" automatically means "has internet access" — these are two independent facts; the IP is just an address, the *route* is what makes it reachable.
+- Confusing Security Groups (stateful, instance-level) with NACLs (stateless, subnet-level, need explicit rules for both directions) — a very common interview trip-up.
+- Putting an instance that only needs outbound access directly in a public subnet with a public IP, instead of using a NAT Gateway from a private subnet.
+
+## 9. 🧠 Remember
+
+> A public IP is just an address — internet access requires the whole chain: Internet Gateway attached, route table pointing to it, NACL and Security Group both allowing the traffic in both directions, and the OS not blocking it itself.
+
+## 10. Quick Self-Test
+
+1. What's the practical difference between a Security Group and a Network ACL, and why does that difference matter for troubleshooting?
+2. Why would an instance with a public IP still have zero internet access if the route table is missing a `0.0.0.0/0` route?
+3. What's the correct architecture for an instance that needs outbound internet access but should never be reachable from outside?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

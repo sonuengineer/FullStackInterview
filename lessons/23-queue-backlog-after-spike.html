@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Queue Backlog After a Spike</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Traffic Is Normal, But 8 Million Jobs Are Still Stuck in the Queue
+
+> **Similar-question flag**: this connects to [[14-cascading-failure-recovery]] (fixing the trigger doesn't undo the backlog it left behind) and [[17-notification-system-design]] (scale workers on queue depth, not CPU). What's new here is a concrete **decision framework** for what to actually do with an existing backlog, since "scale consumers," "drop stale jobs," and "make users wait" aren't mutually exclusive - they apply to different slices of the backlog.
+
+## 1. Story
+
+Traffic spiked, then returned to normal 20 minutes ago. The API is still slow. Digging in: the queue did its job during the spike - it absorbed 8 million jobs instead of dropping requests or erroring out. But absorbing the work isn't the same as finishing it. The backlog is still there, and consumers are draining it at their normal, pre-spike rate.
+
+## 2. Do the Math First
+
+Before choosing an approach: `backlog size / current consumer throughput = time to drain`. If consumers process 1,000 jobs/sec, 8,000,000 jobs is roughly 2.2 hours at the current rate - far too long. This single number tells you whether "just wait it out" is even remotely viable before you consider it as an option.
+
+## 3. Evaluating the Three Options - They're Not Mutually Exclusive
+
+**Scale consumers** - almost always the first lever, and the direct fix for "drain rate is too slow." But scale carefully: if consumers call a downstream service or database, doubling consumer count means doubling concurrent calls to that dependency. Do this too aggressively and you recreate the exact thundering-herd problem from [[14-cascading-failure-recovery]], just self-inflicted by your own backlog-clearing effort instead of by an outage.
+
+**Drop stale jobs** - only valid for job types where the value of the result **decays with time**. A "user is typing" notification, a real-time price alert, or an abandoned-cart reminder for a cart that's already been checked out are all worthless 20 minutes late - processing them wastes capacity that could clear jobs that still matter. This means giving jobs a TTL/max-age at creation (the same expiry philosophy as [[03-ttl-deletion-at-scale]], applied to queued work instead of stored data) so a consumer can check "is this still relevant?" before doing the expensive part, and skip it if not.
+
+**Make users wait** - acceptable only for genuinely asynchronous, non-blocking work where nobody is staring at a spinner (a background email digest, a nightly report). Unacceptable for anything synchronous or user-facing.
+
+## 4. The Real Answer
+
+Production systems typically do all three, applied to different subsets: scale consumers immediately (matched to what the downstream dependency can actually absorb), drop or deprioritize jobs that have exceeded a staleness threshold, and let the remaining, still-relevant, genuinely-tolerant background work simply take its turn.
+
+## 5. Mental Model
+
+> A full queue after the spike has ended is a math problem (arrival rate vs. drain rate) mixed with a business problem (which jobs still matter). Solve both - don't guess one universal answer for every job in the backlog.
+
+## 6. 🧠 Remember
+
+> The queue absorbing a spike buys you time, not a solution - clearing the backlog needs scaling matched to what downstream can handle, staleness-based dropping for time-decaying work, and patience only where patience is actually free.
+
+## 7. Quick Self-Test
+
+1. Why can scaling consumers too aggressively recreate the exact problem from Lesson 14?
+2. What property of a job makes "drop it if stale" the right call, versus a job where that would be unacceptable?
+3. Why is "how long will draining take at the current rate" the first calculation to make, before picking a strategy?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Backend Priorities by Industry</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Which Backend Priority Matters Most: Reliability, Scalability, Security, or Simplicity?
+
+## 1. Story
+
+A candidate is asked to rank Reliability, Scalability, Security, and Simplicity. There's no single correct order - the honest answer is "it depends," but a strong answer explains specifically *what* it depends on, rather than stopping at that word.
+
+## 2. The Framework - Priorities Shift With Domain and Stage
+
+**Regulated, high-stakes domains** (banking, healthcare, aviation software) - **Reliability and Security** dominate. A bug that corrupts a transaction or exposes patient data isn't just costly, it can be catastrophic and often carries legal/regulatory consequences (see [[27-cia-triad]] for what Security is actually protecting). These systems will trade simplicity and even raw feature velocity for correctness guarantees.
+
+**An early-stage startup finding product-market fit** - **Simplicity** usually wins. The system doesn't have real scale yet, and the biggest risk isn't a database falling over, it's building the wrong product slowly. This is the same instinct from [[15-simple-vs-scalable-architecture]] and [[24-kubernetes-pets-vs-cattle]] - premature investment in scalability or elaborate security controls the business doesn't need yet is its own kind of waste.
+
+**A high-growth consumer app** (viral social product, e-commerce during a sale) - **Scalability** becomes the binding constraint, because the failure mode of *not* scaling is immediate and visible (the app falls over during the exact moment it matters most).
+
+**Infrastructure and safety-critical systems** (power grids, payment rails, aviation) - **Reliability** trumps everything else, including simplicity - the cost of downtime or an incorrect result is far higher than the cost of added complexity to prevent it.
+
+## 3. Mental Model
+
+> These four aren't stacked in one universal order - they're four dials, and the *cost of failing at each one* is what should set their priority, and that cost is different in every domain and every stage of a company's life.
+
+## 4. The Trap Worth Naming
+
+None of these should go to zero. A security-obsessed system that's impossible to build features on is unsustainable. A "move fast" startup that ignores security entirely until a breach happens has made a real, disqualifying mistake, not just a trade-off. Simplicity, in particular, is often undervalued as a value in itself - simpler systems tend to be *more* reliable and *more* secure almost automatically, because there's less surface area for a bug or vulnerability to hide in. So simplicity isn't really competing with the other three so much as it's a force multiplier for achieving them cheaply.
+
+## 5. How I'd Answer This in an Interview
+
+"There's no universal ranking - I'd rank them by asking what failing at each one actually costs, in this specific domain and at this company's current stage. A fintech handling real money prioritizes reliability and security even at the cost of complexity; an early-stage product prioritizes simplicity because the biggest risk is building the wrong thing slowly. And I'd add that simplicity tends to make the other three easier to achieve, not something traded away for them."
+
+## 6. 🧠 Remember
+
+> The right priority order isn't fixed - it's set by what failure actually costs in this specific domain and company stage, and simplicity is usually less a competing priority than a force multiplier for the other three.
+
+## 7. Quick Self-Test
+
+1. Why would a regulated fintech and an early-stage startup reasonably rank these four completely differently?
+2. Why does simplicity tend to improve reliability and security rather than trade off against them?
+3. What's the risk of ranking one of these four as zero priority, no matter the domain?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

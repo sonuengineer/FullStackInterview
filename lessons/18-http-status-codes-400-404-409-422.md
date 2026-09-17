@@ -1,0 +1,91 @@
+# When Should an API Return 400, 404, 409, or 422?
+
+## 1. Story
+
+An interviewer asks: "Your API needs to reject a bad request. When do you return 400? When 404? When 409? When 422?" You know all four are "client error" codes (4xx), but picking the right one for a given situation is where most engineers get vague, or just default to 400 for everything.
+
+## 2. The Problem
+
+All four say "the client did something wrong," so it's tempting to treat them as interchangeable. They're not — each answers a genuinely different question about *why* the request failed, and picking the right one is part of your API's contract (see [[11-what-is-an-api]]): callers build logic around these codes (retry, show a specific error, redirect to login), so blurring them makes your API harder to integrate with correctly.
+
+## 3. The Solution — Four Different Questions
+
+**400 Bad Request** — "I could not even understand your request." The request is structurally broken: malformed JSON, a required field missing entirely, wrong data type where a number was expected. This is a **syntactic** failure — the server can't get far enough to evaluate the request's meaning at all.
+
+**404 Not Found** — "The thing you're asking about does not exist." The request is perfectly well-formed, but the resource identified by the URL/path/ID simply isn't there. `GET /orders/999999` when no such order exists.
+
+**409 Conflict** — "What you're asking is valid, the resource exists, but doing this right now conflicts with its current state." Classic examples: trying to register a username that's already taken (ties directly to [[05-username-availability-check]] — the Bloom filter says "maybe available," but the actual `INSERT` fails with a conflict), or an optimistic-locking version mismatch on a concurrent update.
+
+**422 Unprocessable Entity** — "Your request is syntactically perfect, but the data inside it violates a business/semantic rule." The JSON parses fine, the types are correct, but the *content* doesn't make sense: an `email` field containing `"not-an-email"`, a `quantity` of `-5`, or an end date earlier than the start date.
+
+## 4. Mental Model
+
+> **400** = I couldn't parse it. **404** = it doesn't exist. **409** = it exists, but this conflicts with its current state. **422** = I parsed it fine, but the data itself breaks a rule.
+
+The 400-vs-422 line is the one people blur most: 400 is about *structure* (can the server even read this?), 422 is about *meaning* (the server read it fine, but the values are invalid according to business rules).
+
+## 5. Decision Flow
+
+```mermaid
+flowchart TD
+  A[Request arrives] --> B{Syntactically parseable?<br/>Valid JSON, correct types,<br/>required fields present?}
+  B -->|No| R400[400 Bad Request]
+  B -->|Yes| C{Does the target<br/>resource exist?}
+  C -->|No| R404[404 Not Found]
+  C -->|Yes| D{Conflicts with the<br/>resource's current state?}
+  D -->|Yes| R409[409 Conflict]
+  D -->|No| E{Violates a semantic/<br/>business validation rule?}
+  E -->|Yes| R422[422 Unprocessable Entity]
+  E -->|No| OK[200 / 201 Success]
+```
+
+## 6. Code Example
+
+```javascript
+app.post('/orders', (req, res) => {
+  // 400: structurally broken - can't even evaluate it
+  if (typeof req.body !== 'object' || !req.body.amount) {
+    return res.status(400).json({ error: 'Missing required field: amount' });
+  }
+
+  // 422: well-formed, but the value breaks a business rule
+  if (req.body.amount <= 0) {
+    return res.status(422).json({ error: 'amount must be a positive number' });
+  }
+
+  const order = findOrder(req.body.orderId);
+  // 404: the referenced resource does not exist
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  // 409: exists, but conflicts with current state
+  if (order.status === 'already_paid') {
+    return res.status(409).json({ error: 'Order is already paid' });
+  }
+
+  processPayment(order);
+  res.status(200).json({ status: 'paid' });
+});
+```
+
+## 7. Production Reality
+
+In practice, not every real-world API agrees on 400 vs 422 — some large, well-known APIs use 400 broadly for both structural and semantic validation failures and skip 422 entirely; this is a genuinely debated convention, not a universally enforced law. What matters more than picking the "textbook perfect" code every time is **being consistent within your own API** so callers can reliably branch on status codes.
+
+## 8. Common Mistakes
+
+- Returning 400 for everything, including cases that are really 404 (resource doesn't exist) or 409 (conflicts with current state) — this forces every caller to parse your error *message* instead of branching on the status code, defeating the point of having different codes.
+- Using 404 to hide the existence of a resource for security reasons when 403 (Forbidden) would be more accurate — a legitimate but distinct design choice, not a mistake by itself, just worth being deliberate about.
+
+## 9. 🔗 Connection to Other Concepts
+
+The 409 case for a duplicate username is the exact scenario from [[05-username-availability-check]] — the fast Bloom-filter check is just a hint, and the real conflict is what the database's unique constraint enforces at insert time. And these status codes are themselves part of the API contract described in [[11-what-is-an-api]].
+
+## 10. 🧠 Remember
+
+> 400 = I couldn't parse it. 404 = it doesn't exist. 409 = it exists but conflicts with its current state. 422 = I parsed it fine, but the data itself breaks a rule.
+
+## 11. Quick Self-Test
+
+1. A client sends valid JSON with a `birthDate` field set to a date in the future — which code, and why?
+2. Why is 404 sometimes used deliberately instead of 403, even when the real reason is "you're not allowed to see this"?
+3. Why does blurring 400 and 422 into "just always return 400" hurt API consumers?

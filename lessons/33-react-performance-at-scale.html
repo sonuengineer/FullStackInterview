@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>React Performance at Scale</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# The Backend Is Fine, But the React UI Gets Slow at 10,000 Users
+
+## 1. Story
+
+A React app is smooth with 100 users. At 10,000, the UI becomes noticeably sluggish - typing lags, scrolling stutters, clicks feel delayed. The backend API response times are checked and confirmed normal. So the problem isn't the server - it's happening entirely inside the browser.
+
+## 2. The Problem
+
+Recall the flow from `User -> Browser -> DOM -> JavaScript -> Network -> API -> Backend`: a slow *network* leg or a slow *API* leg would show up in the API timing numbers already ruled out. That leaves the **DOM** and **JavaScript** legs - meaning the browser itself is doing too much work rendering, re-rendering, or processing something client-side, independent of how fast the server responds.
+
+"10,000 users" here likely means the UI is now rendering data *about* 10,000 items (a table, a list, a dashboard) - not that 10,000 people are using the browser tab at once. That reframes the question: this is a **rendering scale** problem, not a traffic problem.
+
+## 3. What to Investigate First
+
+**DOM node count** - open the Elements panel and check how many actual DOM nodes exist. Rendering 10,000 rows as 10,000+ real DOM elements is expensive for the browser to lay out, paint, and keep in memory, even before React gets involved.
+
+**Unnecessary re-renders** - use the React DevTools Profiler to record an interaction and look at the flame graph: is a large list or a heavy component re-rendering far more often than the data driving it actually changes? Common causes: passing a new inline function or object as a prop on every render (breaks reference equality, defeating `React.memo`), missing or unstable `key` props causing React to re-mount instead of reuse elements, and state lifted too high, so a small change re-renders a huge subtree unnecessarily.
+
+**Expensive work happening inside render** - formatting, filtering, or computing derived values freshly on every render, for every one of 10,000 items, instead of computing once and caching the result.
+
+**Main-thread blocking** - Chrome's Performance tab shows "long tasks" (JavaScript execution blocking the main thread for 50ms+), which is what causes visible input lag and stutter - this is the concrete, measurable signature of "the UI feels slow."
+
+## 4. The Fixes, Matched to the Cause
+
+- **Virtualization/windowing** (e.g. `react-window`, `react-virtualized`) - render only the rows currently visible in the viewport instead of all 10,000 at once. This is usually the single highest-leverage fix for a large list or table, directly cutting DOM node count.
+- **Memoization** - `React.memo` for components, `useMemo` for expensive derived values, `useCallback` for function props passed to memoized children - prevents re-renders and re-computation that aren't actually necessary.
+- **Pagination or infinite scroll** instead of loading and rendering the entire dataset at once.
+- **Move expensive computation out of the render path** - compute once (on data fetch, or memoized) instead of recomputing on every re-render.
+
+## 5. Mental Model
+
+> A backend that responds in 50ms can still produce a UI that feels slow, because "fast API" and "fast rendering" are two completely different problems in two completely different places - the browser has its own scaling limits (DOM size, re-render cost, main-thread work) that have nothing to do with server response time.
+
+## 6. Flow
+
+```mermaid
+flowchart LR
+  API[Fast API response] --> Data[10,000 rows arrive]
+  Data --> Render{Render strategy?}
+  Render -->|All 10,000 as real DOM nodes| Slow[Expensive layout/paint,<br/>slow scrolling and input]
+  Render -->|Virtualized - only visible rows| Fast[Small DOM, smooth interaction]
+```
+
+## 7. Production Reality
+
+React DevTools Profiler and Chrome's Performance panel are the two tools that turn "the UI feels slow" (a vague complaint) into "this specific component re-renders 40 times per keystroke" (an actionable, measurable finding) - the same diagnostic-first instinct as the backend debugging lessons in this curriculum, just pointed at the browser instead of the server.
+
+## 8. Common Mistakes
+
+- Assuming a frontend performance problem must be a network/API problem, and stopping the investigation once API timing looks fine.
+- Rendering an entire large dataset directly into the DOM "because it's simpler," without virtualization, and only discovering the cost once real data volume arrives.
+
+## 9. 🧠 Remember
+
+> When the API is fast but the UI is slow, the bottleneck lives in the browser's rendering work, not the network - check DOM node count, unnecessary re-renders, and main-thread blocking time before suspecting the backend at all.
+
+## 10. Quick Self-Test
+
+1. Why does a fast API response time not rule out a frontend performance problem?
+2. Why does virtualization reduce rendering cost even though the same amount of data still needs to be fetched?
+3. What specifically does passing a new inline function as a prop break, and why does that matter for performance?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

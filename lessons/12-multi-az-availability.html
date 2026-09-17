@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Surviving an AZ Failure</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Surviving an Availability Zone Failure
+
+## 1. Story
+
+Your application runs entirely in one Availability Zone — say `us-east-1a`. It's midnight, everything's calm, no bad deploy, no traffic spike, no code bug — and then that entire AZ goes dark. Power event, network partition, whatever the cause: the physical building/network segment your servers live in is simply gone. This has genuinely happened to real AWS regions before.
+
+Recall from [[06-ec2-autoscaling]]: an Auto Scaling Group can add or remove EC2 instances automatically based on load. But if that ASG's subnets only exist in **one** AZ, all those instances — even 20 of them — vanish together the moment that AZ fails. Auto Scaling protects you from *load*. It does nothing for a *whole data center disappearing*.
+
+## 2. The Problem
+
+A single AZ is a single point of failure for everything physically tied to it — power, networking hardware, the physical building. "We have redundancy, we run multiple EC2 instances" doesn't help at all if every one of those instances sits in the exact same AZ.
+
+## 3. The Solution — Design for Multi-AZ From the Start
+
+- **Multi-AZ Auto Scaling Group**: configure the ASG's subnets to span at least 2 (ideally 3) AZs in the region. The ASG automatically balances instances across all of them.
+- **Application Load Balancer across AZs**: the ALB itself spans multiple AZs and health-checks instances in each. If every instance in one AZ fails its health check, the ALB simply stops routing there and sends 100% of traffic to the surviving AZs — no manual intervention needed.
+- **RDS Multi-AZ deployment**: a synchronously-replicated standby database instance lives in a *different* AZ. If the primary's AZ fails, AWS automatically fails over to the standby (via a DNS endpoint swap), typically within 60-120 seconds — a brief blip, not a full outage.
+- **Stateless application tier** (same prerequisite as Auto Scaling in [[06-ec2-autoscaling]]): any instance in any AZ must be able to serve any user, meaning sessions live in a shared, Multi-AZ cache (ElastiCache replication group), not on the local instance.
+- **S3 assets**: already durably multi-AZ by default — no action usually needed, though Cross-Region Replication exists for even stronger, region-level guarantees.
+
+## 4. Mental Model
+
+> Run the same restaurant in three different buildings across town, all serving from the same menu (API contract) and the same reservation system (shared data layer). If one building loses power, the host (load balancer) simply stops sending guests there — the other two keep serving, and the customer never notices.
+
+## 5. Flow
+
+```mermaid
+flowchart TB
+  Users --> ALB[Application Load Balancer<br/>spans all AZs]
+  subgraph AZ-a
+    E1[EC2 instance]
+    E2[EC2 instance]
+    RDSp[(RDS Primary)]
+  end
+  subgraph AZ-b
+    E3[EC2 instance]
+    E4[EC2 instance]
+    RDSs[(RDS Standby - sync replica)]
+  end
+  ALB --> E1
+  ALB --> E2
+  ALB --> E3
+  ALB --> E4
+  RDSp -.synchronous replication.-> RDSs
+  RDSp -.automatic failover on AZ-a outage.-> RDSs
+```
+
+## 6. How I'd Answer This in an Interview
+
+1. **Name the single point of failure explicitly**: "A single AZ means the entire app is one power or network failure away from total downtime — no amount of horizontal scaling *within* that AZ changes that."
+2. **Compute tier**: Multi-AZ ASG + ALB — instances spread across AZs, load balancer routes only to healthy ones.
+3. **Data tier**: RDS Multi-AZ (or a naturally distributed database) — explain the mechanism: synchronous replication to a standby in another AZ, automatic DNS-based failover.
+4. **Cache/session tier**: Multi-AZ ElastiCache replication group, so a cache tier loss doesn't take down sessions either.
+5. **Tie it back**: none of this works unless the app is already stateless — the same prerequisite as basic Auto Scaling.
+6. If pushed further: mention Route 53 health checks and multi-**region** failover as the next level up, for surviving a whole-region outage, not just one AZ.
+
+## 7. Production Reality
+
+RDS Multi-AZ failover isn't instant — expect roughly 60-120 seconds of write unavailability during the DNS cutover. Applications should retry transient database connection errors during that window with backoff, rather than surfacing a hard failure to the user immediately.
+
+## 8. Trade-offs
+
+Multi-AZ roughly doubles the cost of the compute and database tiers (extra instances, a mostly-idle standby database) in exchange for eliminating a real, historically-proven failure mode. For anything customer-facing or revenue-generating, this is almost always worth the cost — for an internal, low-stakes tool, single-AZ with fast recovery tooling might be an acceptable trade instead.
+
+## 9. Common Mistakes
+
+- Believing "we have an Auto Scaling Group, so we're resilient" without checking whether that ASG's subnets actually span multiple AZs — a surprisingly common real-world misconfiguration that looks fine until the day one AZ fails.
+- Forgetting the database tier entirely and only making the compute tier Multi-AZ — a resilient app tier still goes down hard if its single-AZ database disappears.
+
+## 10. 🧠 Remember
+
+> Auto Scaling protects you from load; Multi-AZ protects you from an entire data center disappearing — you need both, because more instances in one dying building doesn't help.
+
+## 11. Quick Self-Test
+
+1. Why doesn't having 20 EC2 instances protect you from an AZ outage if they're all in one AZ?
+2. What actually happens, mechanically, when RDS Multi-AZ fails over?
+3. Why must the application already be stateless before Multi-AZ architecture can actually help?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

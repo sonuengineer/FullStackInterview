@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kubernetes Pets vs Cattle</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Should We Adopt Kubernetes for Three Containers?
+
+> **Similar-question flag**: this is the same "don't ship the impressive architecture, ship the one your actual scale needs" principle from [[15-simple-vs-scalable-architecture]], now applied to infrastructure orchestration specifically. What's new here is the concrete list of what Kubernetes actually buys you, and the "pets vs. cattle" framing for deciding when that trade is worth it.
+
+## 1. Story
+
+"Let's add Kubernetes, deployments will be easier." "Easier than what?" "Than SSH and a systemd unit." "How many boxes do we run - or are we adopting an operating system to host three containers?"
+
+## 2. The Problem
+
+Kubernetes doesn't run your containers - it runs a **distributed system that runs your containers**: a control plane, a key-value store (etcd) for cluster state, a scheduler, a networking overlay, RBAC, usually an ingress controller. All of that is real, ongoing operational surface area - upgrades, security patches, learning curve, failure modes of its own - adopted before a single line of your actual application changes.
+
+## 3. What Kubernetes Actually Solves
+
+- **Scheduling across many nodes** - deciding which of dozens/hundreds of machines should run which container, and rebalancing automatically as machines come and go.
+- **Self-healing at fleet scale** - automatically restarting or rescheduling containers when a node dies, across a fleet large enough that a human can't watch every box.
+- **Service discovery and load balancing** across a constantly-changing set of instances.
+- **Rolling deployments across many hosts** - safely updating a fleet of dozens/hundreds of instances without a human running the same deploy script over and over.
+
+## 4. Term: Pets vs. Cattle
+
+**Pets** - servers you know individually, name, and nurse back to health when something goes wrong (SSH in, check logs, restart the service). Fine, even correct, at a small scale.
+
+**Cattle** - a fleet large enough that individual machines are disposable and interchangeable; you don't fix a sick one, you replace it. Orchestration exists to manage cattle at scale, automatically.
+
+> Orchestration is for cattle. Don't build a ranch's worth of infrastructure to manage two pets.
+
+## 5. The Actual Decision
+
+For **three containers on a couple of boxes**, SSH plus a systemd unit (or a simple process manager like PM2, plus a basic deploy script) achieves "easier deployments" with a small fraction of the operational surface area. The genuine trigger for Kubernetes isn't "we want easier deploys" in the abstract - it's a specific, measurable pain: dozens-to-hundreds of services/instances that need automatic scheduling, self-healing, and rolling updates that a human genuinely can't keep up with by hand.
+
+## 6. 🔗 Connection to Other Concepts
+
+This is the exact same reasoning taught in [[15-simple-vs-scalable-architecture]] - ask what the actual requirement is before reaching for the architecture that looks most senior on paper.
+
+## 7. 🧠 Remember
+
+> Kubernetes trades a lot of new operational complexity for the ability to manage a large, disposable fleet automatically - if you're managing a handful of pets, not a herd of cattle, that trade isn't worth making yet.
+
+## 8. Quick Self-Test
+
+1. What specifically does Kubernetes cost you operationally, beyond "another thing to learn"?
+2. What's the actual, measurable trigger that justifies adopting it, versus just "it sounds more professional"?
+3. Why does "pets vs. cattle" matter more than the raw number of containers alone?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

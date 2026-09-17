@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WHERE vs HAVING in SQL</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# WHERE and HAVING Both Filter Data - So Why Do We Need Both?
+
+## 1. Story
+
+Both `WHERE` and `HAVING` show up in the same `SELECT` statement, both look like they're filtering rows, and it's genuinely unclear why SQL needs two different keywords for what looks like the same job.
+
+## 2. The Answer: They Filter at Different Stages of Query Execution
+
+SQL doesn't execute in the order it's written. The real execution order is roughly:
+
+`FROM -> WHERE -> GROUP BY -> HAVING -> SELECT -> ORDER BY`
+
+**WHERE** filters individual rows, **before** any grouping/aggregation happens. At this stage, aggregate values like `COUNT()`, `SUM()`, or `AVG()` don't exist yet - there are only raw rows - so `WHERE` cannot reference an aggregate function.
+
+**HAVING** filters **groups**, after `GROUP BY` has already collapsed rows into groups and computed the aggregate values. It exists specifically to filter on the *result* of aggregation, which is information that simply doesn't exist at the `WHERE` stage.
+
+## 3. Code Example
+
+```sql
+SELECT department, COUNT(*) AS active_employees
+FROM employees
+WHERE active = true          -- filters individual rows FIRST, before grouping
+GROUP BY department
+HAVING COUNT(*) > 10;        -- filters the GROUPS, using the aggregate result
+```
+
+Here, `WHERE active = true` removes inactive employees before grouping even happens. Then rows get grouped by department and counted. Only *after* that does `HAVING COUNT(*) > 10` remove entire departments that don't have enough active employees. Trying to write `WHERE COUNT(*) > 10` would fail - `COUNT(*)` doesn't exist yet at the point `WHERE` runs.
+
+## 4. Mental Model
+
+> WHERE asks "should this row even be considered?" before any grouping happens. HAVING asks "should this group survive?" after the grouping and counting is already done.
+
+## 5. Flow
+
+```mermaid
+flowchart LR
+  A[FROM - raw table] --> B["WHERE - filter individual rows"]
+  B --> C["GROUP BY - collapse into groups,<br/>compute aggregates"]
+  C --> D["HAVING - filter groups using<br/>the aggregate results"]
+  D --> E["SELECT - choose columns to return"]
+```
+
+## 6. Production Reality
+
+Filter as much as possible in `WHERE`, not `HAVING`, whenever the condition doesn't actually depend on an aggregate. `WHERE` reduces the row count *before* the (often expensive) grouping and aggregation work happens, so pushing filters earlier is generally better for performance - `HAVING` should only be used for conditions that genuinely require the aggregated value to evaluate.
+
+## 7. Common Mistakes
+
+- Trying to reference an aggregate function inside `WHERE` and getting a syntax/execution error, without understanding *why* it's not allowed.
+- Using `HAVING` for a condition that could have been expressed in `WHERE`, unnecessarily forcing the database to group more rows than it needed to before filtering.
+
+## 8. 🧠 Remember
+
+> WHERE filters rows before grouping; HAVING filters groups after aggregation - they exist because aggregate values simply don't exist yet at the point WHERE executes.
+
+## 9. Quick Self-Test
+
+1. Why can't `WHERE` reference the result of `COUNT()` or `SUM()`?
+2. Why is filtering in `WHERE` generally more efficient than filtering the same condition in `HAVING`, when possible?
+3. Write a query (in words) where a condition genuinely *must* go in `HAVING` and couldn't be expressed in `WHERE`.
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

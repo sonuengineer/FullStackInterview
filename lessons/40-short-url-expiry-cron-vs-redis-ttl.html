@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title> Cron vs Redis TTL</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Expiring Short URLs: Cron Job or Redis TTL?
+
+> **Same-question flag**: this is a direct instance of the exact contrast taught in [[03-ttl-deletion-at-scale]] - a batch cron sweep versus native per-key TTL expiry. That lesson already explains why the cron approach creates an avalanche and why TTL-based expiry avoids it; this is that same choice, asked directly.
+
+## 1. The Choice
+
+**Design A**: a background cron job periodically scans for expired short URLs and deletes them. **Design B**: store each short URL in Redis with its own TTL, letting Redis expire it natively.
+
+## 2. The Answer: Redis TTL (Design B)
+
+A cron job re-creates exactly the problem [[03-ttl-deletion-at-scale]] walks through: it has to scan for and batch-delete everything that's expired since the last run, all at once, on a schedule - a periodic spike instead of continuous, cheap background work, and it requires you to hand-build the batching/throttling logic to avoid a lock-heavy, disk-I/O-heavy sweep.
+
+Redis's native TTL support does this correctly by design: each key expires **individually**, spread naturally across time as each URL's own creation time plus its own TTL dictates - no coordinated batch, no avalanche, no cron schedule to tune. Redis also serves short URL lookups from memory, which is exactly the access pattern a URL shortener needs (fast, frequent, simple key lookups) - so Redis is doing double duty as both the storage and the expiry mechanism.
+
+## 3. Mental Model
+
+> A cron job is a scheduled batch sweep - a shape known to cause spikes at scale. Native TTL is continuous, cheap, per-item expiry - the same "let it drain continuously instead of all at once" principle from [[03-ttl-deletion-at-scale]], with no manual batching logic to write or maintain.
+
+## 4. 🧠 Remember
+
+> Whenever the storage layer offers native TTL, prefer it over a cron sweep - it turns an expiry problem into something the database already does correctly and continuously, instead of something you have to build batching and throttling logic for yourself.
+
+## 5. Quick Self-Test
+
+1. Why does a cron-based expiry job risk recreating the "avalanche" problem from Lesson 3?
+2. Why is Redis a particularly good fit for both storing and expiring short URLs, beyond just having a TTL feature?
+3. In what situation might a cron-based approach still be preferable to native TTL?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

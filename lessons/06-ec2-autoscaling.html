@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EC2 Auto Scaling</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Auto-Scaling an EC2 App for a 10x Traffic Spike
+
+## 1. Story
+
+Your app runs on a couple of EC2 instances. A product goes viral, or a big sale starts, and traffic jumps 10x within minutes. You need the system to grow on its own, without you SSH-ing into new boxes at 2 AM, and without falling over in the meantime.
+
+## 2. The Problem
+
+A fixed number of EC2 instances is a fixed ceiling. Traffic beyond that ceiling means queued requests, timeouts, and eventually an outage — exactly what you don't want during your highest-traffic moment.
+
+## 3. The Solution
+
+Put your EC2 instances in an **Auto Scaling Group (ASG)** behind an **Application Load Balancer (ALB)**:
+
+- The **ALB** is the single entry point — it health-checks every instance and only routes traffic to healthy ones.
+- The **ASG** watches a **CloudWatch metric** (commonly average CPU utilization, or request count per target) and automatically launches new EC2 instances from a **launch template** when the metric crosses a threshold ("target tracking scaling"), and terminates instances when load drops.
+- New instances must be able to serve traffic immediately — so the app must be **stateless**: no session data stored on the local instance's disk/memory. Sessions go in a shared store like Redis/ElastiCache; static assets go on S3 + CloudFront, not on the instance.
+
+## 4. Mental Model
+
+> ASG + ALB = a pool of interchangeable workers that grows and shrinks automatically, with a receptionist (the load balancer) routing each customer to whichever worker is free and healthy.
+
+## 5. How It Works / Flow
+
+```mermaid
+flowchart TB
+  Users --> R53[Route 53 DNS]
+  R53 --> ALB[Application Load Balancer]
+  ALB --> ASG["Auto Scaling Group<br/>(min 2, max N EC2 instances)"]
+  ASG --> RDS[(RDS - primary + read replicas)]
+  ASG --> Cache[(ElastiCache / Redis - shared sessions)]
+  CW[CloudWatch Metrics: CPU, request count] -.triggers scaling policy.-> ASG
+```
+
+## 6. How I'd Answer This In An Interview
+
+1. **State the prerequisite**: the app must be stateless — otherwise scaling out just creates instances that can't correctly serve a user whose session lives on a different box.
+2. **Name the components**: ALB for routing + health checks, ASG for elastic capacity, a launch template/AMI for consistent instance bootstrapping.
+3. **Name the scaling policy concretely**: target tracking on CPU utilization (e.g., "keep average CPU near 60%") or on ALB request count per target — not just "it scales automatically," show you know the mechanism.
+4. **Address scale-out vs scale-in asymmetry**: scale out fast (react quickly to spikes) but scale in slowly with a cooldown period, to avoid "flapping" (rapidly launching and terminating instances).
+5. **Address cold-start lag**: a freshly launched EC2 instance takes time to boot and initialize the app — mitigate with a pre-baked AMI (app + dependencies already installed) rather than installing everything via user-data scripts at boot, or maintain a small warm pool.
+6. **Mention predictable vs. unpredictable spikes**: for a known event (a scheduled sale), use **scheduled scaling** to pre-warm capacity ahead of time; for an unknown viral spike, rely on **reactive target-tracking** scaling.
+7. **Call out the next bottleneck**: the database. Scaling app servers alone doesn't help if the single RDS instance behind them is now getting 10x the queries — that's the sign of a mature answer in an interview: acknowledging that this fix moves the bottleneck rather than solving it end-to-end.
+
+## 7. Production Reality
+
+Cold start time (EC2 boot + app startup) means reactive scaling always has some lag — for the first minute or two of a sudden spike, existing instances absorb the extra load. This is exactly why load shedding (see the 15k RPS lesson) matters as a complementary short-term measure while ASG catches up.
+
+## 8. Trade-offs
+
+| | EC2 + ASG | Fargate / Lambda |
+|---|---|---|
+| Control | Full control over OS/runtime | Less control, managed runtime |
+| Scale speed | Minutes (instance boot time) | Seconds (containers/functions) |
+| Cost model | Pay for running instances | Pay per request/duration |
+| Ops burden | You manage AMIs, patches | Provider manages infra |
+
+## 9. Common Mistakes
+
+- Forgetting the database. Horizontally scaling the app tier while the database stays a single instance just relocates the bottleneck — this is the single most common gap in this interview answer, and calling it out explicitly signals seniority.
+- Storing session state on the local instance, which breaks correctness the moment a user's second request lands on a different instance than their first.
+- Setting scale-in too aggressively, causing the ASG to thrash (constantly launching and killing instances) as load fluctuates near the threshold.
+
+## 10. 🧠 Remember
+
+> Auto Scaling only works if your app is stateless and your database can take the extra load too — scaling compute without scaling or protecting your data layer just moves the bottleneck.
+
+## 11. Quick Self-Test
+
+1. Why does storing session data on the local EC2 instance break Auto Scaling correctness?
+2. Why would you use scheduled scaling in addition to (not instead of) target-tracking scaling?
+3. If your app servers scale to 20 instances but your RDS instance is maxed out, what actually happens to your users?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

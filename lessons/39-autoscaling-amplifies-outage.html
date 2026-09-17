@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Autoscaling Amplifies Outage</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Why Can Autoscaling Make an Outage Worse?
+
+> **Same-question flag**: this is exactly the "common mistake" already named in [[06-ec2-autoscaling]] and [[04-handling-traffic-spike-15k-rps]] - scaling the app tier when the database is the actual bottleneck makes things worse, not better. Kept short; the new piece worth naming is *why* the autoscaler keeps digging the hole deeper in a loop.
+
+## 1. The Feedback Loop
+
+Traffic spikes -> autoscaler adds instances -> more instances mean more concurrent connections hitting the database -> the database, not the app tier, was the real bottleneck, so it gets more overloaded -> requests slow down further -> the autoscaler sees high latency/CPU-wait and interprets it as "need more capacity" -> it adds even more instances -> the database gets hit even harder. The system amplifies its own failure.
+
+## 2. Why This Happens
+
+An autoscaler reacts to a **symptom** (request latency, CPU utilization, queue depth on the app tier) without knowing the **actual cause**. If the true bottleneck is downstream (the database), adding more of the thing that's *waiting* on that bottleneck doesn't relieve pressure - it multiplies the number of things hammering it. This is the identical class of mistake as scaling app servers during the [[04-handling-traffic-spike-15k-rps]] incident: more compute capacity only helps if compute is actually the constrained resource.
+
+## 3. The Fix
+
+- Scale on a metric that reflects the **actual** bottleneck, not just app-tier symptoms - if the database is the constraint, no app-tier metric should be allowed to trigger unbounded scaling.
+- Cap the number of concurrent connections each instance (and the fleet as a whole) can open to the database - a connection pool ceiling acts as a natural backpressure valve that prevents the fleet from ever overwhelming the database no matter how many instances exist.
+- Fix the actual bottleneck first (caching, read replicas - see [[28-scaling-database-reads]]) before trusting autoscaling to be a safe general-purpose response to any kind of slowdown.
+
+## 4. 🧠 Remember
+
+> Autoscaling amplifies an outage whenever it reacts to a symptom instead of the actual bottleneck - more app instances only help if compute was the real constraint; if the database is drowning, adding instances just means more things drowning it faster.
+
+## 5. Quick Self-Test
+
+1. Why does the autoscaler's own logic ("latency is high, add capacity") make sense in isolation but fail here?
+2. What specifically breaks the loop - what would stop instance count from climbing indefinitely?
+3. What's the difference between scaling on a symptom versus scaling on the actual bottleneck?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

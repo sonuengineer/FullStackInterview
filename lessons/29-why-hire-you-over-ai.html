@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Why Hire You Over AI</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# AI Can Build and Debug Faster Than You - Why Should We Hire You?
+
+*(Personal/career reflection, not a technical concept - kept in its own category as requested.)*
+
+## 1. The Real Question Behind the Question
+
+This question isn't really about typing speed or how fast code gets written. It's asking: **once AI can execute quickly, what's left that a human is actually being paid for?** Answering "I can also write code" loses immediately, because that's the one dimension AI is now competitive or faster on. The honest, strong answer is about everything *around* writing code that AI doesn't own.
+
+## 2. What Actually Doesn't Transfer to AI (Yet, Reliably)
+
+**Judgment under ambiguity.** AI answers the question you ask. A good engineer figures out which question *should* have been asked - this is exactly the distinction in [[30-workload-before-conclusion]]: Candidate B asking about write volume, mutability, and consistency requirements before naming a database isn't slower, they're doing the part of the job that actually determines whether the eventual answer is right.
+
+**Accountability.** Someone has to own what happens when a decision is wrong - a production incident, a security hole, a compliance violation, a bad trade-off that costs the business money. AI has no skin in the game and no accountability structure; a hire does.
+
+**Verifying and directing AI output.** Using AI as a force-multiplier requires being able to evaluate its output correctly - catch a subtly wrong assumption, a security gap, a design that doesn't fit the actual system's constraints. Someone who can't review AI-generated work at least as well as they could have written it isn't using AI as a tool, they're gambling with it.
+
+**System-level thinking over time.** Understanding how a decision made today affects maintainability, technical debt, and team velocity six to eighteen months out - AI optimizes for the prompt in front of it, not the organization's future.
+
+**Debugging genuinely novel production behavior.** Nearly every lesson in this curriculum - a thundering herd, clock skew, a memory leak with no errors - required forming and testing a hypothesis against a real, messy, live system, correlating signals across services no single tool has full visibility into. That's investigative reasoning under uncertainty, not pattern retrieval.
+
+**Communication and pragmatism.** Negotiating trade-offs with product and design, pushing back on a bad requirement, mentoring other engineers, and knowing when a "good enough" solution beats a technically superior one because of time-to-market - none of this is a coding task at all.
+
+## 3. Mental Model
+
+> AI is a fast, tireless engineer who has read everything but has no memory of your specific system's history, no accountability, and no judgment about what's actually worth building. You're not being hired to out-type a machine - you're being hired to decide what should be built, verify that it's actually right, and own what happens when it isn't.
+
+## 4. How to Actually Say This in an Interview
+
+"I'm not competing with AI on execution speed. I bring the judgment to turn an ambiguous problem into the right technical question, the ability to review and direct AI-generated work rather than just trust it, and the accountability for outcomes that a tool can't carry. AI makes me faster at building - it doesn't replace the thinking about what's worth building, or the responsibility for what happens after."
+
+## 5. Reflect on This Yourself
+
+1. Think of a real bug or design decision from your own experience where the hard part wasn't writing the code - what was it?
+2. Can you describe a time you caught something wrong in AI-generated code or advice? What let you catch it?
+3. What's one judgment call you'd be uncomfortable letting an AI make unsupervised, and why?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>
