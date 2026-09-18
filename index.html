@@ -322,6 +322,19 @@
   .img-card img { display: block; width: 100%; height: auto; }
   .img-hint { font-size: 0.78rem; color: var(--muted); margin: 6px 0 14px; font-family: -apple-system, "Segoe UI", Arial, sans-serif; }
   .img-card .read-along { margin-top: 12px; }
+  .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-top: 18px; }
+  .img-tile {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    cursor: pointer;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  }
+  .img-tile:hover { border-color: var(--accent); }
+  #reader .img-tile img { display: block; width: 100%; height: 140px; object-fit: cover; object-position: top; background: #fff; }
+  .img-tile-title { padding: 10px 12px; font-size: 0.88rem; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+  @media (max-width: 768px) { .img-grid { grid-template-columns: 1fr 1fr; gap: 10px; } #reader .img-tile img { height: 110px; } }
   /* Long unbroken strings (e.g. "REST/SOAP/GraphQL/gRPC") must wrap instead of widening the page */
   .home-card .ttl, .toc-item, .suggest-card, .suggest-nav button, #reader h1, #reader h2, #reader h3,
   #reader p, #reader li, #reader td, #reader th { overflow-wrap: anywhere; }
@@ -6078,6 +6091,35 @@ function buildSidebar(filterText) {
     tocContainer.appendChild(group);
   });
 
+  // "Images" group at the top: one entry per diagram, opens on its own page
+  const imgItems = IMAGES.map((img, i) => ({ img, i }))
+    .filter(({ img }) => !q || img.title.toLowerCase().includes(q) || 'images'.includes(q));
+  if (imgItems.length) {
+    const isOpen = q.length > 0 || currentImage !== null || imagesGroupOpen;
+    const group = document.createElement('div');
+    group.className = 'category-group';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'category-title' + (isOpen ? '' : ' collapsed');
+    titleEl.textContent = '\u{1F5BC}️ Images (' + imgItems.length + ')';
+    const itemsEl = document.createElement('div');
+    itemsEl.className = 'category-items' + (isOpen ? '' : ' collapsed');
+    titleEl.addEventListener('click', () => {
+      const nowCollapsed = titleEl.classList.toggle('collapsed');
+      itemsEl.classList.toggle('collapsed', nowCollapsed);
+      imagesGroupOpen = !nowCollapsed;
+    });
+    imgItems.forEach(({ img, i }) => {
+      const btn = document.createElement('button');
+      btn.className = 'toc-item' + (i === currentImage ? ' active' : '');
+      btn.innerHTML = '<span class="toc-num">' + (i + 1) + '</span>' + escHtml(img.title);
+      btn.addEventListener('click', () => renderImage(i));
+      itemsEl.appendChild(btn);
+    });
+    group.appendChild(titleEl);
+    group.appendChild(itemsEl);
+    tocContainer.prepend(group);
+  }
+
   if (!tocContainer.children.length) {
     const note = document.createElement('div');
     note.className = 'empty-note';
@@ -6087,7 +6129,7 @@ function buildSidebar(filterText) {
 }
 
 function renderHome() {
-  currentId = null;
+  currentId = null; currentImage = null;
   document.title = 'Learning Dashboard';
   progressEl.textContent = lessons.length + ' lessons';
   let html = '<h1>Your Learning Library</h1>' +
@@ -6168,7 +6210,7 @@ function buildSuggestions(lesson) {
 function openLesson(id) {
   const lesson = lessons.find(l => l.id === id);
   if (!lesson) return;
-  currentId = id;
+  currentId = id; currentImage = null;
   document.title = lesson.title + ' - Learning Dashboard';
   readerEl.innerHTML = marked.parse(linkifyCrossRefs(lesson.content), { renderer }) +
     buildSuggestions(lesson);
@@ -6210,7 +6252,7 @@ const LINKS = [
 ];
 
 function renderLinks() {
-  currentId = null;
+  currentId = null; currentImage = null;
   document.title = 'Links - Learning Dashboard';
   progressEl.textContent = LINKS.length + ' links';
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -6336,26 +6378,203 @@ const IMAGES = [
       '**Read along with:** [[25-api-styles-comparison]] [[11-what-is-an-api]] [[18-http-status-codes-400-404-409-422]] [[79-blog-rate-limiting]] [[68-schema-change-producer-vs-consumer]] [[27-cia-triad]]',
     ],
   },
+  {
+    file: 'Images/APi stats code.jfif',
+    title: 'API Status Codes Cheat Sheet',
+    notes: [
+      '**In one line:** the first digit tells you *who* has the problem. 2xx = all good, 3xx = look somewhere else, 4xx = the caller sent something wrong, 5xx = the server (or something behind it) failed.',
+      '',
+      '**The codes you will actually meet:**',
+      '- **200 OK** - worked. **201 Created** - a new thing was made (e.g. after a POST). **204 No Content** - worked, nothing to send back (e.g. after a DELETE).',
+      '- **301** - moved forever (browsers remember it). **302** - moved for now. **304 Not Modified** - "use the copy you already have", which saves bandwidth.',
+      '- **400** - the request itself is broken. **401** - we don\'t know who you are (login missing or expired). **403** - we know who you are, but you\'re not allowed. **404** - it doesn\'t exist. **409** - it clashes with the current state (e.g. email already taken). **422** - readable, but the data breaks a rule. **429** - too many requests, slow down.',
+      '- **500** - the server crashed. **502** - the server behind the proxy gave a bad answer. **503** - overloaded or in maintenance. **504** - the server behind the proxy was too slow.',
+      '',
+      '**The pairs people mix up:**',
+      '- **401 vs 403:** "who are you?" vs "I know you, and the answer is no."',
+      '- **400 vs 422:** "I can\'t read this" vs "I read it, but it\'s not valid."',
+      '- **502 vs 503 vs 504:** bad answer from upstream vs nobody available vs upstream took too long.',
+      '',
+      '**3-second debug clue:** 4xx means fix the request (URL, auth, params). 5xx means check server logs, and for 502/504 check the service *behind* the proxy too.',
+      '',
+      '**Read along with:** [[18-http-status-codes-400-404-409-422]] [[74-ingress-502-bad-gateway]] [[79-blog-rate-limiting]] [[02-debugging-random-500-errors]]',
+    ],
+  },
+  {
+    file: 'Images/Must Know backend tech concepts.jfif',
+    title: 'Must-Know Backend Tech Concepts (One-Liners)',
+    notes: [
+      '**In one line:** eleven building blocks that show up in almost every system design. Know what each one is for and, just as important, when you don\'t need it.',
+      '',
+      '**Each one, simply:**',
+      '- **API Gateway** - one front door for all your APIs: checks auth, applies rate limits, routes to the right service.',
+      '- **Load Balancer** - spreads traffic across several servers so no single one is overloaded, and skips unhealthy ones.',
+      '- **Reverse Proxy** (e.g. Nginx) - sits in front of your app and handles HTTPS, compression and caching for it.',
+      '- **Cache** (Redis/Memcached) - keeps frequently read data in memory so you don\'t hit the database every time.',
+      '- **Message Queue** (Kafka/RabbitMQ) - lets one service hand work to another without waiting for it.',
+      '- **Object Storage** (S3) - cheap, durable storage for big files: images, videos, backups.',
+      '- **CDN** (Cloudflare/Akamai) - copies of your static files on servers near your users, so they load fast.',
+      '- **Job Scheduler** - runs background or timed jobs, like cron.',
+      '- **Serverless** (AWS Lambda) - run code without managing servers; good for spiky or low traffic.',
+      '- **Container Orchestration** (Kubernetes) - runs and heals many containers across many machines.',
+      '- **Web Server** (Nginx/Apache) - serves HTTP requests and static files.',
+      '',
+      '**The common confusion:** a **reverse proxy**, a **load balancer** and an **API gateway** all sit in front of your app. A reverse proxy does it for one app; a load balancer splits traffic between many copies; an API gateway adds API rules (auth, rate limits, routing to many services). In practice one tool (e.g. Nginx) can do all three jobs.',
+      '',
+      '**Remember:** add each block only when a real problem calls for it - a small app may need just a web server and a database.',
+      '',
+      '**Read along with:** [[38-first-thing-to-scale]] [[24-kubernetes-pets-vs-cattle]] [[17-notification-system-design]] [[49-large-file-upload-with-status]] [[46-build-vs-rent-infrastructure]] [[77-blog-microservices-are-a-tax]]',
+    ],
+  },
+  {
+    file: 'Images/backend.jfif',
+    title: 'Backend Engineering Topic Map (What to Learn)',
+    notes: [
+      '**In one line:** a checklist of everything a strong backend engineer should be able to explain, from HTTP basics to debugging production. Use it to find your gaps.',
+      '',
+      '**The topics, grouped so they\'re easier to learn:**',
+      '1. **Foundations** - HTTP & networking (TCP, TLS, DNS, proxies), API design (REST, gRPC, GraphQL, pagination, idempotency), databases (SQL/NoSQL, indexes, query plans, transactions), database internals (B-trees, WAL, MVCC, buffer pools, deadlocks), caching (TTLs, eviction, invalidation, stampedes).',
+      '2. **Many things at once** - concurrency (threads, async I/O, races, locks), messaging (queues, Kafka, retries, backpressure), distributed systems (replication, sharding, consensus, CAP), transactions & failures (sagas, outbox, idempotency, partial failures).',
+      '3. **Staying up under load** - scalability (stateless services, replicas, partitioning, hot keys), reliability (backoff, circuit breakers, bulkheads, rate limits, failover), distributed APIs (timeouts, retries, hedging), and scale behavior (contention, hot partitions, queue buildup).',
+      '4. **Running it safely** - security (JWT, OAuth, RBAC, SQL injection, SSRF, secrets), observability (logs, metrics, traces, SLOs), performance (p95/p99, profiling, N+1 queries), testing (unit to chaos), infra (Docker, Kubernetes, CI/CD, autoscaling).',
+      '5. **Ways of thinking** - system design order: requirements -> estimation -> APIs -> data -> architecture -> scaling -> failures -> trade-offs. Debugging order: symptom -> evidence -> hypothesis -> experiment -> root cause.',
+      '',
+      '**How to use it:** go line by line and ask "could I explain this to someone with a real example?" Mark the ones you can\'t, and study those first.',
+      '',
+      '**Read along with:** [[53-blog-senior-system-design-without-big-scale]] [[62-blog-top-10-backend-tips]] [[14-cascading-failure-recovery]] [[19-idempotent-consumer-duplicate-events]] [[63-query-faster-second-time]] [[20-sudden-latency-spike-checklist]]',
+    ],
+  },
+  {
+    file: 'Images/sql concept.jfif',
+    title: 'Essential SQL Concepts (25 Must-Knows)',
+    notes: [
+      '**In one line:** 25 SQL ideas every developer uses. They fall into a few simple groups.',
+      '',
+      '**Grouped:**',
+      '- **Structure:** database, table, **primary key** (a unique ID for each row), **foreign key** (a link to a row in another table), **constraints** (NOT NULL, UNIQUE, CHECK, DEFAULT), **normalization** (don\'t store the same fact in two places).',
+      '- **Reading data:** SELECT, WHERE (filter rows), ORDER BY (sort), GROUP BY + aggregates (COUNT, SUM, AVG, MIN, MAX), HAVING (filter groups), JOIN (combine tables), UNION (stack results), DISTINCT (remove duplicates), subqueries, VIEWs (a saved query you can SELECT from).',
+      '- **Changing data:** INSERT, UPDATE, DELETE.',
+      '- **Speed:** **INDEX**, like a book index, so the database finds rows without reading the whole table.',
+      '- **Safety:** **transactions** (COMMIT, ROLLBACK) and **ACID**, so a group of changes either all happen or none do.',
+      '- **Logic inside the database:** stored procedures and functions.',
+      '',
+      '**Three things interviewers love to ask:**',
+      '- **WHERE vs HAVING:** WHERE filters rows *before* grouping; HAVING filters groups *after*.',
+      '- **INNER vs LEFT JOIN:** INNER keeps only matching rows; LEFT keeps every row from the left table, with NULLs where nothing matches.',
+      '- **UNION vs UNION ALL:** UNION removes duplicates (slower); UNION ALL keeps them all (faster).',
+      '',
+      '**Read along with:** [[34-where-vs-having]] [[57-two-indexes-still-slow-composite]] [[50-slow-query-500m-rows]] [[60-cache-says-100-db-says-20]] [[21-database-partitioning]] [[69-orm-save-in-loop-bulk-insert]]',
+    ],
+  },
+  {
+    file: 'Images/optimize search box in production.jfif',
+    title: 'How to Optimize a Search Box in Production',
+    notes: [
+      '**In one line:** don\'t make 10 API calls faster - make the *right number* of API calls, and make sure only the latest answer is shown.',
+      '',
+      '**The 7 ideas, simply:**',
+      '1. **Debounce** - wait until the user stops typing (~300-400ms) before calling the API. 5 keystrokes become 1 call.',
+      '2. **Cancel stale requests** - when a new search starts, cancel the old one so a slow old answer can\'t overwrite the new one.',
+      '3. **Cache recent searches** - searched "react" a minute ago? Show the saved result instead of calling the API again.',
+      '4. **Minimum query length** - don\'t search for "a" or "re". 2-3 characters is a common threshold.',
+      '5. **Keep the UI responsive** - show a small loader or skeleton, and keep the old results visible while new ones load.',
+      '6. **Handle race conditions** - even with cancelling, check that each response belongs to the *current* query before showing it.',
+      '7. **Use real search infrastructure at scale** - `WHERE name LIKE \'%query%\'` can\'t use a normal index and scans the whole table. Use Elasticsearch, OpenSearch, Algolia, or the database\'s full-text search.',
+      '',
+      '**Small example (debounce + cancel):**',
+      '```javascript',
+      'let timer, controller;',
+      'function onSearchInput(text) {',
+      '  clearTimeout(timer);',
+      '  if (text.length < 3) return;                // minimum length',
+      '  timer = setTimeout(async () => {            // debounce',
+      '    controller?.abort();                      // cancel the previous request',
+      '    controller = new AbortController();',
+      '    const res = await fetch(`/api/search?q=${encodeURIComponent(text)}`, { signal: controller.signal });',
+      '    const data = await res.json();',
+      '    if (text === currentInputValue()) showResults(data); // only the latest query wins',
+      '  }, 350);',
+      '}',
+      '```',
+      '',
+      '**Read along with:** [[33-react-performance-at-scale]] [[51-fast-api-slow-page]] [[50-slow-query-500m-rows]] [[79-blog-rate-limiting]]',
+    ],
+  },
+  {
+    file: 'Images/project to build in 2026.jfif',
+    title: '15 Projects to Build in 2026',
+    notes: [
+      '**In one line:** a menu of portfolio projects. Building 2-3 of them deeply beats building 15 shallow ones.',
+      '',
+      '**How to pick:**',
+      '- **Backend / system design roles:** Distributed URL Shortener (2), Distributed Chat App (5), Event Streaming Analytics Dashboard (7), Cloud File Storage (11), Video Streaming (13), Real-time Trading Platform (12).',
+      '- **AI engineering roles:** AI Coding Agent (1), AI Customer Support Agent with RAG (6), AI Code Review (9), Multi-Agent Research Assistant (10), AI Resume & Job Matching (14).',
+      '- **DevOps / platform roles:** Kubernetes Deployment Platform (8).',
+      '',
+      '**What makes a project stand out in interviews:**',
+      '- It\'s **deployed** and someone can actually use it.',
+      '- The README explains **decisions and trade-offs** ("why Redis here", "why not microservices yet").',
+      '- You **load-tested** it and can say what broke first and how you fixed it.',
+      '- It handles **failure**: retries, idempotency, timeouts, rate limits.',
+      '',
+      '**Several of these are already designed in this library:** the URL shortener and notification system diagrams in this Images section, file uploads in Lesson 49, and chat over WebSockets in Lesson 25.',
+      '',
+      '**Read along with:** [[53-blog-senior-system-design-without-big-scale]] [[42-resilience-vs-overengineering]] [[49-large-file-upload-with-status]] [[40-short-url-expiry-cron-vs-redis-ttl]] [[25-api-styles-comparison]] [[41-build-novel-vs-wanted]]',
+    ],
+  },
 ];
+
+// Images work like lessons: each one has its own page, reachable from the
+// sidebar "Images" group or the gallery, so the page never becomes one long scroll.
+let currentImage = null;
+let imagesGroupOpen = false;
+const escHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function renderImages() {
   currentId = null;
+  currentImage = null;
   document.title = 'Images - Learning Dashboard';
   progressEl.textContent = IMAGES.length + ' diagrams';
-  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  readerEl.innerHTML = '<h1>&#128444;&#65039; System Design Diagrams</h1>' +
-    '<p style="color:var(--muted)">Each diagram with short, simple notes. Tap an image to open it full size (you can zoom on your phone).</p>' +
-    IMAGES.map((img) => {
-      const src = encodeURI(img.file);
-      return '<div class="img-card"><h2>' + esc(img.title) + '</h2>' +
-        '<a class="img-link" href="' + src + '" target="_blank" rel="noopener"><img src="' + src + '" alt="' + esc(img.title) + '" loading="lazy"></a>' +
-        '<div class="img-hint">Tap the image to open it full size</div>' +
-        marked.parse(linkifyCrossRefs(img.notes.join('\n')), { renderer }) + '</div>';
-    }).join('');
+  readerEl.innerHTML = '<h1>&#128444;&#65039; Diagrams &amp; Cheat Sheets</h1>' +
+    '<p style="color:var(--muted)">Tap one to open it with its notes. They are also listed in the side menu under Images.</p>' +
+    '<div class="img-grid">' + IMAGES.map((img, i) =>
+      '<div class="img-tile" data-img="' + i + '">' +
+        '<img src="' + encodeURI(img.file) + '" alt="" loading="lazy">' +
+        '<div class="img-tile-title">' + (i + 1) + '. ' + escHtml(img.title) + '</div></div>').join('') +
+    '</div>';
   buildSidebar(document.getElementById('search').value);
   document.getElementById('reader-wrap').scrollTop = 0;
   closeMobileSidebar();
 }
+
+function renderImage(i) {
+  const img = IMAGES[i];
+  if (!img) return renderImages();
+  currentId = null;
+  currentImage = i;
+  document.title = img.title + ' - Learning Dashboard';
+  progressEl.textContent = 'Image ' + (i + 1) + ' of ' + IMAGES.length;
+  const src = encodeURI(img.file);
+  const prev = IMAGES[i - 1], next = IMAGES[i + 1];
+  readerEl.innerHTML = '<div class="img-card"><h1>' + escHtml(img.title) + '</h1>' +
+    '<a class="img-link" href="' + src + '" target="_blank" rel="noopener"><img src="' + src + '" alt="' + escHtml(img.title) + '"></a>' +
+    '<div class="img-hint">Tap the image to open it full size (you can zoom on your phone)</div>' +
+    marked.parse(linkifyCrossRefs(img.notes.join('\n')), { renderer }) + '</div>' +
+    '<div class="suggest-nav">' +
+      (prev ? '<button data-img="' + (i - 1) + '">&larr; ' + escHtml(prev.title) + '</button>' : '<button data-img="all">&larr; All images</button>') +
+      (next ? '<button class="next" data-img="' + (i + 1) + '">' + escHtml(next.title) + ' &rarr;</button>' : '<button class="next" data-img="all">All images &rarr;</button>') +
+    '</div>';
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+
+readerEl.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-img]');
+  if (!el) return;
+  e.preventDefault();
+  el.dataset.img === 'all' ? renderImages() : renderImage(Number(el.dataset.img));
+});
 
 document.getElementById('btn-images').addEventListener('click', renderImages);
 document.getElementById('btn-links').addEventListener('click', renderLinks);
