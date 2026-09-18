@@ -1,0 +1,147 @@
+# Blog: How to Clear a Senior System Design Round Without Ever Working at Google Scale
+
+*A junior engineer asked: "My company has a few thousand users. I've never worked at Google or Atlassian scale. How am I supposed to clear a Senior system design round?"*
+
+Here's the honest answer.
+
+**You don't need to have worked at Google scale to reason about scale.**
+**You need to show you can find what breaks as the workload grows.**
+
+Interviewers aren't checking whether you've *seen* a million requests per second. They're checking whether you can look at a design and say: "This part breaks first, here's why, here's what I'd change, and here's what that change costs." That skill can be practiced on any system - including the small one you work on today.
+
+Let's make it concrete with one running example.
+
+---
+
+## Our Example: The "Place Order" Feature
+
+Imagine you built the checkout for a small food-ordering app. Today it handles about **100 requests per second** at dinner time.
+
+```
+Client -> API -> OrderService -> Postgres
+                              -> Payment provider (external)
+                              -> sends confirmation email
+```
+
+Nothing fancy. Now let's use it to practice thinking like a senior engineer.
+
+---
+
+## Step 1 - Start With the System You Already Know
+
+Take this one feature and ask:
+
+- **What breaks at 1,000 requests/sec?**
+- **What breaks at 10,000?**
+- **Which component gets saturated first?**
+- **How would I even know?**
+
+Walk through it for our checkout:
+
+| Load | What likely breaks first | How you'd notice |
+|---|---|---|
+| 100 rps | Nothing, it works | - |
+| 1,000 rps | Database connection pool runs out (say 20 connections, each request holds one for ~50ms) | Requests queue waiting for a connection, p99 latency climbs |
+| 1,000 rps | Sending the email *inside* the request adds 300ms to every checkout | Checkout feels slow even though the DB is fine |
+| 10,000 rps | Single Postgres primary maxes out on writes | DB CPU / IO at 100%, lock waits |
+| 10,000 rps | Payment provider rate-limits you | 429 errors from the provider |
+
+Quick math for the pool: 20 connections, each held ~50ms, means about `20 / 0.05 = 400` requests/sec max. So at 1,000 rps you are already over the limit. **That's a real, defensible bottleneck you found with arithmetic, not a Google badge.**
+
+You're not pretending your app is Netflix. You're learning how load actually moves through a real system.
+
+---
+
+## Step 2 - Follow One Request End to End
+
+Trace a single checkout from the moment the user taps "Pay":
+
+`Client -> API -> application -> database -> queue -> worker -> external dependency`
+
+At each hop, ask four questions:
+
+1. **Where does it wait?** (Network calls, locks, disk.) Waiting doesn't show up as high CPU - see [[13-hidden-latency-bottleneck]].
+2. **Which pool is bounded?** (DB connections, thread pool, worker count, provider rate limit.) Bounded pools are where queues form.
+3. **Which operation gets slower as data grows?** ("Check if this coupon was already used" is instant with 10,000 orders and 45 seconds with 500 million if it's not indexed - see [[50-slow-query-500m-rows]].)
+4. **What happens when a downstream service is down?** If the email provider hangs for 20 seconds, does checkout hang for 20 seconds too? (See [[14-cascading-failure-recovery]].)
+
+**The big lesson: scale is usually waiting, contention, and skew - not a giant number printed on a slide.**
+
+- **Waiting**: a request sitting idle on a slow dependency.
+- **Contention**: many requests fighting for the same thing (one row, one lock, one small pool).
+- **Skew**: one hot key, one huge customer, or one popular restaurant taking a disproportionate share of traffic.
+
+---
+
+## Step 3 - Learn the Common Scaling Moves (and What Each One Costs)
+
+There's a small toolkit that covers most interview problems. The senior part is knowing the **cost** of each move, not just its name.
+
+| Problem | Common moves | The new problem it creates |
+|---|---|---|
+| Reads are slow | Index, cache, read replicas, precompute | Stale data, cache invalidation, replication lag ([[28-scaling-database-reads]]) |
+| Writes are hot | Partition, batch, reduce coordination | Cross-partition queries get hard ([[21-database-partitioning]]) |
+| Slow work blocks requests | Move it to a queue | Retries, duplicates, need idempotency ([[19-idempotent-consumer-duplicate-events]]) |
+| One tenant dominates | Isolate them (own pool, own shard, own rate limit) | More infrastructure to run |
+| Users are far away | Serve reads closer (CDN, regional replicas) | Consistency across regions ([[10-clock-skew-last-write-wins]]) |
+
+Apply it to our checkout:
+
+- Email inside the request? **Move it to a queue.** Checkout drops from 350ms to 50ms. *New problem*: if the worker retries, the user might get two emails, so the email job needs an idempotency key.
+- Connection pool maxed? **Tune the pool and cut query time with an index** first. *Cost*: almost nothing. That's why it comes first ([[38-first-thing-to-scale]]).
+- One restaurant chain is 40% of all orders? **Isolate it** with its own rate limit so a sale at that chain doesn't slow down everyone else.
+
+**Every move creates another problem. Saying that out loud in the interview is exactly what makes you sound senior.**
+
+---
+
+## Step 4 - Use Numbers to Guide How Deep You Go
+
+Before drawing boxes, estimate a few things:
+
+- **Peak QPS** (not average - dinner time, sale day)
+- **Read/write ratio**
+- **Object size**
+- **Storage growth** per day/year
+- **Acceptable latency**
+
+Our checkout, quick version:
+
+- 1 million orders/day, peak is roughly 10x average: `1,000,000 / 86,400 = ~12/sec average`, so **~120/sec peak**.
+- Each order row ~1 KB: `1M x 1 KB = ~1 GB/day`, **~365 GB/year**.
+
+What do the numbers tell us? 120 writes/sec is **easy** for a single Postgres. So we don't need sharding. But 365 GB/year means that in 2-3 years, old-order queries will slow down, so we should plan **time-based partitioning or archiving** ([[21-database-partitioning]]).
+
+You don't need perfect math. **You need just enough math to explain why the simple design stops being enough - and when.** That also protects you from the opposite mistake: over-engineering a system that 120 writes/sec never needed ([[15-simple-vs-scalable-architecture]], [[42-resilience-vs-overengineering]]).
+
+---
+
+## Putting It Together in the Interview
+
+A structure that works even if you've never touched huge scale:
+
+1. **Clarify** requirements and the numbers ([[30-workload-before-conclusion]]).
+2. **Draw the simple design** that meets today's needs.
+3. **Grow the load** in steps (10x, 100x) and name what breaks first at each step.
+4. **Apply one scaling move** per bottleneck and state its cost.
+5. **Cover failure**: what happens when a dependency is slow or down.
+
+Example sentence you can reuse:
+
+> "At 100 rps this design is fine. At around 400 rps the connection pool becomes the bottleneck, which I can see from connection wait time. First I'd add the missing index and move email to a queue, which is cheap. If we reach 10,000 rps, write throughput on one primary becomes the limit, so I'd look at partitioning by restaurant, and that makes cross-restaurant reports harder, so I'd precompute those."
+
+That answer shows reasoning, ordering, and trade-offs. None of it required Google.
+
+---
+
+## 🧠 Remember
+
+> Senior system design isn't about having seen massive scale - it's about taking any system, growing the load in your head, finding what breaks first, and explaining the fix *and* its cost.
+
+## Practice Assignment
+
+Pick one feature you actually built this year and write down:
+
+1. Its current peak requests/sec.
+2. The first component that saturates at 10x, and how you'd detect it.
+3. One scaling move for that bottleneck, and the new problem that move creates.

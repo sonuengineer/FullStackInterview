@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Large File Uploads With Status</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Large File Uploads With Status Tracking - Why "Upload Through the API" Is Wrong
+
+> **Builds on**: [[48-huge-json-payloads]] (big data should not flow through your API servers) and [[17-notification-system-design]] (async processing with status tracking).
+
+## 1. Story
+
+The interview problem: build a system where users upload large files (videos, datasets, 2 GB design files) and can see the upload status.
+
+The candidate answers: "Frontend uploads the file, API receives it, backend stores it on the server, save the file URL in the DB."
+
+It sounds reasonable. It breaks in at least five ways.
+
+## 2. What's Wrong With the Candidate's Answer
+
+- **API servers become file pipes.** Every byte of a 2 GB file flows through your app server, holding a connection and memory/disk for minutes. A handful of uploads can saturate the whole API tier.
+- **Storing on the server's local disk.** The file lives on one machine. The next request might hit another instance behind the load balancer that doesn't have it, autoscaling can delete that instance, and disks fill up. This breaks the stateless-server rule from [[06-ec2-autoscaling]].
+- **No resume.** If the network drops at 95%, the user starts over from zero.
+- **No real status.** "Track upload status" is impossible if the only state is "the request is still open."
+- **Timeouts.** Load balancers and proxies commonly cut long requests (often 60 seconds by default), killing large uploads mid-way.
+
+## 3. The Correct Design
+
+**Step 1 - Ask for permission, not bandwidth.** The client calls the API: "I want to upload `video.mp4`, 2 GB." The API creates an `uploads` record (`status = pending`) and returns a **pre-signed URL**.
+
+**Term: Pre-signed URL** - a temporary, signed link that lets the client upload directly to object storage (S3, GCS, Azure Blob) for a limited time, without your API ever touching the bytes and without exposing storage credentials.
+
+**Step 2 - Upload directly to object storage, in parts.** For big files, use **multipart upload**: the file is split into chunks (for example 10 MB each), uploaded in parallel, and each chunk can be retried independently. A dropped connection means re-sending one chunk, not the whole file. This gives you resume for free.
+
+**Step 3 - Track progress.** The client knows which parts are done, so it can show a real progress bar. The server records state transitions: `pending -> uploading -> uploaded -> processing -> ready` (or `failed`).
+
+**Step 4 - Confirm completion.** When the upload finishes, object storage emits an event (e.g. S3 event notification) or the client calls `POST /uploads/{id}/complete`. The API verifies the object exists (size, checksum) and updates the status.
+
+**Step 5 - Post-process asynchronously.** Virus scan, thumbnails, video transcoding, metadata extraction all run in background workers from a queue, updating the status as they go. The user sees "Processing..." then "Ready".
+
+## 4. Mental Model
+
+> Your API is the **traffic controller**, not the **truck**. It hands out permission slips (pre-signed URLs) and keeps the logbook (status table), while the heavy cargo goes straight from the user to the warehouse (object storage).
+
+## 5. Flow
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant API
+  participant S3 as Object Storage
+  participant Q as Queue/Worker
+
+  C->>API: POST /uploads (name, size, type)
+  API-->>C: uploadId + pre-signed part URLs
+  C->>S3: PUT part 1..N (parallel, retry per part)
+  C->>API: POST /uploads/{id}/complete
+  API->>S3: verify object (size, checksum)
+  API->>Q: enqueue post-processing
+  Q-->>API: status = ready
+  C->>API: GET /uploads/{id} (status polling or websocket)
+```
+
+## 6. Data Model
+
+| Column | Purpose |
+|---|---|
+| id | upload id |
+| user_id | owner |
+| object_key | where it lives in storage |
+| size, checksum | integrity check on completion |
+| status | pending / uploading / uploaded / processing / ready / failed |
+| created_at, updated_at | expire abandoned uploads |
+
+## 7. Production Reality
+
+- **Abandoned uploads**: users close the tab mid-upload. Use a lifecycle rule to clean up incomplete multipart uploads and a TTL on `pending` records (same continuous-cleanup idea as [[03-ttl-deletion-at-scale]]).
+- **Security**: validate type/size before issuing the URL, keep the URL short-lived, scan files before they become downloadable, and never trust the client-reported size alone.
+- **Downloads**: serve files via a CDN or pre-signed GET URLs, not through the API.
+
+## 8. Trade-offs
+
+Direct-to-storage uploads add a few more steps (request URL, upload, confirm) and make the client slightly more complex. In return, the API tier stays small and stateless, uploads survive network drops, and status becomes a real, queryable thing.
+
+## 9. 🧠 Remember
+
+> Never stream large files through your API servers or onto their local disks: hand out pre-signed URLs, let clients upload in resumable parts straight to object storage, and track the lifecycle in a status table.
+
+## 10. Quick Self-Test
+
+1. Name three things that break when files are stored on the API server's local disk.
+2. How does multipart upload give you "resume" almost for free?
+3. How does the backend learn that an upload directly to S3 has finished?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

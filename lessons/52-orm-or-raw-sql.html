@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ORM or Raw SQL</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Tech Lead Says "Never Use an ORM." What's Your Reply?
+
+## 1. Story
+
+Your tech lead has been burned before: a page that made 400 database queries, a report that took 30 seconds because the ORM generated an insane join, a migration nobody understood. So now the rule is: "Never use an ORM for database queries."
+
+## 2. What an ORM Actually Is
+
+**Term: ORM (Object-Relational Mapper)** - a library (Prisma, Sequelize, TypeORM, Hibernate, Django ORM, SQLAlchemy) that maps database rows to objects in your code, so you write `User.findById(1)` instead of `SELECT * FROM users WHERE id = 1`.
+
+It's a productivity and safety tool, not a performance tool.
+
+## 3. Why the Tech Lead Isn't Wrong
+
+The pain is real:
+
+- **The N+1 problem.** Load 100 orders, then access `order.customer` in a loop: the ORM quietly runs 1 query for orders + 100 queries for customers = 101 round trips, where one join would have done it.
+- **Hidden, inefficient SQL.** Complex filters and joins can generate SQL no human would write, and nobody looks at it until it's slow.
+- **Over-fetching.** `SELECT *` by default, loading columns you don't need.
+- **Leaky abstraction.** Developers stop learning SQL and can't debug the query plan (see [[50-slow-query-500m-rows]]).
+
+## 4. Why "Never" Is Too Strong
+
+- Most application queries are simple CRUD. Hand-writing hundreds of them is slow, repetitive, and error-prone.
+- ORMs give you **parameterized queries by default**, which protects against SQL injection - hand-built SQL strings are a common source of exactly that bug.
+- Migrations, relations, and type safety come for free.
+- Nearly every ORM has an escape hatch to raw SQL when you need it.
+
+## 5. A Good Reply
+
+> "I agree the ORM has burned us. But I'd rather set rules than ban it: use the ORM for simple CRUD, where it's safe and fast to write. For complex reports, hot paths, and bulk operations, write raw SQL or use a query builder. Log the SQL the ORM generates, watch for N+1 in code review, and check `EXPLAIN` on anything slow. The problem isn't the ORM, it's not knowing what SQL it runs."
+
+## 6. Code Example
+
+```javascript
+// N+1: 1 query for orders + 1 query per order for the customer
+const orders = await Order.findAll();
+for (const o of orders) {
+  console.log((await o.getCustomer()).name);
+}
+
+// Fixed with the ORM: eager-load, one query with a join
+const orders2 = await Order.findAll({ include: Customer });
+
+// Hot reporting path: raw SQL where you control every line
+const rows = await db.query(
+  `SELECT c.name, SUM(o.total) AS revenue
+     FROM orders o JOIN customers c ON c.id = o.customer_id
+    WHERE o.created_at >= $1
+    GROUP BY c.name
+    ORDER BY revenue DESC
+    LIMIT 20`,
+  [since]   // still parameterized - never string-concatenate user input
+);
+```
+
+## 7. Mental Model
+
+> An ORM is an automatic gearbox: great for daily driving, but you should still know how the engine works, and switch to manual (raw SQL) on the steep hills.
+
+## 8. Trade-offs
+
+| | ORM | Raw SQL / query builder |
+|---|---|---|
+| Speed of development | Fast for CRUD | Slower, more code |
+| Performance control | Limited, can surprise you | Full control |
+| Injection safety | Safe by default | Safe only if parameterized |
+| Complex queries | Awkward or inefficient | Natural |
+
+## 9. Common Mistakes
+
+- Banning the ORM entirely and then hand-writing string-concatenated SQL that opens SQL injection holes.
+- Using the ORM everywhere without ever looking at the generated SQL.
+
+## 10. 🧠 Remember
+
+> The right answer isn't "never ORM" or "always ORM" - it's ORM for simple CRUD, raw SQL for complex and hot paths, and always knowing what SQL is actually running.
+
+## 11. Quick Self-Test
+
+1. What is the N+1 query problem, and how do you fix it inside an ORM?
+2. Why can banning ORMs make an application *less* secure?
+3. Which kinds of queries would you always write by hand?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

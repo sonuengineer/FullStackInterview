@@ -3486,6 +3486,636 @@ This isn't a universal law. Technology can win decisively when the advantage is 
 2. What would make a technology advantage genuinely defensible rather than temporary?
 3. How does this connect to the "build wanted, not novel" judgment from Lesson 41?
 </script>
+<script type="text/markdown" class="lesson-data" data-id="48" data-title="Huge JSON Payloads (10-20 MB)" data-category="Web &amp; API Communication" data-order="48">
+# Designing an API That Accepts 10-20 MB JSON Payloads
+
+## 1. Story
+
+A partner integration starts sending your API product catalogs as one giant JSON body: 10-20 MB per request. At first it works. Then a few partners send at the same time, memory spikes, requests time out halfway through, and the process gets OOM-killed. Nothing in the business logic changed. The payload size did.
+
+## 2. The Problem
+
+A normal API handler does this:
+
+1. Read the **entire** body into memory.
+2. `JSON.parse` the whole thing into objects (often 2-5x larger in memory than the raw bytes).
+3. Validate it, then process it, all **inside the HTTP request**.
+
+With a 20 MB body, one request can easily hold 50-100 MB of heap. Ten concurrent uploads and a normal-sized server is out of memory. And because processing happens inside the request, the client is stuck waiting for minutes, load balancers hit their timeouts, and one slow request ties up a worker for everyone else.
+
+## 3. The Solution - Stop Treating a Big Payload Like a Small One
+
+**1. Set explicit limits.** Configure a max body size at the load balancer/reverse proxy and in the app (`express.json({ limit: '20mb' })`). Anything bigger gets a fast `413 Payload Too Large` instead of eating memory first.
+
+**2. Accept compressed bodies.** JSON compresses extremely well (often 5-10x). Accept `Content-Encoding: gzip` so the network transfer is small.
+
+**3. Stream-parse instead of loading everything.** **Term: Streaming parser** - reads the JSON piece by piece and emits one record at a time, so memory stays flat no matter how big the file is. If the payload is an array of items, process each item as it arrives instead of holding all of them.
+
+**4. Make it asynchronous.** The API should only *accept* the payload, store it (object storage like S3), put a job on a queue, and immediately return `202 Accepted` with a `jobId`. Workers process it in the background, and the client polls `GET /jobs/{jobId}` or gets a webhook when done. This is the same "decouple slow work from the request" idea from [[17-notification-system-design]].
+
+**5. Better yet - don't send it through the API at all.** For really large data, let the client upload directly to object storage with a pre-signed URL and just tell the API "it's there." That's the full design in [[49-large-file-upload-with-status]].
+
+**6. Question the format.** If partners are sending huge arrays of records, **NDJSON** (one JSON object per line) or batched pagination (1,000 items per request) is often simpler than one giant document.
+
+## 4. Mental Model
+
+> A big payload is not a big request, it's a **job**. Accept it fast, store it somewhere durable, and process it in the background, piece by piece.
+
+## 5. Flow
+
+```mermaid
+flowchart LR
+  C[Client] -->|gzip JSON, max 20MB| API
+  API -->|store raw payload| S3[(Object storage)]
+  API -->|enqueue jobId| Q[Queue]
+  API -->|202 Accepted + jobId| C
+  Q --> W[Worker - streaming parse]
+  W --> DB[(Database)]
+  C -->|GET /jobs/jobId| API
+```
+
+## 6. Code Example
+
+```javascript
+// Accept fast, process later
+app.post('/imports', express.raw({ type: 'application/json', limit: '20mb' }), async (req, res) => {
+  const jobId = crypto.randomUUID();
+  await s3.putObject({ Bucket: 'imports', Key: `${jobId}.json`, Body: req.body });
+  await queue.send({ jobId });
+  await db.jobs.insert({ id: jobId, status: 'queued' });
+  res.status(202).json({ jobId, statusUrl: `/imports/${jobId}` });
+});
+
+// Worker: stream-parse so memory stays flat
+const { parser } = require('stream-json');
+const { streamArray } = require('stream-json/streamers/StreamArray');
+
+async function processImport(jobId) {
+  const stream = (await s3.getObject({ Bucket: 'imports', Key: `${jobId}.json` })).Body
+    .pipe(parser()).pipe(streamArray());
+  for await (const { value: item } of stream) {
+    await upsertItem(item); // one record at a time, never the whole file in memory
+  }
+  await db.jobs.update(jobId, { status: 'done' });
+}
+```
+
+## 7. Production Reality
+
+- Validate cheaply up front (content type, size, auth), and do deep validation in the worker, reporting row-level errors in the job status.
+- Make the import idempotent (the client sends an idempotency key, see [[32-payment-idempotency-double-click]]) so a retry after a timeout doesn't import twice.
+- Put per-client rate limits on this endpoint, since a single partner can otherwise flood your workers.
+
+## 8. Trade-offs
+
+Async processing means the client no longer gets an instant "done", it gets a job to track. That is more work for API consumers, but it is the only design that stays stable when payloads and concurrency both grow.
+
+## 9. Common Mistakes
+
+- Just raising the body limit to 50 MB and calling it fixed. The memory and timeout problems are still there, just delayed.
+- Parsing the whole payload in the request handler, then processing it synchronously while the client waits.
+
+## 10. 🧠 Remember
+
+> Treat a huge payload as a job, not a request: limit it, compress it, store it, queue it, and stream-parse it in a worker.
+
+## 11. Quick Self-Test
+
+1. Why can a 20 MB JSON body use far more than 20 MB of memory once parsed?
+2. Why is returning `202 Accepted` with a job ID better than processing inside the request?
+3. When would you skip the API entirely and upload straight to object storage?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="49" data-title="Large File Uploads With Status Tracking" data-category="System Design at Scale" data-order="49">
+# Large File Uploads With Status Tracking - Why "Upload Through the API" Is Wrong
+
+> **Builds on**: [[48-huge-json-payloads]] (big data should not flow through your API servers) and [[17-notification-system-design]] (async processing with status tracking).
+
+## 1. Story
+
+The interview problem: build a system where users upload large files (videos, datasets, 2 GB design files) and can see the upload status.
+
+The candidate answers: "Frontend uploads the file, API receives it, backend stores it on the server, save the file URL in the DB."
+
+It sounds reasonable. It breaks in at least five ways.
+
+## 2. What's Wrong With the Candidate's Answer
+
+- **API servers become file pipes.** Every byte of a 2 GB file flows through your app server, holding a connection and memory/disk for minutes. A handful of uploads can saturate the whole API tier.
+- **Storing on the server's local disk.** The file lives on one machine. The next request might hit another instance behind the load balancer that doesn't have it, autoscaling can delete that instance, and disks fill up. This breaks the stateless-server rule from [[06-ec2-autoscaling]].
+- **No resume.** If the network drops at 95%, the user starts over from zero.
+- **No real status.** "Track upload status" is impossible if the only state is "the request is still open."
+- **Timeouts.** Load balancers and proxies commonly cut long requests (often 60 seconds by default), killing large uploads mid-way.
+
+## 3. The Correct Design
+
+**Step 1 - Ask for permission, not bandwidth.** The client calls the API: "I want to upload `video.mp4`, 2 GB." The API creates an `uploads` record (`status = pending`) and returns a **pre-signed URL**.
+
+**Term: Pre-signed URL** - a temporary, signed link that lets the client upload directly to object storage (S3, GCS, Azure Blob) for a limited time, without your API ever touching the bytes and without exposing storage credentials.
+
+**Step 2 - Upload directly to object storage, in parts.** For big files, use **multipart upload**: the file is split into chunks (for example 10 MB each), uploaded in parallel, and each chunk can be retried independently. A dropped connection means re-sending one chunk, not the whole file. This gives you resume for free.
+
+**Step 3 - Track progress.** The client knows which parts are done, so it can show a real progress bar. The server records state transitions: `pending -> uploading -> uploaded -> processing -> ready` (or `failed`).
+
+**Step 4 - Confirm completion.** When the upload finishes, object storage emits an event (e.g. S3 event notification) or the client calls `POST /uploads/{id}/complete`. The API verifies the object exists (size, checksum) and updates the status.
+
+**Step 5 - Post-process asynchronously.** Virus scan, thumbnails, video transcoding, metadata extraction all run in background workers from a queue, updating the status as they go. The user sees "Processing..." then "Ready".
+
+## 4. Mental Model
+
+> Your API is the **traffic controller**, not the **truck**. It hands out permission slips (pre-signed URLs) and keeps the logbook (status table), while the heavy cargo goes straight from the user to the warehouse (object storage).
+
+## 5. Flow
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant API
+  participant S3 as Object Storage
+  participant Q as Queue/Worker
+
+  C->>API: POST /uploads (name, size, type)
+  API-->>C: uploadId + pre-signed part URLs
+  C->>S3: PUT part 1..N (parallel, retry per part)
+  C->>API: POST /uploads/{id}/complete
+  API->>S3: verify object (size, checksum)
+  API->>Q: enqueue post-processing
+  Q-->>API: status = ready
+  C->>API: GET /uploads/{id} (status polling or websocket)
+```
+
+## 6. Data Model
+
+| Column | Purpose |
+|---|---|
+| id | upload id |
+| user_id | owner |
+| object_key | where it lives in storage |
+| size, checksum | integrity check on completion |
+| status | pending / uploading / uploaded / processing / ready / failed |
+| created_at, updated_at | expire abandoned uploads |
+
+## 7. Production Reality
+
+- **Abandoned uploads**: users close the tab mid-upload. Use a lifecycle rule to clean up incomplete multipart uploads and a TTL on `pending` records (same continuous-cleanup idea as [[03-ttl-deletion-at-scale]]).
+- **Security**: validate type/size before issuing the URL, keep the URL short-lived, scan files before they become downloadable, and never trust the client-reported size alone.
+- **Downloads**: serve files via a CDN or pre-signed GET URLs, not through the API.
+
+## 8. Trade-offs
+
+Direct-to-storage uploads add a few more steps (request URL, upload, confirm) and make the client slightly more complex. In return, the API tier stays small and stateless, uploads survive network drops, and status becomes a real, queryable thing.
+
+## 9. 🧠 Remember
+
+> Never stream large files through your API servers or onto their local disks: hand out pre-signed URLs, let clients upload in resumable parts straight to object storage, and track the lifecycle in a status table.
+
+## 10. Quick Self-Test
+
+1. Name three things that break when files are stored on the API server's local disk.
+2. How does multipart upload give you "resume" almost for free?
+3. How does the backend learn that an upload directly to S3 has finished?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="50" data-title="Slow Query on 500M Rows" data-category="Databases" data-order="50">
+# 500 Million Rows, 45-Second Query, Business Wants Under 2 Seconds - What First?
+
+> **Connects to**: [[21-database-partitioning]] and [[28-scaling-database-reads]] cover the bigger tools. This lesson is about the **order**: what you touch *first*, and why the answer is "read the query plan" before anything else.
+
+## 1. Story
+
+A reporting query on a 500-million-row `orders` table takes 45 seconds. The business wants it under 2. Someone suggests "bigger database," someone else says "add Redis," a third wants to shard. Nobody has looked at *why* it takes 45 seconds.
+
+## 2. First Move: Look at the Query Plan
+
+**Term: Query plan** - the step-by-step strategy the database chose to run your query (which indexes, which scan type, which join order). You see it with `EXPLAIN` (estimates) or `EXPLAIN ANALYZE` (actually runs it and shows real timings and row counts).
+
+This is the Database Mode chain in practice: **data -> storage -> index -> query -> query plan -> performance**. A 45-second query on 500M rows almost always shows one of these in the plan:
+
+- **Sequential scan** (reading the whole table) because no usable index exists for the `WHERE` filter.
+- An index exists but **can't be used**: a function on the column (`WHERE DATE(created_at) = ...`), an implicit type cast, a leading wildcard `LIKE '%abc'`, or `OR` across different columns.
+- A huge **sort or hash** spilling to disk because `ORDER BY` / `GROUP BY` isn't backed by an index.
+- Row estimates wildly wrong because **statistics are stale**, so the planner picks a bad strategy.
+
+## 3. Then Fix in Order of Cheapness
+
+1. **Rewrite the query so indexes can be used.** `WHERE created_at >= '2026-01-01' AND created_at < '2026-01-02'` instead of `WHERE DATE(created_at) = '2026-01-01'`. Select only the columns you need instead of `SELECT *`.
+2. **Add the right index.** Usually a **composite index** matching the filter and sort, e.g. `(customer_id, created_at)`. If the index also contains every selected column (a **covering index**), the database never even touches the table rows.
+3. **Update statistics** (`ANALYZE`) so the planner makes good choices.
+4. **Partition** by the filter key (often time) so the query touches one partition instead of 500M rows - see [[21-database-partitioning]].
+5. **Precompute** if it's an aggregate report: a summary table or materialized view refreshed periodically turns a 45-second aggregation into a millisecond lookup - the CQRS idea from [[28-scaling-database-reads]].
+6. Only after all that: caching, read replicas, or bigger hardware.
+
+## 4. Code Example
+
+```sql
+-- Step 1: see what the database is actually doing
+EXPLAIN ANALYZE
+SELECT id, total FROM orders
+WHERE customer_id = 42 AND DATE(created_at) = '2026-09-01'
+ORDER BY created_at DESC;
+-- Plan shows: Seq Scan on orders (rows=500,000,000) ... 45,000 ms
+
+-- Step 2: make the filter index-friendly
+SELECT id, total FROM orders
+WHERE customer_id = 42
+  AND created_at >= '2026-09-01' AND created_at < '2026-09-02'
+ORDER BY created_at DESC;
+
+-- Step 3: index that matches filter + sort, covering the selected columns
+CREATE INDEX CONCURRENTLY idx_orders_customer_created
+  ON orders (customer_id, created_at DESC) INCLUDE (total);
+-- Plan now: Index Only Scan ... ~5 ms
+```
+
+## 5. Mental Model
+
+> Never tune a slow query blind. `EXPLAIN ANALYZE` tells you whether the database is reading 500 million rows or 50 - and most "45 second" queries are one missing or unusable index away from milliseconds.
+
+## 6. Production Reality
+
+- On a live 500M-row table, create indexes **concurrently** (`CREATE INDEX CONCURRENTLY` in Postgres, online DDL in MySQL) so you don't lock writes for an hour.
+- Every index speeds up reads but slows down writes and uses disk, so add the one the plan actually needs, not ten "just in case."
+- Test with production-like data volume; a query that's fast on 10,000 rows in staging can pick a completely different plan on 500M.
+
+## 7. Common Mistakes
+
+- Jumping to Redis or a bigger instance before reading the query plan.
+- Wrapping an indexed column in a function in the `WHERE` clause, silently disabling the index.
+- Adding a single-column index when the query filters on one column and sorts on another, so the database still sorts millions of rows.
+
+## 8. 🧠 Remember
+
+> Slow query on a huge table: run `EXPLAIN ANALYZE` first, make the filter index-friendly, add the index that matches the filter and sort, and only then reach for partitioning, precomputation, or hardware.
+
+## 9. Quick Self-Test
+
+1. Why does `WHERE DATE(created_at) = ...` often ignore an index on `created_at`?
+2. What makes an index "covering," and why is it faster?
+3. When is a materialized view a better fix than an index?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="51" data-title="Fast API, Slow Page (80ms vs 4.8s)" data-category="Frontend" data-order="51">
+# The API Is Fast, But Users Say It's Slow (80ms Backend, 4.8s Experience)
+
+> **Similar-question flag**: this is close to [[33-react-performance-at-scale]] (backend fine, browser is the bottleneck). That lesson was about **rendering a big list** after data arrives. This one is about the **whole page-load timeline**: everything that happens between the user pressing Enter and seeing something usable.
+
+## 1. Story
+
+Backend: 80ms. Database: 20ms. Yet users wait 4.8 seconds before the page is usable. Where did the other 4.7 seconds go?
+
+## 2. The Key Insight
+
+Your 80ms is the time **one API call** spends on **your server**. The user experiences the **whole journey**:
+
+`DNS -> TCP/TLS handshake -> download HTML -> download + parse + execute JavaScript -> render -> fetch data (maybe many calls, maybe one after another) -> render again -> images/fonts load`
+
+The backend is one small slice of that timeline.
+
+## 3. Where to Investigate (in This Order)
+
+**1. Open the browser's Network tab (waterfall view).** It shows every request on a timeline. Look for:
+- A **request waterfall**: call A must finish before call B starts, then C. Five sequential 80ms calls plus network latency each is already over a second. This is [[13-hidden-latency-bottleneck]] happening in the browser: fix it by running independent calls in parallel, or by adding one endpoint that returns everything the page needs.
+- **Huge JavaScript bundles**: a 3 MB bundle must be downloaded, parsed, and executed before anything useful appears, especially slow on mid-range phones.
+- **Large unoptimized images** or web fonts blocking text from showing.
+
+**2. Check network distance.** 80ms on the server can be 300ms+ for a user on the other side of the world. Static assets should come from a **CDN**, and repeat visits should hit the browser cache (correct `Cache-Control` headers).
+
+**3. Check how the page renders.** A pure client-side-rendered app shows a blank screen until JS loads, runs, *then* fetches data. Server-side rendering or static generation can show content much earlier.
+
+**4. Run Lighthouse / Core Web Vitals.**
+- **TTFB** (Time To First Byte): server + network. Yours is probably fine.
+- **LCP** (Largest Contentful Paint): when the main content appears. This is likely where the 4.8s shows up.
+- **INP** (Interaction to Next Paint): how quickly the page responds to clicks and typing.
+
+**5. Measure real users, not just your laptop.** Real User Monitoring (RUM) shows what people on slow phones and 4G actually experience; your fast dev machine on office Wi-Fi hides most of this.
+
+## 4. Fixes, Matched to Cause
+
+| Finding | Fix |
+|---|---|
+| Sequential API calls | Parallelize, or one aggregated endpoint (BFF) |
+| Huge JS bundle | Code-splitting, lazy loading, remove unused libraries |
+| Blank screen until JS runs | SSR / static generation, skeleton UI |
+| Slow assets far from user | CDN + caching headers |
+| Heavy images | Compress, modern formats (WebP/AVIF), lazy-load below the fold |
+| Slow after load | See [[33-react-performance-at-scale]] |
+
+## 5. Mental Model
+
+> "The API is fast" measures one slice of the timeline. Users feel the whole timeline. Measure end-to-end from the user's device, then find the biggest bar in the waterfall.
+
+## 6. Flow
+
+```mermaid
+flowchart LR
+  A[DNS + TLS] --> B[HTML]
+  B --> C["JS bundle 3MB: download + parse + run"]
+  C --> D["API call 1 (80ms)"]
+  D --> E["API call 2 (waits for 1)"]
+  E --> F["API call 3 (waits for 2)"]
+  F --> G[Render + images]
+```
+
+## 7. Common Mistakes
+
+- Treating backend latency as "the" latency and closing the ticket.
+- Testing only on a fast laptop and fast network, never on a mid-range phone on mobile data.
+
+## 8. 🧠 Remember
+
+> An 80ms API can still produce a 4.8s page: check the network waterfall for sequential calls, bundle size, and distance to the user, and measure what real users experience, not just what your server logs.
+
+## 9. Quick Self-Test
+
+1. What does TTFB measure, and why can it be good while LCP is terrible?
+2. How does a request waterfall turn five fast calls into a slow page?
+3. Why can a big JavaScript bundle hurt more on phones than on laptops?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="52" data-title="ORM or Raw SQL?" data-category="Databases" data-order="52">
+# Tech Lead Says "Never Use an ORM." What's Your Reply?
+
+## 1. Story
+
+Your tech lead has been burned before: a page that made 400 database queries, a report that took 30 seconds because the ORM generated an insane join, a migration nobody understood. So now the rule is: "Never use an ORM for database queries."
+
+## 2. What an ORM Actually Is
+
+**Term: ORM (Object-Relational Mapper)** - a library (Prisma, Sequelize, TypeORM, Hibernate, Django ORM, SQLAlchemy) that maps database rows to objects in your code, so you write `User.findById(1)` instead of `SELECT * FROM users WHERE id = 1`.
+
+It's a productivity and safety tool, not a performance tool.
+
+## 3. Why the Tech Lead Isn't Wrong
+
+The pain is real:
+
+- **The N+1 problem.** Load 100 orders, then access `order.customer` in a loop: the ORM quietly runs 1 query for orders + 100 queries for customers = 101 round trips, where one join would have done it.
+- **Hidden, inefficient SQL.** Complex filters and joins can generate SQL no human would write, and nobody looks at it until it's slow.
+- **Over-fetching.** `SELECT *` by default, loading columns you don't need.
+- **Leaky abstraction.** Developers stop learning SQL and can't debug the query plan (see [[50-slow-query-500m-rows]]).
+
+## 4. Why "Never" Is Too Strong
+
+- Most application queries are simple CRUD. Hand-writing hundreds of them is slow, repetitive, and error-prone.
+- ORMs give you **parameterized queries by default**, which protects against SQL injection - hand-built SQL strings are a common source of exactly that bug.
+- Migrations, relations, and type safety come for free.
+- Nearly every ORM has an escape hatch to raw SQL when you need it.
+
+## 5. A Good Reply
+
+> "I agree the ORM has burned us. But I'd rather set rules than ban it: use the ORM for simple CRUD, where it's safe and fast to write. For complex reports, hot paths, and bulk operations, write raw SQL or use a query builder. Log the SQL the ORM generates, watch for N+1 in code review, and check `EXPLAIN` on anything slow. The problem isn't the ORM, it's not knowing what SQL it runs."
+
+## 6. Code Example
+
+```javascript
+// N+1: 1 query for orders + 1 query per order for the customer
+const orders = await Order.findAll();
+for (const o of orders) {
+  console.log((await o.getCustomer()).name);
+}
+
+// Fixed with the ORM: eager-load, one query with a join
+const orders2 = await Order.findAll({ include: Customer });
+
+// Hot reporting path: raw SQL where you control every line
+const rows = await db.query(
+  `SELECT c.name, SUM(o.total) AS revenue
+     FROM orders o JOIN customers c ON c.id = o.customer_id
+    WHERE o.created_at >= $1
+    GROUP BY c.name
+    ORDER BY revenue DESC
+    LIMIT 20`,
+  [since]   // still parameterized - never string-concatenate user input
+);
+```
+
+## 7. Mental Model
+
+> An ORM is an automatic gearbox: great for daily driving, but you should still know how the engine works, and switch to manual (raw SQL) on the steep hills.
+
+## 8. Trade-offs
+
+| | ORM | Raw SQL / query builder |
+|---|---|---|
+| Speed of development | Fast for CRUD | Slower, more code |
+| Performance control | Limited, can surprise you | Full control |
+| Injection safety | Safe by default | Safe only if parameterized |
+| Complex queries | Awkward or inefficient | Natural |
+
+## 9. Common Mistakes
+
+- Banning the ORM entirely and then hand-writing string-concatenated SQL that opens SQL injection holes.
+- Using the ORM everywhere without ever looking at the generated SQL.
+
+## 10. 🧠 Remember
+
+> The right answer isn't "never ORM" or "always ORM" - it's ORM for simple CRUD, raw SQL for complex and hot paths, and always knowing what SQL is actually running.
+
+## 11. Quick Self-Test
+
+1. What is the N+1 query problem, and how do you fix it inside an ORM?
+2. Why can banning ORMs make an application *less* secure?
+3. Which kinds of queries would you always write by hand?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="53" data-title="How to Clear Senior System Design Without Big-Scale Experience" data-category="Blog" data-order="53">
+# Blog: How to Clear a Senior System Design Round Without Ever Working at Google Scale
+
+*A junior engineer asked: "My company has a few thousand users. I've never worked at Google or Atlassian scale. How am I supposed to clear a Senior system design round?"*
+
+Here's the honest answer.
+
+**You don't need to have worked at Google scale to reason about scale.**
+**You need to show you can find what breaks as the workload grows.**
+
+Interviewers aren't checking whether you've *seen* a million requests per second. They're checking whether you can look at a design and say: "This part breaks first, here's why, here's what I'd change, and here's what that change costs." That skill can be practiced on any system - including the small one you work on today.
+
+Let's make it concrete with one running example.
+
+---
+
+## Our Example: The "Place Order" Feature
+
+Imagine you built the checkout for a small food-ordering app. Today it handles about **100 requests per second** at dinner time.
+
+```
+Client -> API -> OrderService -> Postgres
+                              -> Payment provider (external)
+                              -> sends confirmation email
+```
+
+Nothing fancy. Now let's use it to practice thinking like a senior engineer.
+
+---
+
+## Step 1 - Start With the System You Already Know
+
+Take this one feature and ask:
+
+- **What breaks at 1,000 requests/sec?**
+- **What breaks at 10,000?**
+- **Which component gets saturated first?**
+- **How would I even know?**
+
+Walk through it for our checkout:
+
+| Load | What likely breaks first | How you'd notice |
+|---|---|---|
+| 100 rps | Nothing, it works | - |
+| 1,000 rps | Database connection pool runs out (say 20 connections, each request holds one for ~50ms) | Requests queue waiting for a connection, p99 latency climbs |
+| 1,000 rps | Sending the email *inside* the request adds 300ms to every checkout | Checkout feels slow even though the DB is fine |
+| 10,000 rps | Single Postgres primary maxes out on writes | DB CPU / IO at 100%, lock waits |
+| 10,000 rps | Payment provider rate-limits you | 429 errors from the provider |
+
+Quick math for the pool: 20 connections, each held ~50ms, means about `20 / 0.05 = 400` requests/sec max. So at 1,000 rps you are already over the limit. **That's a real, defensible bottleneck you found with arithmetic, not a Google badge.**
+
+You're not pretending your app is Netflix. You're learning how load actually moves through a real system.
+
+---
+
+## Step 2 - Follow One Request End to End
+
+Trace a single checkout from the moment the user taps "Pay":
+
+`Client -> API -> application -> database -> queue -> worker -> external dependency`
+
+At each hop, ask four questions:
+
+1. **Where does it wait?** (Network calls, locks, disk.) Waiting doesn't show up as high CPU - see [[13-hidden-latency-bottleneck]].
+2. **Which pool is bounded?** (DB connections, thread pool, worker count, provider rate limit.) Bounded pools are where queues form.
+3. **Which operation gets slower as data grows?** ("Check if this coupon was already used" is instant with 10,000 orders and 45 seconds with 500 million if it's not indexed - see [[50-slow-query-500m-rows]].)
+4. **What happens when a downstream service is down?** If the email provider hangs for 20 seconds, does checkout hang for 20 seconds too? (See [[14-cascading-failure-recovery]].)
+
+**The big lesson: scale is usually waiting, contention, and skew - not a giant number printed on a slide.**
+
+- **Waiting**: a request sitting idle on a slow dependency.
+- **Contention**: many requests fighting for the same thing (one row, one lock, one small pool).
+- **Skew**: one hot key, one huge customer, or one popular restaurant taking a disproportionate share of traffic.
+
+---
+
+## Step 3 - Learn the Common Scaling Moves (and What Each One Costs)
+
+There's a small toolkit that covers most interview problems. The senior part is knowing the **cost** of each move, not just its name.
+
+| Problem | Common moves | The new problem it creates |
+|---|---|---|
+| Reads are slow | Index, cache, read replicas, precompute | Stale data, cache invalidation, replication lag ([[28-scaling-database-reads]]) |
+| Writes are hot | Partition, batch, reduce coordination | Cross-partition queries get hard ([[21-database-partitioning]]) |
+| Slow work blocks requests | Move it to a queue | Retries, duplicates, need idempotency ([[19-idempotent-consumer-duplicate-events]]) |
+| One tenant dominates | Isolate them (own pool, own shard, own rate limit) | More infrastructure to run |
+| Users are far away | Serve reads closer (CDN, regional replicas) | Consistency across regions ([[10-clock-skew-last-write-wins]]) |
+
+Apply it to our checkout:
+
+- Email inside the request? **Move it to a queue.** Checkout drops from 350ms to 50ms. *New problem*: if the worker retries, the user might get two emails, so the email job needs an idempotency key.
+- Connection pool maxed? **Tune the pool and cut query time with an index** first. *Cost*: almost nothing. That's why it comes first ([[38-first-thing-to-scale]]).
+- One restaurant chain is 40% of all orders? **Isolate it** with its own rate limit so a sale at that chain doesn't slow down everyone else.
+
+**Every move creates another problem. Saying that out loud in the interview is exactly what makes you sound senior.**
+
+---
+
+## Step 4 - Use Numbers to Guide How Deep You Go
+
+Before drawing boxes, estimate a few things:
+
+- **Peak QPS** (not average - dinner time, sale day)
+- **Read/write ratio**
+- **Object size**
+- **Storage growth** per day/year
+- **Acceptable latency**
+
+Our checkout, quick version:
+
+- 1 million orders/day, peak is roughly 10x average: `1,000,000 / 86,400 = ~12/sec average`, so **~120/sec peak**.
+- Each order row ~1 KB: `1M x 1 KB = ~1 GB/day`, **~365 GB/year**.
+
+What do the numbers tell us? 120 writes/sec is **easy** for a single Postgres. So we don't need sharding. But 365 GB/year means that in 2-3 years, old-order queries will slow down, so we should plan **time-based partitioning or archiving** ([[21-database-partitioning]]).
+
+You don't need perfect math. **You need just enough math to explain why the simple design stops being enough - and when.** That also protects you from the opposite mistake: over-engineering a system that 120 writes/sec never needed ([[15-simple-vs-scalable-architecture]], [[42-resilience-vs-overengineering]]).
+
+---
+
+## Putting It Together in the Interview
+
+A structure that works even if you've never touched huge scale:
+
+1. **Clarify** requirements and the numbers ([[30-workload-before-conclusion]]).
+2. **Draw the simple design** that meets today's needs.
+3. **Grow the load** in steps (10x, 100x) and name what breaks first at each step.
+4. **Apply one scaling move** per bottleneck and state its cost.
+5. **Cover failure**: what happens when a dependency is slow or down.
+
+Example sentence you can reuse:
+
+> "At 100 rps this design is fine. At around 400 rps the connection pool becomes the bottleneck, which I can see from connection wait time. First I'd add the missing index and move email to a queue, which is cheap. If we reach 10,000 rps, write throughput on one primary becomes the limit, so I'd look at partitioning by restaurant, and that makes cross-restaurant reports harder, so I'd precompute those."
+
+That answer shows reasoning, ordering, and trade-offs. None of it required Google.
+
+---
+
+## 🧠 Remember
+
+> Senior system design isn't about having seen massive scale - it's about taking any system, growing the load in your head, finding what breaks first, and explaining the fix *and* its cost.
+
+## Practice Assignment
+
+Pick one feature you actually built this year and write down:
+
+1. Its current peak requests/sec.
+2. The first component that saturates at 10x, and how you'd detect it.
+3. One scaling move for that bottleneck, and the new problem that move creates.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="54" data-title="Notify 5,000 Users 10x Faster" data-category="Core Concepts" data-order="54">
+# 5,000 Notifications x 200ms = 16 Minutes. One Change Makes It 10x Faster.
+
+> **Same-question flag**: this is [[13-hidden-latency-bottleneck]] (sequential waits add up) and [[01-concurrency-vs-parallelism]] (I/O-bound work needs concurrency, not more CPU) wearing a notification costume. What's new here is doing it **safely**: bounded concurrency, not "fire all 5,000 at once."
+
+## 1. The Math
+
+The loop sends one notification, waits 200ms for the provider to answer, then sends the next:
+
+`5,000 x 0.2s = 1,000s ~ 16.7 minutes`
+
+During each 200ms, your server is doing almost nothing - it's **waiting** on the network. The CPU is idle.
+
+## 2. The Fix: Send Them Concurrently (With a Limit)
+
+Keep **10 sends in flight at the same time** instead of 1:
+
+`1,000s / 10 = 100s` -> **10x faster.** Same users, same notifications, same 200ms each.
+
+With 50 in flight it's ~20 seconds. The limit is set by what the provider allows (rate limits) and what your connection pool can handle, not by your CPU.
+
+## 3. Why Not Just `Promise.all` on All 5,000?
+
+Firing 5,000 requests at once will hit the provider's rate limit, exhaust sockets/connection pools, and turn into a burst of failures and retries - the thundering herd from [[14-cascading-failure-recovery]]. **Bounded** concurrency gives you the speedup without the stampede.
+
+## 4. Code Example
+
+```javascript
+// BEFORE: sequential, ~1,000 seconds
+for (const user of users) {
+  await sendNotification(user); // 200ms each, one at a time
+}
+
+// AFTER: bounded concurrency, ~100 seconds with limit 10
+const pLimit = require('p-limit');
+const limit = pLimit(10); // at most 10 in flight
+await Promise.all(users.map(u => limit(() => sendNotification(u))));
+```
+
+## 5. Other Moves That Stack On Top
+
+- **Batch API**: many providers (FCM, SES, Twilio) accept many recipients per call - 5,000 users might become 5 calls.
+- **Queue + workers**: put 5,000 jobs on a queue and let several workers drain it, with retries and idempotency - the design from [[17-notification-system-design]]. The API returns immediately instead of blocking for minutes.
+
+## 6. 🧠 Remember
+
+> When time is spent waiting, not computing, the fix is overlap: run the I/O concurrently with a sensible limit, and the total drops from the sum of all waits to roughly the sum divided by the concurrency.
+
+## 7. Quick Self-Test
+
+1. Why doesn't a faster CPU help this job at all?
+2. Why is a concurrency limit of 10-50 safer than sending all 5,000 at once?
+3. How would a provider's batch API change the math?
+</script>
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
