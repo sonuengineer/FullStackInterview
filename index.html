@@ -60,6 +60,40 @@
     padding: 18px 14px;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
   }
+  #sidebar-backdrop { display: none; }
+  #sidebar-toggle { display: none; }
+  @media (max-width: 768px) {
+    /* Sidebar becomes an off-canvas panel that slides in over the content,
+       instead of squeezing the reading pane into a sliver of the screen. */
+    #sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      z-index: 50;
+      width: 84vw;
+      max-width: 320px;
+      transform: translateX(-100%);
+      transition: transform 0.22s ease;
+      box-shadow: 2px 0 16px rgba(0,0,0,0.25);
+    }
+    #sidebar.open { transform: translateX(0); }
+    #sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 40;
+    }
+    #sidebar-backdrop.open { display: block; }
+    #sidebar-toggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #toolbar { padding: 10px 12px; gap: 6px; flex-wrap: wrap; }
+    #toolbar button { padding: 6px 9px; font-size: 0.78rem; }
+    #reader { padding: 24px 16px 100px; font-size: 1rem; }
+  }
   #sidebar h1 {
     font-size: 1.05rem;
     margin: 4px 4px 14px;
@@ -215,6 +249,7 @@
 </style>
 </head>
 <body data-theme="sepia">
+<div id="sidebar-backdrop"></div>
 <div id="sidebar">
   <h1>&#128218; Learning Dashboard</h1>
   <input id="search" type="text" placeholder="Search lessons...">
@@ -222,6 +257,7 @@
 </div>
 <div id="reader-wrap">
   <div id="toolbar">
+    <button id="sidebar-toggle" aria-label="Toggle topics">&#9776; Topics</button>
     <button id="btn-home">Home</button>
     <button id="theme-sepia">Sepia</button>
     <button id="theme-light">Light</button>
@@ -3579,6 +3615,7 @@ function renderHome() {
   buildSidebar(document.getElementById('search').value);
   window.scrollTo(0, 0);
   readerEl.scrollTop = 0;
+  closeMobileSidebar();
 }
 
 function openLesson(id) {
@@ -3592,7 +3629,25 @@ function openLesson(id) {
   buildSidebar(document.getElementById('search').value);
   document.getElementById('reader-wrap').scrollTop = 0;
   try { localStorage.setItem('dashboard.lastLesson', id); } catch (e) {}
+  closeMobileSidebar();
 }
+
+// Mobile off-canvas sidebar: closed by default so the reading pane gets
+// the full screen; a "Topics" button and a tap on the backdrop toggle it.
+const sidebarEl = document.getElementById('sidebar');
+const sidebarBackdropEl = document.getElementById('sidebar-backdrop');
+function openMobileSidebar() {
+  sidebarEl.classList.add('open');
+  sidebarBackdropEl.classList.add('open');
+}
+function closeMobileSidebar() {
+  sidebarEl.classList.remove('open');
+  sidebarBackdropEl.classList.remove('open');
+}
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  sidebarEl.classList.contains('open') ? closeMobileSidebar() : openMobileSidebar();
+});
+sidebarBackdropEl.addEventListener('click', closeMobileSidebar);
 
 document.getElementById('btn-home').addEventListener('click', renderHome);
 document.getElementById('search').addEventListener('input', (e) => buildSidebar(e.target.value));
