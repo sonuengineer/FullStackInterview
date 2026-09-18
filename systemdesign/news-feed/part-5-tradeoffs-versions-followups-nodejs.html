@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>News Feed -- HLD + LLD (Part 5: Trade-offs - 3 Versions - Follow-ups - Node.js Questions)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root { --bg:#fafafa; --fg:#1f2328; --muted:#57606a; --border:#d0d7de; --code-bg:#f6f8fa; --accent:#0969da; --callout-bg:#fff8c5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --border:#30363d; --code-bg:#161b22; --accent:#58a6ff; --callout-bg:#3b3410; }
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.65; max-width:900px; margin:0 auto; padding:40px 24px 100px; }
+  h1,h2,h3 { line-height:1.3; }
+  h1 { font-size:2rem; border-bottom:2px solid var(--border); padding-bottom:10px; }
+  h2 { font-size:1.45rem; margin-top:2.4em; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  h3 { font-size:1.1rem; color:var(--accent); margin-top:1.8em; }
+  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; font-size:0.9em; }
+  pre { background:var(--code-bg); padding:14px 16px; border-radius:8px; overflow-x:auto; border:1px solid var(--border); }
+  pre code { background:none; padding:0; }
+  blockquote { border-left:4px solid var(--accent); background:var(--callout-bg); margin:1.2em 0; padding:0.6em 1em; border-radius:0 6px 6px 0; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:1.2em 0; }
+  th,td { border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul,ol { padding-left:1.4em; }
+  li { margin:0.35em 0; }
+  .mermaid { background:white; border-radius:8px; padding:12px; margin:1.2em 0; }
+  a { color:var(--accent); }
+  hr { border:none; border-top:1px solid var(--border); margin:2.5em 0; }
+  @media (max-width:600px) { body { padding:24px 16px 80px; } h1 { font-size:1.5rem; } }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# News Feed -- HLD + LLD (Part 5: Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions)
+
+> Is file mein prompt ke **Parts 21-25** hain: Chirp ke news feed ke har major decision ka trade-off, MVP -> Scalable -> Highly Scalable versions, 17 interviewer follow-up questions, requirement change ("What if...") questions, aur Node.js specific questions -- sab isi Twitter/Instagram-style home feed se jude hue.
+> Part 4 recap: humne dekha ki scale par pehle kya tootta hai (celebrity fan-out, hot `timeline:{celebId}` keys, hydration misses, Kafka lag), Redis / Cassandra / Kafka fail hone par feed kaise degrade hota hai (stale feed > no feed), consistency kahan chahiye (author ke liye read-your-own-writes, baaki eventual with p99 fan-out lag < 5 s) aur kya monitor karna hai (`fanout_lag_seconds`, `feed_cache_hit_ratio`, `kafka_consumer_lag{group="feed-fanout"}`). Ab un decisions ko **"kyun ye, kyun woh nahi"** ki language mein bolna seekhenge.
+
+Ek baar system yaad kar lo, kyunki har answer isi par tika hai:
+
+```
+Mobile/Web clients
+  -> CDN (media only)
+  -> LB / API Gateway (auth, rate limits)
+  -> Post Service   -> Cassandra (posts_by_id, posts_by_author) ; outbox -> Kafka posts.created / posts.deleted
+  -> Graph Service  -> PostgreSQL (users, follows) + Redis following:{id} / celebs:{id}
+  -> Feed Service   -> Redis Cluster: feed:{userId}, timeline:{authorId}, post:{postId}, counters
+  -> Like Service   -> Cassandra post_likes + Redis likes:{postId} (flushed async)
+  Fan-out workers (kafkajs, group feed-fanout):
+     followers <  10,000 -> ZADD into feed:{followerId} for followers active in last 30 days, trim to 200
+     followers >= 10,000 -> no push; readers pull timeline:{authorId} at read time
+Feed read = feed:{me} + timeline:{each celeb I follow} + timeline:{me} -> k-way merge -> filter -> 20 -> hydrate
+```
+
+Numbers jo baar baar aayenge: **100M DAU, ~35K feed reads/s peak, ~350 posts/s peak (plan 1K/s), avg 200 followers, celeb threshold 10,000, pure push = 2B feed inserts/day (~69K/s peak), FEED_MAX 200 x ~64 B = ~12.8 KB/user -> ~1.28 TB Redis (~20 x 64 GB shards), posts ~3.65 TB/year, feed response ~20 KB -> ~5.6 Gbps peak, Snowflake IDs ~2.1e18 > 2^53.**
+
+---
+
+## PART 21 -- Trade-offs: har decision ka "kyun ye, kyun woh nahi"
+
+### Pehle rule samjho
+
+Payment System mein galti ki keemat thi "paisa do baar kata". File Storage mein "file hamesha ke liye gayab". News Feed mein galti ki keemat **chhoti per request, lekin bahut bade scale par** hai: ek post 3 second late dikhi -- koi nahi marta. Feed 2 second mein khula -- user app band karke chala gaya. Isliye yahan har trade-off ye teen cheezon ke beech hai:
+
+```
+Read latency (feed turant khule)  <->  Write amplification (ek post = kitne writes)  <->  Freshness / correctness (naya post kab dikhe, deleted kab gaye)
+```
+
+Aur ek chauthi: **cost** -- 1.28 TB RAM sasta nahi hai. Hamari requirements: **feed read p99 < 200 ms, stale feed > down feed, eventual consistency OK (fan-out lag p99 < 5 s), author ko apni post turant dikhe, celebrities with 50M followers, posts kabhi na khoyein (feeds rebuild ho sakte hain).**
+
+### 1. Push (fan-out on write) vs Pull (fan-out on read) vs Hybrid
+
+| | Pull (read time par merge) | Push (write time par har follower ke feed mein) | Hybrid (hamara, threshold 10,000) |
+|---|---|---|---|
+| **Pros** | Write sasta (1 post = 1 write); koi precomputed storage nahi; unfollow/delete turant sahi (query hi aisi hai) | Read = ek ZSET range read, super fast; read path simple | Normal users push (fast reads), celebrities pull (koi 50M-insert storm nahi) |
+| **Cons** | Har read = 200 followees ke timelines merge -> 35K/s x 200 = **7M source reads/s**; p99 sabse slow source par | Celebrity post = 50M inserts (~50 s even at 1M inserts/s); inactive users ke feeds par bhi RAM waste; 2B inserts/day | Do code paths; read par celeb timelines merge (k sources); threshold cross karne wale users (9,999 -> 10,001) ka transition handle karna |
+| **Kab use karunga** | Chhota scale (V1), ya jab reads kam aur writes bahut | Jab koi bhi user ke bahut zyada followers na hon (closed groups, company feed) | Twitter/Instagram jaisa skewed follower graph -- default |
+
+**Threshold choice (10,000) kyun?** Ye magic number nahi, ek knob hai. Neeche wale author ke liye push cost = max 9,999 ZADDs = ~10 pipelines of `FANOUT_BATCH = 1_000` -- 1-2 seconds mein ho jaata hai, 5 s lag target ke andar. Upar wale ke liye pull cost = har reader ko ek extra `timeline:{celebId}` read. Threshold neeche karo -> reads mein sources badhenge (`celebrity_merge_sources` histogram); upar karo -> fan-out lag spikes. Metric dekh ke tune karo.
+
+**Decision:** "Hybrid. Follower distribution heavy-tailed hai -- 99%+ users ke kuch sau followers, kuch hazaar accounts ke millions. Majority ke liye push, tail ke liye pull. Twitter ne bhi publicly kuch aisa hi hybrid describe kiya tha, lekin unka real system bahut zyada complex hai."
+
+### 2. Chronological vs Ranked feed
+
+| | Reverse-chronological (V1) | Ranked (V2 score, V3 ML) |
+|---|---|---|
+| **Pros** | Simple, predictable, debuggable ("mera post kyun nahi dikha?" ka answer easy); cursor = time; users trust karte hain | Engagement zyada; 500 posts mein se best 20 dikhe; purani achhi post bhi upar aa sakti hai |
+| **Cons** | 200 followees mein se ek spammy account feed bhar deta hai; jo online nahi tha usne best posts miss kiye | Cursor pagination tricky (score badalte rehte hain); ranking CPU per read; "algorithm ne chupa diya" complaints; ML infra |
+| **Kab use karunga** | V1, "Following" tab, jab users ne explicitly maanga | Jab engagement metrics aur ranking team ho |
+
+**Decision:** "V1 chronological, V2 simple score (recency decay + engagement + affinity) over ~500 candidates, V3 ML. Ranked feed mein main page 1 pe rank karke poori ranked list (ids) short TTL ke saath cache kar leta hoon, taaki page 2 same list se aaye -- warna score badalne se duplicate/missing posts."
+
+### 3. Feed storage: Redis ZSET vs Redis List vs Cassandra materialized feed
+
+| | Redis ZSET (hamara) | Redis List | Cassandra table `feed_by_user` |
+|---|---|---|---|
+| **Pros** | Sorted by score -> out-of-order fan-out bhi sahi jagah; `ZREVRANGEBYSCORE` se cursor pagination; ZADD idempotent (duplicate = no-op) | Memory kam; `LPUSH` + `LTRIM` O(1); simple | Disk par -> sasta per GB; durable; bade feeds (1000s entries) |
+| **Cons** | ~64 B/entry (skiplist + hash overhead); RAM mehenga | Order = insert order: late-arriving message galat jagah; duplicate check nahi; cursor = index (offset jaisa, shift hota hai) | Read latency few ms vs sub-ms; har fan-out = disk write (compaction, tombstones on trim) |
+| **Kab use karunga** | Default | Jab strictly in-order single writer ho | Jab RAM cost > latency concern, ya feed length bahut badi chahiye |
+
+**Decision:** "ZSET with score = `createdAtMs`, member = postId string. Redis cache hai, source of truth nahi -- isliye durability ki fikr nahi, rebuild possible hai."
+
+### 4. Posts: PostgreSQL vs Cassandra
+
+| | PostgreSQL | Cassandra (hamara V3) |
+|---|---|---|
+| **Pros** | Team ko aata hai; joins, transactions, outbox same DB mein; secondary indexes flexible | Append-heavy writes linearly scale; partition `(author_id, bucket)` = ek author ki recent posts ek partition mein; multi-DC replication built-in |
+| **Cons** | ~3.65 TB/year -> kuch saal mein sharding khud; single primary write limit | Query-driven tables (har access pattern = naya table); joins nahi; tombstones (deletes); LWT mehenga; outbox same-transaction nahi |
+| **Kab use karunga** | V1-V2, jab tak ek primary + replicas + partitioning chal jaaye | Multi-TB/year posts, multi-region, jab team Cassandra operate kar sake |
+
+**Decision (honest):** "V1 aur shayad V2 mein Postgres bilkul theek hai -- 116 posts/s avg koi bada write load nahi. Cassandra ka asli fayda saalon ka data + multi-DC mein hai. Interview mein main bolunga ki switch tab karunga jab Postgres par storage/IO ya multi-region pain dikhe, pehle nahi."
+
+### 5. Social graph: Postgres vs Graph DB (Neo4j) vs Redis sets
+
+| | Postgres `follows` (hamara) | Neo4j / graph DB | Redis sets only |
+|---|---|---|---|
+| **Pros** | PK `(follower_id, followee_id)` = "whom do I follow" + no duplicates; `ix_follows_followee` = "who follows X"; transactions for counts | Multi-hop queries ("friends of friends", suggestions) natural | Super fast `SMEMBERS`, `SISMEMBER` |
+| **Cons** | Multi-hop queries mehenge; 50M follower rows ek celeb ke liye -> streaming chahiye | Hamare 2 queries (1-hop) ke liye overkill; sharding/ops mushkil; team skill | Durability/memory; 50M-member set = hundreds of MB on one key |
+| **Kab use karunga** | Default -- feed ko sirf 1-hop chahiye | Recommendations / "people you may know" (alag system, offline bhi ho sakta hai) | Cache only (`following:{userId}`, TTL 10 min) |
+
+**Decision:** "Postgres source of truth + Redis cache. Graph DB tab jab product multi-hop real-time queries maange -- feed ke liye nahi."
+
+### 6. Kafka vs RabbitMQ / SQS for fan-out
+
+| | Kafka (hamara) | RabbitMQ | SQS |
+|---|---|---|---|
+| **Pros** | Replay (rebuild feeds, naya consumer jaise search indexer); key = authorId -> per-author ordering; high throughput; multiple consumer groups same topic | Per-message ack, flexible routing, priority queues; simple for task queues | Fully managed, zero ops, auto scale |
+| **Cons** | Partition = parallelism limit; ek slow message poori partition rokta hai (head-of-line); ops heavy (ya managed) | Replay nahi (consumed = gone); bahut high throughput par tuning | Standard queue mein ordering nahi, duplicates possible; FIFO queues ki throughput limits; replay nahi |
+| **Kab use karunga** | Event stream jo kai consumers padhein (fan-out, search, notifications, analytics) | Task queue with complex routing | AWS-only chhota/medium scale |
+
+**Decision:** "`posts.created` ek event hai jisko fan-out, search indexer, notifications sab padhenge -- isliye Kafka. V2 mein agar team chhoti hai toh SQS bhi chalega; fan-out idempotent hai toh duplicates se darr nahi."
+
+### 7. "New posts" banner: polling vs WebSocket / SSE
+
+| | Polling / pull-to-refresh (hamara) | WebSocket / SSE push |
+|---|---|---|
+| **Pros** | Stateless HTTP, CDN/LB friendly; mobile battery friendly; existing feed API hi reuse | Real-time (< 1 s) |
+| **Cons** | Delay = poll interval (30-60 s) | 100M DAU mein crores concurrent connections (e.g. 20M concurrent / 50K per server = ~400 servers, rough); reconnect storms; mobile background mein OS connection kaat deta hai |
+| **Kab use karunga** | Feed ke liye default | Chat, live sports, jab product "real-time" maange |
+
+**Decision:** "Feed ko real-time hone ki zarurat nahi -- user khud scroll/refresh karta hai. App foreground mein har ~60 s ek sasta call `GET /v1/feed?limit=1` (ya ek chhota `newer_than` check) -> 'N new posts' banner. Zyada tar apps publicly bhi pull-to-refresh hi use karti hain. WebSocket Chat System ka topic hai."
+
+### 8. Cursor vs Offset pagination
+
+| | Offset (`?page=3`) | Cursor (hamara: base64 `{ s, id }`) |
+|---|---|---|
+| **Pros** | Simple; "page 7 par jao" possible | Stable jab upar naye posts aayein; cost page size par depend, depth par nahi |
+| **Cons** | Naye posts aaye -> sab shift -> duplicates / missed posts; deep offset = skip N rows | Random page jump nahi; ranked feed mein cursor design mushkil |
+| **Kab use karunga** | Admin tables | Infinite scroll -- hamesha (lesson 84) |
+
+**Decision:** "Cursor, opaque base64 of `{ s: lastScoreMs, id: lastPostId }`, equal scores par postId se tie-break. Opaque isliye ki kal format badlun toh clients na tootein."
+
+### 9. Feed mein full post vs sirf IDs + hydration
+
+| | Full post JSON in feed | Only postId (hamara) + `post:{postId}` cache |
+|---|---|---|
+| **Pros** | Read = ek call, no hydration | Entry ~64 B vs ~1 KB -> **RAM 15x+ kam**; edit/delete/like count ek jagah update; post ek baar cache, crores feeds refer karein |
+| **Cons** | 200 x 1 KB x 100M = ~20 TB RAM; edit = crores copies update; stale like counts | Har read par 20 posts ka hydration (35K x 20 = **700K lookups/s** -- cache hit ratio critical) |
+| **Kab use karunga** | Chhote, immutable items (notifications list) | Default |
+
+### 10. Counters: exact vs approximate
+
+| | Exact, synchronous (DB update per like) | Redis `INCR` + async flush (hamara) |
+|---|---|---|
+| **Pros** | Hamesha sahi | Viral post par hot row lock nahi; fast |
+| **Cons** | Viral post = ek row par hazaaron writes/s -> contention | Redis crash -> last flush ke baad ke increments lost (count thoda kam); display count few seconds purana |
+| **Kab use karunga** | Paisa, inventory | Likes, views -- "12.3K" dikhana hai, 12,347 exact nahi |
+
+**Decision:** "Like **khud** (`post_likes` row, idempotent) durable hai; sirf **count** approximate/eventually correct. Count drift ho toh `post_likes` se recount job."
+
+### 11. Precompute for all users vs only active users
+
+| | Sab 300M ke feeds | Sirf last 30 days active (hamara, `ACTIVE_DAYS = 30`) |
+|---|---|---|
+| **Pros** | Koi bhi user kabhi bhi aaye, feed ready | RAM aur fan-out writes dono kam; inactive users par koi kaam nahi |
+| **Cons** | Jo 6 mahine se nahi aaya uske liye bhi har post par ZADD | Laute hue user ka pehla open slow: rebuild by pull (`feed_rebuilds_total`) |
+| **Kab use karunga** | Kabhi nahi at this scale | Default |
+
+### 12. Sync vs async fan-out
+
+| | Sync (POST request ke andar) | Async via Kafka (hamara) |
+|---|---|---|
+| **Pros** | Response aate hi sab feeds updated | `POST /v1/posts` fast (Cassandra write + outbox); retry, replay, backpressure free mein |
+| **Cons** | 9,999 followers = request seconds lega; Redis slow = posting down | Lag (p99 < 5 s target); duplicate delivery possible -> idempotent writes chahiye |
+
+**Decision:** "Async. Author ke liye read-your-own-writes `timeline:{me}` se aata hai, toh use lag dikhta hi nahi."
+
+### 13. Strong vs eventual consistency
+
+| | Strong | Eventual (hamara, with read-your-own-writes) |
+|---|---|---|
+| **Pros** | Sab followers ek saath same feed dekhein | High availability; Redis/Kafka ka thoda lag system ko rokta nahi |
+| **Cons** | Har post par sab feeds ka synchronous update -- latency aur availability dono jaate | Delete ke baad bhi kuch seconds tak kisi ke feed id mein; isliye read-time filter chahiye |
+| **Kab use karunga** | Follow/unfollow ka source of truth (Postgres), like idempotency | Feeds, counts |
+
+### 14. Single-region vs multi-region
+
+| | Single region (V1-V2) | Multi-region active-active reads (V3) |
+|---|---|---|
+| **Pros** | Simple, koi replication lag nahi | Users ke paas latency kam; region down par bhi feed |
+| **Cons** | Door ke users ko 150-250 ms extra RTT; region outage = app down | Cassandra multi-DC, Redis per region (fan-out har region mein ya feed rebuild), Kafka mirroring, Postgres writes kahan? |
+| **Kab use karunga** | Jab users ek geography mein | Global app with SLA |
+
+### Summary: saare decisions ek table mein
+
+| Decision | Humne kya chuna | Kab badlenge |
+|---|---|---|
+| Fan-out | Hybrid, threshold 10,000 | `celebrity_merge_sources` p99 high -> threshold tune |
+| Order | V1 chrono, V2 score, V3 ML | Product + ranking team |
+| Feed store | Redis ZSET, ids only, 200 entries | RAM cost -> shorter FEED_MAX, listpack, Cassandra tier |
+| Posts DB | V1-V2 Postgres, V3 Cassandra | Storage/multi-DC pain |
+| Graph | Postgres + Redis cache | Multi-hop real-time queries |
+| Queue | Kafka | Chhoti team -> SQS |
+| New posts | Poll + pull-to-refresh | Real-time requirement |
+| Pagination | Cursor | -- |
+| Counters | Redis INCR + async flush | -- |
+| Consistency | Eventual + read-your-own-writes | -- |
+
+> Interview line: "News feed ka har decision ek sawaal hai: kaam write time par karun ya read time par? Normal users ke liye write time (push), celebrities ke liye read time (pull), aur jo kaam dobara ho sakta hai (feeds) woh cache mein, jo nahi ho sakta (posts, follows) woh durable DB mein."
+
+---
+
+## PART 22 -- Minimum -> Scalable -> Highly Scalable (3 versions)
+
+Interviewer ye dekhna chahta hai ki tum Day 1 par Kafka + Cassandra + hybrid fan-out nahi banaoge, lekin **Snowflake-style sortable IDs, cursor pagination aur idempotent `POST /v1/posts` Day 1 se** hoga -- kyunki woh correctness hai, scale nahi. Baad mein offset se cursor migrate karna = har client update.
+
+### Version 1 -- Simple MVP (Postgres only, pull)
+
+```
+Client
+  |
+  v
+Node.js API (2-3 instances behind LB)
+  |-- POST /v1/posts, follow, like, GET /v1/feed (pull query)
+  |-- per-user feed cache: first page, TTL 30-60 s (in Redis ya even in-process LRU)
+  v
+PostgreSQL primary + 1 read replica
+  users, follows, posts (id BIGINT Snowflake, author_id, text, media_keys, created_at, deleted)
+  INDEX posts (author_id, id DESC)
+```
+
+Feed query (pull):
+
+```sql
+SELECT p.* FROM posts p
+WHERE p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1 UNION ALL SELECT $1)
+  AND p.deleted = false
+  AND p.id > $2                        -- Snowflake of (now - 3 days): bound the scan
+  AND (p.id < $3 OR $3 IS NULL)        -- cursor
+ORDER BY p.id DESC
+LIMIT 20;
+```
+
+- **Kitna traffic?** ~1M DAU -> 10M feed reads/day -> ~116/s avg, **~350/s peak**; ~100K posts/day. 200 followees -> ~200 index probes per read -> peak ~70K index probes/s. Recent data RAM mein hai, toh ek achha Postgres + replica isko handle kar leta hai -- aur 30-60 s feed cache (first page) isse aur kam kar deta hai.
+- **"Humne ye abhi kyun add kiya?"**
+  - **Index `(author_id, id DESC)`** -- har followee ke recent posts ek seek mein. Iske bina har read = full table scan.
+  - **Time bound (`id > snowflake(now - 3 days)`)** -- Snowflake ID time-sortable hai (URL Shortener Part 3), toh "last 3 days" ek ID range ban jaata hai. Scan bounded.
+  - **Short-TTL feed cache** -- user 10 baar/day feed kholta hai, zyada tar pehla page hi. 30 s stale feed koi problem nahi (requirement: eventual OK).
+  - **Idempotency-Key on POST** -- mobile retry par double post (Payment System wala pattern).
+  - **Own posts in query (`UNION ALL SELECT $1`)** -- read-your-own-writes free mein.
+- **Kahan tootega (honestly):** ~1M DAU tak theek; 10M DAU par ~3.5K reads/s x 200 probes = ~700K probes/s -- ek primary + replicas par stretch; jo 5,000 accounts follow karta hai uska har read 5,000 probes; posts table multi-TB.
+- **Kya jaan-boojh ke NAHI hai:** Kafka, fan-out workers, Cassandra, ranking, multi-region.
+
+**Next version kab? (signals)**
+
+| Signal | Threshold (rough) | Matlab |
+|---|---|---|
+| `feed_read_duration_seconds` p99 | > 200 ms sustained, even with cache | Pull merge too costly -> push |
+| Postgres replica CPU | > 60-70% at peak | Read load too high for pull |
+| Heavy followers | Users following 2,000+ accounts common | Pull per read = thousands of probes |
+| DAU | ~1M se upar trend | Plan V2 now, not at 10M |
+
+### Version 2 -- Scalable (push fan-out + Redis)
+
+```mermaid
+flowchart TD
+    C[Clients] --> LB[LB / API Gateway]
+    LB --> PS[Post Service]
+    LB --> FS[Feed Service]
+    PS --> PG[(Postgres: users, follows, posts + outbox)]
+    PG --> OB[Outbox relay] --> K[[Kafka posts.created / posts.deleted]]
+    K --> FW[Fan-out workers x N]
+    FW --> R[(Redis: feed:userId ZSET, post:postId, likes:postId)]
+    FS --> R
+    FS --> PG
+```
+
+- **Kitna traffic?** ~10M DAU -> ~3.5K feed reads/s peak; 1M posts/day -> 200M feed inserts/day (~6.9K/s peak); Redis feeds 10M x 12.8 KB = ~128 GB -> 2-3 shards of 64 GB.
+- **"Humne ye abhi kyun add kiya?"**
+  - **Push fan-out via Kafka** -- read ab ek `ZREVRANGEBYSCORE` hai, 200 probes nahi. Write amplification (x200) async hai, user ko wait nahi.
+  - **Outbox** -- post row aur `post.created` event ek transaction mein; post save hua lekin event gum -- ye nahi hoga (Payment System).
+  - **Redis feed cache (ZSET, 200 entries)** -- feeds derived hain, RAM mein rakho, rebuild possible.
+  - **Post cache `post:{postId}` (TTL 24 h)** -- hydration ke 20 lookups Postgres par nahi.
+  - **Like counters in Redis** -- viral post par row lock contention nahi.
+  - **Simple celebrity rule** -- yahan bhi threshold lagao, warna ek 5M-follower influencer ne pura Kafka lag bana diya.
+- **Kya abhi bhi NAHI hai:** Cassandra, ranking service, multi-region, Redis Cluster ka bada setup.
+
+**Next version kab? (signals)**
+
+| Metric | Threshold (rough) | Matlab |
+|---|---|---|
+| `fanout_lag_seconds` p99 | > 5 s regularly | More partitions/workers, stricter celeb rule |
+| Posts table size / write IO | Multi-TB, vacuum painful | Cassandra for posts |
+| `celebrity_merge_sources` p99 | Readers merging 50+ celeb timelines | Hybrid tuning, ranking with candidate caps |
+| Latency far from region | Non-home users p99 > target | Multi-region |
+
+### Version 3 -- Highly Scalable (spec architecture)
+
+```mermaid
+flowchart TD
+    U[Clients] --> G[GeoDNS]
+    G --> LB[LB / API Gateway per region]
+    LB --> PS[Post Service] --> CS[(Cassandra multi-DC: posts_by_id, posts_by_author, post_likes)]
+    LB --> GS[Graph Service] --> PG[(Postgres sharded by user id: users, follows)]
+    LB --> FS[Feed Service] --> RC[(Redis Cluster ~20 shards + replicas)]
+    FS --> RK[Ranking service]
+    PS --> K[[Kafka posts.created / posts.deleted / follows.changed]]
+    K --> FW[Fan-out workers: push if followers < 10,000]
+    FW --> RC
+    K --> CL[Cleanup + backfill workers]
+```
+
+- **Kitna traffic?** 100M DAU, **~35K feed reads/s**, ~69K fan-out inserts/s peak, ~700K hydration lookups/s, ~1.28 TB Redis feeds, ~5.6 Gbps feed responses, posts ~3.65 TB/year.
+- **"Humne ye abhi kyun add kiya?"**
+  - **Hybrid (threshold 10,000)** -- 50M-follower post = 50M inserts nahi.
+  - **`timeline:{authorId}`** -- celebs ke recent 200 posts ek ZSET mein; readers pull. Plus author ka apna read-your-own-writes.
+  - **Cassandra** -- posts append-heavy, multi-DC, `(author_id, bucket)` partitions bounded.
+  - **Redis Cluster** -- 1.28 TB ek node mein nahi aata.
+  - **Active-only fan-out + rebuild on open** -- RAM ko DAU ke hisaab se rakho, registered users ke hisaab se nahi.
+  - **Ranking service** -- ~500 candidates score karna feed service ke event loop se bahar (PART 25 Q1).
+  - **Cleanup + backfill workers** -- delete/unfollow/block ke baad feeds lazily saaf; naya follow -> last 20 posts backfill.
+  - **Multi-region** -- latency + region outage.
+- **Keemat:** do read paths (push + pull), rebuild logic, threshold transitions, multi-region fan-out -- bada team aur bahut observability.
+
+### Teeno versions side by side
+
+| | V1 MVP | V2 Scalable | V3 Highly Scalable |
+|---|---|---|---|
+| DAU | ~1M | ~10M | 100M |
+| Feed reads peak | ~350/s | ~3.5K/s | ~35K/s |
+| Feed build | Pull SQL + 30-60 s cache | Push via Kafka | Hybrid push/pull |
+| Posts | Postgres | Postgres | Cassandra |
+| Feed store | Short-TTL page cache | Redis ZSET | Redis Cluster ZSET |
+| Order | Chronological | Chronological (+ simple score) | Score / ML |
+| Regions | 1 | 1 | Multi |
+
+> Interview line: "Sortable IDs, cursor pagination aur idempotent POST Version 1 mein bhi hain -- ye correctness hai. Push fan-out tab jab pull ka p99 200 ms cross kare; hybrid tab jab celebrities aayein; Cassandra aur multi-region tab jab metrics bolein."
+
+---
+
+## PART 23 -- Interview Follow-up Questions (17)
+
+> Tip: har answer mein -- **seedha answer, mechanism, number, trade-off**.
+
+### Fan-out aur scale
+
+**1. Interviewer:** "Celebrities ko kaise handle karoge?"
+
+**My Answer:** "Fan-out worker `users.follower_count` dekhta hai: `>= 10,000` -> push nahi, post sirf `timeline:{authorId}` mein. Reader apne `celebs:{me}` (cached set, TTL 10 min) ke har celeb ka `timeline:{celebId}` padhta hai aur `feed:{me}` ke saath k-way merge karta hai. Math: 50M followers push = 50M inserts, 1M/s par bhi ~50 s -- 5 s lag target toot jaata. Pull mein cost reader par: ek extra ZSET read per celeb. Hot key problem: ek celeb ka timeline har second hazaaron reads -> Redis replicas se read + Feed Service mein 1-2 s in-process cache. Threshold cross karne par: 10,000 hote hi push band; unke followers ke feeds mein purani pushed entries rehti hain, naye posts pull se -- merge dono ko dedupe karta hai (same postId)."
+
+**2. Interviewer:** "Ek user 5,000 accounts follow karta hai. Kya problem?"
+
+**My Answer:** "Push mein reader ko farq nahi padta -- `feed:{me}` mein bas zyada entries aati hain, trim 200 par. Problem do jagah: (1) agar 5,000 mein se 300 celebs hain toh har read par 300 timelines merge -- isko cap karo: top ~50 celebs by affinity (interaction history) har read par, baaki ke posts ek background job har few minutes `feed:{me}` mein daal de. (2) Rebuild (inactive user laut ke aaya) = 5,000 partitions padhna -- parallel with bounded concurrency (e.g. 50 at a time) aur sirf last 2-3 days. Plus product limit: Twitter jaise apps publicly following limits rakhte hain, spam bots isi se pakde jaate hain (Rate Limiter)."
+
+**3. Interviewer:** "User scroll kar raha hai, upar naye posts aa gaye. Scroll tooten bina kaise dikhaoge?"
+
+**My Answer:** "Cursor ki wajah se neeche ka scroll kabhi nahi tootta -- page 2 cursor ke score se neeche padhta hai, upar kya aaya usse farq nahi. Upar ke liye: app ke paas pehle item ka score hai; har ~60 s (foreground) ek chhota check 'is score se naye kitne?' -> 'N new posts' banner. Tap karne par hi naye posts prepend + scroll to top. Kabhi automatically list mein insert mat karo -- user padh raha item neeche khisak jaata hai. Offset pagination hota toh yahi naye posts page 2 mein duplicates bana dete (lesson 84)."
+
+**4. Interviewer:** "Post delete hua. Crores feeds se kaise hatega?"
+
+**My Answer:** "Source of truth pehle: `posts_by_id.deleted = true` + `post:{postId}` cache delete/overwrite -> 204. Phir outbox -> `posts.deleted`. Feeds mein postId abhi bhi ho sakta hai, isliye **read-time filter**: hydration mein post deleted/missing mila -> skip, aur page 20 se kam bana toh thoda aur padho (over-fetch, e.g. 25). Background cleanup worker non-celeb author ke followers ke feeds se `ZREM` karta hai (same follower streaming jaisa fan-out); celeb ke case mein sirf `timeline:{celebId}` se ZREM. Guarantee: deleted post kabhi render nahi hota (filter), feed se id eventually hatta hai (cleanup). Legal takedown (e.g. harmful content) bhi isi path se, aur CDN media ka invalidation alag."
+
+**5. Interviewer:** "Block aur mute kaise kaam karenge?"
+
+**My Answer:** "Block = source of truth mein row (Postgres `blocks`), follow dono taraf hata do, `follows.changed` event. Read path par filter: viewer ka block/mute set (`blocked:{me}` cached, small) -> merged candidates mein us author ke posts skip. Mute bhi same filter, sirf follow nahi hatta. Feed se entries cleanup job lazily hatata hai. Important: filter hydration se **pehle** karo (authorId entry ke saath chahiye -- ya post cache se), aur block ka check author timeline API (`GET /v1/users/:id/posts`) par bhi -- blocked user ko uski profile par posts nahi dikhne chahiye. Security angle: block turant effective hona chahiye, isliye cache TTL par depend mat karo -- block par `blocked:{me}` ko invalidate karo."
+
+**6. Interviewer:** "Ranking kaise karoge?"
+
+**My Answer:** "Do stage. (1) **Candidate generation**: ~500 posts -- `feed:{me}` ke 200 + celeb timelines + (optional) popular/suggested. (2) **Scoring**: V2 simple formula, e.g. `score = w1 * recencyDecay(ageHours) + w2 * log(1 + likes) + w3 * affinity(me, author)`; affinity = maine is author ke posts ko kitna like/click kiya (offline job, Redis mein). Top 20 return, poori ranked id list short TTL (e.g. 5 min) ke liye cache taaki pagination stable rahe. V3 ML model (separate service). Honest: real Facebook/Instagram ranking publicly thousands of signals aur multiple models describe karte hain -- interview mein 2-stage structure batana kaafi hai."
+
+**7. Interviewer:** "App open par feed turant kaise dikhe?"
+
+**My Answer:** "Teen layers: (1) **Device cache**: last fetched first page (items + nextCursor) local storage mein -> app open par pehle yahi dikhao (0 ms), background mein fresh fetch, phir 'N new posts' ya silently replace agar user ne scroll nahi kiya. (2) **Server**: `feed:{me}` Redis mein ready (push), hydration `post:{postId}` MGET-style batch. (3) **Prefetch**: page 1 aate hi page 2 ka cursor se background fetch; images ke liye CDN URLs aur thumbnails. Plus response chhota (~20 KB), gzip/brotli, HTTP keep-alive. Server p99 200 ms ka budget: Redis ~few ms, merge ~1 ms, hydration ~5-10 ms, baaki network."
+
+**8. Interviewer:** "Naya user, zero follows -- feed khaali?"
+
+**My Answer:** "Cold start. Onboarding par 'follow suggestions' (topics, contacts, popular accounts in your region) -- follow karte hi async backfill (followee ke last 20 posts `feed:{me}` mein). Tab tak feed ek **popular/trending** candidate source se bharo: region-wise top posts ka ek shared ZSET (`popular:{region}`, har few minutes job update kare) -- ye ek key sab naye users share karte hain, per-user kuch nahi. Jaise-jaise follows badhein, popular ka weight kam. UI mein clear label ('Suggested for you')."
+
+**9. Interviewer:** "Multi-device -- phone par padha, laptop par wahi 'new' kyun dikhe?"
+
+**My Answer:** "Feed khud server par hai (`feed:{me}`), toh content same. 'Read state' (kahan tak padha, new banner) ke liye server par `feed_seen:{me}` = last seen score, har device update kare (max wins -- chhota Lua script: `if new > old then SET`). Banner count = feed entries with score > seen. Ye best-effort hai: dono devices parallel mein update karein toh max rehta hai, koi conflict nahi. Exact 'har post par read receipt' feed ke liye overkill hai."
+
+### Data, Redis, concurrency
+
+**10. Interviewer:** "Viral post par likes kaise scale karoge?"
+
+**My Answer:** "Like = do cheezein. (1) Who liked: `post_likes` Cassandra row `(post_id, user_id)` -- PK se idempotent, `PUT` dobara = same row. (2) Count: Redis `INCR likes:{postId}` sirf tab jab like naya ho (pehle 'already liked?' check -- `SADD` result ya Cassandra LWT mehenga, isliye Redis mein recent likers set with TTL). Viral: 1M likes in 10 min = ~1.7K/s ek key par -- Redis ek key par itna easily handle karta hai; asli bottleneck flush aur `post_likes` ka ek bada partition. Agar ek key hot ho jaaye: counter shard `likes:{postId}:{0..15}`, read par sum. Flush worker har few seconds deltas Cassandra counter mein. Display '1.2M' -- exact nahi chahiye."
+
+**11. Interviewer:** "Fan-out ko test kaise karoge?"
+
+**My Answer:** "Layers: (1) **Unit**: fan-out handler pure function jaisa -- input post + follower batches, output Redis commands; check: celeb (>= 10,000) par zero ZADD, inactive users skip, trim to 200. (2) **Idempotency test**: same message 2 baar -> feed same (ZADD same member/score no-op). (3) **Integration** with testcontainers (real Redis + Kafka/Redpanda): post create -> within 5 s follower feed mein. (4) **Load test**: synthetic graph with heavy-tailed follower counts, measure `fanout_lag_seconds` aur `kafka_consumer_lag`. (5) **Shadow/replay**: production events ko staging consumer par replay karke naya fan-out code compare. PART 25 Q10 mein code."
+
+**12. Interviewer:** "Redis 1.28 TB hai -- cost kaise kam karoge?"
+
+**My Answer:** "Levers, bada se chhota: (1) **FEED_MAX 200 -> 100** -> ~640 GB (aadha). Zyada tar users 1-2 page hi dekhte hain; purana hissa rebuild se aa jaata hai. (2) **FEED_MAX <= 128 ho toh Redis ZSET compact `listpack` encoding** use karta hai (default `zset-max-listpack-entries 128`, member <= 64 bytes) -- memory roughly kaafi kam, ops O(N) lekin N=128 par fark nahi. (3) **Active window 30 -> 7 din** -- kam feeds maintain. (4) Sirf ids already store karte hain -- post JSON feed mein kabhi nahi. (5) Member as binary (8-byte id) instead of 19-char string -- chhota fayda, readability ka nuksaan. (6) Cold users ke feeds Cassandra tier mein. Trade-off: har lever rebuilds badhata hai (`feed_rebuilds_total`) -- Cassandra read load badhega, toh ek-ek karke metrics ke saath."
+
+**13. Interviewer:** "Do fan-out workers same message process kar lein toh?"
+
+**My Answer:** "Kafka at-least-once hai -- rebalance ke waqt ek batch dobara aa sakta hai. Hamara write idempotent hai: `ZADD feed:{uid} <createdAtMs> <postId>` -- same member same score = no change; trim bhi idempotent. Toh duplicate processing = extra Redis load, wrong data nahi. Ek subtle case: delete aur create ka order. Key = authorId, toh ek author ke `posts.created` ek partition mein ordered; lekin `posts.deleted` alag topic hai -- agar delete pehle process hua aur create baad mein, toh deleted post feed mein aa jaayega. Isliye read-time filter (`deleted = true` skip) zaruri hai, sirf cleanup par bharosa nahi."
+
+### Reliability, multi-region, product
+
+**14. Interviewer:** "Multi-region kaise karoge?"
+
+**My Answer:** "User ka **home region** (signup/geo se). Writes (posts, follows) home region mein; Cassandra multi-DC async replicate karta hai (LOCAL_QUORUM writes/reads). Kafka topics region-local + mirroring doosre regions mein, taaki har region ka fan-out worker apne region ke users ke `feed:{uid}` bhare -- Redis per region, cross-region Redis replication nahi. Follower doosre region mein hai toh uska feed wahan ka worker bharega (lag = replication + fan-out, few seconds extra). Postgres graph: home-region primary per user shard. Region down: users doosre region par, feeds wahan missing ho sakte hain -> rebuild by pull. Trade-off: ek post ka fan-out har region mein (cost x regions), aur follow/unfollow ke cross-region conflicts (last-write-wins by timestamp theek hai)."
+
+**15. Interviewer:** "Disaster recovery?"
+
+**My Answer:** "Do categories: (1) **Source of truth** -- posts (Cassandra), users/follows (Postgres), likes. Inke backups + point-in-time recovery + multi-DC replicas; RPO seconds-minutes. (2) **Derived** -- Redis feeds, timelines, counters cache. Inke backup ki zarurat nahi, **rebuild** karo: user open kare toh pull se rebuild (lazy), ya Kafka `posts.created` replay (Kafka retention e.g. 7 din). Lekin dhyan: poori Redis cluster ek saath gayi toh 35K reads/s sab rebuild -> Cassandra par stampede (lesson 83). Isliye rebuild concurrency limit, request coalescing per user, aur degraded mode (sirf celebs + own timeline + popular). Like counters Redis se gaye -> last flush tak Cassandra mein hain, baaki recount job. Drill: saal mein kam se kam ek baar 'Redis shard wipe' game day."
+
+**16. Interviewer:** "Ads kaise insert karoge?"
+
+**My Answer:** "Brief: ads alag system hai (out of scope). Feed service page banne ke baad ek **mixer** step: ad server se 1-2 ads maango (user context ke saath, strict timeout e.g. 50 ms), fixed slots par insert (e.g. position 5 aur 15), feed item type `ad`. Ad server timeout ho toh bina ads ke page -- feed kabhi ads ki wajah se slow nahi. Ads cursor ka hissa nahi, taaki pagination organic posts par stable rahe."
+
+**17. Interviewer:** "Edit post kaise?"
+
+**My Answer:** "Hamara design isme easy hai kyunki feeds sirf ids rakhte hain: `posts_by_id` update (text, `edited_at`) + `post:{postId}` cache overwrite -> sab feeds mein naya text, fan-out dobara nahi. Score (`createdAtMs`) nahi badalta -- edit se post upar nahi kudta. Rules: edit window (e.g. 30 min), edit history table (misinformation ke against, kai apps publicly dikhate hain), aur like count reset nahi. Cache consistency: update DB -> delete/overwrite cache; beech ka race (purana value dobara cache mein) short TTL aur versioned value se kam."
+
+---
+
+## PART 24 -- Requirement Change ("What if...") Questions
+
+> Format: **Current Design -> New Problem -> Change -> Trade-off.**
+
+### 1. What if traffic becomes 100x?
+
+- **Current Design:** ~35K feed reads/s, ~69K fan-out inserts/s peak, ~20-shard Redis Cluster.
+- **New Problem:** ~3.5M feed reads/s, ~6.9M fan-out inserts/s, ~70M hydration lookups/s, ~560 Gbps feed responses. Agar users bhi 100x -> Redis ~128 TB.
+- **Change:** celebrity threshold neeche (e.g. 2,000) taaki push writes kam; FEED_MAX chhota + listpack; cells (users ko cells mein baanto, har cell apna Redis/Kafka/Feed Service); hydration ke liye local in-process LRU (hot posts) + Redis; response caching of first page for 10-30 s; ranking candidate caps.
+- **Trade-off:** threshold neeche = zyada users ke liye read-time merge; cells ke beech follows cross karte hain (fan-out cross-cell). Honest line: "100x par feed systems ka asli cost RAM aur network ho jaata hai, CPU nahi."
+
+### 2. What if Redis is removed?
+
+- **Current Design:** feeds, timelines, post cache, counters sab Redis mein.
+- **New Problem:** har read ko pull karna padega: 35K/s x 200 followees = ~7M partition reads/s Cassandra par -- practical nahi.
+- **Change:** materialized feed Cassandra mein (`feed_by_user ((user_id), score, post_id)` with TTL) -- push fan-out wahan; hydration ke liye in-process LRU + Cassandra row cache; counters Cassandra counters. Ya Redis ki jagah koi aur in-memory store (Memcached for post cache).
+- **Trade-off:** read latency few ms per query se badhti hai (p99 200 ms ke andar ho sakta hai), fan-out writes disk par (compaction, trim = tombstones); ZSET ki `ZREMRANGEBYRANK` jaisi convenience nahi. Kaam karega -- bas mehenga aur slow.
+
+### 3. What if Cassandra (posts DB) is down?
+
+- **Current Design:** posts Cassandra mein, cache mein 24 h.
+- **New Problem:** naye posts nahi likh sakte; hydration misses fail; rebuilds fail.
+- **Change:** reads: `post:{postId}` cache (24 h TTL) se zyada tar feed chal jaata hai -- hit ratio high hai kyunki feeds recent posts hi dikhate hain; misses skip karo (partial feed) instead of 500. Writes: `POST /v1/posts` -> 503 with retry, ya client-side queue (app offline jaisa). Cassandra multi-node hai -- poora cluster down rare hai; zyada common hai ek node/replica down, jo LOCAL_QUORUM (RF=3) sambhal leta hai.
+- **Trade-off:** degraded feed (kuch posts missing) vs down feed -- requirement ne kaha stale > down.
+
+### 4. What if a user with 100M followers posts every minute?
+
+- **Current Design:** >= 10,000 followers -> pull.
+- **New Problem:** push hota toh 100M/min = ~1.67M inserts/s ek user ke liye -- isliye pull already sahi. Naya problem read side: `timeline:{celebId}` ek key par, e.g. 1/3 followers daily active x 10 opens = ~3.9K reads/s avg, **~11.6K/s peak** ek hi Redis shard par.
+- **Change:** hot key mitigation -- Redis replicas se reads; Feed Service instances mein 1 s in-process cache of that timeline (35 instances x 1 req/s = 35 Redis reads/s instead of 11.6K); ya key ko N copies mein duplicate (`timeline:{celebId}:{0..7}`) random read. Posting rate limit bhi (Rate Limiter) -- har minute post karna spam jaisa hai.
+- **Trade-off:** 1 s in-process cache = 1 s extra staleness (koi farq nahi); duplicated keys = write N times.
+
+### 5. What if we need strictly chronological + real-time (< 1 s) delivery?
+
+- **Current Design:** eventual, fan-out lag p99 < 5 s, polling for "new posts".
+- **New Problem:** < 1 s end-to-end matlab Kafka + fan-out + client poll teeno fast hone chahiye.
+- **Change:** producer `linger.ms` ~0, dedicated high-priority partitions; online users ke liye WebSocket/SSE gateway (Chat System jaisa) -- fan-out worker ZADD ke saath "user online hai?" check karke push event bheje; offline users ko sirf ZADD. Celebs ke followers ke liye real-time push = 50M messages -- yahan honestly bolo "celeb posts ke liye < 1 s nahi denge ya sirf online followers ko, sampled".
+- **Trade-off:** crores persistent connections (Chat System jaisa infra), battery, cost; "strict chronological" ranked feed ke saath nahi chalega -- Following tab mein hi.
+
+### 6. What if one user (bot) creates 10M posts?
+
+- **Current Design:** no per-user post limit beyond gateway rate limit.
+- **New Problem:** 10M posts x 200 followers = **2B feed inserts** -- ek poore din ka fan-out ek user ne kha liya; followers ke feeds spam se bhar gaye; `posts_by_author` partition badi (isliye month bucket).
+- **Change:** Rate Limiter on `POST /v1/posts` (e.g. few per minute, few hundred per day per user) + account age/trust score; fan-out worker mein per-author fairness (ek author ke messages ek partition mein hain -- key = authorId -- toh woh sirf apni partition ko slow karta hai, lekin us partition ke baaki authors bhi atakte hain -> spam authors ko alag low-priority topic mein route); spam classifier async.
+- **Trade-off:** strict limits genuine power users (news agencies) ko rokte hain -> verified accounts ke liye alag limits.
+
+### 7. What if post requests are duplicated?
+
+- **Current Design:** `Idempotency-Key` on `POST /v1/posts`.
+- **New Problem:** mobile network timeout -> app retry -> do same posts.
+- **Change:** server `(userId, Idempotency-Key)` -> postId store (Redis `SET NX` with 24 h TTL, ya DB unique) -- dobara aaye toh same `201` + same body. Downstream: outbox event ek hi (same post row); fan-out ZADD idempotent; like `PUT` idempotent by design.
+- **Trade-off:** extra lookup per post (sasta, 350/s); key storage TTL ke baad same key = naya post (client ko naya key banana chahiye har naye compose ke liye).
+
+### 8. What if two fan-out workers process the same message?
+
+- **Current Design:** kafkajs consumer group `feed-fanout`, commit after processing.
+- **New Problem:** rebalance / crash ke baad batch replay.
+- **Change:** kuch nahi -- design already idempotent (ZADD same member + trim). Sirf counters (e.g. `fanout_writes_total`) double count honge -- metric hai, theek. Agar kabhi non-idempotent side effect add ho (e.g. "notify followers"), toh dedupe key `(postId, followerId)` ya notification system ki apni dedupe.
+- **Trade-off:** exactly-once Kafka transactions possible hain, lekin Redis Kafka transaction ka hissa nahi -- idempotent writes sasta aur simple answer hai.
+
+### 9. What if we need "Following" + "For You" tabs?
+
+- **Current Design:** ek home feed.
+- **New Problem:** do alag feeds: Following = chronological, sirf followees; For You = ranked, followees + recommended posts.
+- **Change:** Following = hamara current hybrid feed, bina ranking. For You = candidate generation (following candidates + recommendation sources: similar users ke likes, trending, topics) -> ranking service -> page. For You ka result per user short TTL cache mein (ranked id list), cursor = position in that cached list + list version.
+- **Trade-off:** do caches/do code paths; For You ranking infra (ML) mehenga; recommendations ke liye alag pipeline.
+
+### 10. What if feeds must show posts from groups/pages too?
+
+- **Current Design:** sources = followees only.
+- **New Problem:** group ke 1M members, page ke 20M followers -- celebrity jaisa problem.
+- **Change:** same hybrid rule: chhote groups push (members ko fan-out), bade groups/pages pull (`timeline:group:{groupId}`). Graph mein `memberships` table; `celebs:{me}` ki jagah generic "pull sources" set.
+- **Trade-off:** pull sources badhne se merge sources badhte hain -> cap + ranking; group privacy (private group posts sirf members ko) -- filter mein authz check.
+
+### 11. What if the app must work offline?
+
+- **Current Design:** online feed API.
+- **New Problem:** subway mein app khula -- khaali screen?
+- **Change:** device par last N pages (items + media thumbnails) SQLite mein; offline par wahi dikhao "Last updated 2 h ago". Offline posts/likes local outbox mein, network aane par `Idempotency-Key` ke saath bhejo (duplicate safe). Likes optimistic UI.
+- **Trade-off:** device storage; stale deleted posts device par dikh sakte hain jab tak sync na ho; conflict (offline like, online unlike) -> last action wins.
+
+### 12. What if a user unfollows -- posts turant hatne chahiye? (apna)
+
+- **Current Design:** unfollow -> Postgres row delete -> `follows.changed`; feeds lazily cleaned.
+- **New Problem:** unfollow ke baad bhi feed mein us author ke posts (bura UX, aur block ke case mein safety issue).
+- **Change:** read-time filter: `following:{me}` cache ko unfollow par **turant invalidate**; merge ke baad entries jinka author ab followed nahi hai -> skip (author id `post:{postId}` se ya entry member mein `authorId:postId` encode karke). Async job `feed:{me}` se us author ke ids ZREM.
+- **Trade-off:** member mein authorId encode karna = memory badhti hai; na karo toh filter ke liye hydration pehle chahiye (over-fetch).
+
+---
+
+## PART 25 -- Node.js Specific Interview Questions
+
+### Q1. "Node.js single-threaded hai, toh 35K feed reads/s aur har read mein 10 sources merge kaise karega?"
+
+**My Answer:** "Feed read mostly **I/O** hai, CPU nahi. Ek read: `feed:{me}` ZSET read + ~10 celeb timelines + own timeline -> ye sab Redis calls parallel (`Promise.all`), event loop wait nahi karta, doosre requests serve karta hai. CPU wala hissa:
+- **K-way merge**: ~200 + 10 x 20 entries, min-heap -> O(total log k) -- microseconds.
+- **JSON.parse** of 20 hydrated posts (~20 KB) + **JSON.stringify** of response -- asli CPU cost yahi hai. 35K/s x 20 KB = ~700 MB/s JSON fleet-wide.
+- **Ranking** (V2): 500 candidates x simple formula -- sub-ms, event loop par theek.
+Toh ek instance agar roughly 1-2K reads/s handle kare (measure karo), ~20-35 instances + headroom. Horizontal scaling: stateless Feed Service, `cluster`/Kubernetes pods per core.
+**Kab bahar le jaun?** Agar ranking ML model ho (feature fetch + inference, tens of ms CPU) toh event loop block hoga -> **separate ranking service** (Python/GPU bhi ho sakta hai) over gRPC. Worker threads tab jab CPU kaam medium ho (e.g. 5-20 ms per request) aur alag service overkill -- lekin worker ko data bhejna (structured clone) khud cost hai. Rule: pehle `perf_hooks.monitorEventLoopDelay()` measure, phir decide."
+
+### Q2. "Multiple sources parallel mein padhne hain, ek slow source poora feed slow kar dega. Kya karoge?"
+
+```ts
+type SourceResult = { source: string; entries: FeedEntry[] };
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const t = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`timeout:${label}`)), ms);
+  });
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
+}
+
+export async function gatherSources(me: string, celebIds: string[], cursorScore: number) {
+  const reads: Array<Promise<SourceResult>> = [
+    readZset(`feed:{${me}}`, cursorScore, 50).then((e) => ({ source: 'feed', entries: e })),
+    readZset(`timeline:{${me}}`, cursorScore, 20).then((e) => ({ source: 'own', entries: e })),
+    ...celebIds.slice(0, 50).map((id) =>
+      withTimeout(readZset(`timeline:{${id}}`, cursorScore, 20), 40, id)
+        .then((e) => ({ source: id, entries: e }))),
+  ];
+  const settled = await Promise.allSettled(reads);
+  const ok = settled.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+  const partial = ok.length < reads.length;
+  metrics.histogram('celebrity_merge_sources', celebIds.length);
+  if (!ok.some((r) => r.source === 'feed')) throw new FeedUnavailable();   // primary source is required
+  return { lists: ok.map((r) => r.entries), partial };
+}
+```
+
+**Code Explanation:**
+
+- `withTimeout` -- `Promise.race` with a timer. ioredis commands `AbortSignal` nahi lete, isliye race; `AbortSignal.timeout(ms)` un APIs ke liye use karo jo signal lete hain (`fetch`, undici, kuch drivers). Dhyan: race sirf **wait** band karta hai, Redis command chalti rehti hai -- isliye ioredis ka `commandTimeout` option bhi set karo.
+- `.finally(() => clearTimeout(timer))` -- warna har request par ek zinda timer, 35K/s par timers ka pile.
+- `feed:{me}` aur `timeline:{me}` bina chhote timeout -- ye primary sources hain; celeb timelines 40 ms budget, fail ho toh chhod do.
+- `celebIds.slice(0, 50)` -- 5,000-follow user ka cap (follow-up #2); baaki background job se.
+- `Promise.allSettled` -- ek reject poore `Promise.all` ko reject nahi karta; partial results se feed banta hai. `Promise.all` yahan galat hota: ek celeb timeout = poora feed 500.
+- `partial` flag -- response/log mein, taaki pata chale kitne feeds degraded the. Cursor: partial page ke baad agla page us celeb ke posts miss kar sakta hai -- acceptable for feeds.
+- `limit 50` for feed -- 20 ki jagah over-fetch, kyunki filter (deleted, blocked, unfollowed) kuch entries hataayega.
+
+### Q3. "Redis Cluster mein ioredis pipeline aur MGET -- kya dikkat hai?"
+
+**My Answer:** "Redis Cluster mein multi-key commands (`MGET`, `MULTI`) tabhi chalte hain jab saari keys **same hash slot** mein hon, warna `CROSSSLOT` error. Hydration mein `MGET post:{id1} post:{id2} ...` 20 alag posts = 20 alag slots -> fail. Aur ioredis ki Cluster pipeline saari commands ek hi node ko bhejti hai -- keys alag nodes par hon toh error. Solutions: (1) `enableAutoPipelining: true` -- har command alag `get`, ioredis same event-loop tick ki commands ko **per node** batch kar deta hai; (2) keys ko slot/node ke hisaab se group karke per-node pipeline; (3) hash tags `{...}` se related keys ek slot mein -- `feed:{123}` aur `timeline:{123}` ka hash tag `123` hai, toh ek user ki dono keys same slot mein (useful), lekin posts ko ek slot mein daalna = hot shard, mat karo."
+
+```ts
+import Redis from 'ioredis';
+
+export const redis = new Redis.Cluster(
+  [{ host: process.env.REDIS_HOST!, port: 6379 }],
+  { enableAutoPipelining: true, scaleReads: 'slave', redisOptions: { commandTimeout: 50 } },
+);
+
+export async function hydrateFromCache(ids: string[]): Promise<Map<string, Post>> {
+  const raws = await Promise.all(ids.map((id) => redis.get(`post:{${id}}`)));  // auto-pipelined per node
+  const found = new Map<string, Post>();
+  raws.forEach((raw, i) => { if (raw) found.set(ids[i], JSON.parse(raw) as Post); });
+  return found;                                   // misses -> Cassandra posts_by_id, then SET with EX 86400
+}
+```
+
+**Code Explanation:**
+
+- `Redis.Cluster` -- slot map khud maintain karta hai, `MOVED`/`ASK` redirects follow karta hai.
+- `enableAutoPipelining: true` -- 20 `get` ek tick mein -> ioredis unhe node-wise group karke ek round trip per node mein bhejta hai. MGET jaisa fayda, CROSSSLOT ke bina.
+- `scaleReads: 'slave'` -- reads replicas se (hot celeb timelines ke liye bhi). Trade-off: replica thoda peeche ho sakta hai -- feed ke liye OK, lekin author ka read-your-own-writes `timeline:{me}` master se padhna safer.
+- `commandTimeout: 50` -- Q2 ka point: slow shard par command khud fail ho.
+- Misses -> Cassandra batch, phir `SET post:{id} <json> EX 86400` (24 h TTL). `hydration_cache_miss_total` metric.
+
+### Q4. "Snowflake IDs JavaScript mein number kyun nahi? BigInt aur JSON?"
+
+**My Answer:** "Snowflake ~2.1e18 hai, `Number.MAX_SAFE_INTEGER` = 9,007,199,254,740,991 (~9e15). `Number('2100907437367230464')` -> `2100907437367230500` -- aakhri digits badal gaye, yaani **doosri post ka id**. Isliye IDs strings. BigInt exact hai lekin `JSON.stringify({ id: 1n })` **TypeError throw** karta hai ('Do not know how to serialize a BigInt'). Drivers bhi alag: `pg` BIGINT ko by default **string** deta hai; `cassandra-driver` bigint ko `Long` object deta hai (option `encoding: { useBigIntAsLong: true }` se BigInt). Aur Redis ZSET score double hai -- isliye score = `createdAtMs` (~1.7e12, safe), member = postId string."
+
+```ts
+export function comparePostIds(a: string, b: string): number {
+  if (a.length !== b.length) return a.length - b.length;   // shorter decimal = smaller number
+  return a < b ? -1 : a > b ? 1 : 0;                       // same length -> lexicographic = numeric
+}
+
+export const toRow = (id: string) => BigInt(id);             // for math / driver params
+export const toJson = (id: bigint) => id.toString();         // never put bigint in a JSON response
+```
+
+**Code Explanation:**
+
+- `comparePostIds` -- cursor tie-break (spec: string length phir lexicographic). Snowflake positive hai aur leading zeros nahi, toh ye numeric order ke barabar hai, bina BigInt allocate kiye.
+- `BigInt(id)` -- jab arithmetic chahiye (e.g. timestamp nikaalna: `BigInt(id) >> 22n`).
+- `toJson` -- response mein hamesha string. Galti se BigInt reh gaya toh poora response 500 -- isliye response serializer mein ek test.
+
+### Q5. "kafkajs fan-out consumer -- ek author ke 9,999 followers, batch lamba chale toh?"
+
+```ts
+const consumer = kafka.consumer({ groupId: 'feed-fanout', sessionTimeout: 30_000, heartbeatInterval: 3_000 });
+await consumer.subscribe({ topic: 'posts.created' });
+
+await consumer.run({
+  eachBatchAutoResolve: false,
+  partitionsConsumedConcurrently: 4,
+  eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary, isRunning, isStale }) => {
+    for (const msg of batch.messages) {
+      if (!isRunning() || isStale()) break;
+      const evt = JSON.parse(msg.value!.toString()) as { postId: string; authorId: string; createdAtMs: number };
+      await fanout.handle(evt, heartbeat);          // streams followers in FANOUT_BATCH chunks
+      resolveOffset(msg.offset);                    // only after all pipelines succeeded
+      await heartbeat();
+    }
+    await commitOffsetsIfNecessary();
+  },
+});
+```
+
+**Code Explanation:**
+
+- `groupId: 'feed-fanout'` -- consumer group; partitions workers mein bant jaate hain. Parallelism = partitions count (e.g. 64-128) -- zyada consumers se fayda nahi.
+- Message key = authorId (producer side) -> ek author ke posts ek partition mein, order mein.
+- `eachBatchAutoResolve: false` + `resolveOffset(msg.offset)` -- offset **processing ke baad** mark -> crash hua toh message dobara aayega (at-least-once), khoyega nahi. ZADD idempotent hai, toh duplicate safe.
+- `heartbeat` -- lamba fan-out (10 pipelines) ke beech bhi heartbeat bhejo, warna `sessionTimeout` (30 s) cross -> broker sochega consumer mar gaya -> rebalance -> same batch doosre worker ko -> duplicate kaam.
+- `isRunning() || isStale()` -- shutdown ya rebalance ho gaya toh aage mat badho.
+- `partitionsConsumedConcurrently: 4` -- ek process 4 partitions parallel; Redis connections ka dhyan.
+
+### Q6. "50K followers ko memory mein load karke loop? Backpressure kaise?"
+
+**My Answer:** "Followers ko ek saath load mat karo -- keyset pagination se stream karo, `FANOUT_BATCH = 1_000` per round. Memory bounded, aur Redis ko ek waqt par ek pipeline -- Redis slow hua toh hum khud slow (natural backpressure). (Pure push sirf < 10,000 followers ke liye hai, lekin cleanup/delete jobs aur threshold transitions bade lists bhi stream karte hain.)"
+
+```ts
+export async function* activeFollowers(authorId: string): AsyncGenerator<string[]> {
+  let after = '0';
+  for (;;) {
+    const { rows } = await pg.query<{ follower_id: string }>(
+      `SELECT f.follower_id FROM follows f JOIN users u ON u.id = f.follower_id
+       WHERE f.followee_id = $1 AND f.follower_id > $2
+         AND u.last_active_at > now() - make_interval(days => $3)
+       ORDER BY f.follower_id LIMIT $4`,
+      [authorId, after, ACTIVE_DAYS, FANOUT_BATCH]);
+    if (rows.length === 0) return;
+    yield rows.map((r) => r.follower_id);
+    after = rows[rows.length - 1].follower_id;
+  }
+}
+
+export async function pushToFollowers(evt: PostEvent, heartbeat: () => Promise<void>) {
+  for await (const ids of activeFollowers(evt.authorId)) {
+    const p = redis.pipeline();                      // single-node Redis; see note for Cluster
+    for (const uid of ids) {
+      p.zadd(`feed:{${uid}}`, evt.createdAtMs, evt.postId);
+      p.zremrangebyrank(`feed:{${uid}}`, 0, -(FEED_MAX + 1));
+    }
+    await p.exec();
+    metrics.counter('fanout_writes_total', ids.length);
+    await heartbeat();
+  }
+}
+```
+
+**Code Explanation:**
+
+- `f.follower_id > $2 ORDER BY f.follower_id LIMIT` -- keyset pagination on `ix_follows_followee (followee_id, follower_id)`; offset nahi, har page ek index seek.
+- `JOIN users ... last_active_at` -- sirf `ACTIVE_DAYS = 30` wale active followers ko push. Ye join per page; bade scale par `active:{userId}` Redis check ya bitmap sasta ho sakta hai.
+- `after` string hai -- `pg` BIGINT string deta hai, aur hum wahi wapas bhejte hain; Postgres khud numeric compare karta hai.
+- `async function*` + `for await` -- agla page tabhi aata hai jab pichla Redis mein likh gaya. Memory = ek page (1,000 ids).
+- `zremrangebyrank ... 0, -(FEED_MAX + 1)` -- `0 -201` = sabse purane hatao, newest 200 rakho.
+- **Cluster note:** `redis.pipeline()` Cluster mein ek node ko jaata hai; 1,000 followers alag slots mein -> ya autopipelining (`Promise.all` of individual `zadd`) ya ids ko node-wise group karke per-node pipeline (Q3).
+
+### Q7. "cassandra-driver: prepared statements aur paging -- rebuild mein kaise use karoge?"
+
+```ts
+import { Client, types } from 'cassandra-driver';
+
+const cass = new Client({
+  contactPoints: process.env.CASS_HOSTS!.split(','),
+  localDataCenter: process.env.CASS_DC!,
+  encoding: { useBigIntAsLong: true },
+  socketOptions: { readTimeout: 200 },
+});
+
+const Q = 'SELECT post_id FROM posts_by_author WHERE author_id = ? AND bucket = ? LIMIT ?';
+
+export async function recentPostIds(authorId: string, buckets: string[], perAuthor = 20): Promise<string[]> {
+  const out: string[] = [];
+  for (const bucket of buckets) {                    // e.g. ['2026-09', '2026-08']
+    const rs = await cass.execute(Q, [BigInt(authorId), bucket, perAuthor], {
+      prepare: true, consistency: types.consistencies.localOne, fetchSize: perAuthor,
+    });
+    for (const row of rs.rows) out.push((row.post_id as bigint).toString());
+    if (out.length >= perAuthor) break;
+  }
+  return out.slice(0, perAuthor);
+}
+```
+
+**Code Explanation:**
+
+- `prepare: true` -- query ek baar server par prepare, baad mein sirf id + values; types sahi (bigint), aur token-aware routing (driver seedha us replica ko bhejta hai jiske paas partition hai).
+- `localDataCenter` -- multi-DC mein local DC ke nodes hi query karo (latency).
+- `useBigIntAsLong: true` -- `post_id` JS BigInt aata hai, `Long` object nahi; response ke liye `.toString()`.
+- `readTimeout: 200` -- slow node par hang nahi.
+- Buckets loop -- partition `(author_id, bucket)` hai; is mahine ke 20 nahi mile toh pichla mahina.
+- `localOne` -- rebuild derived data hai, sabse fast consistency theek. Bade result ke liye `fetchSize` + `rs.pageState` agli call mein pass karo (`{ pageState }`) -- driver-level paging, ya `cass.stream()`.
+- Rebuild = followees x ye function -> bounded concurrency (e.g. 50 parallel) warna 5,000 followees = 5,000 parallel queries.
+
+### Q8. "pg pool size kitna rakhoge?"
+
+**My Answer:** "Formula: `instances x pool.max <= Postgres max_connections - reserve`. 40 Graph Service pods x `max: 10` = 400 connections -- Postgres ke liye bahut (har connection ek process, MBs of RAM). Isliye **PgBouncer** (transaction pooling) beech mein, aur pool chhota (5-10) per pod. Graph queries fast hain (PK / index seeks, ~1 ms) -- 10 connections x 1,000 queries/s each = bahut throughput. Zyada tar graph reads Redis (`following:{id}`, TTL 10 min) se hi. Settings: `connectionTimeoutMillis` (pool khaali na mile toh fast fail, queue mein latke nahi), `statement_timeout` server side, `idleTimeoutMillis`. Pool badhane se slow DB fast nahi hota -- queue DB mein shift ho jaati hai."
+
+### Q9. "Fan-out worker ka graceful shutdown?"
+
+```ts
+let shuttingDown = false;
+process.once('SIGTERM', async () => {
+  shuttingDown = true;
+  const force = setTimeout(() => process.exit(1), 25_000).unref();   // < terminationGracePeriod
+  try {
+    await consumer.disconnect();          // stops fetching, waits for the in-flight batch, leaves group
+    await Promise.allSettled([redis.quit(), pg.end()]);
+  } finally {
+    clearTimeout(force);
+    process.exit(0);
+  }
+});
+```
+
+**Code Explanation:**
+
+- `consumer.disconnect()` -- kafkajs naya fetch band karta hai, chal rahe `eachBatch` ke khatam hone ka wait karta hai (roughly), aur group chhodta hai -> rebalance turant, 30 s session timeout ka wait nahi.
+- Offsets sirf `resolveOffset` ke baad commit hote hain (Q5) -- beech mein kata toh woh messages dobara process honge. **Safe kyunki ZADD idempotent hai.** Ye hi rule hai: commit after processing, aur processing idempotent.
+- `force` timer -- batch 25 s mein khatam nahi hua toh exit; uncommitted messages next owner process karega.
+- `redis.quit()` -- pending commands flush karke band (`disconnect()` turant kaat deta hai).
+- `unref()` -- timer process ko zinda na rakhe.
+
+### Q10. "Fan-out ko fake Redis/Kafka ke saath test kaise?"
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import RedisMock from 'ioredis-mock';
+
+describe('fanout.handle', () => {
+  let redis: InstanceType<typeof RedisMock>;
+  beforeEach(() => { redis = new RedisMock(); });
+
+  it('pushes to active followers, trims to FEED_MAX, and is idempotent', async () => {
+    const graph = fakeGraph({ author: 'a1', followers: 250, active: 240 });
+    const svc = new FanoutService(redis as any, graph);
+    for (let i = 0; i < FEED_MAX + 5; i++) await svc.handle(post('a1', i), noop);
+    await svc.handle(post('a1', FEED_MAX + 4), noop);                // redelivered message
+    expect(await redis.zcard('feed:{f1}')).toBe(FEED_MAX);
+    expect(await redis.exists('feed:{f245}')).toBe(0);               // inactive follower skipped
+  });
+
+  it('never pushes celebrity posts', async () => {
+    const graph = fakeGraph({ author: 'c1', followers: CELEBRITY_THRESHOLD, active: 10 });
+    await new FanoutService(redis as any, graph).handle(post('c1', 1), noop);
+    expect(await redis.keys('feed:*')).toEqual([]);
+  });
+});
+```
+
+**Code Explanation:**
+
+- `ioredis-mock` -- in-memory fake, ZSET commands support karta hai; fast unit tests. Limitation: Cluster behaviour (CROSSSLOT, MOVED) nahi pakdega -> uske liye testcontainers mein real Redis Cluster.
+- `fakeGraph` -- Graph Service/Postgres ka fake: 250 followers, 240 active -> inactive skip rule test.
+- `FEED_MAX + 5` posts -> trim check; phir same message dobara -> count wahi (idempotency).
+- Celeb test -- exactly `CELEBRITY_THRESHOLD` (10,000) followers par push **nahi** (rule `>=`) -- boundary test zaruri, off-by-one yahi hota hai.
+- Kafka: handler ko consumer se alag rakho (pure `handle(evt)`), toh Kafka mock ki zarurat nahi; end-to-end ke liye testcontainers Kafka/Redpanda -- post create -> 5 s ke andar follower feed.
+
+### Node.js answers ka summary
+
+| Topic | Chirp feed mein ek line |
+|---|---|
+| Single thread | Feed read I/O hai; CPU = JSON + merge + light ranking; ML ranking alag service |
+| Parallel sources | `Promise.allSettled` + per-source timeout; primary feed required, celebs optional |
+| Redis Cluster | MGET/pipeline cross-slot fail; auto-pipelining per node; `commandTimeout` |
+| IDs | Strings everywhere; BigInt JSON throws; pg -> string, cassandra -> Long/BigInt |
+| Kafka | Group `feed-fanout`, key authorId, resolve after processing, heartbeat in long batches |
+| Backpressure | Stream followers 1,000 at a time with keyset cursor; await each pipeline |
+| Cassandra | Prepared + token-aware, local DC, bucket loop, `pageState` |
+| pg pool | Small pools + PgBouncer; pool size != throughput |
+| Shutdown | Disconnect consumer, uncommitted = replay, idempotent ZADD makes it safe |
+| Testing | Pure handler + ioredis-mock; boundary at 10,000; testcontainers for Cluster/Kafka |
+
+---
+
+## Remember
+
+> **News feed ka har decision ek sawaal se nikalta hai: "kaam write time par karun (push) ya read time par (pull)?" Normal users push, celebrities (>= 10,000 followers) pull, feed mein sirf ids (ZSET, 200 entries, score = createdAtMs), posts aur follows durable DB mein aur feeds rebuildable cache mein -- aur Node mein sources parallel with timeouts, IDs hamesha strings, fan-out idempotent taaki at-least-once Kafka se darr na lage.**
+
+## Quick Self-Test
+
+1. Pure push mein 50M-follower celeb ki ek post ka cost nikaalo. Threshold 10,000 se 2,000 karne par read side par kya badlega, aur kaunsa metric batayega?
+2. V1 pull query ~1M DAU par kyun theek hai aur 10M par kyun nahi? Index probes/s ka math karo.
+3. Redis 1.28 TB ko aadha karne ke teen tareeke batao, aur har ek se `feed_rebuilds_total` / Cassandra par kya asar padega.
+4. Do fan-out workers ne same `posts.created` message process kiya aur ek `posts.deleted` pehle process ho gaya -- feed mein kya dikhega aur kaunsa mechanism user ko bachata hai?
+5. Redis Cluster mein `MGET post:{id1} ... post:{id20}` kyun fail hoga, aur ioredis mein hydration ka sahi tareeka kya hai? `JSON.stringify` BigInt ke saath kya karta hai?
+
+---
+
+**Next (Part 6):** Implement it (TypeScript), 30-second answer, 5-minute answer, whiteboard drawing order, final cheat sheet. "next" bolo.
+
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') return '<div class="mermaid">' + code + '</div>';
+    return '<pre><code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</code></pre>';
+  };
+  renderer.table = function(header, body) {
+    return '<div class="table-wrap"><table><thead>' + header + '</thead><tbody>' + body + '</tbody></table></div>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

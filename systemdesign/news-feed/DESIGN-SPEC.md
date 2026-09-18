@@ -143,6 +143,21 @@ interface FeedPage { items: FeedItem[]; nextCursor: string | null }
 - Files (LLD): `src/routes/{post,feed,follow,like}.routes.ts`, `src/controllers/...`, `src/services/{post,feed,fanout,graph,like,ranking}.service.ts`, `src/workers/fanout.worker.ts`, `src/repositories/{post.repository (cassandra-driver), follow.repository (pg), user.repository (pg)}.ts`, `src/cache/{feed-cache,post-cache,counter-cache}.ts`, `src/utils/{snowflake,cursor,kway-merge}.ts`, `src/infra/{redis,postgres,cassandra,kafka,logger,metrics}.ts`, `src/app.ts`, `src/server.ts`.
 - Metrics: `feed_read_duration_seconds`, `feed_cache_hit_ratio` (feed present in Redis vs rebuild), `feed_rebuilds_total`, `fanout_lag_seconds` (post created -> last follower feed written), `fanout_writes_total`, `kafka_consumer_lag{group="feed-fanout"}`, `post_create_duration_seconds`, `hydration_cache_miss_total`, `celebrity_merge_sources` (histogram: celeb timelines merged per read).
 
+## Decisions settled while writing (parts follow these)
+- Braces in key names (`feed:{userId}`) are placeholders -> real keys are `feed:123`. Real Redis Cluster hash tags are used only where a Lua script touches 2 keys (likes: `likers:{postId}` set + `likes:{postId}` counter in the same slot).
+- Redis Cluster: no cross-slot `MGET`/pipelines. Hydration and fan-out use ioredis `enableAutoPipelining` (+ `Promise.all`) or group keys per node.
+- Cursor read is inclusive: `ZREVRANGEBYSCORE feed:123 <cursorScore> -inf WITHSCORES LIMIT 0 <n+extra>`, then drop items `>= (score, postId)` of the cursor -- an exclusive `(` score would skip same-millisecond posts.
+- Merge is newest-first -> a max-heap by score (same as a min-heap with the comparison flipped).
+- Idempotency for `POST /v1/posts`: Redis `idem:post:<authorId>:<key>` SET NX (24 h) holding the claimed postId (Cassandra LWT table = strict alternative).
+- Outbox with Cassandra: a `post_outbox` table written in the same logged batch as `posts_by_id` + `posts_by_author`; relay publishes to Kafka (direct publish too; relay is the safety net).
+- `timeline:{authorId}` exists for every author (read-your-own-writes + celebrity pull); non-celebrity timelines may be trimmed shorter / TTL to save memory (~640 GB otherwise).
+- Snowflake epoch = `1288834974657` (Twitter epoch), 41/10/12 bits.
+- Celebrity threshold uses hysteresis (e.g. become celebrity at 10,000, stop at 9,000) + backfill on drop, so posts don't vanish.
+- Likes: Lua `SADD likers:{postId}` then `INCR likes:{postId}` only if SADD returned 1; flush deltas to Cassandra counters.
+- Redis memory: 1.28 TB is for 100M DAU; 30-day actives are more, and ~27 shards at a 75% memory target is the realistic count.
+- Follow graph is large (~60B rows): at scale store forward (`following`) and reverse (`followers`) lists separately, each sharded by its own key.
+- Empty vs missing feed: an `active:{userId}` marker distinguishes "follows nobody" from "feed evicted", so rebuild doesn't run on every open.
+
 ## Style rules (every part)
 - Title: `# News Feed -- HLD + LLD (Part N: A -> B -> C)` (the reader uses the text inside `(Part N: ...)` as the chapter label).
 - Easy Hinglish, ASCII only (no em/en dashes, smart quotes, arrows, box-drawing, emojis), Node.js/TypeScript, `**Code Explanation:**` line-by-line after every code block, interview lines, `## Remember` + `## Quick Self-Test` (5 questions) at end, final `**Next (Part N+1):** ... "next" bolo.` line (Part 6 ends with `**News Feed complete.** Next system: **Chat System**. "next" bolo.`).

@@ -1,0 +1,831 @@
+# News Feed -- HLD + LLD (Part 6: Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet)
+
+> Is file mein prompt ke **Parts 26-30** hain: coding round mein "Implement a news feed" (LeetCode 355 "Design Twitter" ka extended version) kaise solve karein, 30-second answer, 5-minute answer, whiteboard par diagram kis order mein banayein, aur poore Chirp News Feed design (Parts 1-5) ki final cheat sheet.
+> Ye last file hai. Parts 1-5 mein humne design samjha (naive `IN (...)` query kyun pighalti hai, pull vs push vs **hybrid with 10,000 threshold**, Redis ZSET feed cache with IDs only, cursor pagination, hydration, read-your-own-writes); yahan hum usko **interview mein bolna, likhna aur draw karna** seekhenge.
+> Honest note: real Twitter / Facebook / Instagram feeds isse kahin complex hain (ML ranking, dozens of candidate sources) aur unke internals sirf partly public hain. Ye woh design hai jo interviewer "Design the Twitter home timeline" par expect karta hai.
+
+---
+
+## PART 26 -- Code Design Question: "Implement a news feed"
+
+### Pehle samjho: interviewer kya dekh raha hai
+
+Prompt (LeetCode 355 style): *"Design a simplified Twitter: `postTweet(userId, tweetId)`, `getNewsFeed(userId)` -- 10 most recent tweet ids from the user and people they follow, newest first -- `follow(followerId, followeeId)`, `unfollow(followerId, followeeId)`."*
+
+Basic version har koi likh leta hai. Senior signal tab milta hai jab tum khud extend karte ho:
+
+- Kya tum **k-way merge with a heap** jaante ho, ya saare posts ek array mein daal ke `sort()` karte ho?
+- Kya tum bol sakte ho ki ye **pull model** hai, aur scale par **push (fan-out on write)** kyun chahiye -- aur celebrity par push kyun phatta hai (**hybrid**)?
+- **Pagination** offset se nahi, **cursor** se -- aur scroll ke beech naya post aaye toh duplicate na dikhe?
+- **Unfollow / delete** ke baad purane entries feeds mein pade hain -- unhe kaise chhupaoge?
+
+Isliye plan: **ek file, ek interface, do implementations** -- `PullFeed` (LeetCode answer) aur `HybridFeed` (Chirp design ka mini version). Demo same script dono par chalata hai aur **assert** karta hai ki feeds identical hain. Connection: File Storage Part 26 mein "commit = visibility" ek synchronous block tha; yahan wahi trick -- har method synchronous hai, toh ek process ke andar koi race nahi.
+
+### Step 1 -- Clarify (1-2 minute, typing se pehle)
+
+| Question | Mera assumption |
+|---|---|
+| IDs kis type ke? | **Strings** (Snowflake ~2.1e18 > 2^53, JS `number` mein exact nahi). Demo mein `b1`, `c1` jaise ids |
+| "Most recent" kaise decide? | Post time ka score (`createdAtMs`). Demo mein **monotonic fake clock** (har post 1 ms baad). Equal score -> bada id pehle |
+| Feed mein apne posts? | Haan (LeetCode bhi yahi kehta hai) -- aur ye hi **read-your-own-writes** hai |
+| Follow ke baad followee ke **purane** posts? | Haan, dikhne chahiye (LeetCode semantics). Hybrid mein iske liye **backfill** (last 20) |
+| Pagination? | `getFeed(userId, limit, cursor)` -> `{ items, nextCursor }`; `limit` 1..50; `getNewsFeed` = first page of 10 |
+| Unfollow / delete ke baad? | Turant feed se gayab. Stored feeds ko touch nahi karenge -- **read par filter** (lazy cleanup) |
+| Celebrity kaun? | followers >= threshold. Spec: **10,000**; demo mein **3** taaki 4 users se dikh jaaye |
+| Same `tweetId` dobara aaye? | Retry maano -> ignore (Payment System wala `Idempotency-Key` idea) |
+
+### Step 2 -- Logic pehle bolo (Hinglish mein)
+
+> "Pehle **PullFeed** -- LeetCode wala. Har author ki posts ek list mein append (oldest first). Feed maangi toh `me + followees` ki lists lo -- ye F+1 **sorted lists** hain -- aur **k-way merge**: har list ka newest element ek **max-heap** mein, top nikalo, us list ka agla element heap mein daalo, jab tak 10 na ho jaayein. Poora sort nahi karna padta.
+>
+> Phir **HybridFeed** -- production idea. Har user ka ek **inbox** (`feed:{userId}`, max 200 entries). Normal author post kare toh har follower ke inbox mein `postId` push. Celebrity (followers >= threshold) post kare toh **push nahi** -- sirf uske `timeline:{authorId}` mein. Read par merge sirf thodi lists ka: mera inbox + mera apna timeline (read-your-own-writes) + har celebrity ka timeline jise main follow karta hoon.
+>
+> Dono mein same `getFeed`: cursor decode, merge, har entry par `visible()` check (deleted? abhi bhi follow karta hoon?), `limit` bhar gaya toh last entry se `nextCursor`. Cursor = `(score, postId)`, isliye beech mein naya post aaye toh page 2 mein duplicate nahi."
+
+### Step 3 -- TypeScript code (single file, self-contained)
+
+```ts
+// ---------- Constants (spec values; the demo passes a tiny celebrity threshold) ----------
+export const CELEBRITY_THRESHOLD = 10_000;
+export const FEED_MAX = 200;   // entries kept per feed:{userId} / timeline:{authorId}
+export const PAGE_SIZE = 20;
+export const MAX_LIMIT = 50;
+export const BACKFILL = 20;    // new follow -> copy followee's last 20 posts into my feed
+export const LEETCODE_SIZE = 10;
+
+// ---------- Types (spec names; Post trimmed: no text/media in this exercise) ----------
+export interface Post { id: string; authorId: string; createdAtMs: number; deleted: boolean }
+export interface FeedEntry { postId: string; scoreMs: number }
+export interface FeedPage { items: FeedEntry[]; nextCursor: string | null } // hydration skipped
+export interface NewsFeed {
+  postTweet(userId: string, tweetId: string): void;
+  getNewsFeed(userId: string): string[];              // LeetCode 355: 10 most recent ids
+  follow(followerId: string, followeeId: string): void;
+  unfollow(followerId: string, followeeId: string): void;
+  deletePost(userId: string, postId: string): void;
+  getFeed(userId: string, limit?: number, cursor?: string | null): FeedPage;
+}
+export class FeedError extends Error {
+  constructor(readonly status: number, readonly code: string) { super(code); }
+}
+export class Clock { // monotonic fake clock: every call = 1 ms later
+  constructor(private ms = 1_000) {}
+  next(): number { return ++this.ms; }
+}
+
+// ---------- Ordering: newest first; equal scores -> bigger id first (ids compared as big numbers) ----------
+const idCmp = (a: string, b: string): number => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+export const newerFirst = (a: FeedEntry, b: FeedEntry): number => b.scoreMs - a.scoreMs || idCmp(b.postId, a.postId);
+
+export const encodeCursor = (e: FeedEntry): string =>
+  Buffer.from(JSON.stringify({ s: e.scoreMs, id: e.postId })).toString('base64url');
+export function decodeCursor(cursor: string): FeedEntry {
+  try {
+    const { s, id } = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (typeof s === 'number' && typeof id === 'string') return { scoreMs: s, postId: id };
+  } catch { /* fall through */ }
+  throw new FeedError(400, 'INVALID_CURSOR');
+}
+
+// ---------- Max-heap (priority = cmp(a, b) > 0 means a comes out first) ----------
+export class MaxHeap<T> {
+  private readonly a: T[] = [];
+  constructor(private readonly cmp: (x: T, y: T) => number) {}
+  get size(): number { return this.a.length; }
+  push(x: T): void {
+    const a = this.a;
+    a.push(x);
+    for (let i = a.length - 1; i > 0;) {
+      const p = (i - 1) >> 1;
+      if (this.cmp(a[i], a[p]) <= 0) break;
+      [a[i], a[p]] = [a[p], a[i]];
+      i = p;
+    }
+  }
+  pop(): T | undefined {
+    const a = this.a;
+    const top = a[0];
+    const last = a.pop();
+    if (a.length > 0 && last !== undefined) {
+      a[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1;
+        let best = i;
+        if (l < a.length && this.cmp(a[l], a[best]) > 0) best = l;
+        if (r < a.length && this.cmp(a[r], a[best]) > 0) best = r;
+        if (best === i) break;
+        [a[i], a[best]] = [a[best], a[i]];
+        i = best;
+      }
+    }
+    return top;
+  }
+}
+
+// Lists are sorted OLDEST first (append order). Returns index of the newest entry strictly older than `after`.
+function startIndex(list: FeedEntry[], after: FeedEntry | null): number {
+  if (!after) return list.length - 1;
+  let lo = 0, hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (newerFirst(after, list[mid]) < 0) lo = mid + 1; else hi = mid;
+  }
+  return lo - 1;
+}
+
+// K-way merge: newest `limit` entries across k sorted lists, after the cursor, skipping !keep and duplicates.
+export function kWayMerge(
+  lists: FeedEntry[][], limit: number, after: FeedEntry | null, keep: (e: FeedEntry) => boolean,
+): FeedEntry[] {
+  const heap = new MaxHeap<{ e: FeedEntry; list: number; idx: number }>((x, y) => newerFirst(y.e, x.e));
+  lists.forEach((list, i) => {
+    const idx = startIndex(list, after);
+    if (idx >= 0) heap.push({ e: list[idx], list: i, idx });
+  });
+  const out: FeedEntry[] = [];
+  while (out.length < limit && heap.size > 0) {
+    const top = heap.pop()!;
+    if (top.idx > 0) heap.push({ e: lists[top.list][top.idx - 1], list: top.list, idx: top.idx - 1 });
+    if (out.length > 0 && out[out.length - 1].postId === top.e.postId) continue; // pushed AND pulled copy
+    if (keep(top.e)) out.push(top.e);
+  }
+  return out;
+}
+
+// ~ ZADD member + ZREMRANGEBYRANK 0 -(FEED_MAX+1): unique member, sorted insert, keep newest FEED_MAX
+export function zadd(list: FeedEntry[], e: FeedEntry): void {
+  if (list.some((x) => x.postId === e.postId)) return;
+  let i = list.length;
+  while (i > 0 && newerFirst(list[i - 1], e) < 0) i--; // usually 0 steps: new posts are newest
+  list.splice(i, 0, e);
+  if (list.length > FEED_MAX) list.splice(0, list.length - FEED_MAX);
+}
+
+const getOr = <K, V>(m: Map<K, V>, k: K, make: () => V): V => {
+  let v = m.get(k);
+  if (v === undefined) { v = make(); m.set(k, v); }
+  return v;
+};
+
+// ---------- Shared parts: source of truth (posts + graph), paging, filtering ----------
+export abstract class BaseFeed implements NewsFeed {
+  protected readonly posts = new Map<string, Post>();            // ~ Cassandra posts_by_id
+  protected readonly following = new Map<string, Set<string>>(); // ~ Postgres follows PK
+  protected readonly followers = new Map<string, Set<string>>(); // ~ ix_follows_followee
+  constructor(protected readonly clock: Clock) {}
+
+  postTweet(userId: string, tweetId: string): void {
+    if (this.posts.has(tweetId)) return; // retried request (Idempotency-Key) -> no second post
+    const post: Post = { id: tweetId, authorId: userId, createdAtMs: this.clock.next(), deleted: false };
+    this.posts.set(tweetId, post);
+    this.onPost(post);
+  }
+  follow(followerId: string, followeeId: string): void {
+    if (followerId === followeeId || this.followingOf(followerId).has(followeeId)) return; // idempotent
+    this.followingOf(followerId).add(followeeId);
+    this.followersOf(followeeId).add(followerId);
+    this.onFollow(followerId, followeeId);
+  }
+  unfollow(followerId: string, followeeId: string): void {
+    this.followingOf(followerId).delete(followeeId); // feeds are NOT touched: filtered at read
+    this.followersOf(followeeId).delete(followerId);
+  }
+  deletePost(userId: string, postId: string): void {
+    const p = this.posts.get(postId);
+    if (!p || p.authorId !== userId) throw new FeedError(404, 'POST_NOT_FOUND');
+    p.deleted = true; // tombstone; feeds cleaned lazily
+  }
+  getNewsFeed(userId: string): string[] {
+    return this.getFeed(userId, LEETCODE_SIZE).items.map((e) => e.postId);
+  }
+  getFeed(userId: string, limit = PAGE_SIZE, cursor: string | null = null): FeedPage {
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new FeedError(400, 'INVALID_LIMIT');
+    const after = cursor ? decodeCursor(cursor) : null;
+    const items = kWayMerge(this.sources(userId), limit, after, (e) => this.visible(userId, e));
+    return { items, nextCursor: items.length === limit ? encodeCursor(items[items.length - 1]) : null };
+  }
+  protected visible(userId: string, e: FeedEntry): boolean {
+    const p = this.posts.get(e.postId);
+    return !!p && !p.deleted && (p.authorId === userId || this.followingOf(userId).has(p.authorId));
+  }
+  protected followingOf(u: string): Set<string> { return getOr(this.following, u, () => new Set<string>()); }
+  protected followersOf(u: string): Set<string> { return getOr(this.followers, u, () => new Set<string>()); }
+  protected abstract onPost(post: Post): void;
+  protected abstract onFollow(followerId: string, followeeId: string): void;
+  protected abstract sources(userId: string): FeedEntry[][];
+}
+
+// ---------- 1) PULL: nothing precomputed; read = merge me + every followee ----------
+export class PullFeed extends BaseFeed {
+  private readonly byAuthor = new Map<string, FeedEntry[]>(); // ~ posts_by_author, oldest first
+  protected onPost(p: Post): void {
+    getOr(this.byAuthor, p.authorId, () => []).push({ postId: p.id, scoreMs: p.createdAtMs });
+  }
+  protected onFollow(): void { /* nothing to do: next read merges the new followee */ }
+  protected sources(userId: string): FeedEntry[][] {
+    return [userId, ...this.followingOf(userId)].map((u) => this.byAuthor.get(u) ?? []);
+  }
+}
+
+// ---------- 2) HYBRID: push for normal authors, pull for celebrities, own timeline for RYOW ----------
+export class HybridFeed extends BaseFeed {
+  readonly inbox = new Map<string, FeedEntry[]>();              // ~ feed:{userId}
+  private readonly timeline = new Map<string, FeedEntry[]>();   // ~ timeline:{authorId}
+  pushWrites = 0;                                               // ~ fanout_writes_total
+  constructor(clock: Clock, private readonly threshold = CELEBRITY_THRESHOLD) { super(clock); }
+
+  isCelebrity(u: string): boolean { return this.followersOf(u).size >= this.threshold; }
+  protected onPost(p: Post): void {
+    const e: FeedEntry = { postId: p.id, scoreMs: p.createdAtMs };
+    zadd(getOr(this.timeline, p.authorId, () => []), e); // author's own recent posts
+    if (this.isCelebrity(p.authorId)) return;           // celebrity: NO fan-out, readers pull
+    for (const f of this.followersOf(p.authorId)) {      // production: Kafka worker, batches of 1,000
+      zadd(getOr(this.inbox, f, () => []), e);
+      this.pushWrites++;
+    }
+  }
+  protected onFollow(followerId: string, followeeId: string): void {
+    if (this.isCelebrity(followeeId)) return; // pulled at read anyway
+    const inbox = getOr(this.inbox, followerId, () => []);
+    for (const e of (this.timeline.get(followeeId) ?? []).slice(-BACKFILL)) zadd(inbox, e);
+  }
+  protected sources(userId: string): FeedEntry[][] {
+    const celebs = [...this.followingOf(userId)].filter((u) => this.isCelebrity(u));
+    return [
+      this.inbox.get(userId) ?? [],                 // pushed entries
+      this.timeline.get(userId) ?? [],              // read-your-own-writes
+      ...celebs.map((c) => this.timeline.get(c) ?? []), // pulled celebrity posts
+    ];
+  }
+}
+```
+
+> Ye code `tsc --strict` (TypeScript 5, target ES2022, `@types/node`) se bina error compile hota hai, aur neeche ka output actually run karke nikala gaya hai.
+
+### Step 4 -- Line-by-line explanation
+
+**Code Explanation -- constants, types, ordering, cursor:**
+
+- Constants spec ke exact: `CELEBRITY_THRESHOLD = 10_000`, `FEED_MAX = 200`, `PAGE_SIZE = 20`, max `limit` 50, backfill 20. `LEETCODE_SIZE = 10` sirf `getNewsFeed` ke liye.
+- `Post`, `FeedEntry`, `FeedPage` -- spec ke names. `Post` trimmed hai (text/media nahi), aur `FeedPage.items` yahan `FeedEntry[]` hain kyunki **hydration** (author, likeCount) is exercise mein skip hai -- production mein yahi ids `MGET post:{id}` se hydrate hote hain.
+- `NewsFeed` interface -- LeetCode ke 4 methods + `deletePost` + `getFeed`. Dono classes isi ko implement karti hain, toh demo ek hi `script()` dono par chala sakta hai.
+- `FeedError(status, code)` -- controller seedha `res.status(status).json({ error: code })` kar sake (400 `INVALID_CURSOR`, 404 `POST_NOT_FOUND`).
+- `Clock.next()` -- har call 1 ms aage. Real system mein ye Snowflake ka timestamp hota; demo deterministic rahe isliye fake.
+- `idCmp` -- ids ko **bade numbers** ki tarah compare: pehle length, phir lexicographic. `"9" < "10"` string mein galat hota (`"10" < "9"`), length check isse bachata hai. Snowflake strings ke liye yahi rule (BigInt bhi chalega).
+- `newerFirst(a, b)` -- negative matlab `a` newer. Pehle score, tie par bada id. **Poore code ka single ordering rule** -- merge, cursor, insert teeno isi par.
+- `encodeCursor` -- `{ s: scoreMs, id: postId }` JSON -> `base64url` (URL-safe base64). Client ke liye **opaque**. `decodeCursor` -- parse fail ya shape galat -> **400 `INVALID_CURSOR`**, 500 nahi.
+
+**Code Explanation -- `MaxHeap`, `startIndex`, `kWayMerge`, `zadd`:**
+
+- `MaxHeap` -- array-based binary heap. `push`: end par daalo, parent `(i - 1) >> 1` se compare karke upar **sift up**. `pop`: top nikalo, last element root par, bade child se swap karte hue neeche **sift down**. Dono O(log n). (Spec "min-heap" kehta hai -- same cheez, comparator ulta; newest-first ke liye max-by-score.)
+- `startIndex` -- lists oldest-first hain (append order). Cursor ho toh **binary search**: pehla index jo cursor se older **nahi** hai; uske ek pehle wala = cursor ke baad ki newest entry. Cursor nahi -> last index (newest).
+- `kWayMerge` -- har list ka start element heap mein (`{ e, list, idx }`). Loop: top pop, **usi list ka agla purana element push** (`idx - 1`), phir 2 checks: (1) pichla output same `postId` tha -> skip (**same post do sources se**: pushed bhi aur celebrity timeline se pulled bhi -- author threshold cross kare tab hota hai; same score + id hone se dono adjacent aate hain); (2) `keep(e)` false -> skip (deleted / unfollowed). `limit` bhar gaya toh ruk jao -- baaki lists ko chhua bhi nahi.
+- `zadd` -- Redis ka `ZADD` + `ZREMRANGEBYRANK 0 -(FEED_MAX+1)` simulate: member unique (dobara aaye toh ignore), sorted jagah par insert (naya post usually newest hai toh 0 steps; backfill purane posts beech mein daalta hai), 200 se zyada ho toh **sabse purane** kaat do.
+
+**Code Explanation -- `BaseFeed` (shared: source of truth + paging):**
+
+- `posts` = Cassandra `posts_by_id`, `following` = Postgres `follows` PK `(follower_id, followee_id)`, `followers` = `ix_follows_followee`. Ye **source of truth** hai; inbox/timeline sirf derived cache.
+- `postTweet` -- id pehle se hai -> return (retry-safe). Warna `Post` banao, `onPost` hook (subclass decide karegi push karna hai ya nahi).
+- `follow` -- self-follow aur duplicate follow ignore (Postgres mein `CHECK` + PK yahi karte hain, API `PUT` idempotent 204). Phir `onFollow` hook.
+- `unfollow` -- sirf graph se hatao. **Feeds ko touch nahi kiya** -- 200 entries scan karke delete karna costly hai, read par filter sasta.
+- `deletePost` -- author nahi ya post nahi -> **404** (dusre ka post delete karne ki koshish par bhi 404, 403 nahi -- existence leak nahi hota). `deleted = true` = **tombstone**.
+- `getFeed` -- `limit` validate (1..50, warna 400), cursor decode, `kWayMerge(this.sources(userId), ...)`. `nextCursor` tabhi jab page poora bhara; last page par exactly `limit` items bache hon toh ek extra empty call aati hai -- acceptable.
+- `visible` -- post exist kare, deleted na ho, aur author **main khud** hoon ya **abhi bhi follow** karta hoon. Unfollow aur delete dono isi ek jagah handle.
+
+**Code Explanation -- `PullFeed` vs `HybridFeed`:**
+
+- `PullFeed.onPost` -- sirf author ki list mein append (O(1)). `onFollow` -- kuch nahi. `sources` -- `[me, ...followees]` ki lists. **Write sasta, read mehenga** (F lists merge).
+- `HybridFeed.onPost` -- pehle author ke `timeline` mein `zadd` (har author ka, celebrity ho ya nahi -- own posts ke liye bhi yahi). Celebrity -> **return, no fan-out**. Normal -> har follower ke `inbox` mein `zadd`, `pushWrites++` (= `fanout_writes_total`). Production mein ye loop Kafka `feed-fanout` worker mein chalta hai, 1,000 followers per Redis pipeline, sirf 30-day active followers.
+- `HybridFeed.onFollow` -- celebrity -> kuch nahi (read par pull hoga). Normal -> uske last 20 posts mera inbox mein **backfill** (spec: async job).
+- `HybridFeed.sources` -- inbox + apna timeline + followed celebrities ke timelines. Merge sirf **2 + C** lists ka (C = celebs I follow, usually chhota), F ka nahi.
+- `isCelebrity` read time aur write time dono par evaluate hota hai; follower count badla toh behaviour badal jaata hai -- edge case table dekho.
+
+### Step 5 -- Chalake dikhao (usage + real output)
+
+```ts
+import { deepStrictEqual } from 'node:assert';
+import { BaseFeed, Clock, FeedError, HybridFeed, PullFeed } from './news-feed';
+
+// Same script runs on both implementations; every checkpoint is recorded, then compared.
+function script(feed: BaseFeed, log: (line: string) => void): string[] {
+  const seen: string[] = [];
+  const show = (label: string, ids: string[]) => { seen.push(`${label}: [${ids.join(', ')}]`); log(seen[seen.length - 1]); };
+  const hy = feed instanceof HybridFeed ? feed : null;
+  const sizes = (...users: string[]) => users.map((u) => `${u}=${hy?.inbox.get(u)?.length ?? 0}`).join(' ');
+
+  feed.postTweet('bob', 'b1');
+  feed.postTweet('carol', 'c1');
+  feed.postTweet('alice', 'a1'); // alice follows nobody yet
+  feed.follow('alice', 'bob');
+  feed.follow('alice', 'carol');
+  show('A  alice feed', feed.getNewsFeed('alice'));
+
+  for (const fan of ['bob', 'carol', 'dave', 'alice']) feed.follow(fan, 'star'); // 4 followers >= 3
+  const before = hy?.pushWrites ?? 0;
+  feed.postTweet('star', 's1');
+  feed.postTweet('star', 's2');
+  feed.postTweet('bob', 'b2'); // bob is normal -> pushed
+  show('B  alice feed', feed.getNewsFeed('alice'));
+  if (hy) log(`   star celebrity=${hy.isCelebrity('star')}; push writes for s1+s2+b2=${hy.pushWrites - before} (pure push: 4+4+1=9); inbox sizes ${sizes('alice', 'bob', 'carol', 'dave')}`);
+
+  const p1 = feed.getFeed('alice', 4);
+  show('C  page 1', p1.items.map((e) => e.postId));
+  log(`   nextCursor=${p1.nextCursor}`);
+  feed.postTweet('carol', 'c2'); // arrives while alice is scrolling
+  const p2 = feed.getFeed('alice', 4, p1.nextCursor);
+  show('   page 2', p2.items.map((e) => e.postId));
+  log(`   nextCursor=${p2.nextCursor}`);
+  show('   refresh page 1', feed.getFeed('alice', 4).items.map((e) => e.postId));
+
+  feed.unfollow('alice', 'carol');
+  show('D  after unfollow carol', feed.getNewsFeed('alice'));
+  if (hy) log(`   alice inbox still holds ${hy.inbox.get('alice')!.map((e) => e.postId).join(',')} (filtered at read)`);
+  feed.deletePost('bob', 'b2');
+  show('E  after bob deletes b2', feed.getNewsFeed('alice'));
+  show('   dave feed', feed.getNewsFeed('dave'));
+  try { feed.deletePost('alice', 'b1'); } catch (e) { log(`   alice deletes b1 -> ${(e as FeedError).status} ${(e as FeedError).code}`); }
+  try { feed.getFeed('alice', 20, 'garbage!'); } catch (e) { log(`   bad cursor -> ${(e as FeedError).status} ${(e as FeedError).code}`); }
+  feed.postTweet('bob', 'b1'); // retried request with same id
+  show('F  after duplicate b1 retry', feed.getNewsFeed('alice'));
+  return seen;
+}
+
+const hybridLog: string[] = [];
+const hybrid = script(new HybridFeed(new Clock(), 3), (l) => hybridLog.push(l));
+const pull = script(new PullFeed(new Clock()), () => {});
+console.log(hybridLog.join('\n'));
+deepStrictEqual(pull, hybrid);
+console.log(`G  PullFeed and HybridFeed returned identical feeds at all ${pull.length} checkpoints`);
+```
+
+**Actual output:**
+
+```
+A  alice feed: [a1, c1, b1]
+B  alice feed: [b2, s2, s1, a1, c1, b1]
+   star celebrity=true; push writes for s1+s2+b2=1 (pure push: 4+4+1=9); inbox sizes alice=3 bob=0 carol=0 dave=0
+C  page 1: [b2, s2, s1, a1]
+   nextCursor=eyJzIjoxMDAzLCJpZCI6ImExIn0
+   page 2: [c1, b1]
+   nextCursor=null
+   refresh page 1: [c2, b2, s2, s1]
+D  after unfollow carol: [b2, s2, s1, a1, b1]
+   alice inbox still holds b1,c1,b2,c2 (filtered at read)
+E  after bob deletes b2: [s2, s1, a1, b1]
+   dave feed: [s2, s1]
+   alice deletes b1 -> 404 POST_NOT_FOUND
+   bad cursor -> 400 INVALID_CURSOR
+F  after duplicate b1 retry: [s2, s1, a1, b1]
+G  PullFeed and HybridFeed returned identical feeds at all 9 checkpoints
+```
+
+**Code Explanation -- output kya prove karta hai:**
+
+- **A** -- alice ne bob, carol ko follow kiya **baad mein**, phir bhi `b1`, `c1` dikhe: Pull mein natural, Hybrid mein **backfill** ki wajah se. Apna `a1` bhi hai (read-your-own-writes).
+- **B** -- 4 log `star` ko follow karte hain, threshold 3 -> `star` celebrity. `s1`, `s2` ke liye **0 push writes**; sirf `b2` ka 1 write (bob ka ek follower, alice). Pure push mein 4+4+1 = 9 hote. `bob`, `carol`, `dave` ke inbox **0** -- phir bhi alice ki feed mein `s2, s1` hain kyunki read par **pulled**. Scale par ye 50M writes vs 0 ka farak hai.
+- **C** -- page 1 (limit 4) = `b2, s2, s1, a1`, cursor = base64 of `{"s":1003,"id":"a1"}`. Beech mein carol ne `c2` post kiya. Page 2 = `c1, b1` -- **na `c2`, na koi duplicate**, kyunki cursor "a1 se purane" maangta hai. Offset pagination hoti toh `c2` aane se sab ek jagah khisak jaata aur `a1` dobara dikhta. `c2` refresh (page 1 without cursor) par top par aaya.
+- **D** -- unfollow carol -> `c1` gayab, lekin alice ka inbox abhi bhi `b1,c1,b2,c2` rakhta hai: **lazy cleanup**, filter at read.
+- **E** -- `b2` deleted -> alice ki feed se gayab (tombstone). dave sirf `star` ko follow karta hai -> uski feed poori **pulled** hai. alice ka `b1` delete karna -> **404**. Kharab cursor -> **400**, crash nahi.
+- **F** -- `b1` dobara post (retry) -> ignore, feed same.
+- **G** -- 9 checkpoints par **Pull aur Hybrid ka output identical** (`deepStrictEqual`). Matlab hybrid sirf ek **optimization** hai, semantics nahi badle. (Caveat: identical tab tak jab tak 200-entry cap aur 20-post backfill hit na ho -- production mein bhi yahi trade-off hai.)
+
+### Step 6 -- Edge cases
+
+| Edge case | Humara code | Production (Parts 2-4) |
+|---|---|---|
+| Same ms par 2 posts | Tie-break by bigger id (`newerFirst`) | Same; Redis `ZREVRANGEBYSCORE` ko score **inclusive** padho aur `(score, id)` se filter karo, warna same-ms post skip ho sakta hai |
+| New post during scroll | Cursor `(s, id)` -> page 2 unaffected (C) | Same; client "N new posts" pill dikhata hai |
+| Unfollow | Filter at read (D) | + async cleanup job; `following:{userId}` cache TTL 10 min, unfollow par invalidate |
+| Delete | Tombstone, filter at read (E) | `posts.deleted` Kafka event -> cleanup; hydration cache `post:{id}` DEL |
+| Pushed + pulled same post | Adjacent duplicate skip | Same (author threshold cross karta hai) |
+| Celebrity -> normal (followers girte hain) | Purane un-pushed posts pull se nikal jaate | **Hysteresis** (e.g. celeb >= 10,000, normal < 8,000) + sticky flag in `users` |
+| Feed > 200 entries | Oldest trimmed | Deep scroll -> fallback to pull from `posts_by_author` |
+| Inactive user (no inbox) | Pull fallback nahi (demo) | **Rebuild** by pull, write back to `feed:{me}` |
+| Duplicate post / follow | Ignored | `Idempotency-Key`, Postgres PK |
+| Bad cursor / limit | 400 | Same |
+| Delete someone else's post | 404 | Same (no existence leak) |
+
+**Concurrency:** har method synchronous hai (koi `await` nahi), toh Node ke ek process mein post aur read interleave nahi hote. Production mein fan-out **async** hai: post ke baad kuch seconds tak followers ko nahi dikhta (target p99 < 5 s) -- lekin author ko turant dikhta hai kyunki `timeline:{me}` read path mein merge hota hai.
+
+### Step 7 -- Complexity
+
+Symbols: **F** = followees of the reader, **C** = celebrities among them, **P** = posts per author list, **k** = limit, **s** = skipped entries (deleted / unfollowed / duplicate), **N** = followers of the author.
+
+| Operation | PullFeed | HybridFeed |
+|---|---|---|
+| `postTweet` | **O(1)** append | **O(N)** inbox writes (demo array `zadd` O(200) each; Redis `ZADD` O(log 200)); celebrity **O(1)** |
+| `follow` | O(1) | O(BACKFILL) zadds (20) |
+| `unfollow` / `deletePost` | O(1) | O(1) -- cleanup lazy |
+| `getFeed` build heap | O(F log P) binary searches + **O(F log F)** pushes | O(F) celeb filter (production: cached `celebs:{userId}`) + O(C log P + C log C) |
+| `getFeed` merge | **O((k + s) log F)** | **O((k + s) log C)** -- C ~ few |
+| Total read | **O(F log P + (F + k + s) log F)** | **O(F + C log P + (C + k + s) log C)**; with cached celebs set -> ~**O(k)** for C small |
+
+| Structure | Space |
+|---|---|
+| Source of truth | O(posts + follow edges) -- dono mein same |
+| PullFeed extra | Nothing |
+| HybridFeed extra | O(users x FEED_MAX) inboxes + O(authors x FEED_MAX) timelines -> spec: ~12.8 KB/user, **~1.28 TB** Redis for 100M DAU |
+
+> Interview line: "Pull mein write O(1) aur read O(F log F) -- har read par F lists ka heap. Push mein write O(followers) aur read ~O(k) kyunki feed precomputed hai. Reads writes se ~100x zyada hain (35K/s vs ~350/s), isliye push -- lekin celebrity ka O(N) 50M ho jaata hai, isliye unke liye pull. Hybrid dono ke sweet spot par hai."
+
+---
+
+## PART 27 -- 30-Second Answer
+
+> "At a high level, I would use a **hybrid fan-out** design. Posts Cassandra mein durable save hote hain aur outbox se Kafka par `post.created` jaata hai. Fan-out workers normal authors ke har active follower ke Redis ZSET feed mein sirf post ID push karte hain -- latest 200. Lekin 10,000 se zyada followers wale celebrities ke liye push nahi; unke posts read time par unke timeline se pull hote hain. Feed read = mera precomputed feed + followed celebrities + mere apne recent posts, k-way merge, cursor pagination with string Snowflake IDs, phir batch hydration. Redis sirf cache hai -- har feed Cassandra aur Postgres se rebuild ho sakti hai."
+
+(~40 seconds. Hybrid 10,000, Redis ZSET of IDs, Kafka async fan-out, merge + cursor + hydration, rebuildable -- bas.)
+
+---
+
+## PART 28 -- 5-Minute Interview Answer (natural Hinglish)
+
+> Ratna nahi hai. Har minute ka **goal** yaad rakho. Beech mein check-in: "Is this direction okay?"
+
+### 0:00 - 0:45 -- Requirements
+
+"Main pehle requirements clarify karunga. Twitter-style home timeline hai na? Toh create post -- 500 chars aur 4 media tak -- follow/unfollow, home feed jo followees ke posts dikhaye, infinite scroll, like, aur delete jo feeds se bhi gayab ho. V1 mein reverse-chronological, ranking V2 mein. Comments, DMs, notifications, search, ads -- scope se bahar.
+
+Non-functional mein feed read p99 200 ms se kam, high availability -- feed thodi stale chalegi par down nahi. Eventual consistency ok, naya post followers ko 5 second mein dikhe, lekin **author ko apna post turant** dikhna chahiye -- read-your-own-writes. Aur celebrities with 50 million followers handle karne hain."
+
+### 0:45 - 1:30 -- Numbers
+
+"100M DAU, 10 feed opens per day -- 1 billion reads/day, ~11.6K/s, peak **~35K reads/s**. Posts 10M/day -- ~116/s, peak ~350. Toh **read-heavy, ~100:1**. Average 200 followers -- agar har post push karein toh 2 billion feed inserts/day, ~69K/s peak. Feed cache: 200 entries x 64 bytes = 12.8 KB per user, 100M users = **~1.28 TB Redis**, ~20 shards. Posts ~3.65 TB/year metadata; media S3 aur CDN mein."
+
+### 1:30 - 2:30 -- Pull first, then why it breaks
+
+"Initially main simple pull model rakhunga. Posts table, follows table, aur feed = `SELECT ... WHERE author_id IN (my followees) ORDER BY created_at DESC LIMIT 20`. Ek server, kam users -- ye bilkul theek hai.
+
+At scale, bottleneck read-time merge ho jaata hai. Har feed open par 200-500 followees ke posts padhke merge karna, 35K baar per second -- DB pighal jaayega aur p99 200 ms nahi aayega. Reads writes se 100 guna zyada hain, toh kaam **write time par** karna chahiye.
+
+Isliye fan-out on write: post save hote hi Kafka event, fan-out workers har follower ke Redis ZSET `feed:{userId}` mein post ID daalte hain, score = createdAtMs, trim to 200. Read ab sirf ek `ZREVRANGEBYSCORE` hai."
+
+### 2:30 - 3:30 -- Celebrity problem + hybrid + read path
+
+"However, celebrities ke liye push nahi -- hybrid. 50M followers wala ek post = 50M writes, 1M/s par bhi ~50 second, aur Kafka backlog baaki sab ke posts ko late kar dega. Toh threshold 10,000 followers: usse upar author ka post sirf `timeline:{authorId}` mein, followers read time par pull karte hain.
+
+Feed read: `feed:{me}` ke pushed entries + jin celebrities ko main follow karta hoon unke timelines + mera apna `timeline:{me}` -- ye read-your-own-writes deta hai. K-way merge by score, deleted / blocked / unfollowed filter, 20 ka page, phir hydration -- `MGET post:{id}` batch, miss par Cassandra. Pagination cursor se -- `(score, postId)` base64 -- offset nahi, kyunki naye posts aate rehte hain. Aur IDs strings hain: Snowflake 2^53 se bada hai, JS number mein corrupt ho jaayega."
+
+### 3:30 - 4:15 -- Storage, failures, scale
+
+"Storage: users aur follows Postgres mein -- relational, unique constraints, `followee_id` index fan-out ke liye. Posts Cassandra mein -- append-heavy, `posts_by_author` partitioned by author + month. Redis source of truth nahi hai: Redis gaya toh feed Cassandra + Postgres se **rebuild** hoti hai, aur inactive users (30 din) ka feed push hi nahi karte, open par rebuild. Kafka fan-out ko async aur retryable banata hai; `kafka_consumer_lag` aur `fanout_lag_seconds` monitor karunga. Feed service stateless Node.js -- horizontally scale; Redis cluster shard by userId."
+
+### 4:15 - 5:00 -- Trade-offs + wrap-up
+
+"One trade-off here is freshness vs cost: push reads fast karta hai lekin writes aur Redis memory mehenge, aur followers ko post kuch seconds late dikhta hai. Doosra -- hybrid read path complex hai: merge, dedupe, threshold ke aas-paas edge cases. Teesra -- unfollow/delete lazy filter se hota hai, toh feed page kabhi 20 se kam items de sakta hai -- isliye thoda extra fetch karte hain.
+
+Summary: pull se start, read-heavy isliye push, celebrities ke liye pull -- hybrid; Redis ZSET mein sirf IDs, cursor pagination, batch hydration, sab kuch rebuildable. Ranking V2 mein candidate set par. Kisi part mein deep dive karein?"
+
+---
+
+## PART 29 -- Whiteboard Drawing Order
+
+**Rule:** har box tab draw karo jab uska **reason** bol rahe ho. Board par do lanes: upar **write path** (post -> fan-out), neeche **read path** (feed -> merge -> hydrate). Yahi split poora design samjha deta hai.
+
+### Step 1 -- Client
+
+```
+[Mobile / Web]   POST /v1/posts, GET /v1/feed?cursor=, PUT /v1/users/:id/follow
+```
+
+**Ab interviewer ko kya explain karna hai?** "Infinite scroll client. IDs JSON mein strings. Media pehle presigned URL se StoreBox mein upload, post mein sirf media keys." **Abhi mat draw karo:** push notifications, websockets for live updates.
+
+### Step 2 -- CDN (media only)
+
+```
+[Mobile / Web] --images/videos--> [CDN] --miss--> StoreBox (S3)
+```
+
+**Ab interviewer ko kya explain karna hai?** "~600 GB/day media, feed service bytes serve nahi karti -- sirf `mediaUrls`. Feed JSON CDN par cache nahi hota (personalised)."
+
+### Step 3 -- LB / API Gateway
+
+```
+[Mobile / Web] --> [LB / API Gateway]   TLS, auth (JWT), rate limits (post/follow spam)
+```
+
+**Ab interviewer ko kya explain karna hai?** "Auth aur Rate Limiter yahan -- bots follow/post spam na karein. Routing: `/posts` -> Post Service, `/feed` -> Feed Service, `/follow` -> Graph Service."
+
+### Step 4 -- Post Service
+
+```
+[Gateway] --POST /v1/posts--> [Post Service (Node.js)]  validate 500 chars / 4 media, Idempotency-Key,
+                                                         Snowflake id (string)
+```
+
+**Ab interviewer ko kya explain karna hai?** "Write path ka entry. ~350 posts/s peak, plan 1K/s. Retry par duplicate post nahi -- `Idempotency-Key` (Payment System)."
+
+### Step 5 -- Cassandra + outbox
+
+```
+[Post Service] --> [Cassandra: posts_by_id | posts_by_author ((author_id, bucket), post_id DESC)]
+       |
+       +--> outbox (same write) -> relay
+```
+
+**Ab interviewer ko kya explain karna hai?** "Source of truth for posts -- append-heavy, query-driven tables, no joins. Outbox isliye ki 'post saved but event lost' na ho." **Abhi mat draw karo:** likes tables, multi-DC.
+
+### Step 6 -- Kafka
+
+```
+[outbox relay] --> [Kafka: posts.created | posts.deleted | follows.changed]  key = authorId
+```
+
+**Ab interviewer ko kya explain karna hai?** "Fan-out ko post request se alag kiya -- author ko 201 turant, fan-out async aur retryable. Key = authorId -> ek author ke events order mein."
+
+### Step 7 -- Fan-out workers (the hybrid decision)
+
+```
+[Kafka posts.created] --> [Fan-out workers x N (group feed-fanout)]
+                             followers < 10,000  -> ZADD feed:{f} for active followers (batches of 1,000)
+                             followers >= 10,000 -> NO push, only timeline:{authorId}
+```
+
+**Ab interviewer ko kya explain karna hai?** "Yahi design ka dil hai. Pure push 2B inserts/day; ek 50M-follower post akela 50M writes. Isliye threshold. Metric: `fanout_lag_seconds` p99 < 5 s."
+
+### Step 8 -- Redis feed cache
+
+```
+[Fan-out workers] --> [Redis Cluster ~20 x 64 GB + replicas]
+                        feed:{userId}      ZSET score=createdAtMs member=postId (max 200)
+                        timeline:{authorId} ZSET (celebs + own posts)
+                        post:{postId}      hydration cache, TTL 24 h
+```
+
+**Ab interviewer ko kya explain karna hai?** "Sirf IDs, ~64 B/entry -- post content ek hi jagah, edit/delete ek jagah. ~1.28 TB. Redis cache hai, source of truth nahi -- rebuild possible."
+
+### Step 9 -- Feed Service (merge + hydrate)
+
+```
+READ LANE:  [Gateway] --GET /v1/feed--> [Feed Service (Node.js)]
+                 1. ZREVRANGEBYSCORE feed:{me}  +  timeline:{celeb} for each celeb I follow  +  timeline:{me}
+                 2. k-way merge -> filter deleted/unfollowed/blocked -> 20
+                 3. MGET post:{id} (miss -> Cassandra posts_by_id) + like counts -> nextCursor
+```
+
+**Ab interviewer ko kya explain karna hai?** "35K reads/s, p99 < 200 ms. Stateless, scale out. Feed missing (inactive user / Redis loss) -> rebuild by pull, write back. Cursor `(score, postId)`, never offset."
+
+### Step 10 -- Graph Service + Postgres
+
+```
+[Graph Service] --> [Postgres: users | follows PK (follower_id, followee_id) + ix_follows_followee]
+                    Redis: following:{userId}, celebs:{userId} (TTL 10 min)
+    ^ used by fan-out workers ("who follows X?") and Feed Service ("which celebs do I follow?")
+```
+
+**Ab interviewer ko kya explain karna hai?** "Graph relational hai, unique follow + no self-follow constraints. Do directions ke do indexes. Follower lists hot hain, isliye Redis cache."
+
+### Final board
+
+```
+                         [CDN] <-- media -- [Mobile / Web]
+                                                 |
+                                        [LB / API Gateway: auth, rate limit]
+                  WRITE LANE                     |                        READ LANE
+      [Post Service] <---------------------------+------------------> [Feed Service]
+            |                                    |                       |  merge + filter + hydrate
+            v                                    v                       v
+   [Cassandra posts_by_id /           [Graph Service] --> [Postgres    [Redis Cluster]
+    posts_by_author] + outbox                             users/follows]  feed:{u} | timeline:{a} | post:{id}
+            |                                    ^                       ^
+            v                                    | followers?            | ZADD + trim 200
+   [Kafka posts.created] --> [Fan-out workers: < 10,000 push | >= 10,000 skip] ----+
+```
+
+### Kya **bilkul** draw nahi karna (jab tak pooche nahi)
+
+- **Ranking ML** (V3), feature store, candidate generation -- V2 mein sirf "simple score over ~500 candidates" bolo.
+- **Ads** insertion, stories, **search**, notifications, DMs -- scope se bahar (alag systems).
+- Multi-region, Cassandra multi-DC details -- scaling discussion mein (Part 4).
+
+---
+
+## PART 30 -- Final Cheat Sheet (5 minute revision)
+
+### Problem
+
+**Chirp** (Twitter/Instagram-style) ka home feed: followees ke recent posts, newest first, infinite scroll. Core problem: **feed = hundreds of followees ke posts ka merge**. Read time par (pull) slow; write time par (push) celebrity par phat-ta hai -> **hybrid**.
+
+### Requirements
+
+| Type | Points |
+|---|---|
+| Functional | Create post (500 chars + 4 media); follow/unfollow; home feed (reverse-chrono V1, ranking V2, cursor, 20/page); user timeline; like/unlike + count + viewerHasLiked; delete (feeds se bhi gayab) |
+| Out of scope | Comments threads, DMs, notifications, search, ads, stories |
+| NFR | Feed p99 **< 200 ms**; HA (stale > down); eventual, fan-out lag p99 **< 5 s**; **read-your-own-writes**; celebs up to 50M; posts durable, feeds rebuildable |
+
+### Numbers
+
+| Metric | Value | Decision |
+|---|---|---|
+| Users | 300M registered, **100M DAU** | -- |
+| Feed reads | 1B/day -> ~11.6K/s -> peak **~35K/s** | Precompute (push), stateless feed svc |
+| Posts | 10M/day -> ~116/s, peak ~350/s (plan 1K/s) | Read:write ~100:1 |
+| Fan-out (pure push) | 10M x 200 = **2B inserts/day** -> ~23K/s, ~69K/s peak | Async via Kafka |
+| Celebrity | 50M followers = 50M inserts (~50 s at 1M/s) | Threshold **10,000** -> pull |
+| Feed cache | 200 x 64 B = 12.8 KB/user -> **~1.28 TB** -> ~20 x 64 GB shards | IDs only; 30-day actives |
+| Post metadata | ~1 KB -> 10 GB/day -> **~3.65 TB/yr** | Cassandra |
+| Media | 20% x 300 KB -> ~600 GB/day -> ~219 TB/yr | StoreBox + CDN |
+| Feed egress | 20 x 1 KB x 35K/s = ~700 MB/s (~5.6 Gbps) | -- |
+| IDs | Snowflake ~2.1e18 > 2^53 (9,007,199,254,740,992) | **Strings** in JS/JSON; ZSET score = ms |
+
+### APIs
+
+| API | Kya |
+|---|---|
+| `POST /v1/posts` | `Authorization`, `Idempotency-Key`; `{ text, mediaKeys }` -> `201 { id: "2100907437367230464", authorId, text, mediaUrls, createdAt }`; 400 / 429 |
+| `DELETE /v1/posts/:id` | 204 (author only; 404 otherwise) |
+| `GET /v1/feed?limit=20&cursor=` | `{ items: [{ post, author, likeCount, viewerHasLiked }], nextCursor }` (nextCursor = string or null); limit max 50 |
+| `GET /v1/users/:id/posts?cursor=` | User timeline, same shape |
+| `PUT` / `DELETE /v1/users/:id/follow` | 204, idempotent |
+| `PUT` / `DELETE /v1/posts/:id/like` | 204, idempotent |
+| `POST /v1/media/uploads` | Presigned StoreBox URL |
+
+### HLD
+
+```
+Clients -> CDN (media) -> LB / API Gateway (auth, rate limits)
+  -> Post Service -> Cassandra (posts_by_id, posts_by_author) + outbox -> Kafka posts.created / posts.deleted
+  -> Fan-out workers (group feed-fanout): < 10,000 followers -> ZADD feed:{f} (active 30 d, trim 200); >= 10,000 -> skip
+  -> Feed Service -> Redis (feed:{u}, timeline:{a}, post:{id}, counters): merge + filter + hydrate
+  -> Graph Service -> Postgres (users, follows) + Redis following/celebs cache
+  -> Like Service -> Cassandra post_likes + Redis counters (async flush)
+```
+
+### LLD
+
+```
+src/routes/{post,feed,follow,like}.routes.ts   src/controllers/...
+src/services/{post,feed,fanout,graph,like,ranking}.service.ts   src/workers/fanout.worker.ts
+src/repositories/{post (cassandra-driver), follow (pg), user (pg)}.repository.ts
+src/cache/{feed-cache,post-cache,counter-cache}.ts   src/utils/{snowflake,cursor,kway-merge}.ts
+src/infra/{redis,postgres,cassandra,kafka,logger,metrics}.ts   src/app.ts   src/server.ts
+```
+
+Constants: `CELEBRITY_THRESHOLD = 10_000`, `FEED_MAX = 200`, `PAGE_SIZE = 20`, `ACTIVE_DAYS = 30`, `FANOUT_BATCH = 1_000`. Types: `Post`, `FeedEntry { postId, scoreMs }`, `FeedItem`, `FeedPage { items, nextCursor }`.
+
+### Database
+
+```sql
+-- Postgres (graph)
+users(id BIGINT PK, handle UNIQUE, display_name, avatar_key, follower_count, following_count, last_active_at, created_at)
+follows(follower_id, followee_id, created_at, PK (follower_id, followee_id), CHECK (follower_id <> followee_id))
+  ix_follows_followee (followee_id, follower_id)            -- "who follows X" for fan-out
+-- Cassandra (posts, likes)
+posts_by_id(post_id PK, author_id, text, media_keys list<text>, created_at, deleted)
+posts_by_author((author_id, bucket 'YYYY-MM'), post_id) CLUSTERING ORDER BY (post_id DESC)
+post_likes((post_id), user_id, created_at)   |   post_counters(post_id PK, like_count counter)
+```
+
+Kyun: Postgres = relational graph, constraints, moderate size. Cassandra = huge append-heavy writes, partition by author + month, linear scale, no joins -> denormalized. V1 mein posts bhi Postgres mein chal jaate hain.
+
+### Redis
+
+| Key | Type | Use |
+|---|---|---|
+| `feed:{userId}` | ZSET score=createdAtMs, member=postId | Pushed feed, max **200** (`ZREMRANGEBYRANK 0 -201`) |
+| `timeline:{authorId}` | ZSET | Latest 200 posts -- celebs (pull) + own posts (RYOW) |
+| `post:{postId}` | JSON, TTL 24 h | Hydration (`MGET`) |
+| `likes:{postId}` | counter | `INCR`, flushed to Cassandra |
+| `following:{u}` / `celebs:{u}` | set, TTL 10 min | Read-path source list |
+
+Redis **source of truth nahi** -- sab rebuildable. Scores ms hain kyunki double 2^53 se bade Snowflake ko exact nahi rakh sakta.
+
+### Queue
+
+**Kafka**: `posts.created`, `posts.deleted`, `follows.changed`; group `feed-fanout`; key = authorId. Kyun: post request fast (async fan-out), retry, backlog visible (`kafka_consumer_lag{group="feed-fanout"}`), multiple consumers.
+
+### Main Algorithm
+
+**Write path (6 lines):**
+1. Gateway: auth, rate limit; Post Service validates (500 chars, 4 media), checks `Idempotency-Key`.
+2. Snowflake id (string); write `posts_by_id` + `posts_by_author` + outbox; `ZADD timeline:{me}`.
+3. `201` to author immediately (own post visible via `timeline:{me}`).
+4. Outbox relay -> Kafka `posts.created` (key authorId).
+5. Fan-out worker: followers >= 10,000 -> stop (celebrity, pulled at read).
+6. Else followers active in 30 d, batches of 1,000: pipelined `ZADD feed:{f}` + trim to 200; record `fanout_lag_seconds`.
+
+**Read path (6 lines):**
+1. Decode cursor `{ s, id }` (400 if bad); load `celebs:{me}`.
+2. `feed:{me}` missing -> **rebuild** by pull from `posts_by_author`, write back.
+3. Read `feed:{me}` + `timeline:{celeb}` each + `timeline:{me}` older than cursor.
+4. K-way merge by (score, postId), dedupe, filter deleted / blocked / unfollowed, take 20.
+5. Hydrate: `MGET post:{id}`, misses from Cassandra (cache 24 h) + like counts + author.
+6. `nextCursor` = base64 of last `(score, postId)` (null at end).
+
+### Scaling
+
+| Stage | Change |
+|---|---|
+| V1 | Monolith, Postgres only, pull with `IN (...)` query + index -- fine for small users |
+| V2 -- our numbers | Hybrid fan-out, Kafka workers, Redis Cluster ~20 shards, Cassandra posts, hydration cache, cursor; simple ranking over ~500 candidates |
+| V3 | ML ranking, multi-region, Postgres graph sharded by user id, more candidate sources |
+
+### Consistency
+
+| Where | Level |
+|---|---|
+| Author sees own post | **Immediate** (read-your-own-writes via `timeline:{me}`) |
+| Followers see post | **Eventual**, p99 < 5 s (fan-out lag) |
+| Delete / unfollow | Immediate at source of truth; feeds filtered at read, cleaned async |
+| Like count | Eventual (Redis counter, async flush); like itself idempotent |
+
+### Failure Handling
+
+| Failure | Behaviour |
+|---|---|
+| Redis shard down | Replica promote; missing feeds **rebuilt** from Cassandra + Postgres (protect DB from stampede -- lesson 83) |
+| Kafka / worker slow | Posts safe in Cassandra; fan-out backlog grows, feeds late; scale consumers, alert on lag |
+| Worker crash mid fan-out | Kafka redelivers; `ZADD` idempotent (same member) -> no duplicates |
+| Celebrity storm | No push -> no backlog; timelines hot -> replicas / local cache |
+| Cassandra node down | RF 3, quorum reads/writes continue |
+
+### Security
+
+- Auth at gateway; **delete/like/follow authorization** (author only for delete, 404 otherwise).
+- Privacy: filter blocked users and private accounts at read; deleted posts never hydrated.
+- Rate limits on post/follow (spam bots); `Idempotency-Key` on posts.
+- Media via presigned URLs + CDN; validate media keys belong to the author.
+
+### Observability
+
+`feed_read_duration_seconds`, `feed_cache_hit_ratio`, `feed_rebuilds_total`, **`fanout_lag_seconds`**, `fanout_writes_total`, **`kafka_consumer_lag{group="feed-fanout"}`**, `post_create_duration_seconds`, `hydration_cache_miss_total`, `celebrity_merge_sources`.
+
+### Top 5 Trade-offs
+
+| Decision | Chosen | Kyun | Kab badlega |
+|---|---|---|---|
+| Fan-out model | Hybrid, threshold 10,000 | Fast reads + no celebrity explosion | Tiny app -> pure pull; no celebs -> pure push |
+| Cache content | IDs only in ZSET + hydration | 64 B/entry, edits/deletes one place | Extremely hot reads -> embed small snippet |
+| Pagination | Cursor `(score, postId)` | Stable under inserts, O(log n) seek | Admin/static lists -> offset ok |
+| Posts DB | Cassandra | Append-heavy, linear scale | V1 / small -> Postgres |
+| Consistency | Eventual + RYOW | Async fan-out cheap, author still happy | Strict ordering needed -> pull |
+
+### Top 10 Follow-up Questions
+
+| # | Question | One-line answer |
+|---|---|---|
+| 1 | Simple `IN (...)` query kyun nahi? | 35K/s x hundreds of followees ka merge -- DB melts; read-heavy toh precompute |
+| 2 | Celebrity ka kya? | >= 10,000 followers -> push nahi, read par `timeline:{celeb}` pull |
+| 3 | Mera post mujhe turant kyun dikhta? | Read path mein `timeline:{me}` merge (read-your-own-writes) |
+| 4 | Redis gaya toh? | Rebuild from Cassandra + Postgres; Redis sirf cache |
+| 5 | Inactive users? | 30 din se inactive ko push nahi; open par rebuild by pull |
+| 6 | Delete ke baad feeds? | Tombstone + filter at read + async cleanup via `posts.deleted` |
+| 7 | Offset pagination kyun nahi? | Naye posts se shift -> duplicates/missed; cursor stable |
+| 8 | IDs string kyun? | Snowflake > 2^53; JS number aur ZSET double exact nahi |
+| 9 | Ranking kaise? | V2: ~500 candidates par recency decay + engagement + affinity; V3 ML |
+| 10 | Naya follow? | Async backfill last 20 posts (non-celeb) into `feed:{me}` |
+
+### 30-second answer
+
+PART 27. Skeleton: **pull melts -> push IDs to Redis ZSET (200) via Kafka workers -> celebs >= 10,000 pulled -> read = feed + celebs + own timeline, merge, cursor, hydrate -> Redis rebuildable.**
+
+### 5-minute answer (skeleton -- full text PART 28)
+
+1. **0:00** "Main pehle requirements clarify karunga": post, follow, feed, like, delete; p99 < 200 ms, lag < 5 s, RYOW.
+2. **0:45** Numbers: 35K reads/s, ~350 posts/s, 2B inserts/day, 1.28 TB Redis.
+3. **1:30** "Initially main simple pull model rakhunga"; "At scale, bottleneck read-time merge ho jaata hai"; "Isliye fan-out on write".
+4. **2:30** "However, celebrities ke liye push nahi -- hybrid"; read path merge + cursor + hydration; string IDs.
+5. **3:30** Postgres graph, Cassandra posts, Redis rebuildable, Kafka lag metrics.
+6. **4:15** "One trade-off here is..." freshness vs cost, hybrid complexity, lazy filtering; "deep dive kahan?"
+
+### MOST IMPORTANT RULE -- 5 sawaal, 3 key decisions par
+
+| Sawaal | Hybrid fan-out (threshold 10,000) | Redis ZSET feed cache: IDs only + hydration | Cursor pagination with string Snowflake IDs |
+|---|---|---|---|
+| **Hum ye kyun kar rahe hain?** | Reads ~100x writes -> precompute (push); lekin 50M-follower post = 50M writes -> celebs pull | Feed read ek sorted range query ban jaata hai; 64 B/entry -> 1.28 TB fits; content ek jagah | Feed live hai, naye posts aate rehte hain; ID > 2^53 |
+| **Agar ye nahi kiya toh?** | Pure pull -> 35K/s heavy merges, p99 toot-ta; pure push -> Kafka backlog, sabke posts late | Full posts cache -> ~16x memory, edit/delete har copy mein; no cache -> DB read storm | Offset -> duplicates/missed posts + deep offsets slow; number IDs -> silently corrupt |
+| **Iska alternative kya hai?** | Pure pull; pure push; push only to online users | Full post JSON in feed; Cassandra feed table; Memcached lists | Offset/page number; timestamp-only cursor |
+| **Alternative kab choose karenge?** | Small app / few followees -> pull; no celebrities (e.g. team app) -> push | Tiny posts + extreme read QPS -> embed snippet; persistent feed needed -> Cassandra table | Static admin lists -> offset; unique timestamps guaranteed -> timestamp cursor |
+| **Scale badhne par kya change hoga?** | Threshold tune by metrics, active-only push, per-region workers | More shards, keep only 30-day actives, trim tighter | Cursor carries ranking state in V2 (score snapshot), still opaque |
+
+### Most Important Things To Remember
+
+1. **Feed = merge problem.** Pull = read slow; push = write explodes for celebs; **hybrid at 10,000**.
+2. Reads **~35K/s** vs posts **~350/s** -> do the work at write time.
+3. **Redis ZSET**: `feed:{userId}`, score = `createdAtMs`, member = postId string, **max 200**.
+4. **Only IDs** in feeds; hydrate with `MGET post:{id}` (TTL 24 h), misses from Cassandra.
+5. Read = `feed:{me}` + `timeline:{celeb}`s + **`timeline:{me}` (RYOW)** -> k-way merge -> filter -> 20.
+6. **Cursor** `{ s, id }` base64, tie-break by id; never offset.
+7. **IDs are strings** -- Snowflake > 2^53.
+8. Kafka `posts.created`, group `feed-fanout`, key authorId; outbox so no lost events; lag < 5 s.
+9. **Redis is not truth** -- rebuild from Cassandra + Postgres; inactive (30 d) users rebuilt on open.
+10. Delete / unfollow = source of truth now, feeds **filtered at read**, cleaned later.
+
+---
+
+## Remember
+
+> **Coding round mein: clarify (ids strings? own posts? backfill on follow? pagination?) -> logic bolo (pull = heap merge; hybrid = push normal, pull celebs, own timeline) -> code with one interface, two implementations -> celebrity, pagination-during-insert, unfollow, delete dikhao -> assert same output -> edge cases -> complexity. Design round mein: requirements (RYOW, lag < 5 s) -> numbers (35K reads/s) -> pull melts -> push -> celebrity -> hybrid -> ZSET IDs + hydration -> cursor.** News feed ka dil ek line hai: "Normal logon ka kaam write time par karo, celebrities ka read time par, aur apna post hamesha khud merge karo."
+
+## Quick Self-Test
+
+1. Output line **B** mein `star` ke 2 posts ke liye 0 push writes hue, phir bhi alice ki feed mein `s2, s1` kaise aaye? `dave` ki feed kis source se bani?
+2. Line **C** mein `c2` page 2 mein kyun nahi aaya? Agar cursor sirf `scoreMs` hota (id nahi) aur do posts same ms mein hote, toh kya galat ho sakta tha?
+3. `kWayMerge` mein duplicate check sirf **pichle output** se kyun kaafi hai? Kis real situation mein ek post pushed aur pulled dono aata hai?
+4. Unfollow ke baad alice ka inbox abhi bhi `c1, c2` rakhta hai (line **D**). Ise turant delete kyun nahi kiya, aur is laziness ka ek user-visible side effect kya hai?
+5. MOST IMPORTANT RULE table se: celebrity threshold 10,000 se 1,000 kar dein toh write cost aur read latency par kya asar hoga? Kaunse 2 metrics dekh ke tune karoge?
+
+---
+
+**News Feed complete.** Next system: **Chat System**. "next" bolo.

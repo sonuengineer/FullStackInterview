@@ -1,0 +1,934 @@
+# Chat System -- HLD + LLD (Part 1: Basics -> Requirements -> Estimation -> HLD)
+
+> Is file mein prompt ke **Parts 1-6** hain: problem ko bilkul zero se samajhna (polling se WebSocket tak ki poori seedhi), requirements, clarifying questions, capacity estimation, HLD, aur har component ka WHY.
+> Next file (Part 2): message send se receive tak ka poora flow, WebSocket frame protocol + REST APIs, database design (Postgres v1 aur Cassandra v3), LLD folder structure, aur Node.js/TypeScript code line-by-line.
+>
+> **Pichhle systems se connection:** Ab tak humne jitne bhi systems banaye -- URL Shortener, Rate Limiter, Search, News Feed, File Storage -- woh sab **stateless request-response** the. Client ne request bheji, koi bhi server ne jawab diya, connection khatam. Load balancer ko kabhi sochna nahi pada ki "ye request kis server par jaani chahiye" -- koi bhi server chalta tha.
+>
+> Chat mein ye tootta hai. Yahan server ko client ko **khud se, bina poochhe** message bhejna padta hai ("bhai, tumhare liye ek naya message aaya hai"). Iske liye connection **khula rehna** padta hai. Khula connection matlab server **stateful** ho gaya -- ab "user B ka socket kis server par pada hai" ye ek **design problem** hai. **Yahi is poore lesson ka dil hai.**
+>
+> Baaki purane systems yahan reuse honge, dobara nahi banenge:
+> - **Notification / Paging** -- recipient offline ho toh message ko push notification banake bhejna hai. Wahi FCM/APNs path hum **call** karenge.
+> - **File Storage (S3-style)** -- image/file attachment chat server se hoke nahi jaayega; client S3 par **presigned URL** se direct upload karega, message mein sirf `mediaKey` jaayega.
+> - **Payment / Idempotency** -- client-generated `messageId` (UUID) wahi **idempotency key** hai: network retry par message do baar nahi dikhna chahiye.
+> - **News Feed** -- dono mein "fan-out" shabd aata hai par matlab alag hai (Part 3 mein detail).
+
+---
+
+## PART 1 -- Problem ko bilkul basic se samjho
+
+### Ek kahani se shuru karte hain
+
+Hum ek messaging app bana rahe hain -- WhatsApp / Slack DM jaisa. Team chhoti hai, Node.js aata hai, aur pehla version banane baithe hain.
+
+Sabse natural idea kya hai? Wahi jo humne pichhle saare systems mein kiya:
+
+```
+POST /api/v1/messages     -> message DB mein daal do
+GET  /api/v1/messages     -> naye messages nikaal lo
+```
+
+Client (mobile app) har **2 second** mein `GET /messages?afterSeq=...` call karta hai. Naya message hoga toh mil jaayega, nahi hoga toh khaali array aayega. Isko **short polling** kehte hain -- "bar bar poochhna: kuch naya aaya kya?"
+
+```ts
+// Naive chat client -- har 2 second mein server se poochho
+setInterval(async () => {
+  const res = await fetch(`/api/v1/messages?afterSeq=${lastSeq}`);
+  const messages = await res.json();
+  if (messages.length > 0) {
+    render(messages);
+    lastSeq = messages[messages.length - 1].seq;
+  }
+}, 2000);
+```
+
+**Code Explanation:**
+
+- `setInterval(..., 2000)` -- har 2000 ms yaani 2 second mein ye function chalega. Yahi "polling" hai.
+- `fetch('/api/v1/messages?afterSeq=' + lastSeq)` -- server se poochho "seq `lastSeq` ke baad wale messages do". `afterSeq` isliye taaki purane messages dobara na aayein.
+- `if (messages.length > 0)` -- **yahi line poora problem hai**. Zyadatar baar ye `false` hota hai, matlab poora HTTP round trip bekaar gaya.
+- `lastSeq = ...` -- client apna pointer aage badha leta hai. Ye sync ka simplest form hai (aage `resume` frame mein wahi idea use hoga).
+
+Demo mein ye bilkul kaam karta hai. 10 users, sab khush.
+
+### Ab ise 50 million users par chalao -- do cheezein toot-ti hain
+
+**Problem 1 -- Waste (server ka paisa aur CPU jal raha hai)**
+
+Hamare peak par **10 million users ek saath online** hain (ye number Part 4 mein derive karenge). Har user har 2 second mein ek request bhej raha hai, matlab **0.5 requests per second per user**:
+
+```
+10,000,000 users x 0.5 req/sec = 5,000,000 requests/sec
+```
+
+**5 million requests per second.** Aur ab isse bhi buri baat: hamara actual message rate sirf ~23,000 messages/sec hai (Part 4). Matlab:
+
+```
+Useful responses  = ~23,000/sec   (jinme sach mein koi message tha)
+Total responses   = 5,000,000/sec
+Khaali responses  = ~99.5%
+```
+
+**99% se zyada requests khaali jawab le kar wapas aati hain.** Har request par TLS, HTTP headers (~800 bytes), auth check, ek DB query -- sab kuch **kuch bhi na hone** ke liye. Ye system ka 99% kaam **"nahi, kuch naya nahi aaya"** bolne mein jaa raha hai.
+
+**Problem 2 -- Latency (aur ye zyada buri hai)**
+
+Itna paisa jalane ke **baad bhi** experience kharaab hai:
+
+```
+t = 0.0 s   Priya ne message bheja, server ne accept kar liya
+t = 0.1 s   Rahul ka client abhi-abhi poll karke khaali jawab le chuka hai
+t = 2.1 s   Rahul ka client agla poll karta hai -> ab message dikhta hai
+```
+
+Message **2 second** tak server par pada raha. Chat mein 2 second ka lag "app hang ho gaya" feel deta hai. Aur latency kam karne ka ek hi tarika hai -- poll interval kam karo (1 sec -> 10M rps, 500 ms -> 20M rps). Yaani **latency aur cost ek doosre ke dushman** hain, aur dono side par haar hai.
+
+Yahin se asli sawaal nikalta hai:
+
+> **"Client baar-baar kyun poochhe? Jab message aaye, server khud kyun na bata de?"**
+
+### Transport ki seedhi -- 4 steps mein evolution
+
+Ye sawaal industry ne 20 saal mein 4 steps mein solve kiya. Interview mein **yahi seedhi bolna** sabse achha opening hai.
+
+**Step 1 -- Short polling.** Client har 2 s poochhta hai. Simple, har proxy/firewall mein chalta hai, par 99% khaali requests + 2 s lag.
+
+**Step 2 -- Long polling.** Client request bhejta hai aur server use **jawab diye bina rok ke rakhta hai** (30 s tak). Jaise hi naya message aata hai, server usi rukti hui request ka response bhej deta hai. Latency ab ~0 ho gayi [OK]. Par har message ke baad client ko **naya HTTP request** banana padta hai -- naye headers, naya TCP/TLS handshake (agar keep-alive na ho), aur server par 10M requests "rukti hui" padi rehti hain.
+
+**Step 3 -- SSE (Server-Sent Events).** Ek HTTP connection khula rehta hai aur server usme ek ke baad ek **events stream** karta rehta hai. Long polling ka "har message par naya request" problem khatam [OK]. Par SSE **ek tarfa (one-way)** hai -- sirf server se client. Client ko message **bhejne** ke liye alag HTTP POST karna padega. Aur SSE sirf **text** bhej sakta hai, binary nahi.
+
+**Step 4 -- WebSocket.**
+
+> **WebSocket ka simple matlab:** ek normal HTTP request se shuru hone wala connection, jo beech mein **"upgrade"** ho jaata hai ek permanent, do-tarfa (bidirectional) pipe mein. Ek hi TCP connection par dono taraf se, kabhi bhi, text ya binary messages bheje jaa sakte hain -- bina naya request banaye.
+
+Chat ko exactly yahi chahiye: dono taraf, hamesha khula, sasta.
+
+| | Short polling | Long polling | SSE | **WebSocket** |
+|---|---|---|---|---|
+| Kaise kaam karta hai | Har 2 s naya HTTP request | Request server par rok ke rakha jaata hai | Ek HTTP response jo khatam hi nahi hota | HTTP `Upgrade` se banaya gaya permanent TCP pipe |
+| Latency | Poll interval jitni (2 s) | ~0 | ~0 | ~0 |
+| Server cost | Sabse zyada (5M rps, 99% khaali) | Medium (10M rukti hui requests) | Kam | **Sabse kam** |
+| Direction | Client -> server | Client -> server | **Server -> client only** | **Dono taraf** |
+| Data type | Text/JSON | Text/JSON | **Text only** | Text + **binary** |
+| Per-message overhead | Poore HTTP headers (~800 B) | Poore HTTP headers | ~10 B | **2-6 bytes frame header** |
+| Kab ye sahi choice hai | Data 1 min mein badalta ho (dashboard refresh) | Legacy environment jahan WS block hai | Stock ticker, live score, notification stream, LLM token streaming | **Chat, multiplayer game, collaborative editor** |
+
+> **Yaad rakho:** WebSocket har jagah ka jawab nahi hai. Agar server ko sirf **bhejna** hai (live cricket score) toh **SSE simpler hai** -- plain HTTP hai, auto-reconnect browser khud karta hai, koi custom protocol nahi. WebSocket tab lo jab **client bhi bahut kuch bhejta ho** -- chat mein client messages, receipts, typing, heartbeats sab bhejta hai.
+
+### WebSocket handshake -- byte level par kya hota hai
+
+**Handshake ka simple matlab:** connection shuru hone par dono taraf jo "hello, chalo aise baat karte hain" wali baat-cheet hoti hai.
+
+Sabse important baat: WebSocket connection ek **normal HTTP GET request** se shuru hota hai. Isliye ye port 443 par chalta hai aur corporate firewall/proxy ise rok nahi paate.
+
+**Client bhejta hai:**
+
+```
+GET /ws HTTP/1.1
+Host: chat.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Origin: https://chat.example.com
+```
+
+**Server jawab deta hai:**
+
+```
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+Ab is poore exchange ko line-by-line samjho:
+
+| Line | Matlab |
+|---|---|
+| `GET /ws HTTP/1.1` | Bilkul normal HTTP GET hai. Isliye same LB, same TLS, same port 443. |
+| `Upgrade: websocket` | "Main is connection ko HTTP se WebSocket mein badalna chahta hoon." |
+| `Connection: Upgrade` | Beech ke proxies ko batata hai ki ye ek upgrade request hai, ise aage pass karo. |
+| `Sec-WebSocket-Key` | Ek random 16-byte value, base64 mein. **Ye security nahi hai**, ye sirf ye confirm karta hai ki jawab dene wala sach mein WebSocket samajhta hai, koi purana cached proxy nahi. |
+| `Sec-WebSocket-Version: 13` | Protocol version. Aaj 13 hi standard hai. |
+| **`101 Switching Protocols`** | **Yahi woh moment hai.** 200 nahi, 101. Iske baad is TCP connection par HTTP bolna band, WebSocket frames bolna shuru. |
+| `Sec-WebSocket-Accept` | Server ne client ki key + ek fixed magic string ko SHA-1 karke base64 kiya. Client verify karta hai. |
+
+`101` ke baad kya badalta hai:
+
+```
+Pehle (HTTP):        request -> response -> connection free/closed
+101 ke baad (WS):    connection KHULA hai
+                     client -----frame-----> server   (kabhi bhi)
+                     client <----frame------ server   (kabhi bhi)
+```
+
+Har WebSocket message ab ek **frame** hai jiska header sirf **2 se 6 bytes** ka hai (HTTP ke ~800 bytes ke muqable). Isliye ek "typing indicator" bhejna ab practically free hai.
+
+### Aur ab woh consequence jo poore system ko define karta hai
+
+Connection khula reh gaya. Iska seedha matlab:
+
+> **WS Gateway nodes ab STATEFUL hain.**
+>
+> **Stateful ka simple matlab:** server ki memory mein aisi cheez padi hai jo sirf **usi** server ke paas hai. Yahan woh cheez hai -- **user ka live TCP socket**. Woh socket sirf ek machine ki memory mein hai. Doosri machine us user ko kuch bhej hi nahi sakti.
+
+Pichhle saare systems mein ye problem thi hi nahi:
+
+| | Stateless system (Rate Limiter, URL Shortener) | **Chat (stateful)** |
+|---|---|---|
+| Request kahan jaa sakti hai | Koi bhi node | Fixed -- jis node par socket hai |
+| Node mar jaaye toh | LB agli request doosre node par bhej dega, kisi ko pata nahi chalega | 50,000 connections toot-te hain, sab reconnect karte hain |
+| Deploy | Rolling restart, zero impact | Har restart = mass reconnect (thundering herd) |
+| "Message kis node par bhejun?" | Sawaal hi nahi tha | **Ye ab hamari sabse badi design problem hai** |
+
+Concrete problem dekho. Priya aur Rahul dono online hain, par alag gateway nodes par:
+
+```
+Priya ka socket  -> gateway node-12
+Rahul ka socket  -> gateway node-77     (LB ne aise hi baant diya)
+
+Priya message bhejti hai -> node-12 par aata hai
+node-12 ke paas Rahul ka socket HAI HI NAHI
+                   |
+                   v
+       "Ab main Rahul tak kaise pahunchun?"
+```
+
+Iska jawab hi hamara poora architecture hai (Part 5 mein): **session registry** + **pub/sub**.
+
+> **Session registry ka simple matlab:** ek chhoti si shared directory (hum Redis use karenge) jisme likha hai "user B ka device D abhi gateway node-77 par juda hai". Phone directory jaise -- naam daalo, address milta hai.
+>
+> **Pub/sub (publish-subscribe) ka simple matlab:** ek "channel" hota hai. Koi usme message **publish** karta hai, aur jo us channel ko **subscribe** kiye baithe hain, unhe woh message mil jaata hai. Hamare paas har gateway node ka apna channel hoga: `gw:node-77`.
+
+### Ek message ka poora safar (ASCII trace)
+
+```
+Priya (node-12 par)                                    Rahul (node-77 par)
+     |                                                          ^
+     | 1. {"type":"send","messageId":"a1b2","body":"kal milein?"}
+     v                                                          |
++-------------+                                          +-------------+
+| Gateway A   |                                          | Gateway B   |
+| node-12     |                                          | node-77     |
++-------------+                                          +-------------+
+     |                                                          ^
+     | 2. validate + authorize                        7. socket.send(frame)
+     v                                                          |
++----------------+  3. INCR seq:<convId>  -> seq = 4211         |
+| Chat Service   |----------------------------> Redis           |
+| (STATELESS)    |  4. INSERT INTO messages -> Postgres         |
++----------------+                                              |
+     |                                                          |
+     | 5. produce to Kafka `chat-events` (key = conversationId)  |
+     v                                                          |
++------------------+  6a. members nikalo -> Rahul                |
+| Delivery Worker  |  6b. GET conn:rahul:dev1 -> "node-77"  <----+---- Redis
+|                  |  6c. PUBLISH gw:node-77 {message}      -----+
++------------------+
+     |
+     | 6d. agar koi session nahi mili (offline)
+     v
+Notification service -> FCM / APNs -> phone par push banner
+```
+
+Dhyan do: message ko **do hop** lagte hain -- pehle sender ke gateway se chat service tak, phir delivery worker se recipient ke gateway tak. Ye **two-hop routing** is design ki reeh ki haddi hai.
+
+### Ye system kya karta hai / kya NAHI karta
+
+| Chat system kya karta hai | Kya NAHI karta |
+|---|---|
+| Client ke saath ek khula WebSocket connection maintain karta hai | Media files ko apne through nahi bhejta (woh S3 par direct jaata hai) |
+| Har message ko persist karta hai, **phir** sender ko `sent` ack deta hai | Push notification khud nahi bhejta (Notification service ko call karta hai) |
+| Har conversation ke liye ek monotonic `seq` assign karta hai (ordering) | **Global** ordering guarantee nahi deta (zarurat hi nahi) |
+| Message ko sahi gateway node par route karta hai (session registry se) | Exactly-once delivery nahi deta (at-least-once + client dedup) |
+| Offline recipient ke liye message store karta hai aur push trigger karta hai | Message ka content encrypt-end-to-end nahi karta (v1 mein) |
+| Receipts (`sent`/`delivered`/`read`) aur presence track karta hai | Typing indicator kabhi store nahi karta (fire and forget) |
+| Reconnect par `afterSeq` se delta sync deta hai | Message search nahi karta (v3 / Search System lesson) |
+
+### Real life mein iska example kya hai?
+
+- **WhatsApp** -- ek grey tick (`sent`), do grey tick (`delivered`), do blue tick (`read`). Yahi hamara delivery state machine hai.
+- **Slack** -- WebSocket par messages + typing + presence, aur channel offline hone par email/push digest.
+- **Telegram** -- multi-device sync (phone, desktop, web sab par same history) -- yahi hamari FR #5 hai.
+- **Instagram DM / Messenger** -- media chat server se nahi, direct storage par jaata hai.
+- **Discord** -- gateway nodes ka concept literally isi naam se, aur presence ka N-squared problem inka famous scaling issue raha hai.
+
+### Interview mein 30 seconds mein kya bolun?
+
+> "Chat system ka core problem ye hai ki ye pehla **stateful** system hai -- server ko client ko bina poochhe message push karna padta hai, isliye connection khula rakhna padta hai. Main WebSocket use karunga, kyunki polling par 10 million online users har 2 second mein poll karein toh 5 million requests per second banti hain jinme 99% khaali hoti hain, aur phir bhi 2 second ka lag rehta hai. Connection khula rakhne ka matlab hai gateway nodes stateful ho gaye -- user ka socket ek specific node ki memory mein hai. Isliye main ek Redis **session registry** rakhunga jo batati hai ki `userId:deviceId` kis `nodeId` par hai, aur node-to-node routing Redis **pub/sub** se karunga: delivery worker recipient ka node dekh kar `gw:<nodeId>` channel par publish karega. Message ka flow hai: gateway -> chat service (validate, seq assign, persist) -> Kafka -> delivery worker -> session lookup -> recipient ka gateway. Recipient offline ho toh Notification service se push notification, aur reconnect par `afterSeq` se delta sync."
+
+---
+
+## PART 2 -- Requirements
+
+### Functional Requirements (system kya karega)
+
+**1. 1:1 aur group chat (group max 256 members), text message max 4 KB.**
+Priya aur Rahul ka direct chat, aur "Family" group jisme 12 log hain. 256 ki limit isliye taaki ek message ka fan-out control mein rahe (Part 5 mein reason).
+
+**2. Real-time delivery -- recipient online ho toh p95 < 500 ms.**
+Priya ne "kal milein?" bheja, Rahul ka phone khula hai -- half second se pehle uski screen par dikhna chahiye.
+
+**3. Delivery receipts: `sent` -> `delivered` -> `read`, teeno alag event.**
+`sent` = server ne accept aur persist kar liya (ek grey tick). `delivered` = Rahul ke device tak pahuncha (do grey tick). `read` = Rahul ne chat khola (do blue tick). Har transition ka apna event hai jo wapas Priya tak jaata hai.
+
+**4. Offline delivery.**
+Rahul ka phone band hai. Message (a) store rahe aur (b) push notification jaaye, aur (c) jab woh app khole toh sync ho jaaye.
+
+**5. History + multi-device sync.**
+Rahul phone par bhi logged in hai aur laptop par bhi. Dono jagah same history. App 3 din baad khule toh `afterSeq` se sirf **naye** messages aayein, poori history nahi.
+
+**6. Presence (online / offline / last-seen) + typing indicator.**
+
+> **Presence ka simple matlab:** "ye user abhi online hai ya nahi, aur nahi hai toh aakhri baar kab tha." Typing indicator ephemeral hai -- **kabhi store nahi hota**.
+
+**7. Media attachments.**
+Priya ek photo bhejti hai. Photo S3 par presigned URL se **direct** jaati hai; message mein sirf `mediaKey` + thumbnail meta jaata hai.
+
+**8. Unread counts per conversation.**
+Chat list mein "Family (3)". Ye `last_read_seq` se calculate hota hai, alag se count maintain karke nahi.
+
+**9. Ordering -- ek conversation ke messages har device par same order mein.**
+Priya ne "kal" phir "milein?" bheja -- Rahul ko bhi usi order mein dikhe, phone aur laptop dono par. **Global order ki zarurat nahi**, per-conversation kaafi hai.
+
+### Non-Functional Requirements (system kaisa hona chahiye)
+
+| Requirement | Simple meaning | **Is system mein KYUN important hai?** |
+|---|---|---|
+| **Low latency (p95 < 500 ms end to end)** | Message turant dikhe | Chat mein 2 second ka lag turant "app hang ho gaya" feel deta hai. Ye product ki **core quality** hai, optimization nahi. Isliye poora architecture is ek number ke around bana hai. |
+| **Availability 99.99%** | System hamesha chale | Messaging down = **product down**. Koi workaround nahi hai -- user "thodi der baad try" nahi karega, doosra app khol lega. |
+| **Durability: accepted message kabhi na khoye** | Ek bhi message gayab na ho | Ek message ka khona **trust** todta hai. Concrete rule: **server jab tak persist na kar le, client ko `sent` ack mat do.** Pehle ack dene se user ko lagega gaya hai, par gaya nahi. |
+| **Ordering per conversation (strong)** | Ek chat ke messages sahi kram mein | Ulta order = baat ka matlab hi badal jaata hai. Par **global ordering ki zarurat NAHI** hai -- do alag chats ke messages ka aapas mein kram kisi ko farak nahi padta. Global ordering bahut mehenga hota hai (ek hi sequencer, ek hi bottleneck). |
+| **Scalability: 10M concurrent connections** | Itne log ek saath jude rahein | **Ye sabse mushkil NFR hai, aur iska twist ye hai ki ye CPU ka problem NAHI hai.** Ek idle connection CPU 0 use karta hai. Ye **memory** (per-socket buffers + TLS state) aur **file descriptors** (har socket OS ke liye ek open file hai) ka problem hai. Isliye solution "bada CPU lo" nahi, "zyada nodes + `ulimit` theek karo" hai. |
+| **Delivery semantics: at-least-once + client dedup** | Message do baar aa sakta hai | Network par **exactly-once possible hi nahi hai** (ack kho sakta hai, toh sender retry karega). Isliye at-least-once bhejo aur client `messageId` se duplicate hata de. Duplicate dikhna galat hai par **recoverable**; message khona nahi. |
+| **Security** | Sirf sahi log sahi chat dekhein | Connect par JWT auth, aur **har send par** authorization (sender us conversation ka member hai?). Media URL leak na ho (presigned URL short-lived). Spam/abuse control. |
+
+### v1 mein jaan-boojh kar kya NAHI hai (out of scope)
+
+| Feature | Kyun nahi (abhi) |
+|---|---|
+| **End-to-end encryption (E2EE)** | E2EE ke baad server message ka content dekh hi nahi sakta -- toh server-side search, server-side fan-out of content, aur naye device par history sab mushkil ho jaate hain. Ye ek poora alag design hai (Part 5 mein deeply discuss). |
+| **Voice / video calls** | Woh WebRTC + TURN/STUN servers ka alag system hai. Media path bilkul alag hai (peer-to-peer UDP, server nahi). |
+| **Message search** | v3 ka feature, aur woh **Search System lesson** hai. Elasticsearch yahan abhi nahi. |
+| **Disappearing messages** | TTL-based deletion + har device par delete ka coordination. Interesting hai par core nahi. |
+| **Reactions / threads** | Message par extra rows + fan-out multiply karta hai. v2 ka kaam. |
+
+> Interview tip: in paanch ko **naam le kar** out of scope bolo. Isse dikhta hai ki tumhe pata hai ye exist karte hain aur inka cost kya hai -- bhoole nahi ho.
+
+---
+
+## PART 3 -- Clarifying Questions
+
+Architecture banane se pehle ye poochho. Har jawab design **badalta** hai.
+
+| # | Question | Ye KYUN pooch raha hoon? | Answer design ko kaise badlega |
+|---|---|---|---|
+| 1 | **Sirf 1:1 chat hai ya groups bhi?** | Ye seedha **fan-out** decide karta hai -- ek message kitne logon tak jaayega | Sirf 1:1 -> 1 message = 1 delivery, design bahut simple. Groups -> delivery amplification (Part 4 ka sabse bada number) |
+| 2 | **Group ka max size kitna?** | 256 aur 100,000 do bilkul alag systems hain | <= 256 -> normal fan-out chalega. Lakhs members -> fan-out-on-read / broadcast channel chahiye, receipts band karne padenge |
+| 3 | **Read receipts chahiye? Group mein bhi?** | Receipts ka volume **messages se zyada** hota hai | Haan -> `last_read_seq` per member. Group mein per-member receipts = 29x aur events. Nahi -> storage aur traffic dono adhe |
+| 4 | **Multi-device support chahiye?** | Ye session registry ki key badal deta hai | Single device -> `conn:<userId>`. Multi-device -> `conn:<userId>:<deviceId>`, aur delivery har device par alag, aur sync protocol per-device |
+| 5 | **History kitne time tak rakhni hai?** | Ye seedha storage number hai | 30 din -> Postgres bhi chal jaayega. **Forever** -> 219 TB/year -> Cassandra + S3 archival |
+| 6 | **Media (image/file/voice note) chahiye?** | Media ka volume text se 1000x bada hota hai | Haan -> S3 presigned upload + CDN, aur **media chat servers se hoke bilkul nahi jaayega**. Nahi -> ek poora sub-system bach gaya |
+| 7 | **End-to-end encryption chahiye?** | Ye sabse bada architectural fork hai | Haan -> server content nahi dekh sakta: no server-side search, no server-side link preview, multi-device key exchange (Signal protocol) chahiye. Nahi -> v1 simple |
+| 8 | **Online / last-seen presence chahiye?** | Presence messaging se **mehenga** hai (Part 4 mein 14x) | Haan -> heartbeats + TTL keys + subscribe-only-to-open-chats. Nahi -> 333K ops/sec ka load bach gaya |
+| 9 | **Ordering ki kya guarantee expected hai?** | Global ordering ek single bottleneck maang leti hai | Per-conversation -> `INCR seq:<conversationId>`, parallel, sasta. Global -> ek hi sequencer / Snowflake + clock sync, bahut mehenga |
+| 10 | **Mobile-first hai ya web-first?** | Mobile connections **toot-te rehte hain** (network switch, doze mode) | Mobile -> reconnect + resume protocol critical, push notification critical, backoff with jitter must. Web-only -> connections zyada stable, push kam important |
+| 11 | **Push infra apna hai ya FCM/APNs?** | Ye "banayenge ya call karenge" decide karta hai | FCM/APNs -> hum **Notification service ko call** karenge (wahi purana lesson). Apna banana -> device token management, retries, rate limits -- poora alag system |
+| 12 | **Peak concurrent users kitne, DAU kitne?** | Connections ka number hi node count decide karta hai | 10M concurrent -> 250 gateway nodes, `ulimit` tuning, LB choice. 100K concurrent -> 2-3 nodes, ye poora lesson overkill hai |
+
+### Agar interviewer bole: "50M DAU, 10M concurrent" -- kya badlega?
+
+| Area | Chhota scale (~100K concurrent) | **50M DAU / 10M concurrent** |
+|---|---|---|
+| Gateway | 2-3 Node.js processes, `ws` library | **250 stateful gateway nodes**, 50K conn each, `ulimit -n` 200,000 |
+| Routing | Sab connections ek process mein -> `Map` se seedha socket mil jaata hai | **Redis session registry + pub/sub per node** (ye poora problem hi yahan paida hota hai) |
+| Load balancer | Kuch bhi | **L4, least-connections** (round-robin long-lived connections ke liye galat hai) |
+| Message store | Ek Postgres | Postgres v1 -> **Cassandra v3** (219 TB/year) |
+| Fan-out | Inline, sync | **Kafka `chat-events` (64 partitions) + delivery worker consumer group** |
+| Presence | Sabko broadcast kar do | 333K heartbeats/sec -> TTL keys + **subscribe only to open chats** |
+| Receipts | Har message par ek row | **`last_read_seq` / `last_delivered_seq`** (per-message rows 660 GB/day ban jaate) |
+| Media | Server ke through upload | **S3 presigned direct upload** (30 TB/day servers se hoke nahi guzar sakta) |
+| Failure | Restart kar do | **Thundering herd** -- 50K clients ek saath reconnect. Full-jitter backoff must |
+
+> Interview line: "10 million concurrent connections ka matlab hai 250 stateful gateway nodes, aur wahin se asli problem shuru hoti hai -- socket ek node par hai, toh message ko us node tak route karna padega. Main session registry plus pub/sub lunga. Aur main capacity messages par nahi, **deliveries** par plan karunga, kyunki group chat 6.6x amplification deta hai."
+
+---
+
+## PART 4 -- Capacity Estimation
+
+Goal wahi purana hai: **exact number nahi, order of magnitude.** Par is system mein ek number aisa hai jo interview jeet-ta hai -- **delivery amplification**. Use dhyan se dekhna.
+
+**Assume (interviewer se confirm karo):**
+
+- **50M DAU**, peak **10M concurrent** connections (DAU ka ~20% ek saath online)
+- Har user **40 messages/day**
+- 80% messages 1:1, 20% group (avg group size 30)
+- Peak = **3x average**
+- 1 din = 86,400 sec
+
+### Step 1 -- Messages per day -> Average msg/sec
+
+```
+Messages/day  = 50,000,000 x 40 = 2,000,000,000  = 2B messages/day
+Average       = 2,000,000,000 / 86,400 = 23,148 msg/sec  (~23K/sec)
+```
+
+**Ye number architecture mein useful kahan hai?** Ye hamara **write rate** hai -- itni baar `INCR seq`, itni baar DB insert, itni baar Kafka produce. 23K writes/sec ek single Postgres primary ke liye already bahut zyada hai -- yahin se Cassandra ka case banna shuru hota hai.
+
+### Step 2 -- Peak msg/sec
+
+```
+Peak = 23,148 x 3 = 69,444  -> round off: ~70,000 msg/sec peak
+```
+
+**Ye number useful kahan hai?** Hum design **peak ke liye** karte hain, average ke liye nahi. Aur chat ka peak bahut sharp hota hai -- New Year ki raat 12 baje ya cricket match ke aakhri over mein.
+
+### Step 3 -- Delivery amplification (YE SABSE IMPORTANT NUMBER HAI)
+
+Ab tak humne **messages** gine. Par server ka asli kaam messages store karna nahi, **deliver** karna hai. Ek group message ek baar store hota hai par **29 logon tak jaata hai**.
+
+```
+1:1 messages    = 2B x 80% = 1.6B
+  deliveries    = 1.6B x 1 recipient        = 1,600,000,000
+
+Group messages  = 2B x 20% = 0.4B
+  deliveries    = 0.4B x 29 other members   = 11,600,000,000
+
+TOTAL deliveries/day = 1.6B + 11.6B         = 13,200,000,000  = 13.2B
+Average  = 13,200,000,000 / 86,400          = ~153,000 deliveries/sec
+Peak     = 153,000 x 3                      = ~460,000 deliveries/sec
+```
+
+Ab dono ko saath rakh ke dekho:
+
+```
+Messages   :  23,000/sec average,  70,000/sec peak
+Deliveries : 153,000/sec average, 460,000/sec peak
+                     ^
+                     +--- 6.6x amplification, sirf 20% group messages se
+```
+
+> **Sikhne wali baat (ye line interview mein bolo):** "Messages 23K per second hain, par deliveries 153K per second. Group chat 6.6x amplification deta hai. **Capacity hamesha deliveries par plan hoti hai, messages par nahi.**"
+
+**Ye number architecture mein useful kahan hai?** Har jagah:
+- **Kafka** -- 23K messages/sec produce, par consumer side par 153K fan-out operations. Isliye delivery workers ko horizontally scale karna hai, aur `chat-events` mein **64 partitions** rakhe hain.
+- **Redis** -- har delivery par ek session lookup (`GET conn:<userId>:<deviceId>`) + ek `PUBLISH`. Peak par ~460K lookups + publishes/sec. **Yahi Redis ka asli load hai**, messages nahi.
+- **Group limit 256** -- agar limit 10,000 hoti toh ek message 10,000 deliveries banata. Ek "good morning" 10,000 socket writes = ek node ke liye mini-DDoS.
+
+### Step 4 -- Connections aur gateway nodes
+
+```
+Peak concurrent connections      = 10,000,000
+Ek gateway node safely handle    = 50,000 connections
+Nodes chahiye = 10,000,000 / 50,000 = 200 nodes
++ headroom (failure, deploy, spike) -> 250 nodes
+```
+
+**Ye number useful kahan hai?** Ye seedha cluster ka size hai, aur ye batata hai ki **ek node marne ka blast radius 50,000 users** hai. Headroom isliye ki jab 2 nodes mar jaayein toh unke 100K connections baaki nodes absorb kar sakein.
+
+### Step 5 -- Memory per node (connections ka asli cost)
+
+```
+Per connection memory (approx):
+  TCP socket send/recv buffers  ~8 KB
+  TLS session state             ~6 KB
+  JS objects (ws + hamara state) ~6 KB
+  --------------------------------------
+  Total                        ~20 KB
+
+Per node = 50,000 x 20 KB = 1,000,000 KB = ~1 GB  (sirf connections ke liye)
+Node ko dena = 8 GB RAM   (baaki message buffers, GC headroom, app ke liye)
+```
+
+**Ye number useful kahan hai?** Ye NFR ko concrete banata hai: **10M connections ek MEMORY problem hai, CPU problem nahi.** Ek idle connection 0% CPU khaata hai. Isliye instance choose karte waqt memory-optimized lo, compute-optimized nahi. Aur yahi reason hai ki hum **Socket.IO ki jagah raw `ws`** lenge (v3 mein) -- Socket.IO per connection zyada memory leta hai, aur 50,000 x extra KBs jud kar bada ho jaata hai.
+
+### Step 6 -- File descriptors (`ulimit`) -- classic production trap
+
+Linux mein **har open socket ek file descriptor (fd) hai**. Process kitne fd khol sakta hai, uski ek limit hoti hai.
+
+```
+Default Linux `ulimit -n`  = 1024
+Hamari zarurat per node    = 50,000 connections
+                           + upstream (Redis, Kafka, Postgres) connections
+                           + log files, DNS sockets, etc.
+Set karo                   = ulimit -n >= 200,000
+```
+
+**Default 1024 par kya hota hai?** Server bilkul theek chalta hai... **1024 connections tak**. Uske baad:
+
+```
+Error: accept EMFILE: too many open files
+```
+
+Naye clients connect hi nahi ho paate, purane theek chalte rehte hain. Monitoring mein CPU 5%, memory 300 MB, "sab healthy" -- par users bol rahe hain "app connect nahi ho raha". **Ye classic production trap hai**, aur interview mein ise bolna bahut achha impression deta hai.
+
+**Ye number useful kahan hai?** Deployment config mein (`LimitNOFILE=200000` systemd unit mein, ya container ka ulimit), aur ek metric mein -- `ws_connections_active{node}` ko fd limit ke against alert karo.
+
+### Step 7 -- Storage (messages)
+
+```
+Avg message size = 200 B text + 100 B metadata (ids, seq, timestamps) = ~300 bytes
+
+Per day    = 2,000,000,000 x 300 B = 600,000,000,000 B = ~600 GB/day
+Per year   = 600 GB x 365           = ~219 TB/year
+Replication factor 3                = 219 x 3 = ~657 TB
+```
+
+**Ye number useful kahan hai?** Ye Postgres ko disqualify karta hai. 657 TB ek single Postgres primary par possible hi nahi, aur sharding manually karni padegi. Messages **append-only time-series** hain, koi join nahi chahiye, read pattern hamesha "ek conversation ke last N messages" -- ye **Cassandra/ScyllaDB ka perfect use case** hai. Isliye: **v1 Postgres** (simple, sab ek jagah), **v3 Cassandra** sirf `messages` table ke liye. Users aur membership Postgres mein hi rehte hain.
+
+### Step 8 -- Storage (receipts) -- aur yahan ek surprise hai
+
+```
+Deliveries/day        = 13.2B  (Step 3 se)
+Agar har delivery ka ek receipt row banayein:
+  Row size approx     = ~50 B (conversationId, seq, userId, state, ts)
+  Per day             = 13,200,000,000 x 50 B = 660,000,000,000 B = ~660 GB/day
+```
+
+Ab compare karo:
+
+```
+Messages ka storage : ~600 GB/day
+Receipts ka storage : ~660 GB/day     <-- receipts MESSAGES SE ZYADA
+```
+
+> **Receipts messages se zyada storage khaate hain.** Sochne mein ulta lagta hai -- receipt toh sirf ek tick hai! Par receipts messages se **6.6x zyada** hain (kyunki har delivery ka apna receipt hai), aur size ka farak sirf 6x hai.
+
+**Ye number useful kahan hai?** Ye **seedha schema decision** deta hai. Hum per-message receipt row **nahi** banayenge. Uski jagah `conversation_members` table mein sirf **do columns**:
+
+```
+last_delivered_seq BIGINT    -- "is user ne is conversation mein yahan tak receive kar liya"
+last_read_seq      BIGINT    -- "is user ne yahan tak padh liya"
+```
+
+Ab receipts ka storage = **13.2B rows ki jagah, per (conversation, user) sirf 2 numbers**. Aur ye kaam bhi karta hai kyunki receipts **monotonic** hain -- agar `last_read_seq = 4211` hai toh 4211 se pehle sab automatically read hai. Ek update, poori history cover.
+
+### Step 9 -- Presence load
+
+```
+Connections            = 10,000,000
+Heartbeat har          = 30 seconds
+Heartbeats/sec         = 10,000,000 / 30 = ~333,000/sec
+```
+
+Ab compare karo:
+
+```
+Message rate   :  23,000/sec
+Presence rate  : 333,000/sec     <-- 14x ZYADA
+```
+
+> **Presence messaging se mehenga hai.** Log sochte hain "online dot toh chhota sa feature hai" -- par woh 14x zyada operations generate karta hai.
+
+**Ye number useful kahan hai?** Teen decisions:
+1. Heartbeat ko **Redis TTL** se handle karo, DB se nahi -- `presence:<userId>` with TTL 90 s, har heartbeat par refresh. Key expire = user offline. Koi background "offline marker" job nahi chahiye.
+2. Last-seen ko **batch** mein persist karo, har heartbeat par Postgres update nahi.
+3. Presence **broadcast mat karo**. Agar har user ke online hone par uske saare contacts ko notify karein: 10M users x avg 200 contacts = **2B notifications per presence flip**. Iski jagah: **pull on demand + subscribe only to open chats** (jo screen abhi khuli hai, sirf unke liye).
+
+### Step 10 -- Media
+
+```
+Media messages    = 2B x 5% = 100,000,000 media/day
+Avg media size    = 300 KB
+Per day           = 100,000,000 x 300 KB = 30,000,000,000 KB = ~30 TB/day
+```
+
+**Ye number useful kahan hai?** Ye ek **hard rule** banata hai: **media chat servers se hoke bilkul nahi jaayega.**
+
+Sochoiye agar jaata: 30 TB/day = ~350 MB/sec average, peak par ~1 GB/sec, hamare 250 gateway nodes ke through. Ek node ka network card bhi ye nahi jhelega, aur ek 5 MB photo upload hote waqt us node ki memory mein padi rahegi -- jahan 50,000 aur logon ke sockets hain.
+
+Solution: client `POST /api/v1/media/presign` karta hai, **presigned URL** leta hai, aur photo **direct S3 par** upload karta hai. Message mein sirf `mediaKey` (ek string) jaata hai -- ~50 bytes. Download CloudFront (CDN) se. **File Storage lesson se seedha reuse.**
+
+### Summary table
+
+| Metric | Value | Design decision |
+|---|---|---|
+| DAU / concurrent | 50M / **10M** | 250 gateway nodes |
+| Messages | 2B/day, **23K/s avg, 70K/s peak** | Write rate; Kafka produce rate |
+| **Deliveries** | **13.2B/day, 153K/s avg, 460K/s peak** | **Capacity deliveries par plan hoti hai.** Delivery workers scale karo |
+| Connections/node | 50,000 | 10M / 50K = 200 + headroom = **250 nodes** |
+| Memory/connection | ~20 KB -> ~1 GB/node | **Memory problem hai, CPU nahi.** 8 GB RAM/node, raw `ws` |
+| File descriptors | `ulimit -n` >= **200,000** | Default 1024 = 1024 connections ke baad `EMFILE` |
+| Message storage | 600 GB/day, 219 TB/yr, x3 = **657 TB** | Postgres v1 -> **Cassandra v3** |
+| Receipt storage | **660 GB/day** (messages se zyada!) | Per-message rows NAHI -> **`last_read_seq`** |
+| Presence | **333K heartbeats/s** (14x messages) | Redis TTL keys, no broadcast, pull on demand |
+| Media | **30 TB/day** | **S3 presigned direct upload**, chat servers ko chhue bina |
+
+### Interview mein kaise bolun (short)
+
+> "50 million DAU, har user 40 messages -- 2 billion messages per day, yaani 23K per second average, 70K peak. Par asli number ye nahi hai. 80% messages 1:1 hain aur 20% group jisme average 30 members hain, toh deliveries banti hain 1.6 billion plus 11.6 billion = **13.2 billion per day, yaani 153K deliveries per second, peak 460K**. Toh **capacity main deliveries par plan karunga, messages par nahi** -- group chat 6.6x amplification deta hai. Connections ki taraf: 10 million concurrent, ek node 50,000 handle karega, toh 200 nodes plus headroom = 250. Per connection ~20 KB, toh ~1 GB per node -- ye **memory aur file descriptor** ka problem hai, CPU ka nahi, isliye `ulimit -n` 200,000 set karna zaruri hai. Storage 600 GB per day, saal ka 219 TB, replication ke saath 657 TB -- isliye v3 mein Cassandra. Ek interesting baat: agar har delivery ka receipt row banayein toh receipts 660 GB per day lenge, messages se bhi zyada -- isliye main per-message receipts nahi, per-member `last_read_seq` rakhunga. Aur presence 333K heartbeats per second hai, messaging se 14x zyada, isliye woh Redis TTL keys par chalega, broadcast par nahi."
+
+---
+
+## PART 5 -- HLD (High-Level Design)
+
+### Poora architecture (ASCII)
+
+```
+Mobile / Web client
+  |  WebSocket (wss://), heartbeat 30 s, reconnect w/ full-jitter backoff, resume with lastSeq
+  v
+L4 Load Balancer (TCP/TLS, least-connections; NOT round-robin -- connections long-lived hain)
+  v
+WS Gateway nodes  (250 nodes x 50K connections, STATEFUL -- ye hamara pehla stateful tier hai)
+  |-- connect par JWT auth, phir socket ko userId/deviceId se bind
+  |-- session registry -> Redis  conn:<userId>:<deviceId> = gatewayNodeId   (TTL 90 s, heartbeat par refresh)
+  |-- subscribe to its own delivery channel  gw:<nodeId>  (Redis Pub/Sub)
+  v
+Chat Service (STATELESS)  -- validate, authorize, seq assign, persist, then fan out
+  |-- Redis  seq:<conversationId>  INCR  -> per-conversation monotonic sequence number
+  |-- Message store: v1 Postgres, v3 Cassandra  ((conversationId), seq DESC)
+  |-- Kafka chat-events (64 partitions, key=conversationId) -> async consumers
+  v
+Delivery Workers (consumer group `delivery`)
+  |-- conversation ke members nikalo -> har member ke devices nikalo
+  |-- har device ka session registry lookup -> gatewayNodeId
+  |-- PUBLISH to gw:<nodeId>  -> wahi gateway socket par push karta hai
+  |-- koi session nahi mili (offline) -> Notification service ko push bhejo  [Notification lesson]
+  v
+Recipient device  -> `delivered` receipt wapas -> sender ko do tick
+
+Side consumers on chat-events: unread-counter worker (Redis), search indexer [Search lesson],
+analytics, archival to S3.
+Support: Postgres (users, conversations, members, devices), Redis (sessions, seq, presence,
+unread, typing), S3 (media), Prometheus + OpenTelemetry.
+```
+
+### Wahi cheez mermaid mein
+
+```mermaid
+flowchart TD
+    C1[Client A - Priya] -->|WebSocket send| LB[L4 Load Balancer<br/>least-connections]
+    C2[Client B - Rahul] -->|WebSocket| LB
+    LB --> GWA[WS Gateway node-12<br/>STATEFUL 50K conns]
+    LB --> GWB[WS Gateway node-77<br/>STATEFUL 50K conns]
+    GWA -->|frame: send| CS[Chat Service<br/>STATELESS]
+    CS -->|INCR seq| R[(Redis<br/>seq / sessions / presence / unread)]
+    CS -->|INSERT message| PG[(PostgreSQL<br/>v3: Cassandra for messages)]
+    CS -->|produce key=conversationId| K[Kafka: chat-events<br/>64 partitions]
+    K --> DW[Delivery Workers<br/>group: delivery]
+    K --> UW[Unread Worker]
+    K --> AW[Archiver -> S3]
+    DW -->|GET conn:userId:deviceId| R
+    DW -->|PUBLISH gw:node-77| R
+    R -.pub/sub.-> GWB
+    GWB -->|socket write| C2
+    DW -->|no session = offline| NS[Notification Service<br/>FCM / APNs]
+    GWA -.presigned upload.-> S3[(S3 + CloudFront<br/>media only)]
+    GWA --> PM[Prometheus / OpenTelemetry]
+```
+
+> Dotted lines = hot path ka side branch. Media kabhi bhi chat service ya Kafka se hoke nahi jaata.
+
+### Sabse zaroori idea: TWO-HOP ROUTING
+
+Ye ek line poore system ka essence hai:
+
+```
+sender -> gateway A -> chat service -> delivery worker -> session lookup -> gateway B -> recipient
+          ^^^^^^^^^                                       ^^^^^^^^^^^^^^   ^^^^^^^^^
+          hop 1: sender ka node                           "B kahan hai?"   hop 2: recipient ka node
+```
+
+Gateway A ke paas Rahul ka socket **nahi** hai. Gateway B ke paas hai. Beech mein **session registry** batati hai ki B kahan hai, aur **pub/sub** message ko wahan pahuncha deta hai.
+
+Ye kyun zaroori hai, ek chhota sa code dekh lo:
+
+```ts
+// gateway/connection-manager.ts (simplified)
+const localSockets = new Map<string, WebSocket>();   // key: `${userId}:${deviceId}`
+
+export async function onAuthenticated(userId: string, deviceId: string, ws: WebSocket) {
+  const key = `${userId}:${deviceId}`;
+  localSockets.set(key, ws);                                  // (1) local memory
+  await redis.set(`conn:${key}`, NODE_ID, 'EX', 90);          // (2) shared registry
+}
+
+export function deliverLocally(userId: string, deviceId: string, frame: ServerFrame): boolean {
+  const ws = localSockets.get(`${userId}:${deviceId}`);
+  if (!ws || ws.readyState !== ws.OPEN) return false;          // (3) yahan nahi hai
+  ws.send(JSON.stringify(frame));                              // (4) mil gaya, bhej do
+  return true;
+}
+```
+
+**Code Explanation:**
+
+- `const localSockets = new Map(...)` -- **yahi hai "stateful"**. Ye `Map` sirf **is process** ki memory mein hai. `node-12` ke `Map` mein Rahul ka socket kabhi nahi milega.
+- `localSockets.set(key, ws)` -- socket ko local memory mein rakh lo, taaki O(1) mein mil jaaye.
+- `redis.set('conn:' + key, NODE_ID, 'EX', 90)` -- **ye line hi problem solve karti hai**. Poore cluster ko bata do ki "ye user is node par hai". `EX 90` = 90 second TTL. Heartbeat har 30 s par ise refresh karega; node crash ho jaaye toh key **apne aap** expire ho jaayegi -- koi cleanup job nahi chahiye. Ye ek bahut sundar pattern hai: **stale state khud mar jaati hai.**
+- `if (!ws || ws.readyState !== ws.OPEN) return false;` -- socket ya toh yahan hai hi nahi, ya band ho chuka hai. `false` ka matlab: "main deliver nahi kar paaya" -- caller ko decide karne do (offline push bhejna hai kya).
+- `ws.send(...)` -- ek WebSocket frame, 2-6 byte header. Yahi woh "push" hai jo polling nahi kar sakta tha.
+
+### Ek message ki poori timeline -- recipient ONLINE (p95 budget: 500 ms)
+
+| t (ms) | Kahan | Kya ho raha hai |
+|---|---|---|
+| 0 | Priya ka phone | `{"type":"send","messageId":"a1b2-...","conversationId":"c9","body":"kal milein?"}` frame bheja |
+| 25 | Gateway A (node-12) | Frame aaya (mobile RTT ~25 ms). Socket already authenticated hai, toh koi auth kaam nahi |
+| 26 | Gateway A | Frame parse + size check (4 KB se bada? `413 MESSAGE_TOO_LARGE`) |
+| 28 | Chat Service | **Authorization:** Priya `c9` ki member hai? Redis membership cache hit (~0.5 ms) |
+| 30 | Redis | `INCR seq:c9` -> `seq = 4211`. Ye is conversation ka order tay karta hai |
+| 42 | Postgres | `INSERT INTO messages ... ON CONFLICT DO NOTHING` (idempotency `messageId` par) |
+| 44 | Chat Service | **Ab, persist hone ke BAAD**, `ack` frame banaya |
+| 45 | Gateway A | `{"type":"ack","messageId":"a1b2-...","seq":4211}` socket par likha |
+| **70** | **Priya ka phone** | **Ek grey tick dikha (`sent`)** -- 70 ms |
+| 46 | Kafka | `chat-events` par produce, key = `c9` (parallel, ack ka wait nahi) |
+| 58 | Delivery worker | Consume kiya (Kafka lag ~10-15 ms) |
+| 60 | Redis | Members nikale -> Rahul. Uske devices -> `dev1` (phone), `dev2` (web) |
+| 62 | Redis | `GET conn:rahul:dev1` -> `"node-77"`, `GET conn:rahul:dev2` -> `"node-41"` |
+| 64 | Redis | `PUBLISH gw:node-77 {...}` aur `PUBLISH gw:node-41 {...}` |
+| 68 | Gateway B (node-77) | Pub/sub par message mila -> local `Map` se Rahul ka socket nikala |
+| **70** | **Gateway B** | **`socket.send(message)`** -- **yahi hamara North Star SLI ka end point hai** |
+| 95 | Rahul ka phone | Message screen par render hua (network RTT) |
+| 98 | Rahul ka phone | `{"type":"receipt","seq":4211,"state":"delivered"}` bheja |
+| 145 | Gateway A -> Priya | `receipt` frame wapas aaya |
+| **170** | **Priya ka phone** | **Do grey tick (`delivered`)** |
+| 8,000+ | Rahul chat kholta hai | `{"type":"receipt","seq":4211,"state":"read"}` -> Priya ko **do blue tick** |
+
+**Budget check:**
+
+```
+North Star SLI (server accept -> recipient socket write) = t=28 se t=70 = ~42 ms
+End-to-end client -> client                              = ~95 ms
+p95 SLO                                                  = 500 ms
+Headroom                                                 = 5x   [OK]
+```
+
+Ye headroom zaroori hai: mobile network 25 ms nahi, kabhi-kabhi 200 ms deta hai; Kafka lag spike karta hai; GC pause aata hai. **Budget mein hamesha jagah chhodo.**
+
+### Timeline -- recipient OFFLINE
+
+| t | Kahan | Kya ho raha hai |
+|---|---|---|
+| 0 - 70 ms | Wahi | Bilkul same: persist -> `ack` -> Priya ko **ek grey tick**. Sender ke liye kuch alag nahi hai |
+| 60 ms | Delivery worker | `GET conn:rahul:dev1` -> **`nil`** (key expire ho chuki -- Rahul offline hai) |
+| 62 ms | Delivery worker | Koi session nahi mili -> `push-notifier` path par bhejo |
+| 65 ms | Notification service | Device ka `push_token` nikala (Postgres `devices` table se) |
+| 120 ms | FCM / APNs | Push accept kar liya. **Yahan se aage hamara control khatam** |
+| ~1-5 s | Rahul ka phone | Notification banner dikha. Ye time Google/Apple decide karte hain, hum nahi |
+| Baad mein | Rahul app kholta hai | WebSocket connect -> JWT auth -> `{"type":"resume","lastSeqByConversation":{"c9":4205}}` |
+| +40 ms | Sync service | `seq > 4205` wale saare messages bheje (4206...4211) |
+| +80 ms | Rahul ka phone | Sab render -> ek saath `delivered` receipt bheja -> Priya ko **do grey tick** (ab, ghante baad) |
+
+> **Important:** Priya ke liye **kuch bhi alag nahi hua**. Usko `sent` tick usi 70 ms mein mila. `delivered` tick tab aaya jab Rahul actually online hua. Delivery state machine ka yahi to fayda hai -- sender ko sach-much pata chalta hai message kahan tak pahuncha.
+
+### Har component ka kaam (Hinglish mein)
+
+**1. Client (mobile / web)**
+WebSocket connect karta hai, heartbeat bhejta hai, messages/receipts/typing bhejta hai. **Client ke do critical kaam:** (a) `messageId` (UUID) khud generate karta hai -- ye idempotency key hai, (b) `lastSeqByConversation` yaad rakhta hai -- reconnect par isi se sync hota hai.
+
+**2. L4 Load Balancer**
+TCP/TLS level par connections ko 250 gateway nodes mein baantta hai. **Least-connections** algorithm, round-robin nahi (kyun -- Part 6 mein).
+
+**3. WS Gateway nodes (250, STATEFUL)**
+Connection ko hold karte hain. Connect par JWT verify, socket ko `userId:deviceId` se bind, session registry mein entry, aur apne channel `gw:<nodeId>` ko subscribe. Ye **bahut patle (thin)** rakhne hain -- inme business logic nahi hona chahiye, warna deploy karna mushkil ho jaayega (har deploy = 50K reconnects).
+
+**4. Chat Service (STATELESS)**
+Yahan asli kaam hota hai: validate (size <= 4 KB), authorize (sender member hai?), `INCR seq`, persist, phir Kafka par produce. Stateless hai isliye normal tarike se scale/deploy hota hai.
+
+**5. Redis**
+Chaar alag kaam, ek hi technology: session registry (`conn:*`), seq counter (`seq:*`), presence (`presence:*`), unread (`unread:*`), typing (`typing:*`), aur **pub/sub** channels (`gw:*`).
+
+**6. Postgres**
+Users, devices, conversations, conversation_members, aur v1 mein messages bhi.
+
+**7. Kafka (`chat-events`, 64 partitions, key = `conversationId`)**
+Chat service ke baad sab kuch async karta hai. Key `conversationId` isliye ki **ek conversation ke saare events ek hi partition mein jaayein** -- Kafka partition ke andar order guarantee karta hai, toh per-conversation ordering delivery tak bani rehti hai.
+
+**8. Delivery workers (consumer group `delivery`)**
+Fan-out ka asli kaam. Members -> devices -> session lookup -> publish (ya offline push).
+
+> **Fan-out ka simple matlab:** ek event ko bahut saare recipients tak pahunchana. Yahan 1 group message -> 29 members x unke devices = 40+ deliveries.
+
+**9. Notification service**
+Hamara **purana lesson**. Offline user ke liye FCM/APNs push. Hum ise call karte hain, banate nahi.
+
+**10. S3 + CloudFront**
+Sirf media. Presigned upload, CDN download.
+
+**11. Prometheus + OpenTelemetry**
+`ws_connections_active{node}`, `message_delivery_latency_seconds` (**North Star SLI**), `fanout_size`, `ws_buffered_amount_bytes`, `slow_client_drops_total`, `kafka_consumer_lag{group}`.
+
+---
+
+## PART 6 -- Har Component ka WHY
+
+> Rule wahi hai: koi component tabhi add karo jab uska reason bol sako. Aur jinki zarurat nahi, unhe **naam le kar** reject karo.
+
+### Component: L4 Load Balancer (least-connections)
+
+- **Kya hai?** TCP/TLS level ka load balancer (AWS NLB, HAProxy in TCP mode) jo naye connections ko 250 gateway nodes mein baantta hai.
+- **Kyun use kar rahe hain?** 10M connections ek node par possible hi nahi. Aur **L4 kyun, L7 nahi:** WebSocket connection sirf shuruaat mein HTTP hai; `101` ke baad usme HTTP requests hoti hi nahi. L7 LB ka poora kaam (URL path dekhna, header routing, per-request logging) yahan bekaar hai aur per-connection memory badhata hai. L4 bas TCP bytes forward karta hai -- sasta aur fast.
+- **Least-connections kyun, round-robin nahi?** **Ye sabse achha detail hai jo tum bol sakte ho.** Round-robin har naye connection ko bari-bari deta hai. Short HTTP requests ke liye ye perfect hai kyunki har request turant khatam ho jaati hai. Par yahan connection **ghanton** chalta hai. Ab socho: `node-12` restart hua, uske 50,000 clients reconnect kar rahe hain. Round-robin unhe baaki 249 nodes mein baant dega -- par woh **purane connections ko gin nahi raha**. Nateeja: kuch nodes 50K par pahunch jaate hain aur kuch 30K par -- imbalance jo apne aap kabhi theek nahi hoga (connections khatam hi nahi hote). **Least-connections** har naya connection **sabse kam load wale node** ko deta hai, toh ye khud-ba-khud balance hota rehta hai.
+- **Agar hata dein toh?** Ek node par saara load, aur ek single point of failure jiska blast radius 10M users hai.
+- **Kab zarurat nahi?** Jab ek hi gateway process se kaam chal jaaye (< ~50K concurrent).
+- **Interview mein kaise bolun?** "L4 load balancer lunga, L7 nahi, kyunki `101 Switching Protocols` ke baad ye HTTP hai hi nahi -- L7 ka per-request processing bekaar overhead hai. Aur **least-connections** algorithm, round-robin nahi, kyunki connections long-lived hain: round-robin sirf naye connections ginta hai aur node restart ke baad permanent imbalance chhod deta hai."
+
+### Component: WS Gateway nodes
+
+- **Kya hai?** 250 Node.js processes jo `ws` library se WebSocket connections hold karte hain. **Hamara pehla stateful tier.**
+- **Kyun use kar rahe hain?** Kahin toh sockets rakhne hi padenge. Inko **alag tier** isliye rakha hai (chat service se mila ke nahi) kyunki dono ka lifecycle bilkul alag hai: chat service ko roz 10 baar deploy kar sakte ho (stateless), gateway ka har deploy **50,000 connections todta hai**. Alag rakhne se gateway ko kam se kam chhedna padta hai.
+- **Agar hata dein toh?** (Yaani agar business logic bhi gateway mein daal dein?) Har code change = mass reconnect = thundering herd. Aur gateway ka memory footprint badh jaayega, jisse per-node connection capacity girti hai.
+- **Kab zarurat nahi?** Chhote scale par gateway aur app ek hi process ho sakte hain. Ye separation 100K+ connections se pehle overkill hai.
+- **Interview mein kaise bolun?** "Gateway nodes ko main **jitna patla ho sake utna patla** rakhunga -- sirf connection lifecycle, auth handshake, heartbeat, aur frame routing. Business logic stateless chat service mein, kyunki gateway ka har deploy ek reconnect storm hai."
+
+### Component: Redis session registry (`conn:<userId>:<deviceId>`)
+
+- **Kya hai?** Ek simple key-value mapping: "ye user-device is node par juda hai." Value = `nodeId`, TTL 90 s.
+- **Kyun use kar rahe hain?** **Ye hi poore system ka core problem solve karta hai** -- "B kahan hai?". Aur TTL wala hissa bahut khoobsurat hai: node crash ho jaaye toh entry **khud expire ho jaati hai**. Koi cleanup job, koi graveyard detection, koi distributed consensus nahi.
+- **Agar hata dein toh?** Options bahut bure hain: (a) har gateway har message **sabko broadcast** kare -- 250 nodes x 460K deliveries/sec = N-squared, bekaar; (b) sticky sessions -- node restart par sab toot-ta hai aur rebalance nahi hota; (c) sabhi gateways ko ek hi node par rakho -- possible hi nahi.
+- **Kab zarurat nahi?** Agar sab connections ek hi process mein hain (single node), toh ek in-memory `Map` kaafi hai. Registry ka wajood hi multi-node hone se hai.
+- **TTL 90 s kyun, jab heartbeat 30 s hai?** Deliberate margin. Heartbeat har 30 s, 2 miss (60 s) par connection close. TTL 90 s isse thoda zyada hai, taaki ek heartbeat late ho jaane par session galti se gayab na ho (race condition). Cost: ek crashed node ka user 90 s tak "online" dikh sakta hai -- uske messages publish honge aur gir jaayenge, aur reconnect par sync ho jaayenge. **Acceptable.**
+- **Interview mein kaise bolun?** "Session registry Redis mein rakhunga: key `conn:userId:deviceId`, value `nodeId`, TTL 90 seconds jo heartbeat par refresh hoti hai. TTL isliye ki node crash hone par entry apne aap saaf ho jaaye -- mujhe koi failure detection ya cleanup job nahi likhna padega."
+
+### Component: Redis Pub/Sub (`gw:<nodeId>`)
+
+- **Kya hai?** Har gateway node apne naam ka ek channel subscribe karta hai. Delivery worker us channel par publish karta hai.
+- **Kyun use kar rahe hain?** Session registry ne bata diya ki B `node-77` par hai -- ab message wahan pahunchana hai. Pub/sub sabse simple tarika hai: **fire and forget, ek hop, sub-millisecond.**
+- **Alternatives compare karo (interview mein ye poori list bolo):**
+
+| Option | Kaise | Problem |
+|---|---|---|
+| (a) Har gateway sabko broadcast kare | Ek common channel, sab sunte hain | **N-squared.** 460K deliveries/sec x 250 nodes = har node 460K messages/sec parse karega jinme 99.6% uske nahi hain |
+| (b) Consistent hashing: user -> fixed node | `hash(userId) % nodes` se node tay | Node add/remove par **rebalance**: hazaron connections jabardasti tod ke doosre node par bhejne padenge. Aur user ko us node par jaana padega jahan LB ne nahi bheja |
+| (c) **Session registry + pub/sub** | Registry batati hai, pub/sub pahunchata hai | **Hamari choice.** Simple, no rebalance, TTL se self-healing. Cost: Redis pub/sub **at-most-once** hai (recipient ka node us pal down ho toh message gira) -- par message Postgres mein hai, reconnect par sync ho jaayega |
+| (d) Kafka topic per node | Har node ka apna topic | **Partition explosion:** 250 topics, aur node scale karne par topics banane/hataane padenge. Kafka is pattern ke liye bana hi nahi hai (heavyweight, disk-backed) |
+| (e) Direct gRPC node-to-node | Worker seedha `node-77` ko call kare | **Sabse fast** (Redis ka hop bacha). Par service discovery + connection mesh (250x250) + health checks chahiye. **v3 ka option**, v1 ka nahi |
+
+- **Agar hata dein toh?** Upar ki (a) ya (b) lena padega -- dono kharaab.
+- **Kab zarurat nahi?** Single node par. Ya jab tum gRPC mesh (option e) bana lo.
+- **Interview mein kaise bolun?** "Node-to-node routing Redis pub/sub se karunga: har gateway `gw:<nodeId>` subscribe karta hai. Ye at-most-once hai, par mere liye theek hai kyunki message pehle hi persist ho chuka hai -- client reconnect par `afterSeq` se sync kar lega. Broadcast N-squared hota, consistent hashing rebalance problem deta, aur Kafka per node topic explosion. gRPC mesh fastest hai par service discovery chahiye -- woh v3."
+
+### Component: Chat Service (stateless)
+
+- **Kya hai?** Normal stateless service: validate -> authorize -> `INCR seq` -> persist -> Kafka produce.
+- **Kyun use kar rahe hain?** Business logic ko gateway se **alag** rakhne ke liye (upar wala reason), aur isliye ki ye normal tarike se scale aur deploy ho sake.
+- **Sabse important kaam: authorization.** Har `send` par check: sender us `conversationId` ka member hai? Membership Redis mein cached (TTL 300 s), miss par Postgres.
+- **Agar ye check hata dein toh?** **Ye is system ka sabse bada security hole hai.** Koi bhi client kisi bhi `conversationId` par message bhej sakta hai -- ya aur bura, `resume` frame se kisi ki bhi poori chat history maang sakta hai. WebSocket mein ye galti common hai kyunki log sochte hain "connect par auth ho gaya na" -- par auth (tum kaun ho) aur authorization (tum is chat ke member ho) do alag cheezein hain.
+- **Kab zarurat nahi?** MVP mein ye gateway ke andar ek function ho sakta hai.
+- **Interview mein kaise bolun?** "Chat service stateless rakhunga: validate, per-conversation authorization, `INCR seq`, persist, phir Kafka. Authorization har single send par hoga, sirf connect par nahi -- membership Redis mein 5 minute cache karke."
+
+### Component: Redis `seq:<conversationId>` counter
+
+- **Kya hai?** Per-conversation monotonic integer. `INCR seq:c9` -> 4211, 4212, 4213...
+- **Kyun use kar rahe hain?** Ye teen kaam ek saath karta hai: **ordering** (4211 hamesha 4210 ke baad), **gap detection** (client ko 4210 ke baad 4212 mila = 4211 miss ho gaya, maang lo), aur **delta sync** (`afterSeq=4205` -> bas uske baad wale bhejo).
+- **Timestamp se kyun nahi?** Client ki ghadi galat ho sakti hai (user manually badal sakta hai), aur do servers ke clocks mein bhi **skew** hota hai. `createdAt` sirf **display** ke liye hai, ordering ke liye **kabhi nahi**.
+- **Agar hata dein toh?** Ordering timestamp par karni padegi -> do messages ek hi millisecond par -> order har device par alag -> baat ka matlab badal jaayega.
+- **Gap acceptable hai, reuse nahi.** Agar `INCR` ho gaya par insert fail ho gaya, toh us number ka message kabhi nahi banega -- sequence mein **gap** rah jaayega. Ye bilkul theek hai. Par **kabhi bhi ek seq do messages ko mat do** -- woh ek slot mein do messages daal dega.
+- **Redis khoye toh?** `seq:<conversationId>` ko `conversations.last_message_seq` (Postgres) se rebuild karo, aur sirf tab set karo jab key maujood na ho.
+- **Kab zarurat nahi?** Agar globally sortable ID chahiye bina per-conversation counter ke -> **Snowflake ID** (Part 3 mein compare, URL Shortener lesson se link).
+- **Interview mein kaise bolun?** "`messageId` aur `seq` do alag cheezein hain: `messageId` client ka UUID hai, idempotency ke liye; `seq` server ka per-conversation counter hai, ordering ke liye. Ordering timestamp par kabhi nahi karunga -- client clocks jhooth bolte hain."
+
+### Component: PostgreSQL
+
+- **Kya hai?** Relational DB: `users`, `devices`, `conversations`, `conversation_members`, aur v1 mein `messages` bhi.
+- **Kyun use kar rahe hain?** Membership aur authorization **relational** problem hai ("ye user is conversation ka member hai?"). Transactions chahiye (group banate waqt conversation + members ek saath). `ON CONFLICT DO NOTHING` idempotency ko **free** mein de deta hai -- wahi `messageId` ka unique constraint.
+- **Agar hata dein toh?** Membership kahin aur rakhni padegi, aur ek "user ko group mein add karo" operation atomic nahi rahega.
+- **Kab zarurat nahi?** `messages` ke liye scale par nahi (219 TB/year) -- **v3 mein Cassandra**. Par `users` aur `conversation_members` **phir bhi Postgres mein hi rahenge**, ye important hai bolna.
+- **Interview mein kaise bolun?** "v1 mein sab Postgres -- primary key `(conversation_id, seq)` dono read patterns serve karti hai: last N messages aur everything after seq X. Jab messages 219 TB per year par pahunche, tab sirf `messages` table Cassandra par le jaaunga, kyunki woh append-only time-series hai aur usme koi join nahi chahiye. Membership Postgres mein hi rahegi."
+
+### Component: Kafka (`chat-events`, 64 partitions)
+
+- **Kya hai?** Durable, partitioned event log. Chat service produce karta hai, kai consumer groups padhte hain.
+- **Kyun use kar rahe hain?** Teen reason: (1) **Decoupling** -- chat service ko sirf persist karke `ack` dena hai; fan-out (153K deliveries/sec ka kaam) uske request path se bahar ho jaata hai. (2) **Multiple consumers** -- delivery, unread-counter, push-notifier, archiver, search indexer -- sab **same stream** padhte hain bina chat service ko chhue. Naya feature = naya consumer group, koi code change nahi. (3) **Replay** -- delivery worker mein bug tha? Offset peechhe karke dobara chala do.
+- **Key = `conversationId` kyun?** Kafka **partition ke andar** order guarantee karta hai. Same key = same partition = same order. Toh ek conversation ke messages delivery workers tak bhi usi order mein pahunchte hain. Agar key random hoti toh 4212 pehle aur 4211 baad mein deliver ho sakta tha.
+- **64 partitions kyun?** Ye delivery workers ka **max parallelism** hai -- ek partition ek hi consumer padh sakta hai, toh 64 partitions = max 64 parallel delivery workers. 153K deliveries/sec ke liye kaafi headroom, aur partitions baad mein **badhaye jaa sakte hain par ghataye nahi** -- isliye thoda upar rakha hai.
+- **Agar hata dein toh?** Fan-out chat service ke request path mein aa jaayega: ek group message = 29 lookups + 29 publishes **sender ke `ack` se pehle**. Sender ka `sent` tick 70 ms ki jagah 300 ms mein aayega. Aur delivery worker crash = message hamesha ke liye gaya (koi retry log nahi).
+- **Kab zarurat nahi?** Chhote scale par chat service seedha delivery kar sakta hai (Redis pub/sub par direct publish). Kafka tab aata hai jab (a) fan-out bada ho, (b) ek se zyada consumer ho, ya (c) replay chahiye.
+- **Interview mein kaise bolun?** "Kafka rakhunga taaki fan-out sender ke request path se bahar rahe, aur taaki delivery, unread count, push, archival, search indexing sab independent consumer groups ban sakein. Topic `chat-events`, 64 partitions, key `conversationId` -- key isliye ki per-conversation ordering partition level par bani rahe."
+
+### Component: Delivery workers (consumer group `delivery`)
+
+- **Kya hai?** Kafka consumers jo fan-out ka asli kaam karte hain: members -> devices -> session lookup -> publish.
+- **Kyun use kar rahe hain?** Ye system ka **sabse bada load** yahan hai -- 460K deliveries/sec peak. Ise alag scale karna padta hai (messages se 6.6x zyada).
+- **Agar hata dein toh?** Fan-out chat service mein ghusega, `ack` latency badhegi, aur ek 256-member group ka message ek user ke request path ko 256 operations ka bana dega.
+- **Kab zarurat nahi?** 1:1-only chat mein amplification 1x hai -- tab chat service khud deliver kar sakta hai.
+- **Idempotency ka dhyan:** Kafka at-least-once hai, toh worker crash ke baad same message dobara process ho sakta hai -> recipient ko duplicate frame. **Isiliye client `messageId` se dedup karta hai.** Ye poora chain hai: Kafka at-least-once -> worker retry -> duplicate delivery -> client dedup.
+- **Interview mein kaise bolun?** "Delivery workers alag consumer group hain kyunki wahan 6.6x amplification hai. Woh at-least-once hain, toh duplicate delivery possible hai -- client `messageId` se dedup karega. Exactly-once network par possible hi nahi hai."
+
+### Component: Notification service hand-off
+
+- **Kya hai?** Hamara **pehle bana hua system**. Delivery worker ko koi session nahi mili -> user offline -> push notification.
+- **Kyun use kar rahe hain?** Offline user tak pahunchne ka **koi aur rasta hai hi nahi**. Socket band hai, toh FCM/APNs hi ek option hai.
+- **Agar hata dein toh?** Message DB mein pada rahega aur user ko tab pata chalega jab woh khud app khole. Engagement khatam.
+- **Kab zarurat nahi?** Web-only product mein jahan browser notification optional ho.
+- **Important boundary:** Hum **push nahi bhejte**, hum **Notification service ko batate hain**. Device token management, FCM rate limits, retries, silent push vs alert push -- woh sab uska kaam hai. Interview mein ye boundary saaf bolna achha lagta hai.
+- **Interview mein kaise bolun?** "Offline path ke liye main pehle se bane Notification service ko call karunga -- device tokens, FCM/APNs retries, aur rate limits us system ki zimmedari hai. Chat system ka kaam bas ye batana hai ki 'is user ke liye ye message pending hai'."
+
+### Component: S3 + CloudFront (sirf media)
+
+- **Kya hai?** Object storage + CDN. Client `POST /api/v1/media/presign` se ek short-lived upload URL leta hai aur **direct S3 par** upload karta hai.
+- **Kyun use kar rahe hain?** **30 TB/day.** Agar ye hamare gateways se guzre toh 250 nodes ka network saturate ho jaayega aur ek 5 MB photo upload hote waqt us node ki memory mein padi rahegi -- jahan 50,000 aur sockets hain.
+- **Agar hata dein toh?** Media chat server se jaayega -> bandwidth blow up, memory pressure, aur ek slow upload 50,000 logon ka node hila dega.
+- **Kab zarurat nahi?** Text-only chat mein (Slack ka bot channel jaisa) media ka poora sub-system hi nahi chahiye.
+- **Interview mein kaise bolun?** "Media kabhi chat servers se hoke nahi jaayega. Presigned S3 upload, message mein sirf `mediaKey`. CDN sirf media ke liye -- messages ke liye CDN ka koi matlab nahi, woh per-user private hain, cacheable nahi."
+
+### Component: Prometheus + OpenTelemetry
+
+- **Kya hai?** Metrics + distributed tracing.
+- **Kyun use kar rahe hain?** Is system mein failures **chupchaap** hote hain. Server "healthy" dikhta hai (CPU 5%) jabki users connect nahi kar paa rahe (`EMFILE`). Ya ek slow client node ki memory kha raha hai. Bina metrics ke pata hi nahi chalega.
+- **North Star SLI:** `message_delivery_latency_seconds` = **server accept se recipient socket write tak**. Yahi woh number hai jiska p95 500 ms se neeche rakhna hai. Baaki sab metrics iske support mein hain.
+- **Critical metrics aur woh kya batate hain:**
+
+| Metric | Kya batata hai |
+|---|---|
+| `ws_connections_active{node}` | Nodes balanced hain? `ulimit` ke kitne paas hain? |
+| `message_delivery_latency_seconds` | **North Star.** SLO bhang ho raha hai kya |
+| `fanout_size` (histogram) | Koi 256-member group hot ho gaya kya |
+| `ws_buffered_amount_bytes` | Slow clients kitne hain (memory pressure ka early warning) |
+| `slow_client_drops_total` | Hum kitne logon ko drop kar rahe hain |
+| `kafka_consumer_lag{group}` | Delivery workers peechhe reh gaye kya -- ye latency SLO ka pehla dushman hai |
+| `reconnect_storm_rate` | Thundering herd shuru ho raha hai |
+| `seq_gap_detected_total` | Clients ko gaps mil rahe hain -- kuch kho raha hai |
+
+- **Interview mein kaise bolun?** "Mera North Star SLI `message_delivery_latency_seconds` hoga -- server accept se recipient ke socket par write tak -- aur uska p95 500 ms se neeche. Saath mein per-node active connections, Kafka consumer lag, aur `bufferedAmount` histogram, kyunki is system ke failures chup-chaap hote hain."
+
+### Components jinki zarurat NAHI hai (aur ye bolna important hai)
+
+| Component | Kyun nahi? |
+|---|---|
+| **Sticky sessions / session affinity LB par** | Zarurat hi nahi -- session registry already batati hai user kis node par hai. Aur sticky sessions ek **anti-pattern** ban jaate hain: node restart par saari affinity toot-ti hai, rebalance nahi hota, aur LB ko state rakhni padti hai (LB ko stateful banane ka koi fayda nahi jab hamare paas registry hai). |
+| **Socket.IO** | v3 mein nahi. Socket.IO auto-reconnect aur transport fallback (polling par gir jaana) free deta hai -- **v1/v2 ke liye bilkul theek hai**. Par per-connection memory zyada leta hai, aur 50,000 x extra KBs per node jud kar mahenga hai. Aur uska apna protocol overhead hai. Raw `ws` + apna reconnect logic = kam memory, poora control. Trade-off Part 5 mein detail. |
+| **End-to-end encryption (v1 mein)** | Server content dekh nahi paayega -> server-side search gaya, link preview gaya, aur naye device par history dena ek poora key-exchange problem ban jaata hai (Signal protocol). Ye feature nahi, **ek alag architecture** hai. |
+| **CDN for messages** | CDN cacheable, shared content ke liye hai. Har message ek hi user ke liye private hai aur ek hi baar padha jaata hai -- cache hit rate practically zero. CDN **sirf media** ke liye. |
+| **Elasticsearch** | Message search v3 ka feature hai, aur woh poora **Search System lesson** hai. v1 mein `afterSeq`/`beforeSeq` keyset pagination hi sab kuch hai. |
+| **Separate presence service (v1 mein)** | Presence Redis TTL keys se ho jaata hai. Alag service tab chahiye jab presence ka apna fan-out (subscriptions, contact graph) itna bada ho jaaye ki woh chat ke Redis ko dabaane lage. |
+
+### Final component checklist
+
+| Component | v1 mein? | Scale par? | Reason |
+|---|---|---|---|
+| L4 LB (least-connections) | Optional | Yes | 10M connections, long-lived -> round-robin galat |
+| WS Gateway (stateful) | Yes | **250 nodes** | Sockets kahin toh rakhne hain; patla rakho |
+| Redis session registry | Single node se bhi | Yes (cluster) | "User kis node par hai" -- core problem |
+| Redis Pub/Sub routing | Yes | Yes | Node-to-node, ek hop, self-healing |
+| Chat service (stateless) | Gateway ke andar function chalega | Yes, alag | Deploy lifecycle alag |
+| Redis `seq` counter | Yes | Yes | Ordering + gap detection + delta sync |
+| Postgres | Yes (sab kuch) | Yes (messages chhod kar) | Membership relational hai |
+| Cassandra | No | **v3** | 219 TB/year, append-only |
+| Kafka | No (direct publish) | Yes | Fan-out request path se bahar + multiple consumers |
+| Delivery workers | No | Yes | 6.6x amplification alag scale maangta hai |
+| Notification service | Yes | Yes | Offline ka koi aur rasta nahi |
+| S3 + CloudFront | Media ho toh Yes | Yes | 30 TB/day servers ko chhu bhi nahi sakta |
+| Prometheus / OTel | Basic | Yes | Failures yahan chup-chaap hote hain |
+| Sticky sessions / Socket.IO / E2EE / CDN for messages / Elasticsearch | No | No | Upar wali table dekho |
+
+---
+
+## Remember
+
+> **Chat system hamara pehla STATEFUL system hai: connection khula rehta hai, isliye user ka socket ek specific gateway node ki memory mein pada hai -- aur "us node tak message kaise pahunchaun" hi poora design hai.** Jawab: Redis **session registry** (`conn:<userId>:<deviceId> -> nodeId`, TTL 90 s, khud saaf ho jaati hai) + **pub/sub per node** (`gw:<nodeId>`). Aur capacity hamesha **deliveries** par plan karo, messages par nahi -- 23K messages/sec, par **153K deliveries/sec**.
+
+## Quick Self-Test (answers baad mein check karna)
+
+1. Polling par 10M online users se 5M requests/sec banti hain. Agar hum poll interval 2 s se badha kar 10 s kar dein toh cost 5x kam ho jaayega -- phir bhi ye solution kyun nahi hai?
+2. Messages 23K/sec hain par deliveries 153K/sec. Ye 6.6x kahan se aaya, aur is number ka asar **kin-kin** components par padta hai?
+3. Gateway node ka `ulimit -n` default 1024 hai. Server ka CPU 5%, memory 300 MB, health check green -- phir bhi naye users connect nahi kar paa rahe. Kya ho raha hai, aur monitoring mein tumhe kya dikhega?
+4. Session registry ki TTL 90 s hai par heartbeat 30 s ka. 90 kyun, 35 kyun nahi -- aur is choice ki keemat kya hai jab koi node crash kare?
+5. Agar har delivery ka ek receipt row banayein toh receipts messages se **zyada** storage lenge. Ye kaise possible hai, aur `last_read_seq` ye problem kaise solve karta hai (aur woh kaam kyun karta hai)?
+
+---
+
+**Next (Part 2):** Message send se receive tak ka poora flow, WebSocket frame protocol + REST APIs, database design (Postgres v1 aur Cassandra v3), LLD folder structure, Node.js/TypeScript code line-by-line. "next" bolo.
