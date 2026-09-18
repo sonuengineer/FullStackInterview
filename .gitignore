@@ -8,3 +8,9 @@ interview-prep/
 systemdesign/prompt.md
 preparation.md
 
+
+# Company codebase knowledge (infra IPs, security findings): only inside the encrypted prep page
+codebaseknowledge/
+
+# Private: current-work codebase notes -- only go into the encrypted prep page
+codebaseknowledge/

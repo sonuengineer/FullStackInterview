@@ -1,0 +1,1366 @@
+# Chat System -- HLD + LLD (Part 4: Scaling -> Failures -> Consistency -> Security -> Observability)
+
+> Is file mein prompt ke **Parts 16-20** hain: scaling (1x se 1000x), failure scenarios, consistency, security, aur observability.
+> Pichle part ka recap (Part 3): transport ki seedhi (short polling -> long polling -> SSE -> **WebSocket**) aur session registry routing ke alternatives compare kiye; `messageId` (client UUID = idempotency) aur `seq` (`INCR seq:<conversationId>` = ordering) ka farak clear kiya, aur concurrency mein do senders ka seq race + `bufferedAmount` backpressure dekha; caching layer mein `conn:`, `presence:`, `unread:`, `typing:` aur membership cache ka TTL design kiya.
+> Ab dekhenge ye system **traffic badhne par, cheezein tootne par, aur attack hone par** kaisa behave karta hai -- aur production mein hum kya-kya naapte hain.
+
+**Ek baat pehle se yaad rakho:** har pichhla system **stateless** tha, isliye scaling ka matlab tha "aur boxes daal do". Yahan har user ka socket **ek specific gateway node** par pada hai. Isliye is part ka har sawaal ghoom-phir ke ek hi cheez par aata hai:
+
+> **"Agar ye node abhi mar jaaye, toh uske 50,000 sockets ka kya hoga?"**
+
+Ye ek line poore Part 4 ki jaan hai.
+
+---
+
+## PART 16 -- Scaling: 1x -> 10x -> 100x -> 1000x
+
+### Pehle ek rule
+
+Har level par sirf teen sawaal:
+
+1. **Sabse pehle kya tootega?** (bottleneck)
+2. **Usko todne ka sabse sasta tareeka kya hai?**
+3. **Kya abhi zarurat NAHI hai?**
+
+### Levels define karte hain
+
+Hum chhote se shuru karte hain aur har step par ~10x jaate hain. **Step 3 hamara spec hai** (50M DAU) -- ise hum "100x" keh rahe hain kyunki ye hamari scaling ladder ka teesra paydaan hai, DAU ka exact multiple nahi (50K se 50M technically 1000x hai). Label se mat uljho, **numbers dekho**.
+
+| Level | DAU | Peak concurrent conns | Messages/s (avg / peak) | **Deliveries/s (avg / peak)** | Storage/day | Gateway nodes |
+|---|---|---|---|---|---|---|
+| **1x** (startup) | 50K | 10K | 23 / 70 | 153 / 460 | 600 MB | **1 process** |
+| **10x** | 500K | 100K | 230 / 700 | 1.5K / 4.6K | 6 GB | 4 |
+| **100x** (hamara spec) | **50M** | **10M** | **23K / 70K** | **153K / 460K** | **600 GB** | **250** |
+| **1000x** | 500M | 100M | 231K / 700K | 1.53M / 4.6M | 6 TB | 2,500 |
+
+Deliveries messages se **6.6x** zyada hain (spec: 80% 1:1 + 20% group avg 30 members). Ye ratio har level par same rehta hai -- aur yahi poore capacity plan ka base hai.
+
+---
+
+### 1x -- 50K DAU, 10K concurrent: ek hi process
+
+```
+Browser / App
+   |  wss://
+   v
++-----------------------------------+
+|  ek Node.js process               |
+|  - ws server (10K sockets)        |
+|  - chat logic (same process)      |
+|  - connections: Map<userId, ws>   |   <-- session registry PROCESS MEMORY mein
++-----------------------------------+
+   |
+   v
+Postgres (users, conversations, members, messages)
+```
+
+- **Session registry ki zarurat hi nahi.** Sab sockets isi process ki `Map` mein hain. Message aaya -> recipient ka socket usi Map se utha ke `ws.send()`. Bas.
+- **Kafka nahi.** Fan-out 153/s hai -- seedha loop mein kar lo. Kafka daalna yahan pure overhead hai (ek aur cluster, ek aur on-call).
+- **Redis pub/sub nahi.** Kisko publish karoge? Ek hi node hai.
+- **seq kahan se?** Redis ke bina bhi chal jaayega: Postgres mein `UPDATE conversations SET last_message_seq = last_message_seq + 1 RETURNING last_message_seq` ek transaction ke andar. 23 msg/s par row lock bilkul theek hai.
+- **Memory:** 10K x 20 KB = **200 MB** sockets ke liye. 2 GB ka box kaafi.
+- **Ek cheez abhi bhi honi chahiye:** `ulimit -n`. Default 1024 hai -- 1,024 sockets ke baad server `EMFILE` de kar marega. **Day one par hi 200,000 set karo.**
+
+**Sabse pehle kya toota:**
+
+| Kya toota | Kab | Fix |
+|---|---|---|
+| `ulimit -n` 1024 | 1,024th connection par | `ulimit -n 200000` (systemd `LimitNOFILE`) |
+| Process restart = sab offline | har deploy par | 1x par accept karo (raat 3 baje deploy) |
+| Ek process crash = poora app down | kabhi bhi | Yahi 10x ka trigger hai |
+
+> Interview line: "1x par main WebSocket sockets ko ek hi process ki in-memory Map mein rakhunga. Session registry, Redis pub/sub aur Kafka -- teeno sirf tab chahiye jab **do** gateway nodes ho jaayein. Ek node par woh sab overengineering hai. Bas `ulimit -n` day one par theek kar lunga."
+
+---
+
+### 10x -- 500K DAU, 100K concurrent: yahan design *badalta* hai
+
+100K / 50K = 2 nodes chahiye, par HA ke liye **4** rakho (ek mare toh baaki sambhal lein).
+
+Aur yahin woh cheez paida hoti hai jo is system ko baaki sab se alag banati hai:
+
+```
+              L4 LB (least-connections)
+             /      |       |      \
+         GW-1     GW-2    GW-3    GW-4        (25K sockets each)
+           \        |       |       /
+            \       v       v      /
+             +--> Redis <--------+
+                  |  conn:<userId>:<deviceId> = nodeId   (TTL 90 s)
+                  |  gw:<nodeId>   (Pub/Sub channel)
+                  |  seq:<conversationId>  (INCR)
+                  v
+              Postgres
+```
+
+**Problem jo 1x par thi hi nahi:** Alice ka socket GW-1 par hai, Bob ka GW-3 par. Alice ne message bheja -- GW-1 ke paas Bob ka socket **hai hi nahi**.
+
+**Fix (spec ki choice):**
+1. Har gateway connect par likhta hai: `SET conn:<bobId>:<deviceId> GW-3 EX 90`, heartbeat par refresh.
+2. Har gateway apne channel `gw:<nodeId>` ko `SUBSCRIBE` karta hai.
+3. Send ke waqt: `GET conn:bob:dev1` -> `GW-3` -> `PUBLISH gw:GW-3 {...}` -> GW-3 apne socket par likh deta hai.
+
+| Area | Kya tootega | Change | Kyun |
+|---|---|---|---|
+| Routing | 2+ nodes = recipient dusre node par | **Session registry + Redis Pub/Sub** | Ye is scale ka asli naya component hai |
+| LB algorithm | Round-robin se ek node par connections jama ho jaate hain | **Least-connections** (L4/NLB) | Connections **long-lived** hain -- round-robin naye connections baantta hai, purane nahi. Ek node restart hua toh RR uspe kuch nahi bhejta aur baaki loaded rehte hain |
+| seq | Postgres row lock par 700 msg/s | **Redis `INCR seq:<conversationId>`** | Ek conversation ka counter, atomic, ~0.2 ms |
+| Deploy | Deploy = 100K sockets ek saath toot-te hain | **Staggered drain** (PART 17 #2) | Warna self-inflicted reconnect storm |
+| Presence | 100K conns x heartbeat/30 s = **3,333 heartbeats/s** | Redis `presence:<userId>` TTL 90 s | Heartbeat pehle se hi messaging traffic (230/s) se **14x zyada** hai |
+
+- **Kafka abhi bhi nahi.** 4.6K deliveries/s peak -- chat service seedha fan-out kar sakti hai. Kafka tab aayega jab (a) fan-out itna bada ho ki send path ko block kare, ya (b) side consumers (unread, search index, archival, push) chahiye hon.
+- **Kya NAHI chahiye:** Cassandra (2.2 TB/year Postgres ke liye kuch bhi nahi), multi-region, sharded pub/sub.
+
+**Sabse pehle kya toota:**
+
+| Kya toota | Kyun | Fix |
+|---|---|---|
+| Message "gum" ho gaya | Recipient dusre node par tha | Session registry + pub/sub |
+| Ek node par 60K conns, dusre par 5K | Round-robin LB + ek restart | Least-connections |
+| Har deploy par 30 sec ka blackout | Sab sockets ek saath toote | Staggered drain + full-jitter reconnect |
+
+> Interview line: "Do gateway nodes hote hi system ka character badal jaata hai -- ab 'kaunsa user kis node par hai' ek design problem hai. Main Redis mein `conn:<userId>:<deviceId> -> nodeId` session registry rakhta hoon aur har node apne `gw:<nodeId>` channel ko subscribe karta hai. Sticky sessions **nahi** lunga -- woh node restart par sab tod deti hain, aur registry se woh zarurat khatam ho jaati hai."
+
+---
+
+### 100x -- 50M DAU, 10M concurrent (hamara design point)
+
+Ye woh design hai jo Parts 1-3 mein bana.
+
+```mermaid
+flowchart LR
+    C[10M clients] --> LB[L4 LB least-connections]
+    LB --> GW[250 WS Gateways<br/>50K conns each<br/>STATEFUL]
+    GW --> CS[Chat Service<br/>~40 instances<br/>STATELESS]
+    CS --> R[(Redis Cluster<br/>seq / sessions / presence)]
+    CS --> DB[(Message store<br/>Postgres v1 -> Cassandra v3)]
+    CS --> K[Kafka chat-events<br/>64 partitions key=conversationId]
+    K --> DW[Delivery Workers<br/>~46 at peak]
+    K --> UC[unread-counter]
+    K --> PN[push-notifier]
+    K --> AR[archiver]
+    DW --> R
+    DW -->|PUBLISH gw:nodeId| GW
+```
+
+#### Section ka sabse bada insight: teen alag scaling axes
+
+Ye woh cheez hai jo is system ko interview mein jeetati hai. **Teen tiers, teen alag units par scale hote hain:**
+
+| Tier | Scale karta hai | Number | Bottleneck resource |
+|---|---|---|---|
+| **WS Gateways** | **CONNECTIONS** par | 10M / 50K = 200 -> **250** (headroom) | **RAM + file descriptors** (CPU nahi) |
+| **Chat Service** | **MESSAGES** par | 70K msg/s peak / ~2K per instance = **~40** | CPU + DB writes |
+| **Delivery Workers** | **DELIVERIES** par | 460K/s peak / ~10K per worker = **~46** | Redis ops (lookup + publish) |
+
+**Proof ki ye teen alag hain, spec ke numbers se:**
+
+```
+messages/sec  peak  =   70,000
+deliveries/sec peak =  460,000     <-- 6.6x zyada
+conns               = 10,000,000   <-- iska messages se koi rishta hi nahi
+```
+
+- Agar tum **messages (23K/s)** dekh ke delivery workers size karoge, toh **6.6x under-provisioned** ho -- Kafka lag badhega aur ticks 30 sec late aayenge.
+- Agar tum **messages** dekh ke gateways size karoge, toh 40 nodes nikalenge -- par 10M sockets ko 40 nodes par rakhna matlab 250K conns/node = **~5 GB sirf sockets** + fd limit ka blast. Gateways ka messages se lena-dena hi nahi.
+- Gateway par actual CPU kaam: 460K deliveries / 250 nodes = **1,840 socket writes/s per node**. Ye kuch bhi nahi. **Gateway memory-bound hai, CPU-bound nahi.** Isiliye gateway par business logic mat daalo -- use patla rakho.
+
+> Interview line: "Main teen tiers ko teen alag units par scale karta hoon: gateways connections par (RAM aur fd), chat service messages par (70K/s peak), aur delivery workers deliveries par (460K/s peak). Sabse common galti ye hai ki log 23K msg/s dekh ke poora system size kar dete hain -- group chat 6.6x amplification deta hai, isliye capacity hamesha deliveries par plan karni chahiye."
+
+#### Gateway ka connection ceiling: 50,000 hi kyun? Aur usse zyada kyun nahi?
+
+50,000 ek jaadui number nahi hai -- ye **chaar** alag limits ka sabse chhota wala hai. Interview mein charon bolna:
+
+**1. File descriptors (fd)**
+Har TCP socket = ek fd. 50,000 sockets + Redis connections + Kafka + log files + DNS. Linux default `ulimit -n` = **1024**. Iska matlab tumhara mahangaa 8 GB server 1,024 users ke baad `EMFILE: too many open files` de kar mar jaayega.
+
+```
+# systemd unit
+[Service]
+LimitNOFILE=200000
+```
+
+Spec kehta hai `>= 200,000`. **Ye is system ka classic production trap hai** -- load test 500 users par pass ho jaata hai aur launch day par 1,024 par gir jaata hai.
+
+**2. Memory per socket -- ~20 KB**
+Isme kya-kya hai:
+
+```
+kernel socket buffers (rcv + snd)  ~ 8-12 KB   <-- sabse bada hissa
+TLS session state (OpenSSL)        ~ 4-6 KB
+Node ws object + JS closures       ~ 3-5 KB
+--------------------------------------------
+total                              ~ 20 KB
+50,000 x 20 KB                     = ~1 GB      (sirf connections)
+```
+
+Baaki heap (message buffers, GC headroom) ke liye node ko **8 GB** do. 100K conns rakhoge toh 2 GB sockets + GC pressure -> pauses badhengi -> latency SLI toot-ta hai.
+Tuning: `net.ipv4.tcp_rmem` / `tcp_wmem` ko chhota karo (chat frames 4 KB hain, 6 MB buffers ki zarurat nahi) -- isse per-socket memory sach mein girti hai.
+
+**3. Ephemeral ports -- LB ki taraf ka chhupa hua ceiling**
+Ye woh limit hai jo log bhool jaate hain. Agar LB **proxy mode** mein hai (ALB/HAProxy), toh LB ka har backend connection ek source port kharch karta hai. Ek `(LB IP, GW IP, GW port)` tuple par usable ephemeral ports:
+
+```
+/proc/sys/net/ipv4/ip_local_port_range = 32768 60999
+                                       = 28,232 ports
+```
+
+Matlab **ek** LB node **ek** gateway node ke **ek** port par 50,000 connections bana hi nahi sakta -- ~28K par `EADDRNOTAVAIL` milega.
+
+Fix (koi ek ya sab):
+- **L4 NLB / IPVS with DSR** -- LB connection ko proxy nahi karta, client ka TCP seedha gateway se banta hai. Tab ye limit hoti hi nahi. **Spec ki choice yahi hai.**
+- Zyada LB nodes (har LB node ka apna source IP = apna 28K pool).
+- Gateway ko multiple ports par listen karao (`:8443-8447`) -- har port alag tuple.
+
+**4. TLS handshakes per second -- connect storm ka asli killer**
+Steady state mein handshake cheap hai (din mein ek baar). Problem **storm** mein hai: ek node mara, uske 50,000 clients reconnect kar rahe hain.
+
+```
+RSA-2048 handshake  ~ 1.5 ms CPU  -> 50,000 x 1.5 ms = 75 CPU-seconds
+ECDSA P-256         ~ 0.3 ms CPU  -> 50,000 x 0.3 ms = 15 CPU-seconds
+```
+
+8 cores par ECDSA ke saath ~2 second, RSA ke saath ~10 second -- aur us dauraan baaki sab kuch (existing sockets ke writes) latency kha raha hai.
+Fix: **ECDSA certificates**, **TLS session resumption / tickets** (reconnect par full handshake nahi), aur TLS ko NLB/terminating layer par offload karna.
+
+#### Kafka partition sizing (64, key = `conversationId`)
+
+```
+throughput check:  70K msg/s x 300 B = 21 MB/s total
+                   21 MB/s / 64      = 0.33 MB/s per partition    -> hasna aa raha hai, bahut kam
+consumer check:    delivery workers peak = 46
+                   partitions        = 64                          -> 46 < 64  [OK]
+```
+
+**Seekhne wali baat: partition count throughput se nahi, consumer parallelism se decide hota hai.** Ek partition ko ek hi consumer padh sakta hai (ek consumer group mein). 64 partitions ka matlab **max 64 delivery workers**. Peak par 46 chahiye -> 18 ka headroom. Agar traffic 1.5x badh gaya toh 64 se zyada workers chahiye honge, aur **partition count badhana peechhe se painful hai** (key ka hash dusri partition par chala jaata hai -> purane aur naye messages ka ordering mix ho sakta hai).
+
+**Key = `conversationId` kyun:** ek conversation ke saare messages ek hi partition mein jaate hain -> ek hi consumer -> **per-conversation ordering** Kafka level par bhi bani rehti hai. Agar key `messageId` hoti toh ek conversation ke do messages do workers par jaate aur ulte order mein deliver ho sakte the.
+
+**Cost:** ek bahut active group ka poora load ek partition par. 256-member group ka fan-out 768 hai -- agar worker use serially karega toh wahi partition lag karegi (head-of-line blocking). Fix PART 17 #9 mein.
+
+#### Message store: Postgres -> Cassandra
+
+```
+600 GB/day -> 219 TB/year -> x3 replication = 657 TB
+write rate: 23K inserts/s average, 70K peak
+```
+
+Ek Postgres primary ye **nahi** sambhal sakta (single writer, WAL, vacuum, 657 TB). Isliye v3 mein:
+
+```sql
+CREATE TABLE messages (
+  conversation_id uuid, seq bigint, message_id uuid, sender_id uuid,
+  body text, media_key text, created_at timestamp,
+  PRIMARY KEY ((conversation_id), seq)
+) WITH CLUSTERING ORDER BY (seq DESC);
+```
+
+- **Partition key `conversation_id`** = ek conversation ki saari rows ek node par, `seq` se sorted. Hamara poora read pattern ("last 50", "seq > X") ek range scan hai -- Cassandra ka perfect use case.
+- **Sharding apne aap ho gaya:** Cassandra token ring `conversation_id` ko hash karke nodes mein baant deta hai. Hamein manual shard logic likhna hi nahi pada.
+- **Gotcha -- fat partition:** ek 256-member group jo 3 saal se chal rahi hai = lakhs rows ek partition mein. Fix: `PRIMARY KEY ((conversation_id, month_bucket), seq)`.
+- **Membership aur users Postgres mein hi rehte hain** -- wahan relational queries, transactions aur `ON CONFLICT` chahiye. Sirf `messages` (append-only time series, koi join nahi) Cassandra jaata hai. **Poora DB migrate karna galti hai.**
+
+#### Redis scaling -- do alag problems, alag solutions
+
+**(a) Session registry lookups:** 460K deliveries/s peak = 460K `GET conn:*` peak. Ek Redis node ~50-80K ops/s. Seedha 6-9 nodes chahiye.
+Par sasta fix pehle: **delivery worker ek fan-out ke saare lookups ek `MGET` mein karo.** 768 deliveries wali group ke liye 768 round trips ki jagah **1**. Ops/s 460K se girke ~25K reh jaati hai (ek `MGET` per message). Ye ek line ka change hai aur Redis cluster ki zarurat 6 months aage tak taal deta hai.
+
+**(b) Pub/Sub -- yahan ek asli cluster trap hai:**
+
+> **Classic Redis Pub/Sub cluster-aware nahi hai.** Cluster mode mein `PUBLISH` cluster bus par **har node** ko broadcast hota hai, kyunki Redis ko nahi pata kaunsa node us channel ka subscriber rakhta hai. Matlab 6 nodes ka cluster banane se pub/sub throughput **badhta nahi** -- har node ko phir bhi saare publishes dekhne padte hain. Ye log ko bahut late pata chalta hai.
+
+Teen options:
+
+| Option | Kaise | Kab |
+|---|---|---|
+| **Alag standalone Redis sirf pub/sub ke liye** | Registry cluster mein, pub/sub ek dedicated pair par | Sabse simple, 100x tak chalta hai |
+| **Sharded Pub/Sub (Redis 7+)** | `SSUBSCRIBE gw:<nodeId>` / `SPUBLISH gw:<nodeId>` -- channel name hash hoke ek slot par jaata hai, broadcast nahi | 100x ke upar ki asli fix |
+| **Direct gRPC node-to-node** | Delivery worker seedha GW-37 ko gRPC call kare | v3 -- fastest (~1 ms kam), par service discovery + mesh + health checking ka bojh |
+
+Hamare liye: `gw:<nodeId>` channel name **already** nodeId se keyed hai, isliye **sharded pub/sub mein migrate karna trivial hai** -- sirf `PUBLISH` ko `SPUBLISH` aur `SUBSCRIBE` ko `SSUBSCRIBE` karna hai. Design ne ye door pehle se khula rakha tha.
+
+**Sabse pehle kya toota (100x):**
+
+| Kya toota | Kyun | Fix |
+|---|---|---|
+| Gateway node OOM | 20 KB x conns + ek slow client ka buffer | 50K cap per node + `bufferedAmount > 1 MB` par drop |
+| Redis pub/sub saturate | Cluster mode mein publish sabko broadcast | Dedicated pub/sub Redis -> sharded pub/sub |
+| Kafka lag (delivery group) | Workers deliveries par size nahi kiye the | Deliveries par size karo (460K/s), MGET batching |
+| Postgres primary write saturate | 23K inserts/s + 657 TB | Cassandra for `messages` only |
+| Presence Redis CPU | 333K heartbeats/s -- messaging se 14x | Heartbeat interval 30 s, TTL refresh only, batch last-seen writes |
+
+---
+
+### 1000x -- 500M DAU, 100M concurrent: multi-region majboori ban jaata hai
+
+```
+231K msg/s avg, 700K peak
+1.53M deliveries/s avg, 4.6M peak
+100M concurrent / 50K = 2,000 gateways -> 2,500
+6 TB/day storage -> 2.19 PB/year -> x3 = 6.6 PB
+3.33M presence heartbeats/s
+300 TB/day media
+```
+
+| Bottleneck | Kyun | Kya karunga |
+|---|---|---|
+| **Kafka partitions** | 4.6M deliveries / 10K = **460 workers** chahiye, par 64 partitions = max 64 | `chat-events` ko **512+ partitions**, aur **per-region Kafka cluster** (ek global cluster cross-region replication ka dard hai) |
+| **Redis pub/sub** | 4.6M publishes/s -- ek Redis se bahut door | Sharded pub/sub, ya **direct gRPC** delivery -> gateway (yahan mesh ka cost justify ho jaata hai) |
+| **2,500 gateways ka fleet** | Ek region mein itne nodes = LB aur network limits | Multi-region, har region ~500-800 gateways |
+| **Latency** | Ek user India mein, doosra US mein; cross-region RTT 200-250 ms | Neeche dekho -- ye sabse interesting sawaal hai |
+| **Storage** | 6.6 PB replicated, badhta hua | Cassandra ring per region + **tiered retention** (1 saal hot, uske baad S3 par archive, on-demand restore) |
+| **Presence** | 3.33M heartbeats/s | Presence ko **region-local** rakho, cross-region async replicate, kabhi strongly consistent mat banao |
+| **Media** | 300 TB/day | Pehle se hi S3 + CloudFront -- chat servers ko chhua hi nahi. Ye design ka sabse achha decision nikla |
+
+#### Multi-region: do users, do regions -- imaandaar jawab
+
+Sawaal: Priya Mumbai mein hai (region `ap-south`), Sam California mein (`us-west`). Dono ek conversation mein hain. **Seq counter kahan rahega?**
+
+Galat jawab: "dono regions mein Redis, dono `INCR` karein." Tab do messages ko **same seq** mil jaayega -> hamara `PRIMARY KEY (conversation_id, seq)` toot jaayega, ya ek message overwrite ho jaayega. **Seq ek single writer maangta hai.**
+
+**Sahi jawab -- conversation ka home region:**
+
+```mermaid
+flowchart LR
+    P[Priya<br/>Mumbai] -->|ws| GA[GW ap-south]
+    GA -->|cross-region 120 ms| CS[Chat Service<br/>us-west = conversation home]
+    CS --> SEQ[(Redis seq<br/>us-west only)]
+    CS --> K[Kafka us-west]
+    K --> DW[Delivery Worker us-west]
+    DW -->|local publish| GU[GW us-west] --> S[Sam]
+    DW -->|cross-region relay 120 ms| GA --> P
+```
+
+- `conversations` table mein ek column: `home_region`. Conversation banate waqt fix ho jaata hai (aksar creator ka region, ya majority members ka).
+- **Saare writes** (seq assign + persist) us home region mein hote hain. Ordering strong rehti hai kyunki writer ek hi hai.
+- **Reads/history** local read replica se -- history immutable hai, replica lag se koi nuksaan nahi.
+- **Cross-region ki keemat imaandaari se bolo:** Priya ka message Sam tak ~250-300 ms mein pahunchega, local chat ke 60 ms ke muqable. Hamara SLO p95 < 500 ms hai -> **fit ho jaata hai**, par tight hai. Isliye SLO ko **local vs cross-region** mein alag-alag track karo, warna ek global p95 sach chhupa lega.
+- **Presence globally consistent banane ki koshish kabhi mat karo.** 100M users x presence flips ko 3 regions mein sync karna = ek aur poora distributed system. Presence har region mein local hai, cross-region ko **async replicate** (ya on-demand pull) karo, aur 30-90 s staleness **product feature** hai ("last seen 2 minutes ago"). Interview mein ye confidently bolna -- ye maturity dikhata hai.
+- **Bonus:** `home_region` data residency (GDPR / India ke data rules) ke liye bhi chahiye hi tha. Ek design decision, do problems solve.
+
+**Sabse pehle kya toota (1000x):**
+
+| Kya toota | Kyun | Fix |
+|---|---|---|
+| Kafka consumer parallelism | 64 partitions, 460 workers chahiye | 512+ partitions, per-region clusters |
+| Redis pub/sub throughput | 4.6M publishes/s | Sharded pub/sub -> direct gRPC |
+| Cross-region seq races | Do regions ek counter chahte hain | Conversation `home_region` = single writer |
+| Presence sync | 3.33M heartbeats/s x regions | Region-local + async, eventual by design |
+| Global p95 SLO | Cross-region 250 ms | SLO ko local/cross-region labels se split karo |
+
+### Cost ka direction (kya mahanga hota jaata hai)
+
+| Level | Sabse badi cost line | Kyun |
+|---|---|---|
+| 1x | Kuch bhi nahi (~ek box) | Sab ek process mein |
+| 10x | Compute (nodes) | Abhi bhi sasta |
+| **100x** | **Storage + media egress** | 657 TB messages + **30 TB/day** media. Gateway RAM (250 x 8 GB = 2 TB) iske saamne chhota hai |
+| 1000x | Media CDN egress + cross-region transfer | 300 TB/day media; cross-region bytes per-GB charge hote hain -- isiliye conversation ko ek region mein "ghar" dena cost bhi bachata hai |
+
+**Ek non-obvious baat:** connections khud sasti hain (RAM). **Deliveries** mahangi hain (CPU + Redis ops) aur **media** sabse mahanga hai (storage + egress). Isiliye media ko chat servers se door rakhna (presigned S3) sirf architecture ka nahi, **bill** ka decision bhi tha.
+
+### Har scaling tool -- kab lagana hai, kab nahi
+
+| Tool | Hamare system mein kab | Kab NAHI |
+|---|---|---|
+| **In-process socket Map** | 1x (ek node) | 2+ nodes -- tab registry chahiye |
+| **Session registry (Redis)** | 2+ gateway nodes se, hamesha | Single node |
+| **Redis Pub/Sub routing** | 10x se | Single node |
+| **Sharded Pub/Sub / gRPC** | 100x ke upar, jab publish saturate ho | Pehle -- extra complexity |
+| **Kafka** | 100x (side consumers + send path ko fan-out se alag karna) | 1x/10x -- seedha fan-out kaafi hai |
+| **Cassandra** | Jab write rate + size Postgres se nikal jaaye (v3) | Membership/users ke liye **kabhi nahi** |
+| **DB read replicas** | History reads ke liye | Send path ke liye (woh write hai) |
+| **CDN** | Sirf media | Messages ke liye kabhi nahi (personal + uncacheable) |
+| **Sticky sessions** | **Kabhi nahi** | -- registry se zarurat khatam; node restart par tootti hai |
+| **Multi-region** | 1000x ya data residency | 100x tak -- sirf dard |
+
+---
+
+## PART 17 -- Failure Scenarios (interviewer style)
+
+Format: **Problem -> Impact (user ko kya dikhta hai) -> Solution.** Golden rule is system ka:
+
+> **Push best-effort hai, store durable hai.** Har real-time path (pub/sub, socket write, push notification) fail ho sakta hai. Jo cheez fail nahi honi chahiye woh hai **persist + ack**. Agar message store mein hai aur uska `seq` hai, toh koi bhi failure sirf **deri** banati hai, **data loss** nahi -- kyunki client reconnect par `resume` se sab utha lega.
+
+### Failure map
+
+```
+Failure                        Message khoya?   User ko kya dikha
+GW node crash (50K sockets)    Nahi             3-15 s "connecting...", phir sab aa gaya
+Rolling deploy                 Nahi             1-3 s reconnect blip
+Redis session registry down    Nahi             Live push ruk gaya; app kholne par sab hai
+Redis pub/sub restart          Nahi             Kuch messages late (resume par aaye)
+Kafka lag (delivery group)     Nahi             Ticks / delivery 30 s late
+Postgres primary failover      Nahi             10-30 s "sending..." spinner, phir sent
+seq counter Redis se gaya      Nahi             Kuch nahi (gap invisible hai)
+Slow client (2G)               Nahi             Disconnect + reconnect, history sync
+Huge group blast               Nahi             Us group mein ticks late
+Push provider down             Nahi             Notification nahi aaya; app kholne par message hai
+```
+
+---
+
+### 1. "Ek gateway node crash ho gaya jiske paas 50,000 sockets the"
+
+- **Problem:** Kernel panic / OOM / EC2 instance retire. Node gaya, uske 50,000 TCP connections ek saath RST ho gaye.
+- **Impact:** 50,000 users ko turant "connecting..." dikhta hai. **Asli khatra ye nahi hai** -- asli khatra ye hai ki 50,000 clients **ek hi second mein** reconnect karenge. LB unhe baaki 249 nodes par bhejega = 200 extra conns per node -- ye theek hai. Par agar client naive retry (`setTimeout(connect, 1000)`) karta hai toh sab **same second** par baar-baar aayenge: **thundering herd**. TLS handshakes ka storm gateway CPU kha jaata hai, handshakes fail hote hain, aur failures agla retry trigger karte hain -> **retry storm self-sustaining ho jaata hai.** Ye is system ka signature failure hai.
+- **Solution (teen layers):**
+  1. **Full-jitter backoff (spec):** `delay = random(0, min(30s, 2^attempt * 1000))`. Pehla retry 0-1 s mein, doosra 0-2 s, phir 0-4... 50,000 clients 30 second mein **bikhar** jaate hain, ek second mein nahi. `random(0, X)` zaruri hai -- `X/2 + random` wala "equal jitter" bhi peak ko aadha hi karta hai, full jitter poora flatten karta hai.
+  2. **LB least-connections:** naye connections un nodes par jaayenge jinke paas kam hain -- yaani jo abhi restart hue.
+  3. **Pre-warmed headroom:** 200 nodes chahiye the, 250 chala rahe hain. Ek node ka 50K load 249 nodes par baant-na = 200 extra per node, jo 20% headroom ke andar hai. **Headroom hi capacity plan ka failure budget hai.**
+- Registry apne aap saaf ho jaati hai: `conn:*` keys ka TTL 90 s hai, refresh karne wala node hai hi nahi -> expire.
+
+---
+
+### 2. "Rolling deploy -- aur ye sabse common self-inflicted storm hai"
+
+- **Problem:** 250 nodes ka rolling deploy. Naive Kubernetes rollout 25 pods ek saath maar deta hai = **1.25M sockets** ek saath toot-te hain. Aur ye **har din** hota hai, jabki node crash mahine mein ek baar.
+- **Impact:** Har deploy par 1-2 minute ka global reconnect storm; p95 delivery latency spike; kuch users ko 10-20 s tak "connecting..."; on-call ko lagta hai outage hai.
+- **Solution -- staggered drain:**
+  1. Pod ko LB se **pehle** hatao (`preStop` hook, readiness fail) taaki naye connections na aayein.
+  2. Phir apne sockets ko **dheere-dheere** band karo -- ek saath nahi. Jaise 60 second mein, har 100 ms par ~85 sockets.
+  3. Close code **`1012` (Service Restart)** bhejo. Client ise "planned" maanta hai aur **chhota** backoff (0-2 s) lagata hai, jabki `1006` (abnormal) par poora full-jitter.
+  4. `maxSurge`/`maxUnavailable` ko 1-2 pods par rakho, 10% par nahi. 250 nodes ka deploy dheere hoga -- **theek hai**, har din ka storm usse bura hai.
+
+```ts
+// src/gateway/graceful-shutdown.ts
+async function drain(wss: WebSocketServer, totalMs = 60_000) {
+  isReady = false;                                 // 1) /ready ab 503 -- LB naye conns nahi bhejega
+  await sleep(5_000);                              //    LB ko health check dekhne do
+
+  const sockets = [...wss.clients];
+  const perTick = Math.max(1, Math.ceil(sockets.length / (totalMs / 100)));
+
+  for (let i = 0; i < sockets.length; i += perTick) {
+    for (const ws of sockets.slice(i, i + perTick)) {
+      ws.close(1012, 'service restart');           // 2) planned restart code
+    }
+    await sleep(100);                              // 3) 100 ms ka gap = trickle
+  }
+  await sleep(2_000);
+  process.exit(0);
+}
+```
+
+**Code Explanation:**
+
+- `isReady = false` -- `/ready` endpoint ab fail karega. LB is node ko naye connections dena band kar deta hai. Purane connections abhi bhi zinda hain.
+- `await sleep(5_000)` -- LB ke do health check intervals ka intezaar. Ye na karo toh LB abhi bhi naye sockets bhejta rahega jinhe hum agle hi second maar denge.
+- `perTick` -- 50,000 sockets / (60,000 ms / 100 ms) = 50,000 / 600 = **~84 sockets har 100 ms**. Ek saath 50,000 ki jagah steady trickle.
+- `ws.close(1012, 'service restart')` -- **close code hi asli signal hai.** Client `1012` par 0-2 s ka chhota backoff lagata hai; `1006` (connection abruptly closed) par poora full-jitter. Deploy ko crash jaisa treat karna clients ko 30 s tak door rakh dega -- bekaar ki deri.
+- `await sleep(2_000)` fir `process.exit(0)` -- aakhri close frames network par nikal jaayein, phir process khatam. Turant `exit` karoge toh clients ko clean close mila hi nahi, sabko `1006` dikhega aur poora fayda chala gaya.
+
+---
+
+### 3. "Redis session registry down"
+
+- **Problem:** Registry Redis (`conn:*`) down ya network se kat gaya.
+- **Impact:** Delivery worker `GET conn:<userId>:<deviceId>` nahi kar sakta -> **kisi ko route nahi kar sakta.** Par dhyaan do: **message phir bhi persist ho raha hai** (Postgres/Cassandra Redis se alag hai) aur **`sent` ack sender ko ja raha hai**. Sender ko ek tick dikhta hai, doosra tick nahi aata. Recipient ko live message nahi milta.
+- **Solution:**
+  - **Store-and-let-resume:** persist path ko chalne do, delivery ko fail hone do. Jab registry wapas aati hai, clients ka agla heartbeat/reconnect registry ko dobara bhar deta hai aur `resume` se saare missed messages aa jaate hain. **Kuch kho nahi raha, sirf late hai.**
+  - Fallback: registry miss par **push notification** bhej do (user ko offline maan lo). Thoda extra push, par user ko pata chal jaata hai.
+  - Registry ko `AOF everysec` ya seedha "ephemeral" maano -- ye derived state hai, source of truth nahi. Redis fresh start ho toh 90 s ke andar heartbeats se bhar jaata hai.
+  - Alert: `deliveries_total{result="no_session"}` achanak spike.
+
+---
+
+### 4. "Redis pub/sub ne restart ke beech message drop kar diya"
+
+- **Problem:** Redis pub/sub **fire-and-forget** hai -- na persistence, na ack, na replay. `PUBLISH` ke waqt agar subscriber (gateway) ek second ke liye disconnected tha, toh woh message **hamesha ke liye** chala gaya.
+- **Impact:** Recipient ke phone par woh message **live nahi aaya**. Sender ko ek tick dikha, doosra nahi.
+- **Solution:** Yahi wajah hai ki hamara design **push ko best-effort** maanta hai:
+  - Message pehle hi **store mein `seq` ke saath** hai. Client ka agla `ping`/reconnect `resume` bhejta hai (`lastSeqByConversation`) -> server `seq > lastSeq` sab bhej deta hai -> message aa jaata hai.
+  - Client-side **gap detection**: agar naya message `seq = 51` aaya par local last `seq = 49` hai, toh client khud `GET /conversations/:id/messages?afterSeq=49` maar deta hai. Metric: `seq_gap_detected_total`.
+  - **Kabhi mat sochna ki pub/sub reliable hai.** Agar tumhein reliable per-recipient delivery chahiye toh Kafka/queue lagta, par tab har socket ke liye ek queue = 10M queues. Hamara tareeka sasta aur sahi hai: **durable store + cheap push + resume.**
+
+---
+
+### 5. "Kafka `delivery` consumer group lag kar raha hai"
+
+- **Problem:** Delivery workers slow ya kam hain (deploy, rebalance, Redis slow, ya bas peak). `kafka_consumer_lag{group="delivery"}` badhta ja raha hai.
+- **Impact:** **Ye sabse dhokhebaaz failure hai** -- kuch bhi "down" nahi dikhta. Sender ko `sent` tick **turant** mil raha hai (woh Kafka se pehle hota hai). Par recipient ko message **30-60 second late** mil raha hai. User ka feel: "app kaam kar raha hai par messages atak rahe hain."
+- **Solution:**
+  - **Alert lag par, error rate par nahi.** `kafka_consumer_lag{group="delivery"} > 100000` for 2 min -> **page**. Error rate 0 hoga, isliye error-based alerting yahan andhi hai.
+  - Delivery workers ko **deliveries** par autoscale karo (`rate(deliveries_total[5m])`), messages par nahi.
+  - Worker ke andar **bounded concurrency** (jaise 32) se fan-out parallel karo -- serial fan-out hi aksar lag ki jad hoti hai.
+  - Consumer partitions 64 hain -> workers 64 se zyada mat karo, faayda nahi hoga. Us case mein pehle partitions badhane padenge.
+  - `unread-counter` group lag kare toh alag baat hai -- unread badge late hoga, message nahi. Iska threshold dheela rakho.
+
+---
+
+### 6. "Postgres primary failover ho gaya"
+
+- **Problem:** Primary crash / patch / AZ issue. Replica promote hone mein 10-30 s.
+- **Impact:** Us window mein `INSERT INTO messages` fail. Hum **`sent` ack nahi bhejte** (spec: ack tabhi jab persist ho chuka ho). Sender ko message "sending..." (clock icon) dikhta hai. **Message kho nahi raha -- bas confirm nahi hua.**
+- **Solution:**
+  - **Client retries with the same `messageId`.** Yahi poori design ka fayda hai:
+
+```ts
+// idempotent insert -- retry safe
+const row = await pg.query(
+  `INSERT INTO messages (conversation_id, seq, message_id, sender_id, body, media_key)
+   VALUES ($1, $2, $3, $4, $5, $6)
+   ON CONFLICT (conversation_id, message_id) DO UPDATE SET body = messages.body
+   RETURNING seq`,
+  [conversationId, seq, messageId, senderId, body, mediaKey],
+);
+return row.rows[0].seq;                      // hamesha pehla wala seq
+```
+
+**Code Explanation:**
+
+- `ON CONFLICT (conversation_id, message_id)` -- `messages_msgid_uniq` index par. Client ne wahi `messageId` dobara bheja, toh naya row nahi banega.
+- `DO UPDATE SET body = messages.body` -- ye ek trick hai: `DO NOTHING` likhte toh `RETURNING` **khaali** aata aur hum retry ko "fail" samajh lete. Apne hi value se "update" karke hum `RETURNING seq` guarantee kar lete hain.
+- `RETURNING seq` -- **pehle wala** seq wapas jaata hai, naya `INCR` wala nahi. Client ko dono baar **same** `ack` milta hai -> duplicate message kabhi render nahi hota.
+- Side effect: retry ne ek naya `seq` `INCR` kar liya tha jo kabhi use nahi hoga -> **sequence mein gap**. Spec kehta hai gap **acceptable** hai. Agla point dekho.
+- App level: write failure par `Retry-After` jaisa backoff, client 3 baar try kare, phir "message not sent, tap to retry" dikhaye -- **jhooth mat bolo ki chala gaya.**
+
+---
+
+### 7. "Redis wipe ho gaya -- `seq:<conversationId>` counters chale gaye"
+
+- **Problem:** Redis restart bina persistence ke, ya maxmemory eviction ne counter key uda di.
+- **Impact:** **Ye potentially sabse khatarnak failure hai.** Agar counter 0 se shuru ho gaya, toh naya message `seq = 1` lega -- jo pehle se exist karta hai. `PRIMARY KEY (conversation_id, seq)` par insert fail (achha), ya (agar upsert likha hota) purana message **overwrite** ho jaata (bahut bura).
+- **Solution:**
+  - **Rebuild, reuse nahi.** Counter missing hone par use `conversations.last_message_seq` se seed karo:
+
+```ts
+// src/services/chat.service.ts -- seq allocation with self-healing
+async nextSeq(conversationId: string): Promise<number> {
+  const key = `seq:${conversationId}`;
+  const seq = await redis.incr(key);
+  if (seq === 1) {
+    // counter missing tha -- Postgres se sach lo
+    const { last_message_seq } = await this.conversationRepo.getSeqHighWater(conversationId);
+    if (last_message_seq > 0) {
+      await redis.set(key, String(last_message_seq + 1));
+      seqRebuildTotal.inc();
+      return last_message_seq + 1;
+    }
+  }
+  return seq;
+}
+```
+
+**Code Explanation:**
+
+- `redis.incr(key)` -- key na ho toh Redis use 0 maan ke 1 return karta hai. Isliye **`seq === 1` hi hamara "counter kho gaya" signal hai** (ya sach mein conversation ka pehla message).
+- `getSeqHighWater` -- `SELECT last_message_seq FROM conversations WHERE id = $1`. Ye durable sach hai; Postgres har successful insert par ise aage badhata hai.
+- `redis.set(key, last_message_seq + 1)` -- counter ko **aage** set karo, high-water mark ke upar. Sabse zaruri line: **hum kabhi peeche nahi jaate.**
+- `seqRebuildTotal.inc()` -- alert-worthy. Healthy system mein ye flat zero hai.
+- **Gap kyun theek hai:** client `seq` ko sirf **ordering aur "kya main peeche hoon"** ke liye use karta hai -- `seq 50` ke baad `seq 57` aaya toh client `afterSeq=50` maang leta hai, server kehta hai "kuch nahi hai", aur baat khatam. Par **do messages ko same seq** dena unrecoverable corruption hai. Isliye: **gap OK, reuse NEVER.**
+
+---
+
+### 8. "Ek slow client (2G network) socket buffer bhar raha hai"
+
+- **Problem:** User train mein hai, 2G par. Hum use 50 messages/second bhej rahe hain, uska link 5/second nikaal pa raha hai. Kernel send buffer bharta hai, phir Node userland mein queue karta hai -- **unbounded**.
+- **Impact:** Ek slow client gateway ki heap khaata rehta hai. 50 aise clients ek node par = **node OOM**. Aur us node ke **50,000 healthy users** bhi gir gaye. **Production mein chat servers ka asli OOM yahi hota hai.**
+- **Solution:**
+
+```ts
+// src/gateway/backpressure.ts
+const MAX_BUFFERED = 1_048_576;   // 1 MB (spec)
+
+export function safeSend(ws: WebSocket, frame: ServerFrame, userId: string): boolean {
+  if (ws.bufferedAmount > MAX_BUFFERED) {
+    slowClientDrops.inc({ reason: 'buffer_full' });
+    logger.warn({ userId, buffered: ws.bufferedAmount }, 'slow client dropped');
+    ws.close(1013, 'try again later');
+    return false;
+  }
+  bufferedAmountHist.observe(ws.bufferedAmount);
+  ws.send(JSON.stringify(frame));
+  return true;
+}
+```
+
+**Code Explanation:**
+
+- `ws.bufferedAmount` -- kitne bytes `send()` ho chuke hain par abhi network par gaye nahi. Healthy client par ye ~0 rehta hai. Badhta hua number = client ka pipe bhara hai.
+- `> 1_048_576` -- 1 MB. Chat frames ~300 B hain, toh 1 MB ka matlab **~3,000 messages backlog** -- koi bhi asli user itna peeche nahi hota. Ye clearly ek toota hua client hai.
+- `ws.close(1013, 'try again later')` -- **client ko maarna hi daya hai.** Woh reconnect karega, `resume` bhejega, aur jo miss hua woh ek clean paginated batch mein aa jaayega -- 3,000 individual frames ke bajaye.
+- `bufferedAmountHist.observe(...)` -- histogram. p99 dekh ke tumhein pata chalta hai network kharab ho raha hai **isse pehle** ki drops shuru hon.
+- **Yaad rakho:** durability store se aati hai, socket se nahi. Isliye drop karna safe hai.
+
+---
+
+### 9. "Ek badi group ek hot conversation ban gayi"
+
+- **Problem:** 256-member group (spec ki max limit). Har member ke avg 3 devices (phone + web + tablet) = **256 x 3 = 768 deliveries ek message ke liye**. Ab us group mein 20 log ek saath "Happy New Year" bhej rahe hain: 20 msg/s x 768 = **15,360 deliveries/s -- ek conversation se.**
+- **Impact:** Kafka key `conversationId` hai, toh ye poora load **ek partition** par hai -> ek delivery worker par. Woh worker peeche pad jaata hai -> **us partition ki baaki conversations bhi late** (head-of-line blocking). Us group ke members ko ticks late dikhte hain; badkismati se unke saath partition share karne wale doosre logon ko bhi.
+- **Solution:**
+  - **Fan-out ke andar bounded concurrency:** ek message ke 768 deliveries ko serial mat karo -- 32 ki concurrency se parallel karo. Ordering safe hai kyunki **alag recipients ke beech order matter nahi karta** (per-conversation order har recipient ke liye `seq` se aata hai).
+  - **`MGET` batching:** 768 session lookups ek `MGET` mein. 768 round trips -> 1.
+  - **Gateway-level coalescing:** ek hi gateway par us group ke 40 members ho sakte hain -> delivery worker unhe ek hi `PUBLISH gw:<nodeId>` frame mein bhej sakta hai jisme recipient list ho. Gateway 40 socket writes karta hai. Network frames 40 -> 1.
+  - **`fanout_size` histogram** rakho -- p99 = 768 hi woh number hai jo tumhari tail latency explain karta hai (PART 20).
+  - **256 ki limit kyun hai:** isse bada karo toh fan-out aur receipts dono phat-te hain (1000 members x 3 devices = 3,000 deliveries + 3,000 receipt events **per message**). Badi audiences ke liye alag design chahiye -- broadcast channel, jahan receipts hote hi nahi.
+
+---
+
+### 10. "Ek user ka device reconnect loop mein fasa hai"
+
+- **Problem:** Ek buggy app version: auth fail hone par turant reconnect karta hai, bina backoff. Ya user ka network har 2 second mein flap kar raha hai. Ek device 500 connect/s maar raha hai.
+- **Impact:** Har connect = TLS handshake + JWT verify + Redis writes. Ek device ek gateway node ka CPU kha sakta hai. Hazaaron aise devices (bad release) = **poore fleet par self-DDoS**.
+- **Solution:**
+  - **Per-user connect rate limit** (Rate Limiter lesson ka token bucket wapas): `ratelimit:connect:<userId>` -- 10 connects/min. Cross karne par `429`-equivalent close code aur `Retry-After` jaisa hint bhejo.
+  - Edge par **per-IP connect limit** (nginx `limit_conn` / WAF) -- Node tak aane se pehle hi ruk jaaye.
+  - `reconnect_storm_rate` metric: connects/s vs active connections ka ratio. Healthy system mein ye bahut kam hota hai (connections ghanton chalte hain). Achanak spike = ya node gaya, ya koi client bug.
+  - **Auth failure par client ko backoff karna chahiye aur retry limit chahiye** -- `4001` par app ko re-login flow dikhana chahiye, loop nahi.
+
+---
+
+### 11. "User ko ek hi message do baar dikh raha hai"
+
+- **Problem:** At-least-once delivery ka natural nateeja. Delivery worker ne publish kiya, gateway ne likha, phir worker crash hua **offset commit se pehle** -> Kafka ne message dobara diya -> dobara publish -> user ko do baar.
+- **Impact:** Chat mein duplicate bahut ganda dikhta hai ("kya maine do baar bheja?"). Par ye **recoverable** hai; message **kho jaana** nahi hai.
+- **Solution:**
+  - **Client-side dedup by `messageId`** (spec ka decision). Client ek `Set<messageId>` (ya local DB ka unique index) rakhta hai; already-seen id aaye toh chup-chaap ignore.
+  - Server side bhi: `messages_msgid_uniq` insert ko idempotent banata hai, toh store mein kabhi duplicate row nahi.
+  - **Exactly-once network par possible nahi hai** -- ye interview mein confidently bolne wali line hai. Tum sirf choose kar sakte ho: at-most-once (message kho sakta hai) ya at-least-once (duplicate ho sakta hai) + dedup. **Chat mein kho jaana unacceptable hai, duplicate sirf badsurat hai** -> at-least-once + dedup.
+
+---
+
+### 12. "Server clocks alag hain -- timestamps bekaar ho gaye"
+
+- **Problem:** Do chat service instances, NTP drift ke saath 200 ms alag. Ya user ne apne phone ka time 2 din peeche kar diya.
+- **Impact:** Agar hum **timestamp se order** karte, toh message B (jo baad mein bheja gaya) message A se **upar** dikh sakta -- conversation ka matlab hi ulta ho jaata. Phone ka time badalne wala user apne message ko 1990 mein bhej sakta hai.
+- **Solution (spec ka decision, dohrane layak):**
+  - **Ordering `seq` se hoti hai, hamesha.** `seq` ek hi jagah se aata hai (`INCR seq:<conversationId>`), isliye us conversation ke liye ek hi ghadi hai. Clock skew ka koi asar nahi.
+  - **`createdAt` sirf display ke liye hai**, aur woh **server** set karta hai, client nahi. Client ka bheja hua time kabhi trust mat karo.
+  - UI mein order hamesha `seq` se; "10:42 AM" label `createdAt` se. Do messages ka same-minute label ho sakta hai -- theek hai, order phir bhi sahi hai.
+  - NTP sab nodes par chalao (skew kam rahega toh latency metrics bhi sahi rahenge -- PART 20), par **correctness NTP par depend nahi karti.** Ye design ki khoobsurti hai.
+
+---
+
+### 13. "Push notification provider (FCM/APNs) down hai"
+
+- **Problem:** Recipient offline hai (koi session registry entry nahi). `push-notifier` worker FCM ko call karta hai -- FCM 503 de raha hai ya timeout.
+- **Impact:** User ke lock screen par notification nahi aayi. **Message phir bhi store mein hai.**
+- **Solution:**
+  - **Push ko best-effort maano.** Retry with backoff (3 tries), phir chhod do. `offline_push_total{result="failed"}` metric.
+  - **Kabhi bhi** push failure par `sent` ack ko rok mat do -- sender ka tick push se koi rishta nahi rakhta.
+  - User jab app kholta hai, `resume` chalta hai aur saare messages aa jaate hain. **Sabse bura outcome: notification miss, message nahi.**
+  - Invalid push token (`UNREGISTERED`) par token ko `devices` table se hata do -- warna wahi failure roz repeat hoti rahegi.
+  - Dead-letter queue un events ke liye jinki retries khatam ho gayin -- debugging ke liye, replay ke liye nahi (purana notification bhejna bekaar hai).
+
+---
+
+### 14. "User ek mahine baad app khol raha hai -- 10,000 messages pending hain"
+
+- **Problem:** `resume` frame aata hai `lastSeqByConversation` ke saath jo 30 din purana hai. 40 conversations x avg 250 messages = **10,000 messages ek `resume` mein**.
+- **Impact:** Agar hum sab ek saath bhej dein: ~3 MB ek socket par -> `bufferedAmount` turant 1 MB cross -> **hamara apna backpressure rule us client ko drop kar dega** -> woh reconnect karega -> phir wahi 10,000 -> **infinite loop**. Ye ek asli production bug hai jo apne hi safety mechanism se paida hota hai.
+- **Solution:**
+  - **`resume` ko cap karo:** per conversation max 50 messages, per resume max 500 total. Response mein `hasMore: true` bhejo.
+  - Client baaki ke liye REST pagination kare: `GET /api/v1/conversations/:id/messages?afterSeq=1200&limit=50`. Ye **backpressure-friendly** hai -- client apni raftaar se maangta hai.
+  - Agar gap bahut bada hai (jaise > 1,000 messages), resume ko chhodo aur client ko **"load earlier messages"** dikhao -- 30 din purana conversation user turant padhne wala nahi hai.
+  - Conversation list pehle bhejo (last message preview + unread count), **poori history baad mein**. User ko screen 200 ms mein bhari hui dikhni chahiye, 30 second mein nahi.
+
+---
+
+### 15. "Delivery worker fan-out ke beech mein crash ho gaya"
+
+- **Problem:** Worker ne 768 mein se 400 deliveries ki, phir crash. Kafka offset commit nahi hua.
+- **Impact:** Rebalance ke baad doosra worker wahi message dobara uthata hai aur **poore 768** dobara karta hai. 400 users ko duplicate.
+- **Solution:** #11 wala hi -- client dedup by `messageId`. Isiliye **offset commit hamesha fan-out ke baad** karo (at-least-once), pehle nahi (woh at-most-once ban jaata aur messages kho jaate). Aur rebalance ko kam karo: `session.timeout.ms` sahi rakho, deploys par static group membership use karo taaki har restart poora rebalance na kare.
+
+---
+
+### 16. "Load balancer node ya poori AZ chali gayi"
+
+- **Problem:** Ek AZ down. Us AZ ke gateways aur LB nodes gaye -- maano hamare 250 mein se ~83 nodes.
+- **Impact:** ~4.2M connections ek saath toote. Ye #1 ka bada version hai.
+- **Solution:** Gateways ko **3 AZ** mein barabar failao, aur capacity ko **N+1 AZ** par plan karo (yaani ek AZ ka load baaki do sambhal lein -- 250 nodes ka matlab hi yahi hai, 200 nahi). Full-jitter backoff ab 4.2M clients ko 30 s mein failata hai. DNS TTL chhota rakho taaki clients healthy LB endpoints par jaayein. Ye woh moment hai jab 25% headroom ka bill justify hota hai.
+
+### Failure summary
+
+| Failure | Detect kaise | Fallback |
+|---|---|---|
+| Gateway crash | `ws_connections_active{node}` ka cliff | Full-jitter reconnect + headroom |
+| Rolling deploy storm | `ws_connect_total` spike deploy ke waqt | Staggered drain + close `1012` |
+| Registry Redis down | `deliveries_total{result="no_session"}` spike | Persist + resume; push fallback |
+| Pub/sub drop | `seq_gap_detected_total` | Client gap detection + resume |
+| Kafka lag | `kafka_consumer_lag{group="delivery"}` | Autoscale on deliveries, bounded concurrency |
+| Postgres failover | Send error rate, `message_send_duration_seconds` p99 | Client retry same `messageId` |
+| seq counter lost | `seq_rebuild_total` > 0 | Rebuild from `last_message_seq`, never reuse |
+| Slow client | `slow_client_drops_total`, buffered p99 | Drop at 1 MB, close `1013` |
+| Hot conversation | `fanout_size` p99, per-partition lag | Bounded concurrency + MGET + coalescing |
+| Reconnect loop | `reconnect_storm_rate` | Per-user connect limit |
+| Duplicates | Client-side (report) | Dedup by `messageId` |
+| Push provider down | `offline_push_total{result="failed"}` | Best-effort; resume covers it |
+| Month-old sync | Resume payload size | Cap + paginate + "load earlier" |
+
+---
+
+## PART 18 -- Consistency
+
+### Teen words, simple Hinglish mein
+
+- **Strong consistency:** jaise hi value badli, **har** padhne wala turant nayi value dekhega. Ek hi cash register -- sab usi ko dekhte hain.
+- **Eventual consistency:** abhi kuch log purani value dekh sakte hain, thodi der mein sab same ho jaayenge. Jaise ek dost ke phone par tumhara "online" 40 second baad update hona.
+- **Read-after-write consistency:** **jisne likha, woh turant apna likha hua dekhe.** Baaki thoda late dekhein toh chalega. Chat mein ye **sabse zaruri** wala hai -- neeche dekho.
+
+### Is system mein kahan kya?
+
+| Cheez | Guarantee | Kaise milta hai |
+|---|---|---|
+| **Per-conversation ordering** | **STRONG** | `INCR seq:<conversationId>` (single atomic counter) + `PRIMARY KEY (conversation_id, seq)` |
+| **Global ordering (across conversations)** | **Guarantee NAHI** | Zarurat hi nahi -- neeche example |
+| **Delivery** | At-least-once + client dedup | Kafka at-least-once, `messageId` dedup |
+| **Presence / last-seen** | **Eventual, 30-90 s stale** | `presence:<userId>` TTL 90 s, heartbeat refresh |
+| **Receipts (`last_read_seq`)** | **Monotonic** (kabhi peeche nahi) | `GREATEST()` update |
+| **Sender ka apna message** | **Read-your-writes** | Optimistic local render + `ack` se reconcile |
+| **Multi-device convergence** | Eventual, par **converge guaranteed** | `seq` + `resume` |
+| **Unread count** | Eventual (Redis), recomputable | `lastMessageSeq - last_read_seq` |
+
+---
+
+### 1. Per-conversation ordering -- STRONG (aur ye non-negotiable hai)
+
+Ek conversation ke messages har device par **same order** mein dikhne hi chahiye. Warna:
+
+```
+Priya ka phone:              Priya ka laptop:
+  Sam: "haan chalo"            Sam: "movie chalein?"
+  Sam: "movie chalein?"        Sam: "haan chalo"
+```
+
+Baat ka matlab hi ulta ho gaya. Isliye:
+
+- **`INCR seq:<conversationId>`** atomic hai (Redis single-threaded) -- do concurrent senders ko **kabhi** same number nahi milega.
+- **`PRIMARY KEY (conversation_id, seq)`** database mein ise enforce karta hai. Agar kisi bug se do messages same seq maangen, toh doosra insert **fail** ho jaayega -- silently corrupt nahi hoga. **Ye "belt and suspenders" hai: Redis speed deta hai, PK sach ki guarantee deta hai.**
+- Clients hamesha `seq` se sort karte hain, arrival order se nahi.
+
+### 2. Global ordering -- NAHI, aur ye bilkul theek hai
+
+**Global ordering ka matlab hota:** poore system ke **saare** messages ka ek hi numbering. 70K msg/s par ek global counter = ek single bottleneck jo poora system gira dega (ya Lamport/vector clocks ka poora distributed consensus ka pahaad).
+
+**Kyun zarurat nahi -- ek example:**
+
+Priya do chats mein hai. 10:00:00.100 par Sam ne "Chat A" mein likha; 10:00:00.150 par Riya ne "Chat B" mein likha.
+
+- Priya ke phone par Chat A wala pehle aaya, Chat B wala baad mein.
+- Priya ke laptop par network ke chakkar mein **ulta** ho gaya.
+
+**Kya kuch toota?** Kuch nahi. Dono alag conversations hain -- unke messages ek doosre ka jawab nahi hain. Chat list mein order thoda alag ho sakta hai (jo waise bhi `createdAt` se sort hoti hai), aur kisi ko pata bhi nahi chalega.
+
+> Interview line: "Main per-conversation ordering ko strong rakhta hoon aur global ordering ko explicitly chhod deta hoon. Ordering ki zarurat wahan hai jahan **causality** hai -- ek hi baatcheet ke messages. Do alag conversations ke beech causality hai hi nahi, aur global order khareedne ke liye ek global sequencer lagta jo 70K msg/s par poora system throttle kar deta."
+
+### 3. Delivery -- at-least-once + client dedup
+
+Network par exactly-once **possible nahi** hai (ack kho sakta hai, aur bhejne wale ko pata nahi chalega ki message pahuncha ya ack kho gaya).
+
+| Choice | Chat mein nateeja |
+|---|---|
+| At-most-once | Message chup-chaap kho jaata hai -> **trust khatam** |
+| **At-least-once + dedup** | Kabhi kabhi duplicate -> client `messageId` se chhaant deta hai |
+
+**Effectively-once at the user level** -- yahi hum deliver karte hain. Word "exactly-once" interview mein bolne se pehle ye distinction bolna.
+
+### 4. Presence -- **jaan-boojh ke** eventual
+
+`presence:<userId>` ka TTL 90 s hai, heartbeat har 30 s. Matlab:
+
+```
+t=0s    user ne app band kiya (socket clean close) -> hum key turant DEL karte hain -> accurate
+t=0s    user ka network achanak gaya (no close frame) -> key tab tak zinda jab tak TTL na kate
+t=90s   key expire -> ab "offline"
+```
+
+Yaani **worst case 90 second tak hum jhooth bol rahe hain** ki user online hai.
+
+**Aur ye product mein literally dikhta hai:** "last seen 2 minutes ago". WhatsApp ka wo text isi staleness ka UI roop hai. Product ne is technical compromise ko **feature** bana diya -- "abhi-abhi tha yahan" kaafi hai, millisecond accuracy kisi ko nahi chahiye.
+
+**Strong presence banane ki keemat:** har disconnect ko turant detect karna (TCP ko 2 minute lag sakte hain), har flip ko us user ke **saare** contacts tak pahunchana = spec ka N-squared problem (10M users x 200 contacts = 2B notifications per flip). **Kabhi mat karna.**
+
+### 5. Receipts -- monotonic (sirf aage badhte hain)
+
+`last_read_seq` aur `last_delivered_seq` **kabhi peeche nahi ja sakte.**
+
+Kyun ye zaruri hai: receipts out of order aa sakte hain (do devices, network jitter). Agar phone ne `read seq=50` bheja aur phir laptop ka purana `read seq=30` aaya, aur hum blindly likh dete, toh sender ka **blue tick wapas grey ho jaata** aur recipient ka **unread badge phir se dikhne lagta**. User ke liye ye "bug" jaisa nahi, "bhoot" jaisa lagta hai.
+
+```sql
+UPDATE conversation_members
+   SET last_read_seq = GREATEST(last_read_seq, $3)
+ WHERE conversation_id = $1 AND user_id = $2;
+```
+
+**Code Explanation:**
+
+- `GREATEST(last_read_seq, $3)` -- naya value tabhi lagta hai jab woh purane se **bada** ho. Purana/out-of-order receipt chup-chaap no-op ban jaata hai.
+- Koi read-modify-write nahi, koi lock nahi -- ek hi atomic statement, isliye do concurrent receipts bhi safe hain.
+- Yahi pattern Redis unread counter par bhi: unread ko `DECR` mat karo, `lastMessageSeq - last_read_seq` se **compute** karo. Computed value kabhi drift nahi karti.
+
+### 6. Read-your-writes -- **sender ka apna message**
+
+Ye chat ka sabse zaroori consistency rule hai, aur sabse aasaani se bhula diya jaata hai.
+
+Agar Priya "hello" bheje aur use apni screen par **500 ms baad** dikhe (server round trip ke baad), toh app **toota hua** lagta hai. Chahe woh 500 ms technically SLO ke andar ho.
+
+**Solution: optimistic local render.**
+
+```
+1. Priya types "hello", presses send
+2. Client turant:
+     - messageId = uuidv4()
+     - message ko local list mein daalo, state = 'pending'  -> UI mein ek chhoti ghadi (clock icon)
+     - frame bhejo: { type: 'send', messageId, conversationId, body }
+3. Server: authorize -> INCR seq -> persist -> ack
+4. Client par ack aaya: { type:'ack', messageId, seq, serverTs }
+     - wahi local message dhoondo messageId se
+     - state 'pending' -> 'sent'  (ek grey tick)
+     - seq aur serverTs set karo -> ab ye list mein sahi jagah sort hota hai
+```
+
+- **Ordering safe rehta hai** kyunki final position `seq` se aati hai, local guess se nahi. Pending message list ke **end** mein dikhta hai (jo sach ke sabse kareeb hai) aur `ack` ke baad apni asli jagah le leta hai.
+- Agar ack 10 s mein nahi aaya -> `pending` se `failed`, "tap to retry" -- **wahi `messageId` ke saath** (idempotency).
+- **Ye ek UI trick nahi hai, ye ek consistency decision hai:** hum sender ko read-your-writes de rahe hain jabki system ka baaki hissa eventual hai.
+
+### 7. Multi-device convergence
+
+Priya ke teen devices hain: phone, laptop, tablet (2 hafte se band).
+
+**Guarantee:** teeno ko aakhir mein **bilkul same history, same order** milegi. Kaise:
+
+- History ka sach ek hi jagah hai: `messages` table, `(conversation_id, seq)` se ordered. Koi per-device copy nahi (News Feed ki tarah fan-out-on-write nahi -- **yahi dono systems ka farak hai**).
+- Har device apna `lastSeqByConversation` khud rakhta hai aur `resume` par jo missing hai woh maang leta hai.
+- Tablet 2 hafte baad khula -> `resume` -> paginated backfill (PART 17 #14) -> converge.
+- **Receipts bhi devices ke beech share hote hain:** Priya ne laptop par chat padha, toh phone ka unread badge bhi hat-na chahiye. Isiliye `last_read_seq` **per user** hai, **per device** nahi. Receipt aane par server usi user ke baaki devices ko bhi `receipt` frame bhejta hai.
+
+**Ye "eventual" hai (tablet abhi peeche hai) par "convergent" hai (tablet pakka pahunchega).** Ye farak bolna: eventual consistency ka matlab "kabhi bhi kuch bhi" nahi hai, matlab hai "guaranteed convergence, bas abhi nahi."
+
+> Interview line: "Per-conversation ordering strong hai -- Redis `INCR` plus `(conversation_id, seq)` primary key. Global ordering main jaan-boojh ke nahi deta kyunki alag conversations ke beech causality nahi hoti aur global sequencer 70K msg/s par bottleneck ban jaata. Delivery at-least-once hai, client `messageId` se dedup karta hai. Presence eventual hai aur 90 second tak stale ho sakti hai -- 'last seen 2 minutes ago' usi ka UI hai. Receipts monotonic hain `GREATEST` se. Aur sender ke liye read-your-writes optimistic local render se, ack par reconcile."
+
+---
+
+## PART 19 -- Security
+
+Ek WebSocket connection **ghanton, kabhi-kabhi dinon** khula rehta hai. Iska matlab har woh security assumption jo "har request par check hota hai" wali duniya mein thi, yahan dobara sochni padegi.
+
+### Threat -> defence map
+
+| Threat | Defence |
+|---|---|
+| Token URL se leak (logs, proxy, Referer) | Auth **first frame** mein, query string mein kabhi nahi |
+| Connection dino tak khula, token expire ho gaya | Socket par periodic re-auth |
+| Kisi aur ki conversation mein message bhej dena | **Har send par** membership check (Redis TTL 300 s) |
+| Cross-Site WebSocket Hijacking (CSWSH) | `Origin` header validation (CORS yahan lagta hi nahi) |
+| Ek connection se flooding | Per-connection token bucket + 4 KB size cap |
+| Media URL forward hoke hamesha ke liye public | Presigned URL, chhoti expiry |
+| Spam / new-account abuse | New-account limits, block list, report flow |
+| Message body logs mein | Log allow-list, body kabhi nahi |
+
+---
+
+### 1. Authentication on connect -- token **first frame** mein, URL mein nahi
+
+**Sabse tempting galti:**
+
+```
+wss://chat.example.com/ws?token=eyJhbGciOi...     <-- [X] KABHI NAHI
+```
+
+Ye tempting hai kyunki browser ka `WebSocket` constructor custom headers **allow nahi karta** -- toh log token ko query string mein daal dete hain. Par query string leak hoti hai:
+
+- **LB / nginx access logs** -- poora URL, plain text, mahino tak retain, aur log aggregation system tak jaata hai jise poori company padh sakti hai.
+- **Proxies aur APM tools** -- URL ko span name / metric label bana lete hain.
+- **Browser history aur Referer** -- agar page kahin navigate kare.
+- **Error tracking (Sentry)** -- breadcrumbs mein URL.
+
+Ek leaked token = kisi ki poori chat.
+
+**Spec ki choice: connect karo bina auth ke, phir pehla frame `{ type: 'auth', token, deviceId }` bhejo.**
+
+```ts
+// src/gateway/ws-server.ts -- auth as the first frame
+const AUTH_TIMEOUT_MS = 5_000;
+
+wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+  let session: Session | null = null;
+
+  const authTimer = setTimeout(() => {
+    if (!session) ws.close(4001, 'auth timeout');      // spec: 4001 = auth failure
+  }, AUTH_TIMEOUT_MS);
+
+  ws.on('message', async (raw) => {
+    if (raw.length > 4096) return ws.close(1009, 'frame too large');
+    const frame = parseFrame(raw);                      // safe JSON parse + zod validate
+
+    if (!session) {
+      if (frame?.type !== 'auth') return ws.close(4001, 'auth required');
+      const claims = await verifyJwt(frame.token);      // signature + exp + aud + iss
+      if (!claims) { wsAuthFailures.inc(); return ws.close(4001, 'invalid token'); }
+
+      clearTimeout(authTimer);
+      session = { userId: claims.sub, deviceId: frame.deviceId, expiresAt: claims.exp * 1000 };
+      await sessionRepo.bind(session, NODE_ID);         // SET conn:<userId>:<deviceId> = nodeId EX 90
+      return ws.send(JSON.stringify({ type: 'auth_ok', userId: session.userId }));
+    }
+
+    await frameRouter.handle(session, frame, ws);
+  });
+});
+```
+
+**Code Explanation:**
+
+- `AUTH_TIMEOUT_MS = 5_000` -- agar 5 second mein auth frame nahi aaya toh socket band. Iske bina koi bhi laakhon unauthenticated sockets khol ke tumhari memory kha sakta hai (har socket 20 KB). **Ye sirf auth nahi, DoS protection bhi hai.**
+- `raw.length > 4096` -- **auth se pehle** size check. Warna attacker 100 MB ka frame bhej ke node ko OOM kar sakta hai bina login kiye. Spec ka max message 4 KB hai.
+- `if (!session)` gate -- jab tak session nahi bana, **sirf** `auth` frame allowed. `send`, `receipt`, `typing` sab reject. Ye "unauthenticated state machine" explicit hona chahiye, implicit nahi.
+- `verifyJwt` -- signature ke saath `exp`, `aud`, `iss` bhi check karo. Sirf signature verify karna classic bug hai (kisi doosre service ka valid token yahan chal jaayega).
+- `close(4001, ...)` -- spec ka custom code. Client ise "re-login chahiye" samajhta hai aur **reconnect loop nahi** banata (PART 17 #10).
+- `sessionRepo.bind(...)` -- ab jaake registry mein entry banti hai. Auth se **pehle** kabhi bind mat karo.
+- Browser `WebSocket` headers nahi de sakta -- isiliye first-frame auth. Mobile apps `Authorization` header de sakte hain (unke liye woh bhi theek hai), par ek hi raasta rakhna simpler hai.
+
+### 2. Token expiry on a long-lived connection
+
+**Problem:** JWT ki `exp` 1 ghanta hai. Connection 3 din khula reh sakta hai. Agar hum sirf connect par check karein, toh ek user ka access **days** tak zinda rehta hai -- chahe usne logout kiya ho, password badla ho, ya account suspend hua ho. Stateless HTTP mein har request naya token laati thi; **yahan woh natural checkpoint hai hi nahi.**
+
+**Solution:**
+- Session object mein `expiresAt` rakho. Har ~60 s ka server timer (ya heartbeat ke saath) check kare:
+  - `expiresAt - now < 5 min` -> server bhejta hai `{ type:'error', code:'REAUTH_REQUIRED' }`; client naya token lekar `auth` frame dobara bhejta hai **usi socket par**.
+  - `expiresAt` nikal gaya aur re-auth nahi aaya -> `close(4001)`.
+- **Revocation (logout / ban) ko ek TTL se zyada intezaar nahi karna chahiye:** ek `revoked:<userId>` Redis key ya version number rakho; gateway use heartbeat par check kare (sirf tab jab version cache stale ho). Suspended user ka socket 30 s ke andar kat jaana chahiye, 1 ghante mein nahi.
+- Refresh token **socket par kabhi mat bhejo** -- refresh HTTPS endpoint par ho, socket sirf naya short-lived access token le.
+
+### 3. **Authorization on every single send** -- system ka sabse bada hole
+
+Auth kehta hai "tum Priya ho". Authorization kehta hai "Priya is conversation ki member hai".
+
+**Agar tum ye skip karo, toh koi bhi authenticated user kisi bhi conversation ka `conversationId` guess/leak karke usme message bhej sakta hai** -- ajnabiyon ki private chat mein. Aur kyunki fan-out authorization ke baad hota hai, woh message legit dikhega. **Ye is system ka single biggest security hole hai** (spec ke shabdon mein).
+
+```ts
+// src/services/chat.service.ts
+const MEMBER_TTL_S = 300;       // spec
+const NEGATIVE_TTL_S = 30;
+
+async assertMember(conversationId: string, userId: string): Promise<void> {
+  const key = `member:${conversationId}:${userId}`;
+  const cached = await redis.get(key);
+  if (cached === '1') return;
+  if (cached === '0') throw new AppError(403, 'NOT_A_MEMBER');
+
+  const row = await this.conversationRepo.findMember(conversationId, userId);
+  await redis.set(key, row ? '1' : '0', 'EX', row ? MEMBER_TTL_S : NEGATIVE_TTL_S);
+  if (!row) {
+    authzDenied.inc({ reason: 'not_a_member' });
+    throw new AppError(403, 'NOT_A_MEMBER');
+  }
+}
+```
+
+**Code Explanation:**
+
+- `member:${conversationId}:${userId}` -- cache key. 70K sends/s par har send ek Postgres query nahi kar sakta; TTL 300 s se ~99.9% sends Redis se ban jaate hain (~0.2 ms).
+- `cached === '0'` -- **negative caching.** Agar koi attacker random conversation ids try kar raha hai, toh bina iske har attempt ek Postgres query hai -- yaani authorization check khud ek DoS vector ban jaata. Negative entry uski har koshish ko sasta bana deti hai.
+- `NEGATIVE_TTL_S = 30` -- negative TTL **chhoti** rakho. Abhi-abhi group mein add hua user 5 minute tak "not a member" nahi dikhna chahiye. Positive 300, negative 30 -- ye asymmetry jaan-boojh ke hai.
+- **Removal par cache stale ho jaata hai:** group se nikale gaye user ka `'1'` 300 s tak cached rahega -- woh 5 minute tak bhej sakta hai. Isliye member remove karte waqt **explicitly `DEL member:<conversationId>:<userId>`** karo (aur multi-node ke liye ek invalidation publish). TTL safety net hai, primary mechanism nahi.
+- `authzDenied.inc(...)` -- is metric ka spike **attack ka pehla signal** hai. Normal users kabhi non-member conversation mein nahi bhejte.
+- Yahi check `receipt` aur `typing` frames par bhi chahiye, aur `GET /conversations/:id/messages` par bhi -- **padhna bhejne se zyada sensitive hai.**
+
+### 4. Cross-Site WebSocket Hijacking (CSWSH) -- aur `Origin` kyun
+
+**Ye interview ka behtareen point hai kyunki zyadatar log yahin phisalte hain.**
+
+> **CORS WebSockets par lagta hi nahi.** Browser `wss://` connection ke liye koi preflight nahi bhejta aur `Access-Control-Allow-Origin` ko honor nahi karta. Matlab `evil.com` ka JavaScript **seedha** `new WebSocket('wss://chat.example.com/ws')` kar sakta hai -- aur agar tum cookies se auth karte ho, toh browser **cookies bhej dega** (cookies origin se nahi, domain se attach hoti hain). Ab evil.com victim ki chat padh raha hai. Isi ko **Cross-Site WebSocket Hijacking** kehte hain.
+
+**Do bachav (dono lagao):**
+
+1. **Origin validation handshake par** -- kyunki browser `Origin` header khud set karta hai aur page uska jhooth nahi bol sakta.
+2. **Cookie se auth mat karo** -- hamara first-frame token isliye bhi achha hai: browser token ko apne aap attach nahi karta, evil.com ke paas woh hai hi nahi.
+
+```ts
+// src/gateway/ws-server.ts -- Origin check on the HTTP upgrade
+const ALLOWED_ORIGINS = new Set([
+  'https://chat.example.com',
+  'https://web.chat.example.com',
+]);
+
+httpServer.on('upgrade', (req, socket, head) => {
+  const origin = req.headers.origin;
+
+  if (typeof origin === 'string' && !ALLOWED_ORIGINS.has(origin)) {
+    wsRejected.inc({ reason: 'bad_origin' });
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+```
+
+**Code Explanation:**
+
+- `httpServer.on('upgrade', ...)` -- WebSocket ek HTTP request se shuru hota hai (`Upgrade: websocket`, `101 Switching Protocols`). Ye us handshake ko intercept karta hai -- **socket banne se pehle**, taaki reject karne mein ek byte bhi zaya na ho.
+- `req.headers.origin` -- **browsers ise hamesha bhejte hain aur page ise badal nahi sakta.** Yahi is defence ki jad hai.
+- `typeof origin === 'string' && !ALLOWED_ORIGINS.has(origin)` -- note: agar `origin` **hai hi nahi** toh hum allow kar rahe hain. Kyun? Native mobile apps aur server-to-server clients `Origin` bhejte hi nahi. **Aur non-browser clients ke liye CSWSH problem hoti bhi nahi** (woh victim ka browser nahi hai, unke paas victim ka token hai hi nahi). Browser hone par check sakht, non-browser par auth khud raksha karta hai.
+- `ALLOWED_ORIGINS` ek **exact-match Set** hai. `origin.endsWith('example.com')` mat likhna -- `evil-example.com` pass ho jaayega. Ye ek bahut common CVE-class bug hai.
+- `socket.write('HTTP/1.1 403 ...')` + `destroy()` -- clean HTTP-level reject.
+- **Aur haan: `Origin` check auth ki jagah nahi hai.** Ye sirf browser-based CSWSH ko rokta hai. Auth phir bhi first frame mein hona hi chahiye.
+
+### 5. Rate limiting per connection
+
+Ek authenticated user bhi 10,000 frames/second bhej sakta hai. Socket khula hai, koi HTTP layer nahi jo beech mein roke.
+
+- **Token bucket per user** (Rate Limiter lesson wapas): `ratelimit:send:<userId>` -- jaise 30 messages / 10 s burst, refill 5/s. Cross -> `{ type:'error', code:'RATE_LIMITED' }` aur baar-baar ho toh `close(1013)`.
+- **Alag buckets alag frames ke liye:** `typing` bahut zyada aata hai par sasta hai (3 s throttle client par, server par bhi enforce karo); `send` mehnga hai (DB write + fan-out); `receipt` beech mein.
+- **Size limit har frame par: 4 KB** (spec), handler ke **pehle** check ho (upar wala code).
+- **Connect rate limit** per user aur per IP (PART 17 #10).
+- **Group creation / member add** par bhi limit -- warna spam bot 500 groups bana ke sabko add kar dega.
+
+### 6. Media URL security -- presigned, chhoti expiry
+
+- Upload: `POST /api/v1/media/presign` -> S3 presigned PUT URL, **expiry 5 minute**, `Content-Type` aur `sizeBytes` fix. Server `mediaKey` generate karta hai (randomly, guessable nahi -- `media/2026/09/<uuid>`).
+- Download: bucket **private**; padhne ke liye bhi presigned GET, **expiry 15 minute**, aur **sirf** us user ko diya jaaye jo us conversation ka member hai (wahi `assertMember`).
+- **Permanent public URL kyun zeher hai:** ek baar ek dost ne woh URL forward kar diya (WhatsApp par, email mein, ek screenshot mein), toh woh **hamesha ke liye** public hai. User ne message delete kar diya, account delete kar diya -- URL phir bhi kaam karta hai. Chhoti expiry ka matlab leak ki "shelf life" minute bhar hai, anant nahi.
+- CloudFront ke saath **signed URLs / signed cookies** use karo -- CDN pe cache hone ke bawajood authorization bana rahe.
+- Upload par **content-type validation aur malware scan** (async, Kafka consumer) -- media ek attack vector hai.
+
+### 7. Spam aur abuse
+
+| Control | Kya rokta hai |
+|---|---|
+| **New-account send limits** (pehle 24 ghante: 20 naye conversations, 100 messages) | Bulk spam accounts -- spammer ko warm-up ka waqt lagta hai, jo mahenga hai |
+| **Block list** (`blocked:<userId>` set) -- send par check | Harassment. Blocked sender ko `sent` ack milta hai par delivery nahi hoti (**silent block** -- warna woh naya account banayega) |
+| **Report flow** -- report par last 20 messages ka snapshot + metadata | Moderation ko evidence milta hai |
+| **Unknown-sender throttle** -- jisse pehle kabhi baat nahi hui, usko kam rate | Cold outreach spam |
+| **Device / phone verification** | Account farming |
+
+### 8. PII in logs -- **message body kabhi nahi**
+
+Message body **sabse sensitive data** hai jo is system mein hai. Ek accidental `logger.info({ frame })` poore logging pipeline mein chat bhej deta hai -- jise dozens engineers padh sakte hain, jo 90 din retain hota hai, aur jo teesre-party SaaS par jaata hai.
+
+```ts
+// src/infra/logger.ts
+export function frameLogFields(session: Session, frame: ClientFrame) {
+  return {                                  // explicit ALLOW-LIST, not a deny-list
+    userId: session.userId,
+    deviceId: session.deviceId,
+    frameType: frame.type,
+    conversationId: 'conversationId' in frame ? frame.conversationId : undefined,
+    messageId: 'messageId' in frame ? frame.messageId : undefined,
+    bodyLength: 'body' in frame ? frame.body?.length : undefined,   // length, not content
+    hasMedia: 'mediaKey' in frame ? Boolean(frame.mediaKey) : undefined,
+  };
+}
+```
+
+**Code Explanation:**
+
+- **Allow-list, deny-list nahi.** `redact: ['body']` likhna tempting hai par agla developer `caption` ya `quotedText` field add karega aur woh chup-chaap log ho jaayegi. Allow-list mein naya field **by default log nahi hota** -- ye fail-safe direction hai.
+- `bodyLength` -- debugging ke liye length kaafi hai ("4 KB ke messages fail ho rahe hain"), content ki zarurat nahi.
+- `messageId` aur `conversationId` **ids** hain, content nahi -- inse hum ek complaint ko trace kar sakte hain bina message padhe.
+- Phone numbers / emails bhi mat log karo -- `userId` (UUID) hi kaafi hai, aur usse identity sirf woh nikal sakta hai jiske paas DB access ho.
+- `Authorization` header aur `auth` frame ka `token` **kabhi nahi** -- pino `redact` se bhi aur code review se bhi.
+
+### 9. E2EE -- imaandaar paragraph
+
+**E2EE (end-to-end encryption)** matlab message sender ke device par encrypt ho aur sirf recipient ke device par decrypt ho -- **server ke paas key nahi hoti**, isliye server plaintext dekh hi nahi sakta.
+
+**Kya fix karta hai:** server breach ho jaaye toh bhi attacker ko sirf ciphertext milta hai. Rogue insider chat nahi padh sakta. Legal demands par tum content de hi nahi sakte (kyunki hai hi nahi). **Ye badi jeet hai.**
+
+**Kya NAHI fix karta:** metadata phir bhi tumhare paas hai -- kaun kisse, kab, kitni baar baat karta hai. Aur metadata aksar content jitna hi revealing hota hai. E2EE spam, abuse aur account takeover bhi nahi rokta.
+
+**Keemat (isiliye spec ne v1 mein nahi liya):**
+- **Server-side search khatam** -- ciphertext mein search nahi ho sakti. Search client par, sirf local history par.
+- **Server-side fan-out ka matlab badal jaata hai** -- ab har **recipient device** ke liye alag encrypted copy chahiye (Signal protocol mein per-device session). Hamara 768-delivery fan-out 768 **encryption operations** ban jaata hai.
+- **Multi-device sync mushkil** -- naye device ke paas purani keys nahi hain. WhatsApp ko iske liye poora "device linking + history transfer" system banana pada, aur web client saalon tak phone se tethered raha.
+- **Server-side features marte hain:** link previews, spam detection on content, cloud backup (ya backup ko alag key se encrypt karo -- ek aur system).
+
+> Interview line: "E2EE add karna encryption ka kaam nahi, **architecture** ka kaam hai. Server ko content-blind karne ka matlab hai search, content-based fan-out, multi-device onboarding aur backup -- sab dobara design karne padenge. Main v1 mein transport-level TLS aur at-rest encryption lunga, aur E2EE ko ek explicit v2 project banaunga, chhupa hua feature flag nahi."
+
+---
+
+## PART 20 -- Observability
+
+Chat mein ek khaas dikkat hai: **"down" aur "slow" alag dikhte hain par user ke liye ek jaise hain.** Error rate 0% ho sakta hai jabki har message 30 second late aa raha ho. Isliye yahan observability ka center **latency** hai, errors nahi.
+
+### 1. North Star SLI -- `message_delivery_latency_seconds`
+
+> **Definition (spec):** chat service ne message **accept** kiya (persist + ack) us pal se le kar us pal tak jab recipient ke gateway ne **socket par likh diya**.
+
+Ye woh ek number hai jo poore product ki sehat batata hai. Target: **p95 < 500 ms**.
+
+**Ise end-to-end kaise naapein (teen nodes ke beech):**
+
+```
+Chat Service (node A)         Kafka        Delivery Worker (node B)      Gateway (node C)
+  acceptedAtMs = Date.now() ---------------> event carries acceptedAtMs -----> just before ws.send():
+  traceId = trace.getSpan()                  aur traceId                       observe(now - acceptedAtMs)
+```
+
+```ts
+// src/gateway/frame-router.ts -- gateway par, delivery frame nikalne se theek pehle
+function deliverToSocket(ws: WebSocket, msg: DeliveryEnvelope) {
+  const latencyMs = Date.now() - msg.acceptedAtMs;
+
+  if (latencyMs < 0) {
+    latencyNegative.inc();                       // clock skew -- aage ki jaanch ke liye
+  } else {
+    deliveryLatency.observe(
+      { conversation_type: msg.conversationType, region: REGION },
+      latencyMs / 1000,
+    );
+  }
+  safeSend(ws, { type: 'message', message: msg.message }, msg.userId);
+}
+```
+
+**Code Explanation:**
+
+- `msg.acceptedAtMs` -- chat service ne stamp kiya, Kafka event mein gaya, delivery worker ne pub/sub payload mein pass kiya. **Timestamp poore pipeline ke saath safar karta hai** -- yahi ise end-to-end banata hai.
+- `Date.now() - acceptedAtMs` -- **do alag machines ki ghadiyaan.** NTP ke saath skew usually < 5 ms hota hai, jo 500 ms budget mein noise hai. (Yaad rakho: **ordering clocks par depend nahi karti** -- sirf ye metric karta hai. Metric thoda galat ho toh product nahi tootta.)
+- `latencyMs < 0` -> `latencyNegative.inc()` -- recipient ka clock sender se peeche hai. Ise histogram mein daal dena p50 ko jhootha bana deta. Isko count karo aur agar ye badhe toh **NTP ko dekho**.
+- Labels sirf `conversation_type` (direct/group) aur `region` -- **low cardinality**. `userId` ya `conversationId` label banana = laakhon time series = Prometheus khatam (**cardinality explosion**).
+- Group vs direct alag rakhna zaruri hai: group ki latency hamesha zyada hogi (fan-out ki wajah se), aur ek hi mixed p95 dono ki kahani chhupa deta hai.
+- Wahi `traceId` frame mein bhi jaata hai (`message.traceId`), taaki client-reported issue ko server trace se jodha ja sake.
+
+### 2. Metrics -- poori list, thresholds ke saath
+
+| Metric | Type | Kya batata hai | Alert |
+|---|---|---|---|
+| `message_delivery_latency_seconds` | Histogram | **North Star SLI** | p95 > 500 ms for 5 min -> **Page** |
+| `message_send_duration_seconds` | Histogram | Accept path (authz + INCR + persist) | p99 > 200 ms for 5 min -> Page |
+| `ws_connections_active{node}` | Gauge | Har node par kitne sockets | Kisi node par 20%+ ka achanak drop -> **Page** |
+| `ws_connect_total` | Counter | Connect rate | Baseline se 5x for 2 min -> Page (storm) |
+| `ws_disconnect_total{reason}` | Counter | Kyun toota (`client_close`, `timeout`, `slow_client`, `server_restart`, `error`) | `reason="error"` > 1% -> Warn |
+| `reconnect_storm_rate` | Gauge | connects/s / active conns | > 0.05 -> Page |
+| `deliveries_total{result}` | Counter | `delivered` / `no_session` / `dropped` | `no_session` fraction achanak > 30% -> Page (registry problem) |
+| `fanout_size` | Histogram | Ek message ki deliveries | p99 > 800 -> Warn (hot group) |
+| `kafka_consumer_lag{group}` | Gauge | Pipeline backlog | `delivery` > 100K for 2 min -> **Page**; `unread-counter` > 1M -> Warn |
+| `ws_buffered_amount_bytes` | Histogram | Slow clients | p99 > 256 KB -> Warn |
+| `slow_client_drops_total` | Counter | 1 MB par drops | rate > 100/s -> Warn |
+| `offline_push_total{result}` | Counter | Push provider sehat | `failed` fraction > 10% -> Warn |
+| `presence_heartbeats_total` | Counter | 333K/s expected | 30% se zyada girna -> Warn (clients disconnected?) |
+| `seq_gap_detected_total` | Counter | Clients ko missing messages mile | rate > 10/s -> **Page** (push path toota hai) |
+| `seq_rebuild_total` | Counter | Redis counters kho gaye | > 0 -> Page |
+| `authz_denied_total{reason}` | Counter | Non-member send attempts | Baseline se 10x -> Warn (attack) |
+
+### 3. Connection-tier metrics -- jo sirf stateful system mein hote hain
+
+Ye woh metrics hain jo tumhare pichhle **kisi bhi** system mein nahi the, kyunki wahan connections the hi nahi.
+
+**(a) `ws_connections_active{node}` -- aur ek behtareen rule:**
+
+> **Ek node ka connection count kabhi bhi teezi se nahi girta. Agar gira, toh ya node mar gaya, ya tumne use maar diya.**
+
+Stateless world mein "request count gir gaya" ka matlab shayad traffic kam hai. Yahan connections **ghanton** chalte hain, toh ek cliff hamesha ek **event** hai. Isiliye ye page-worthy alert hai jabki stateless system mein ye kuch bhi nahi hota.
+
+```
+# ek node ka 20%+ drop 2 minute mein
+(
+  ws_connections_active
+  - ws_connections_active offset 2m
+) / (ws_connections_active offset 2m) < -0.20
+```
+
+**(b) Connect / disconnect rate aur close-code distribution:**
+
+Close codes ek **diagnosis** hain, sirf counter nahi:
+
+| Code | Matlab | Kya batata hai |
+|---|---|---|
+| `1000` | Normal close | User ne app band kiya -- healthy |
+| `1001` | Going away | Browser tab band / navigate |
+| `1006` | **Abnormal** (koi close frame nahi) | Network toota ya **node mara** -- iska spike sabse bada red flag |
+| `1012` | Service restart | Hamara apna deploy -- expected, par **spike deploy ke bahar = kuch galat** |
+| `1013` | Try again later | Hamne slow client drop kiya |
+| `4001` | Auth failure | Token expire / bad token -- spike = auth service problem ya buggy client |
+
+```
+# close-code distribution (kaunsi wajah se socket toot rahe hain)
+sum by (reason) (rate(ws_disconnect_total[5m]))
+
+# 1006 (abnormal) ka share -- healthy system mein ye chhota rehta hai
+sum(rate(ws_disconnect_total{reason="abnormal"}[5m]))
+  / sum(rate(ws_disconnect_total[5m]))
+```
+
+**(c) `ws_buffered_amount_bytes` histogram + `slow_client_drops_total`:**
+
+```
+# p99 buffered bytes -- drops se PEHLE ka warning
+histogram_quantile(0.99, sum by (le) (rate(ws_buffered_amount_bytes_bucket[5m])))
+
+# drops per second
+sum(rate(slow_client_drops_total[5m]))
+```
+
+Buffered p99 badhna matlab clients ka network bigad raha hai (ya hum unhe zyada bhej rahe hain). Drops usse **baad** mein aate hain -- isliye buffered histogram ek **leading indicator** hai aur drops **lagging**.
+
+**(d) Per-node fairness:**
+
+```
+# sabse loaded aur sabse khaali node ka farak -- LB theek se baant raha hai?
+max(ws_connections_active) - min(ws_connections_active)
+```
+
+Agar ye bada hai toh LB shayad round-robin par hai (least-connections nahi), ya kuch nodes restart hue the aur unhe traffic wapas nahi mila.
+
+### 4. `fanout_size` -- tail latency ka asli explanation
+
+```
+histogram_quantile(0.99, sum by (le) (rate(fanout_size_bucket[5m])))
+```
+
+Agar ye **768** dikhata hai (256 members x 3 devices), toh tumhein apni p99 delivery latency ka jawab mil gaya:
+
+```
+ek message, fan-out 768:
+  session lookups:  1 MGET        ~ 1 ms
+  publishes:        768 PUBLISH   ~ 768 x 0.05 ms = 38 ms (serial)
+  aakhri recipient sabse pehle wale se ~38 ms peeche hai
+  ismein Kafka + network + gateway write jodo -> p99 saaf saaf p50 se door khinch jaata hai
+```
+
+**Isiliye p50 aur p99 ki kahani alag hoti hai:** p50 ek 1:1 chat hai (fan-out 1-3), p99 ek badi group hai. Agar tum sirf average dekhoge toh tumhein lagega sab theek hai jabki group users ka experience kharab hai.
+
+```
+# p99 delivery latency, direct vs group -- SIRF is split se sach dikhta hai
+histogram_quantile(0.99,
+  sum by (le, conversation_type) (rate(message_delivery_latency_seconds_bucket[5m])))
+```
+
+### 5. Logs -- kya log karein, kya kabhi nahi, aur 70K msg/s par sampling
+
+**Hamesha log karo (100%):**
+
+| Event | Kyun |
+|---|---|
+| Connect / disconnect (`userId`, `deviceId`, `nodeId`, close code, duration) | Ek connection ghanton chalta hai -- ye low volume, high value hai |
+| Auth failures | Security signal |
+| `authz_denied` (non-member send) | Attack signal |
+| Slow client drops | Durlabh aur actionable |
+| Koi bhi 5xx / unhandled error | Zahir hai |
+| seq rebuild / seq gap | Data-integrity signal |
+
+**Kabhi mat log karo:** message body, media content, tokens, phone numbers, `auth` frame ka poora payload (PART 19 #8).
+
+**Sampling at 70K msg/s:** har send log karna = 70K lines/s = ~6B lines/day. Logging bill messaging bill se zyada ho jaayega.
+
+- **Successful sends: 0.1% random sample.** Exact count metrics se aata hai, log sirf shape dekhne ke liye hai.
+- **Tail-based tracing:** OpenTelemetry mein saara trace collector par bhejo, aur wahan **rakho sirf woh** jinme (a) error hai, ya (b) latency > 1 s. Head-based 0.1% sampling ka masla ye hai ki jo 30 s wala message tumhe chahiye, wahi 99.9% mein giraya gaya hoga. Tail sampling **exactly wahi** rakhta hai jo interesting hai.
+- **Per-user first occurrence:** har user ka pehla error per minute log karo, chahe sampling kuch bhi ho -- warna chhote blast-radius wale bugs dikhte hi nahi.
+
+### 6. Dashboard layout
+
+```
++---------------------------------------------------------------------------+
+|  ROW 1 -- PRODUCT HEALTH (yahi SLO hai)                                   |
+|  delivery latency p50/p95/p99 (direct vs group)  |  messages/s  deliveries/s |
+|  send duration p99                                |  offline push rate      |
++---------------------------------------------------------------------------+
+|  ROW 2 -- CONNECTION TIER (sirf is system mein hota hai)                   |
+|  ws_connections_active (total + per-node heatmap) |  connect/disconnect rate |
+|  close-code distribution (stacked)                |  max-min node spread     |
++---------------------------------------------------------------------------+
+|  ROW 3 -- PIPELINE                                                        |
+|  kafka lag per group (delivery/unread/push)       |  fanout_size p50/p99    |
+|  deliveries_total by result (delivered/no_session)|  worker CPU + restarts  |
++---------------------------------------------------------------------------+
+|  ROW 4 -- DEPENDENCIES                                                    |
+|  Redis: ops/s, p99 latency, memory, evictions     |  DB: write p99, errors  |
+|  Node: event loop lag p99, heap, GC pause         |  S3 / push provider     |
++---------------------------------------------------------------------------+
+|  ROW 5 -- SAFETY                                                          |
+|  slow_client_drops  |  buffered p99  |  seq_gap  |  authz_denied           |
++---------------------------------------------------------------------------+
+```
+
+**Row 1 upar kyun:** on-call ko 5 second mein pata chalna chahiye "users ko dard ho raha hai ya nahi". Baaki rows "kyun" batati hain. Dashboard ko **cause** se nahi, **symptom** se shuru karo.
+
+### 7. Debugging story: "Users bol rahe hain messages 30 second late aa rahe hain"
+
+Ye is system ka sabse common real incident hai. **Error rate 0% hoga.** Main is kram mein dekhta hoon:
+
+**Step 0 -- "Kya badla?"** Deploy timeline, config change, feature flag. 70% incidents ka jawab yahin mil jaata hai. Agar 10 minute pehle deploy hua tha, **pehle rollback socho, phir debug karo.**
+
+**Step 1 -- Confirm karo ki ye sach hai aur kitne logon ko hai.**
+
+```
+histogram_quantile(0.95,
+  sum by (le, conversation_type) (rate(message_delivery_latency_seconds_bucket[5m])))
+```
+
+- Sab kuch upar? -> systemic.
+- Sirf `conversation_type="group"`? -> fan-out path (Step 4 par jao).
+- p95 theek par p99 kharab? -> tail -- shayad ek node ya ek hot conversation.
+
+**Step 2 -- Pipeline ko do hisson mein kaato: accept vs deliver.**
+
+```
+histogram_quantile(0.99, sum by (le) (rate(message_send_duration_seconds_bucket[5m])))
+```
+
+- **Send duration bhi upar** -> problem **accept path** mein hai (Redis `INCR`, DB write, authz). Delivery ka dosh hi nahi. Redis latency aur DB write p99 dekho. Aksar: Postgres par ek lambi transaction / lock, ya Redis par memory pressure.
+- **Send duration theek (~20 ms) par delivery latency 30 s** -> **message accept ho raha hai par pipeline mein atka hai.** Aage badho.
+
+**Step 3 -- Kafka lag dekho (sabse zyada baar yahi hota hai).**
+
+```
+max by (group) (kafka_consumer_lag)
+sum by (partition) (kafka_consumer_lag{group="delivery"})     # per-partition breakdown
+```
+
+- **Saari partitions par lag** -> workers kam hain ya sab slow hain. Wajah: worker deploy/rebalance, Redis slow (worker har delivery par Redis touch karta hai), ya bas traffic peak. **Fix: workers scale karo** (yaad rakho: 64 partitions = max 64 workers).
+- **Ek ya do partitions par lag, baaki 0** -> **hot conversation.** Ek badi group blast kar rahi hai aur apni partition ko block kiye hue hai. Confirm karo `fanout_size` p99 se. Fix: bounded concurrency badhao, gateway coalescing, ya us conversation ko temporarily throttle.
+
+**Step 4 -- Agar Kafka lag 0 hai, toh dosh Kafka ke baad wale hop ka hai.**
+
+```
+sum by (result) (rate(deliveries_total[5m]))                  # no_session badh raha hai?
+histogram_quantile(0.99, sum by (le) (rate(redis_command_duration_seconds_bucket[5m])))
+```
+
+- `result="no_session"` upar -> **session registry** problem (Redis down/slow, ya TTL refresh fail ho raha hai aur log "offline" mark ho rahe hain). Users ko push notifications mil rahe honge live messages ke bajaye -- ye ek bahut distinct symptom hai.
+- Redis p99 upar -> registry lookups aur publishes dono slow. Redis CPU, memory, evictions dekho. (Aur yaad karo: **cluster mode mein pub/sub sab nodes ko broadcast hota hai** -- agar recently cluster mein move kiye ho toh yahi ho sakta hai.)
+
+**Step 5 -- Agar sab upstream healthy hai, toh ek bura gateway node hai.**
+
+```
+topk(5, ws_connections_active)
+topk(5, nodejs_eventloop_lag_p99_seconds)
+histogram_quantile(0.99, sum by (le, node) (rate(ws_buffered_amount_bytes_bucket[5m])))
+```
+
+- Ek node ka **event loop lag** 500 ms -> woh node har socket write late kar raha hai. Uske users ko 30 s dikh raha hai, baaki ko kuch nahi.
+- Wajah aksar: us node par ek badi group ke bahut saare members, ya ek memory leak, ya GC pause.
+- **Fix turant:** us node ko drain karo (staggered, PART 17 #2). Users 1-2 s mein doosre nodes par reconnect ho jaayenge. Postmortem baad mein.
+
+**Step 6 -- Ek trace utha ke poora raasta dekho.**
+
+```
+trace_id = a3f9...   message send
+  |-- ws.frame.received      (gateway-14)              2 ms
+  |-- chat.authorize         (redis GET member:...)    0.4 ms
+  |-- chat.seq               (redis INCR)              0.3 ms
+  |-- db.insert messages                              14 ms
+  |-- kafka.produce                                    3 ms
+  |   ....................... 28,400 ms QUEUE WAIT .......................   <-- mil gaya
+  |-- delivery.consume       (worker-7)               12 ms
+  |-- redis MGET conn:*                                1 ms
+  |-- redis PUBLISH gw:gateway-22                      0.3 ms
+  |-- ws.send                (gateway-22)              0.2 ms
+```
+
+Woh 28-second ka gap **exactly** batata hai kahan waqt gaya -- aur ye metrics se pehle hi mil jaata hai agar tumne trace id ko frame ke saath carry kiya ho. **Yahi wajah hai ki traceId ko delivery envelope mein daalna zaroori hai.**
+
+> Interview line: "Mera North Star SLI `message_delivery_latency_seconds` hai -- server accept se recipient ke socket write tak, jise main `acceptedAtMs` aur traceId ko Kafka event aur pub/sub payload ke saath carry karke naapta hoon. Chat mein error rate lagbhag hamesha 0 hota hai, isliye main latency aur **Kafka consumer lag** par alert karta hoon, errors par nahi. Connection tier ke apne metrics hain jo stateless systems mein hote hi nahi -- per-node active connections (jiska achanak girna hamesha ek event hai), close-code distribution, aur buffered-bytes histogram jo slow-client drops ka leading indicator hai. Aur `fanout_size` p99 -- 768 -- wahi number hai jo meri tail latency explain karta hai."
+
+---
+
+## Remember
+
+> **Connections ko RAM aur file descriptors par scale karo, messages ko CPU par, aur deliveries ko Redis ops par -- teen alag axes, aur 6.6x amplification hamesha deliveries wala number jeet-ta hai. Push best-effort hai, store durable hai: isliye har failure sirf deri banati hai, data loss nahi. Per-conversation ordering strong (`seq`), presence jaan-boojh ke stale, sender ko read-your-writes. Har send par membership check karo, `Origin` verify karo kyunki CORS WebSockets par lagta hi nahi, aur latency par alert karo -- errors par nahi.**
+
+## Quick Self-Test
+
+1. Spec 23,148 msg/s aur 153,000 deliveries/s dono deta hai. In do numbers se tum gateway nodes, chat service instances aur delivery workers alag-alag kaise size karoge -- aur agar tumne sirf messages wala number use kiya toh sabse pehle kya tootega?
+2. Ek gateway node 50,000 sockets ke saath mara. Teen cheezein batao jo reconnect storm ko rokti hain, aur ye bhi ki rolling deploy usi storm ko **rozana** kyun paida karta hai jabki crash mahine mein ek baar hota hai. Deploy ke waqt kaunsa close code bhejoge aur kyun?
+3. Redis wipe ho gaya aur `seq:<conversationId>` counters chale gaye. Tum unhe kaise rebuild karoge, aur "gap acceptable hai par reuse kabhi nahi" -- reuse se exactly kya toot-ta hai?
+4. Ek attacker `evil.com` se `new WebSocket('wss://chat.example.com/ws')` chalata hai. CORS ise kyun nahi rokta, kaunsa header rokta hai, aur token ko URL query string mein rakhna kyun teen alag jagah leak karta hai?
+5. Users kehte hain messages 30 second late aa rahe hain par error rate 0% hai. Pehle chaar cheezein kaunsi dekhoge, aur kaise batayoge ki dosh accept path ka hai, Kafka consumer lag ka hai, session registry ka hai, ya ek hi bure gateway node ka hai?
+
+---
+
+**Next (Part 5):** Trade-offs (WebSocket vs SSE vs long polling, Postgres vs Cassandra, pub/sub vs gRPC routing, E2EE ki keemat), MVP -> Scalable -> Highly Scalable, 20+ follow-up questions, what-ifs, Node.js specific questions. "next" bolo.

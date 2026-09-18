@@ -1,0 +1,1405 @@
+# Chat System -- HLD + LLD (Part 6: Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet)
+
+> Is file mein prompt ke **Parts 26-30** hain: coding round mein "Implement a chat server" kaise solve karein, 30-second answer, 5-minute answer, whiteboard par diagram kis order mein banayein, aur poore Chat System (Parts 1-5) ki final cheat sheet.
+> **Part 5 ka 3-line recap:** (1) Top trade-offs -- WebSocket vs polling, session registry vs consistent hashing, raw `ws` vs Socket.IO, Postgres vs Cassandra, E2EE abhi nahi. (2) V1 (ek gateway + Postgres) -> V2 (250 gateways + Redis registry + Kafka) -> V3 (Cassandra, multi-region, direct gRPC node-to-node). (3) Follow-ups -- reconnect storm, group 256 ki limit, receipts ka storage, presence ka N-squared, multi-device ordering.
+> **Ye revision file hai.** Parts 1-5 samajhne ke liye the; ye file interview se ek raat pehle padhne ke liye hai. Ek baar poora padho, phir sirf PART 30 dobara-dobara.
+
+---
+
+## PART 26 -- Code Design Question: "Implement a chat server"
+
+### Pehle samjho: ye kya round hai
+
+"Implement a rate limiter" ek class thi. **"Implement a chat server" ek chhota system hai jo ek file mein aata hai.** Interviewer 40-50 minute mein ye dekhna chahta hai:
+
+- Tum **scope clarify** karte ho ya seedha typing shuru kar dete ho?
+- Tum **connection state** ko sahi manage karte ho (add, remove, cleanup)?
+- **Ack persist ke baad** dete ho ya pehle?
+- `messageId` aur `seq` ka **farak** tumhe pata hai?
+- **Multi-device** handle karte ho, ya "ek user = ek socket" maan lete ho?
+- Disconnect par **cleanup** karte ho? (ye sabse common memory leak hai)
+
+Iska matlab: **ek process, in-memory store, fake socket bhi chalega.** Lekin har jagah bolna hai ki "production mein ye Redis/Postgres/Kafka banega, interface wahi rahega".
+
+> Connection: Rate Limiter ke Part 26 mein bhi yahi pattern tha -- in-memory class + injectable clock, phir "storage badlega, interface nahi". Chat mein ek extra cheez hai: **socket** bhi inject karna padta hai, kyunki ye hamara pehla stateful system hai.
+
+### Step 1 -- 60 second mein scope clarify karo (typing se pehle)
+
+Ye bolo, seedha bolo:
+
+> "Main ek single-process chat server likhunga jo WebSocket frames handle karta hai. Transport ko main abstract rakhunga taaki test mein fake socket daal sakun. Storage in-memory rahega lekin uske **do contracts** wahi honge jo production mein hain -- per-conversation monotonic `seq` aur `messageId` par idempotency. Auth, Redis, Kafka, push notification -- ye main **stub** karunga aur bataunga ki asli mein kya hota."
+
+| Question | Mera assumption (agar interviewer bole "you decide") |
+|---|---|
+| 1:1 ya group? | Dono -- conversation ke members ki list, 1:1 bas 2 members wali conversation hai |
+| Persistence chahiye? | In-memory `Map`, par contract production jaisa (`seq`, idempotency) |
+| Multi-device? | **Haan** -- ek user ke multiple sockets. Ye poora design badal deta hai (`Map<userId, Set<Connection>>`) |
+| Receipts? | `delivered` aur `read`, monotonic per user per conversation |
+| Presence / typing? | Typing haan (ephemeral, throttled), full presence out of scope |
+| Auth? | `verifyToken(token) -> userId` ek injected function -- JWT verify stub |
+| Offline delivery? | Message store hota hai + ek `onOffline` hook (production mein push notification service) |
+| Multiple server nodes? | **Nahi, ek node.** Multi-node ke liye Redis session registry + pub/sub -- bolunga, likhunga nahi |
+| Clock? | Injectable, taaki heartbeat test bina `sleep` ke ho |
+
+**Kya build karunga:** frame types -> `MessageStore` -> `ConnectionManager` -> `ChatServer` (frame router) -> heartbeat/backpressure -> ek chalta hua scenario.
+
+**Kya stub karunga:** token verify, push notification, Redis, Kafka, real `ws` socket.
+
+### Step 2 -- Logic pehle bolo (Hinglish mein, code se pehle)
+
+> "Teen alag cheezein hain aur main unhe alag rakhunga.
+>
+> Ek -- **messages ka data**: kaunsi conversation, kaun member hai, kaunsa message kis `seq` par hai. Ye `MessageStore` hai. Isme do guarantee hain: `seq` per conversation **badhta hi jaata hai**, aur ek hi `messageId` do baar insert nahi hota.
+>
+> Do -- **live connections**: kaun abhi online hai aur uske kitne device khule hain. Ye `ConnectionManager` hai, `Map<userId, Set<Connection>>`. Set isliye kyunki ek user ke phone aur web dono khule ho sakte hain.
+>
+> Teen -- **protocol**: frame aaya toh kya karna hai. Ye `ChatServer` hai, ek switch.
+>
+> `send` ka order sabse important hai: validate -> **authorize** (member ho ya nahi) -> persist (yahin `seq` milta hai) -> **tab** sender ko ack -> phir baaki sab devices par fan-out. Ack persist ke baad, warna user ko tick dikh jaayega aur message gayab ho jaayega.
+>
+> Disconnect par connection ko `Map` se hataana bhoolna sabse badi bug hai -- 50,000 connections wale node par woh OOM hai."
+
+Ab code.
+
+### Step 3 -- Code block 1: frame types (protocol pehle)
+
+```ts
+// ---- protocol (spec ke exactly same frames) ----
+export type ClientFrame =
+  | { type: 'auth'; token: string; deviceId: string }
+  | { type: 'send'; messageId: string; conversationId: string; body: string; mediaKey?: string }
+  | { type: 'receipt'; conversationId: string; seq: number; state: 'delivered' | 'read' }
+  | { type: 'typing'; conversationId: string }
+  | { type: 'resume'; lastSeqByConversation: Record<string, number> }
+  | { type: 'ping' };
+
+export type ServerFrame =
+  | { type: 'auth_ok'; userId: string }
+  | { type: 'ack'; messageId: string; seq: number; serverTs: string }
+  | { type: 'message'; message: ChatMessage }
+  | { type: 'receipt'; conversationId: string; seq: number; userId: string; state: 'delivered' | 'read' }
+  | { type: 'presence'; userId: string; status: 'online' | 'offline'; lastSeenAt?: string }
+  | { type: 'typing'; conversationId: string; userId: string }
+  | { type: 'error'; code: string; message: string }
+  | { type: 'pong' };
+
+export interface ChatMessage {
+  messageId: string;        // client UUID = idempotency key
+  conversationId: string;
+  seq: number;              // server assigned, per conversation
+  senderId: string;
+  body: string;
+  mediaKey?: string;
+  createdAt: string;        // display only, NEVER used for ordering
+}
+
+// transport ko abstract rakha hai: test mein fake socket, prod mein `ws`
+export interface Socket {
+  readyState: number;          // 1 = OPEN
+  bufferedAmount: number;      // ws deta hai; backpressure ka signal
+  send(data: string): void;
+  close(code: number, reason: string): void;
+}
+```
+
+**Code Explanation:**
+
+- `ClientFrame` aur `ServerFrame` **discriminated unions** hain -- `type` field discriminator hai. Iska fayda: `switch (frame.type)` ke andar TypeScript khud jaanta hai ki `frame.body` sirf `send` case mein exist karta hai. Interview mein bolo: "main protocol ko type system se enforce kar raha hoon, `any` se nahi."
+- `auth` mein `deviceId` hai, sirf `token` nahi -- kyunki **multi-device** hai. Session registry ki key hi `conn:<userId>:<deviceId>` hai; bina `deviceId` ke phone aur web ek doosre ko overwrite kar dete.
+- `send` mein `messageId` **client** bhejta hai (UUID v4). Ye idempotency key hai. Server generate karta toh retry par server ko pata hi nahi chalta ki ye wahi message hai.
+- `mediaKey?` -- media ka **content** frame mein nahi jaata, sirf S3 ka key. 30 TB/day gateways se nahi guzarna chahiye.
+- `ack` mein `seq` wapas jaata hai -- yahi sender ka "ek grey tick" hai, aur client isi se apna local pending message ko server wale se match karta hai.
+- `receipt` client -> server mein `userId` nahi hai (server socket se jaanta hai kaun bola), par server -> client mein `userId` hai (group mein batana padta hai **kisne** padha).
+- `createdAt: string; // display only` -- ye comment code mein rakhna. Interviewer ye line dekh ke hi samajh jaata hai ki tumhe clock skew ka pata hai.
+- `Socket` interface -- ye sabse important design choice hai. Asli `ws` ka `WebSocket` isi shape ka hai (`readyState`, `bufferedAmount`, `send`, `close`). Isko abstract karne se poora server **testable** ho jaata hai bina network ke.
+
+### Step 4 -- Code block 2: `MessageStore` (do contracts jo asli maayne rakhte hain)
+
+```ts
+interface Conversation {
+  id: string;
+  type: 'direct' | 'group';
+  members: Set<string>;
+  lastSeq: number;                          // production: Redis INCR seq:<conversationId>
+  messages: ChatMessage[];                  // seq se sorted (append-only)
+  byMessageId: Map<string, ChatMessage>;    // production: UNIQUE (conversation_id, message_id)
+  readState: Map<string, { lastDeliveredSeq: number; lastReadSeq: number }>;
+}
+
+export class MessageStore {
+  private readonly convs = new Map<string, Conversation>();
+
+  createConversation(id: string, type: 'direct' | 'group', memberIds: string[]): void {
+    const conv: Conversation = {
+      id, type, members: new Set(memberIds), lastSeq: 0,
+      messages: [], byMessageId: new Map(), readState: new Map(),
+    };
+    for (const m of memberIds) conv.readState.set(m, { lastDeliveredSeq: 0, lastReadSeq: 0 });
+    this.convs.set(id, conv);
+  }
+
+  isMember(convId: string, userId: string): boolean {
+    return this.convs.get(convId)?.members.has(userId) ?? false;
+  }
+
+  members(convId: string): string[] {
+    const c = this.convs.get(convId);
+    return c ? [...c.members] : [];
+  }
+
+  // CONTRACT 1: seq per conversation monotonic.  CONTRACT 2: messageId idempotent.
+  append(convId: string, input: { messageId: string; senderId: string; body: string; mediaKey?: string; createdAt: string }):
+    { message: ChatMessage; duplicate: boolean } {
+    const c = this.convs.get(convId);
+    if (!c) throw new Error('NO_CONVERSATION');
+
+    const existing = c.byMessageId.get(input.messageId);
+    if (existing) return { message: existing, duplicate: true };   // retry -> wahi purana message
+
+    const seq = ++c.lastSeq;                                        // monotonic, never reused
+    const message: ChatMessage = {
+      messageId: input.messageId, conversationId: convId, seq,
+      senderId: input.senderId, body: input.body, createdAt: input.createdAt,
+      ...(input.mediaKey ? { mediaKey: input.mediaKey } : {}),
+    };
+    c.messages.push(message);
+    c.byMessageId.set(input.messageId, message);
+    return { message, duplicate: false };
+  }
+
+  // resume / delta sync: seq > afterSeq wale messages
+  after(convId: string, afterSeq: number, limit = 500): ChatMessage[] {
+    const c = this.convs.get(convId);
+    if (!c) return [];
+    let lo = 0, hi = c.messages.length;
+    while (lo < hi) {                       // binary search: pehla index jiska seq > afterSeq
+      const mid = (lo + hi) >> 1;
+      if (c.messages[mid].seq <= afterSeq) lo = mid + 1; else hi = mid;
+    }
+    return c.messages.slice(lo, lo + limit);
+  }
+
+  // receipts monotonic hain: peeche nahi ja sakte
+  markReceipt(convId: string, userId: string, seq: number, state: 'delivered' | 'read'): boolean {
+    const c = this.convs.get(convId);
+    if (!c) return false;
+    const st = c.readState.get(userId) ?? { lastDeliveredSeq: 0, lastReadSeq: 0 };
+    c.readState.set(userId, st);
+    if (state === 'read') {
+      if (seq <= st.lastReadSeq) return false;
+      st.lastReadSeq = seq;
+      if (seq > st.lastDeliveredSeq) st.lastDeliveredSeq = seq;   // read ka matlab delivered bhi
+      return true;
+    }
+    if (seq <= st.lastDeliveredSeq) return false;
+    st.lastDeliveredSeq = seq;
+    return true;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `members: Set<string>` -- membership lookup O(1). Production mein ye `conversation_members` table hai, aur hot path par **Redis mein cache** (TTL 300 s), warna har send par ek DB query = 23K queries/sec sirf authorization ke liye.
+- `lastSeq: number` + `++c.lastSeq` -- **Contract 1**. Production mein ye `INCR seq:<conversationId>` hai Redis par. Do baaton par dhyaan do: (a) `seq` per **conversation** hai, global nahi -- global counter ek single hot key ban jaata; (b) `seq` mein **gap chalega** (Redis restart par counter `conversations.last_message_seq` se rebuild hota hai), par **reuse kabhi nahi** -- reuse do alag messages ko ek hi slot de deta.
+- `byMessageId: Map<string, ChatMessage>` -- **Contract 2**. Production mein yahi `CREATE UNIQUE INDEX messages_msgid_uniq ON messages (conversation_id, message_id)` hai, aur insert `INSERT ... ON CONFLICT (conversation_id, message_id) DO NOTHING RETURNING seq` se hota hai. Cassandra mein `IF NOT EXISTS` (lightweight transaction) mehenga hai, isliye wahan dedup **client side** aur ek chhote Redis `SETNX msgid:<id>` guard se hota hai.
+- `append` pehle `byMessageId.get` karta hai aur **duplicate par seq consume nahi karta**. Ye line hi idempotency hai. Agar hum pehle `++lastSeq` karte aur baad mein duplicate check karte, toh har retry ek `seq` jala deta.
+- Return type `{ message, duplicate }` -- caller ko dono chahiye: ack dono case mein bhejna hai (wahi `seq`), lekin **fan-out sirf pehli baar**. Agar duplicate par bhi fan-out karte toh recipient ko message do baar dikhta.
+- `createdAt` input se aata hai (injected clock se), `Date.now()` andar se nahi -- testability.
+- `after()` binary search karta hai, `filter` nahi. `filter` O(n) hai poori history par; binary search O(log n) + O(k) jitne messages wapas bhejne hain. 3 saal purani chat mein ye farak asli hai.
+- `limit = 500` -- resume par unbounded replay mat karo. Client 3 mahine baad khula toh 50,000 messages ek saath socket mein daalna = backpressure + OOM. Baaki history REST `GET /api/v1/conversations/:id/messages?afterSeq=...` se paginate hoti hai.
+- `markReceipt` **monotonic** hai: `if (seq <= st.lastReadSeq) return false`. Kyun? Receipts network par out of order aa sakte hain (seq 5 ka read pehle, seq 3 ka delivered baad mein). Agar hum blindly set karte toh blue tick wapas grey ho jaata. Ye bug real apps mein dikhta hai.
+- `read` par `lastDeliveredSeq` bhi aage badhta hai -- padh liya matlab pahuncha toh tha hi. Ye state machine ka implicit rule hai.
+- Return `boolean` (`changed`) -- agar kuch badla hi nahi toh receipt frame **broadcast mat karo**. 153K deliveries/sec wale system mein bekaar broadcast sabse pehle mehenga padta hai.
+
+### Step 5 -- Code block 3: `ConnectionManager` (aur woh classic memory leak)
+
+```ts
+const OPEN = 1;
+const EMPTY: ReadonlySet<Connection> = new Set();
+
+export interface Connection {
+  id: string;
+  socket: Socket;
+  userId: string | null;
+  deviceId: string | null;
+  authed: boolean;
+  lastSeenAt: number;
+}
+
+export class ConnectionManager {
+  private readonly byUser = new Map<string, Set<Connection>>();
+  private total = 0;
+
+  constructor(private readonly nodeId: string, private readonly metrics: Metrics) {}
+
+  add(conn: Connection): void {
+    if (!conn.userId) throw new Error('cannot register an unauthenticated connection');
+    let set = this.byUser.get(conn.userId);
+    if (!set) { set = new Set(); this.byUser.set(conn.userId, set); }
+    set.add(conn);
+    this.total++;
+    this.metrics.ws_connections_active = this.total;
+  }
+
+  // THE cleanup. Ise bhoolna = 50K connections wale node par OOM.
+  remove(conn: Connection): boolean {
+    if (!conn.userId) return false;
+    const set = this.byUser.get(conn.userId);
+    if (!set || !set.delete(conn)) return false;   // already removed -> idempotent
+    if (set.size === 0) this.byUser.delete(conn.userId);   // <-- khaali Set bhi hatao
+    this.total--;
+    this.metrics.ws_connections_active = this.total;
+    return true;
+  }
+
+  devicesOf(userId: string): ReadonlySet<Connection> {
+    return this.byUser.get(userId) ?? EMPTY;
+  }
+
+  isOnline(userId: string): boolean {
+    return (this.byUser.get(userId)?.size ?? 0) > 0;
+  }
+
+  // ek user ke saare devices par bhejo, optionally ek connection chhod kar
+  deliver(userId: string, frame: ServerFrame, exceptConnId?: string): number {
+    let n = 0;
+    for (const conn of [...this.devicesOf(userId)]) {   // copy: send() beech mein remove kar sakta hai
+      if (exceptConnId && conn.id === exceptConnId) continue;
+      if (this.send(conn, frame)) n++;
+    }
+    return n;
+  }
+
+  // send() -- backpressure ke saath -- Step 7 mein
+}
+```
+
+**Code Explanation:**
+
+- `Map<string, Set<Connection>>` -- **ek user ke multiple devices**. Agar tum `Map<userId, Connection>` likhte (bahut log likhte hain), toh user ka web login uske phone ka socket overwrite kar deta aur phone ko messages milne band ho jaate. Interviewer yahi dekhta hai.
+- `Connection` mein `userId: string | null` -- socket **pehle** khulta hai, auth **baad mein** aata hai. Auth se pehle connection kisi user ka nahi hai.
+- `add()` mein `if (!conn.userId) throw` -- unauthenticated connection registry mein nahi jaani chahiye, warna `byUser.get(null)` jaisi ajeeb state banti hai.
+- `remove()` ki **teen lines hi asli baat hain**:
+  1. `set.delete(conn)` -- ye connection hataya.
+  2. `if (set.size === 0) this.byUser.delete(conn.userId)` -- **khaali `Set` bhi hataao.** Ye bhoolne par: 50M DAU mein se har user jo kabhi connect hua, uska ek khaali `Set` hamesha ke liye memory mein reh jaata hai. Node kabhi crash nahi karta, bas dheere dheere RSS badhta rehta hai aur 3 din baad OOM. Ye **"connection hi hata di par Map key reh gayi"** wali classic leak hai.
+  3. `if (!set || !set.delete(conn)) return false` -- **idempotent**. `close` event do baar aa sakta hai (error + close), aur hum counter do baar decrement nahi kar sakte.
+- Return `boolean` -- caller (`onClose`) tabhi log/metric karta hai jab sach mein kuch hata.
+- `devicesOf` `EMPTY` (ek shared frozen-jaisa `Set`) return karta hai, `null` nahi -- caller ko har jagah null-check nahi karna padta, aur naya `Set()` per call allocate nahi hota.
+- `deliver` mein `[...this.devicesOf(userId)]` -- **copy banakar iterate karo.** Kyun? `send()` ke andar slow-client drop ya write error `close()` call kar sakta hai, jo `remove()` chalata hai, jo isi `Set` ko modify karta hai. Set ko iterate karte hue modify karna yahan silently entries skip kara deta.
+- `exceptConnId` -- **multi-device echo** ka dil. Sender ke **doosre** devices ko message bhejna hai (web par bhi dikhna chahiye), par **jis socket ne bheja usko nahi** (usko `ack` mil chuka hai). Isliye except sirf `conn.id` par hai, `userId` par nahi.
+- `metrics.ws_connections_active` -- ye gateway ka sabse important gauge hai. Node par 50,000 ka target hai; 60,000 dikhe toh LB least-connections theek se kaam nahi kar raha.
+
+### Step 6 -- Code block 4: `ChatServer` (frame router)
+
+```ts
+const MAX_BODY_BYTES = 4096;
+const TYPING_THROTTLE_MS = 3000;
+const SESSION_TTL_MS = 90_000;
+
+export class ChatServer {
+  private readonly typingSeen = new Map<string, number>();
+  private connSeq = 0;
+
+  constructor(private readonly deps: {
+    nodeId: string;
+    store: MessageStore;
+    conns: ConnectionManager;
+    sessions: Map<string, { nodeId: string; expiresAt: number }>;  // prod: Redis
+    now: () => number;
+    verifyToken: (token: string) => string | null;                  // prod: JWT verify
+    metrics: Metrics;
+    onOffline: (userId: string, message: ChatMessage) => void;      // prod: push-notifier
+  }) {}
+
+  onConnection(socket: Socket): Connection {
+    const conn: Connection = {
+      id: `c${++this.connSeq}`, socket, userId: null, deviceId: null,
+      authed: false, lastSeenAt: this.deps.now(),
+    };
+    return conn;   // caller socket ke 'message' / 'close' events ko wire karta hai
+  }
+
+  onClose(conn: Connection, code: number, reason: string): void {
+    const removed = this.deps.conns.remove(conn);
+    if (conn.userId) this.deps.sessions.delete(`conn:${conn.userId}:${conn.deviceId}`);
+    if (removed) this.deps.metrics.ws_disconnect_total++;
+  }
+
+  handleRaw(conn: Connection, raw: string): void {
+    let frame: ClientFrame;
+    try {
+      frame = JSON.parse(raw) as ClientFrame;
+    } catch {
+      this.deps.conns.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'frame is not valid JSON' });
+      return;                                   // connection band mat karo, ek bura frame sab kuch na toote
+    }
+    if (!frame || typeof frame.type !== 'string') {
+      this.deps.conns.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'frame has no type' });
+      return;
+    }
+    if (conn.authed) conn.lastSeenAt = this.deps.now();     // koi bhi frame = zinda hai
+    if (!conn.authed && frame.type !== 'auth') {
+      this.deps.conns.send(conn, { type: 'error', code: 'UNAUTHENTICATED', message: 'auth first' });
+      conn.socket.close(4001, 'auth required');
+      return;
+    }
+    switch (frame.type) {
+      case 'auth':    return this.onAuth(conn, frame);
+      case 'send':    return this.onSend(conn, frame);
+      case 'receipt': return this.onReceipt(conn, frame);
+      case 'typing':  return this.onTyping(conn, frame);
+      case 'resume':  return this.onResume(conn, frame);
+      case 'ping':    return void this.deps.conns.send(conn, { type: 'pong' });
+      default:
+        this.deps.conns.send(conn, { type: 'error', code: 'UNKNOWN_TYPE', message: 'unknown frame type' });
+    }
+  }
+
+  private onAuth(conn: Connection, frame: Extract<ClientFrame, { type: 'auth' }>): void {
+    if (conn.authed) return;                                   // dobara auth ignore
+    const userId = this.deps.verifyToken(frame.token);
+    if (!userId || typeof frame.deviceId !== 'string') {
+      this.deps.conns.send(conn, { type: 'error', code: 'UNAUTHENTICATED', message: 'bad token' });
+      conn.socket.close(4001, 'auth failed');
+      return;
+    }
+    conn.userId = userId;
+    conn.deviceId = frame.deviceId;
+    conn.authed = true;
+    conn.lastSeenAt = this.deps.now();
+    this.deps.conns.add(conn);
+    this.deps.sessions.set(`conn:${userId}:${conn.deviceId}`,
+      { nodeId: this.deps.nodeId, expiresAt: this.deps.now() + SESSION_TTL_MS });   // prod: SET .. EX 90
+    this.deps.conns.send(conn, { type: 'auth_ok', userId });
+  }
+
+  private onSend(conn: Connection, frame: Extract<ClientFrame, { type: 'send' }>): void {
+    // 1. validate
+    if (typeof frame.messageId !== 'string' || typeof frame.conversationId !== 'string' || typeof frame.body !== 'string') {
+      return void this.deps.conns.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'send needs messageId, conversationId, body' });
+    }
+    if (Buffer.byteLength(frame.body, 'utf8') > MAX_BODY_BYTES) {
+      return void this.deps.conns.send(conn, { type: 'error', code: 'MESSAGE_TOO_LARGE', message: 'body > 4 KB' });
+    }
+    // 2. AUTHORIZE -- is system ka sabse bada security check
+    if (!this.deps.store.isMember(frame.conversationId, conn.userId!)) {
+      return void this.deps.conns.send(conn, { type: 'error', code: 'NOT_A_MEMBER', message: 'you are not a member of this conversation' });
+    }
+    // 3. PERSIST (yahin seq milta hai, yahin idempotency lagti hai)
+    const { message, duplicate } = this.deps.store.append(frame.conversationId, {
+      messageId: frame.messageId, senderId: conn.userId!, body: frame.body,
+      mediaKey: frame.mediaKey, createdAt: new Date(this.deps.now()).toISOString(),
+    });
+    // 4. ACK -- persist ke BAAD, kabhi pehle nahi
+    this.deps.conns.send(conn, { type: 'ack', messageId: message.messageId, seq: message.seq, serverTs: message.createdAt });
+    // 5. duplicate par dobara fan-out NAHI
+    if (duplicate) { this.deps.metrics.duplicate_send_total++; return; }
+    // 6. fan-out
+    this.fanOut(message, conn.id);
+  }
+
+  private fanOut(message: ChatMessage, senderConnId: string): void {
+    let devices = 0;
+    for (const memberId of this.deps.store.members(message.conversationId)) {
+      // sender ke DOOSRE devices ko bhi bhejo (multi-device echo), bhejne wale socket ko nahi
+      const except = memberId === message.senderId ? senderConnId : undefined;
+      const n = this.deps.conns.deliver(memberId, { type: 'message', message }, except);
+      devices += n;
+      if (n === 0 && memberId !== message.senderId) this.deps.onOffline(memberId, message);
+    }
+    this.deps.metrics.deliveries_total += devices;
+  }
+
+  private onReceipt(conn: Connection, frame: Extract<ClientFrame, { type: 'receipt' }>): void {
+    if (!this.deps.store.isMember(frame.conversationId, conn.userId!)) {
+      return void this.deps.conns.send(conn, { type: 'error', code: 'NOT_A_MEMBER', message: 'not a member' });
+    }
+    if (frame.state !== 'delivered' && frame.state !== 'read') {
+      return void this.deps.conns.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'state must be delivered|read' });
+    }
+    if (!this.deps.store.markReceipt(frame.conversationId, conn.userId!, frame.seq, frame.state)) return;  // purana receipt -> chup raho
+    const out: ServerFrame = {
+      type: 'receipt', conversationId: frame.conversationId,
+      seq: frame.seq, userId: conn.userId!, state: frame.state,
+    };
+    for (const memberId of this.deps.store.members(frame.conversationId)) {
+      if (memberId === conn.userId) continue;
+      this.deps.conns.deliver(memberId, out);
+    }
+  }
+
+  private onTyping(conn: Connection, frame: Extract<ClientFrame, { type: 'typing' }>): void {
+    if (!this.deps.store.isMember(frame.conversationId, conn.userId!)) return;   // chup-chaap drop
+    const key = `${frame.conversationId}:${conn.userId}`;
+    if (this.deps.now() - (this.typingSeen.get(key) ?? 0) < TYPING_THROTTLE_MS) return;
+    this.typingSeen.set(key, this.deps.now());
+    const out: ServerFrame = { type: 'typing', conversationId: frame.conversationId, userId: conn.userId! };
+    for (const memberId of this.deps.store.members(frame.conversationId)) {
+      if (memberId === conn.userId) continue;
+      this.deps.conns.deliver(memberId, out);       // fire and forget, kabhi persist nahi
+    }
+  }
+
+  private onResume(conn: Connection, frame: Extract<ClientFrame, { type: 'resume' }>): void {
+    const map = frame.lastSeqByConversation ?? {};
+    for (const [convId, lastSeq] of Object.entries(map)) {
+      if (!this.deps.store.isMember(convId, conn.userId!)) {
+        this.deps.conns.send(conn, { type: 'error', code: 'NOT_A_MEMBER', message: `not a member of ${convId}` });
+        continue;
+      }
+      for (const message of this.deps.store.after(convId, Number(lastSeq))) {
+        if (!this.deps.conns.send(conn, { type: 'message', message })) break;   // socket bhar gaya -> ruk jao
+      }
+    }
+  }
+}
+```
+
+**Code Explanation:**
+
+- `constructor(private readonly deps: {...})` -- sab kuch **injected**: clock, token verify, session map, push hook. Isi wajah se ye class bina Redis, bina network, bina `sleep` ke test hoti hai.
+- `onConnection` sirf ek `Connection` object banata hai -- **auth se pehle registry mein kuch nahi jaata.** Production mein `ws` ka `'connection'` event yahan aata hai, aur JWT `wss://.../ws?token=` query ya pehle `auth` frame se aata hai.
+- `onClose` mein **do cleanup** hain: `conns.remove(conn)` (memory) aur `sessions.delete('conn:<userId>:<deviceId>')` (Redis registry). Doosra bhoolne par delivery worker us dead node par publish karta rahega aur messages chup-chaap gir jaayenge -- 90 s ke TTL tak. TTL isliye hai taaki node **crash** ho jaaye (jahan `onClose` chalta hi nahi) tab bhi entry khud saaf ho jaaye.
+- `JSON.parse` ke `catch` mein hum **connection band nahi karte**, sirf `error` frame bhejte hain. Ek buggy client version poore session ko na maare. (Agar bad frames ki rate bahut ho toh per-connection rate limit se close karo.)
+- `if (conn.authed) conn.lastSeenAt = now()` -- **koi bhi** frame liveness ka proof hai, sirf `ping` nahi. Isse active user ka socket heartbeat sweep se galti se nahi katega.
+- `if (!conn.authed && frame.type !== 'auth')` -> close code **`4001`**. 4000-4999 application-defined range hai; client isko dekh kar "token refresh karo phir reconnect" karta hai, jabki 1013 par "wait karke reconnect" karta hai. Alag codes = alag client behaviour.
+- `onAuth` mein `if (conn.authed) return` -- dobara auth se user switch nahi hona chahiye (session fixation jaisa hole).
+- **`onSend` ka order hi poora answer hai:** validate -> **authorize** -> persist -> **ack** -> fan-out. Ye 5 numbers comments mein likhe hue hain; interview mein inhe zor se bolo.
+  - Step 2 (`isMember`) skip karna is system ka **sabse bada security hole** hai -- koi bhi apne client se kisi bhi `conversationId` par message bhej dega.
+  - Step 4 ka ack **step 3 ke baad** hai. Pehle ack dete toh: user ko grey tick dikhta, phir DB write fail hota, aur message gayab. Durability requirement ("accepted message kabhi na khoye") ka concrete roop yahi ek line ka order hai.
+  - Step 5: duplicate par ack **phir bhi jaata hai** (client ko uska tick chahiye) par fan-out **nahi** jaata. Ye at-least-once + idempotency ka asli behaviour hai.
+- `fanOut` mein `const except = memberId === message.senderId ? senderConnId : undefined` -- sender ka phone ne bheja, sender ka **web** bhi woh message dekhega. Bina iske multi-device sync toota hai aur user ko web par apne bheje hue messages nahi dikhte.
+- `if (n === 0 && memberId !== message.senderId) onOffline(...)` -- **zero live devices = offline = push notification.** Sender khud ke liye push nahi. Production mein ye Kafka `chat-events` ka `push-notifier` consumer hai, inline call nahi -- taaki FCM slow ho toh send path slow na ho.
+- `onReceipt` mein `if (!markReceipt(...)) return` -- purana/duplicate receipt aaya toh **broadcast hi mat karo**. Receipts already 660 GB/day ka traffic hain; bekaar wale rok do.
+- `onTyping` -- non-member ko error bhi nahi dete, **chup-chaap drop**. Typing ephemeral hai, uska error dikhane ka koi matlab nahi. 3 s throttle server par bhi hai (client par bhi hona chahiye) -- ek tez typist warna 20 frames/sec bhej dega.
+- `onResume` -- har conversation ke liye **membership dobara check** hota hai. Client kuch bhi bhej sakta hai; `lastSeqByConversation` mein kisi aur ki conversation daal dena sabse aasan attack hai.
+- `if (!conns.send(...)) break` resume loop mein -- agar socket bhar gaya (backpressure) toh replay rok do. Client phir se reconnect + resume karega aur wahin se shuru karega jahan ruka tha. **Yahi backpressure aur resume protocol ka milna hai.**
+
+### Step 7 -- Code block 5: heartbeat, dead-connection sweep, backpressure drop
+
+```ts
+const MAX_BUFFERED_BYTES = 1024 * 1024;   // 1 MB
+const HEARTBEAT_MS = 30_000;
+const HEARTBEAT_TIMEOUT_MS = 60_000;      // 2 missed beats
+
+// ---- class ConnectionManager (continued) ----
+send(conn: Connection, frame: ServerFrame): boolean {
+  const sock = conn.socket;
+  if (sock.readyState !== OPEN) return false;                 // closing/closed socket par likhna crash hai
+  if (sock.bufferedAmount > MAX_BUFFERED_BYTES) {             // BACKPRESSURE
+    this.metrics.slow_client_drops_total++;
+    sock.close(1013, 'slow client');                          // 1013 = try again later
+    return false;                                             // close -> onClose -> remove()
+  }
+  try {
+    sock.send(JSON.stringify(frame));
+    return true;
+  } catch {
+    this.metrics.ws_write_error_total++;                      // socket mid-write mar gaya (EPIPE/ECONNRESET)
+    sock.close(1011, 'write failed');
+    return false;
+  }
+}
+
+// ---- class ChatServer (continued) ----
+heartbeat(): void {
+  for (const [, set] of [...this.deps.conns.entries()]) {
+    for (const conn of [...set]) {
+      const silentMs = this.deps.now() - conn.lastSeenAt;
+      if (silentMs > HEARTBEAT_TIMEOUT_MS) {                  // DEAD-CONNECTION SWEEP
+        this.deps.metrics.ws_heartbeat_timeout_total++;
+        conn.socket.close(1001, 'heartbeat timeout');         // -> onClose -> remove + session delete
+        continue;
+      }
+      // zinda hai: session registry ka TTL aage badhao (prod: EXPIRE conn:<u>:<d> 90)
+      this.deps.sessions.set(`conn:${conn.userId}:${conn.deviceId}`,
+        { nodeId: this.deps.nodeId, expiresAt: this.deps.now() + SESSION_TTL_MS });
+    }
+  }
+}
+// prod: setInterval(() => server.heartbeat(), HEARTBEAT_MS).unref();
+```
+
+**Code Explanation:**
+
+- `readyState !== OPEN` check sabse pehle -- `ws` par CLOSING/CLOSED socket ko `send()` karna error phenkta hai. Hum silently `false` return karte hain; caller (`deliver`) usko "ye device nahi mila" ki tarah ginta hai, aur zero devices = push notification. Correct behaviour.
+- `bufferedAmount > 1 MB` -- **backpressure**. `bufferedAmount` matlab "kitna data application ne `send` kiya par abhi tak TCP par nikla nahi". 2G par baitha ek user socket buffer bharta jaata hai. Agar hum likhte rahe toh **ek slow client gateway node ki poori memory kha jaata hai** -- production mein OOM ka sabse aam karan.
+- Fix seedha hai: **usko drop kar do** close code `1013` (try again later) ke saath. Woh reconnect karega, `resume` bhejega, aur sab miss hue messages `seq` se le lega. **Message kho nahi raha -- persist ho chuka hai.** Ye line interview mein bolo: "drop karna safe isliye hai kyunki durability socket par nahi, store par tiki hai."
+- `try/catch` around `sock.send` -- socket **mid-write** mar sakta hai (`EPIPE`, `ECONNRESET`), aur `'close'` event abhi aaya nahi hota. Bina catch ke ye exception poore fan-out loop ko tod dega aur baaki members ko message nahi milega. Catch karke `close(1011)` -> `onClose` -> cleanup.
+- `heartbeat()` do kaam karta hai:
+  1. **Sweep**: 60 s se chup connection = dead (2 missed beats). Kyun zaruri hai? TCP connection **chup-chaap** mar sakta hai -- mobile network switch, NAT timeout, laptop sleep. OS ko pata hi nahi chalta, socket "open" dikhta rehta hai. Bina sweep ke ye **ghost connections** memory aur registry dono mein pade rehte hain aur unke messages gayab hote rehte hain.
+  2. **TTL refresh**: zinda connections ke liye `conn:<userId>:<deviceId>` ka TTL 90 s par reset. TTL (90 s) > timeout (60 s) jaan-boojh kar rakha hai taaki race na ho -- entry sweep se pehle expire na ho jaaye.
+- Close code `1001` (going away) heartbeat ke liye, `1013` slow client ke liye, `1011` server error ke liye, `4001` auth ke liye. Client inhe alag alag handle karta hai: `1013` par lamba backoff, `4001` par token refresh, baaki par normal **full jitter** backoff `random(0, min(30s, 2^attempt))`.
+- `.unref()` production mein -- ye timer process ko band hone se na roke (graceful shutdown).
+- Node crash hone par ye sweep chalta hi nahi -- **isliye Redis TTL hai.** Do layers: normal case mein sweep saaf karta hai, crash case mein TTL.
+
+### Step 8 -- Code block 6: `main()` -- poora scenario end to end
+
+```ts
+function main(): void {
+  const metrics = newMetrics();
+  const store = new MessageStore();
+  const sessions = new Map<string, { nodeId: string; expiresAt: number }>();
+  const conns = new ConnectionManager('gw-07', metrics);
+  const tokens: Record<string, string> = { 'tok-amit': 'user-amit', 'tok-bina': 'user-bina' };
+
+  const server = new ChatServer({
+    nodeId: 'gw-07', store, conns, sessions, now: clock, metrics,
+    verifyToken: (t) => tokens[t] ?? null,
+    onOffline: (userId, message) => {
+      metrics.offline_push_total++;
+      log('push-notifier', `${userId} ka koi device online nahi -> FCM/APNs push for seq=${message.seq}`);
+    },
+  });
+
+  store.createConversation('conv-1', 'direct', ['user-amit', 'user-bina']);
+  store.createConversation('conv-9', 'group', ['user-chetan', 'user-bina']);
+
+  // 1. dono connect + auth
+  const amit = new FakeClient('amit/phone', 'user-amit', 'dev-amit-phone', server).connect();
+  amit.frame({ type: 'auth', token: 'tok-amit', deviceId: 'dev-amit-phone' });
+  advance(400);
+  const bina = new FakeClient('bina/phone', 'user-bina', 'dev-bina-phone', server).connect();
+  bina.frame({ type: 'auth', token: 'tok-bina', deviceId: 'dev-bina-phone' });
+
+  // 2. amit typing -> send; bina ko message milta hai
+  advance(1200);
+  amit.frame({ type: 'typing', conversationId: 'conv-1' });
+  advance(800);
+  amit.frame({ type: 'send', messageId: 'm-11111111-aaaa', conversationId: 'conv-1', body: 'Kal milte hain 7 baje?' });
+
+  // 3. bina: delivered -> read;  amit: do grey tick -> blue tick
+  advance(120);
+  bina.frame({ type: 'receipt', conversationId: 'conv-1', seq: 1, state: 'delivered' });
+  advance(4000);
+  bina.frame({ type: 'receipt', conversationId: 'conv-1', seq: 1, state: 'read' });
+
+  // 4. bina disconnect; amit phir bhejta hai -> offline -> push
+  advance(1000);
+  bina.disconnect('app closed / network gaya');
+  advance(2000);
+  amit.frame({ type: 'send', messageId: 'm-22222222-bbbb', conversationId: 'conv-1', body: 'Bina? Reply kar do.' });
+
+  // 5. bina 45 s baad reconnect + resume -> missed message mil jaata hai
+  advance(45_000);
+  const bina2 = new FakeClient('bina/phone', 'user-bina', 'dev-bina-phone', server).connect();
+  bina2.frame({ type: 'auth', token: 'tok-bina', deviceId: 'dev-bina-phone' });
+  bina2.frame({ type: 'resume', lastSeqByConversation: { 'conv-1': 1 } });
+  advance(100);
+  bina2.frame({ type: 'receipt', conversationId: 'conv-1', seq: 2, state: 'delivered' });
+}
+```
+
+**Code Explanation:**
+
+- `newMetrics()` / `clock` / `advance()` -- ek fake clock (`let nowMs`, `advance(ms)`) taaki 45 second ka gap bina `sleep` ke ho. Poora scenario milliseconds mein chalta hai aur output **deterministic** hai.
+- `FakeClient` -- ek in-process fake socket wrapper. `frame(f)` server ka `handleRaw(conn, JSON.stringify(f))` call karta hai; server ka `socket.send(...)` wapas client ke handler mein aa jaata hai jo use print karta hai. **Koi network nahi, koi `ws` nahi -- phir bhi poora protocol asli chalta hai.**
+- `conv-9` jaan-boojh kar banaya hai jisme amit member **nahi** hai -- edge case demo ke liye.
+- `onOffline` yahan sirf log karta hai. Production mein ye `chat-events` Kafka topic par event hai, aur `push-notifier` consumer group use padh kar Notification System ko call karta hai.
+- Step 3 ka order dhyaan se dekho: **`delivered` pehle, `read` baad mein**, 4 second ke gap se. Real app mein `delivered` app ke background mein automatically jaata hai, `read` tab jab user chat kholta hai. Isi se do grey tick aur blue tick alag alag moment par aate hain.
+- Step 5 mein `resume` ka `lastSeqByConversation: { 'conv-1': 1 }` -- client ko yaad hai ki uske paas seq 1 tak hai, isliye server sirf seq 2 bhejta hai. **Poori history nahi, sirf delta.** Yahi `afterSeq` pagination ka WebSocket wala roop hai.
+
+### Step 9 -- Real output (ye output sach mein run karke nikala gaya hai)
+
+> **Ye output banaya nahi gaya hai -- upar wale server ka JavaScript equivalent Node par chalaya gaya aur output paste kiya gaya hai.** `ws` library nahi use ki (taaki koi dependency na lage); transport ek **in-process fake socket** hai, lekin poori logic -- router, store, connection manager, backpressure, heartbeat -- bilkul wahi chali hai jo upar likhi hai. Time fake clock se aata hai, isliye har run par same output aata hai.
+
+```
+================ SCENARIO: do users, ek conversation (conv-1) ================
+t+   0.0s  amit/phone    WebSocket open (wss:// handshake done)
+t+   0.0s  amit/phone    <- auth_ok userId=user-amit
+t+   0.0s  server        auth_ok user=user-amit device=dev-amit-phone -> registry conn:user-amit:dev-amit-phone=gw-07; active=1
+t+   0.4s  bina/phone    WebSocket open (wss:// handshake done)
+t+   0.4s  bina/phone    <- auth_ok userId=user-bina
+t+   0.4s  server        auth_ok user=user-bina device=dev-bina-phone -> registry conn:user-bina:dev-bina-phone=gw-07; active=2
+t+   1.6s  amit/phone    -> typing
+t+   1.6s  bina/phone    <- typing in conv-1 by user-amit
+t+   2.4s  amit/phone    -> send "Kal milte hain 7 baje?"
+t+   2.4s  amit/phone    <- ack seq=1 -> ONE GREY TICK (sent)
+t+   2.4s  bina/phone    <- message seq=1 from=user-amit "Kal milte hain 7 baje?"
+t+   2.4s  server        persisted seq=1 -> ack sent -> fan-out to 1 live device(s), 0 offline -> push
+t+   2.5s  bina/phone    -> receipt delivered seq=1
+t+   2.5s  amit/phone    <- receipt delivered seq=1 by=user-bina -> TWO GREY TICKS
+t+   6.5s  bina/phone    -> receipt read seq=1 (chat khola)
+t+   6.5s  amit/phone    <- receipt read seq=1 by=user-bina -> BLUE TICK
+t+   7.5s  bina/phone    disconnect (app closed / network gaya)
+t+   7.5s  server        cleanup conn=c2 user=user-bina code=1000 (app closed / network gaya); active=1
+t+   9.5s  amit/phone    -> send "Bina? Reply kar do."  (bina offline hai)
+t+   9.5s  amit/phone    <- ack seq=2 -> ONE GREY TICK (sent)
+t+   9.5s  push-notifier user-bina ka koi device online nahi -> FCM/APNs push for seq=2
+t+   9.5s  server        persisted seq=2 -> ack sent -> fan-out to 0 live device(s), 1 offline -> push
+t+  54.5s  bina/phone    WebSocket open (wss:// handshake done)
+t+  54.5s  bina/phone    <- auth_ok userId=user-bina
+t+  54.5s  server        auth_ok user=user-bina device=dev-bina-phone -> registry conn:user-bina:dev-bina-phone=gw-07; active=2
+t+  54.5s  bina/phone    -> resume { conv-1: 1 }
+t+  54.5s  bina/phone    <- message seq=2 from=user-amit "Bina? Reply kar do."
+t+  54.5s  server        resume from user-bina: replayed 1 missed message(s)
+t+  54.6s  bina/phone    -> receipt delivered seq=2
+t+  54.6s  amit/phone    <- receipt delivered seq=2 by=user-bina -> TWO GREY TICKS
+```
+
+Aur edge cases ka output (usi run se):
+
+```
+================ EDGE CASES ================
+t+  55.6s  amit/phone    -> send SAME messageId again (network retry)
+t+  55.6s  amit/phone    <- ack seq=2 -> ONE GREY TICK (sent)
+t+  55.6s  server        DUPLICATE messageId=m-222222 -> same ack seq=2, NO second fan-out
+t+  56.1s  amit/phone    -> send into conv-9 (amit is NOT a member)
+t+  56.1s  amit/phone    <- error NOT_A_MEMBER: you are not a member of this conversation
+t+  56.6s  amit/phone    -> raw garbage bytes (not JSON)
+t+  56.6s  amit/phone    <- error BAD_FRAME: frame is not valid JSON
+t+  57.1s  amit/web      second device of the SAME user connects
+t+  57.1s  amit/web      <- auth_ok userId=user-amit
+t+  57.1s  server        auth_ok user=user-amit device=dev-amit-web -> registry conn:user-amit:dev-amit-web=gw-07; active=3
+t+  57.1s  amit/phone    -> send "Multi-device test"
+t+  57.1s  amit/phone    <- ack seq=3 -> ONE GREY TICK (sent)
+t+  57.1s  amit/web      <- message seq=3 from=user-amit "Multi-device test"
+t+  57.1s  bina/phone    <- message seq=3 from=user-amit "Multi-device test"
+t+  57.1s  server        persisted seq=3 -> ack sent -> fan-out to 2 live device(s), 0 offline -> push
+t+  57.6s  bina/phone    -> resume with seq far behind { conv-1: 0 }
+t+  57.6s  bina/phone    <- message seq=1 from=user-amit "Kal milte hain 7 baje?"
+t+  57.6s  bina/phone    <- message seq=2 from=user-amit "Bina? Reply kar do."
+t+  57.6s  bina/phone    <- message seq=3 from=user-amit "Multi-device test"
+t+  57.6s  server        resume from user-bina: replayed 3 missed message(s)
+t+  58.1s  bina/phone    -> receipt read seq=1 again (already read)
+t+  58.1s  server        receipt read seq=1 from user-bina ignored (not monotonic)
+t+  58.6s  test          amit/web ka socket 2 MB bufferedAmount par hai (slow 2G client)
+t+  58.6s  amit/phone    -> send "slow client test"
+t+  58.6s  amit/phone    <- ack seq=4 -> ONE GREY TICK (sent)
+t+  58.6s  server        cleanup conn=c4 user=user-amit code=1013 (slow client); active=2
+t+  58.6s  bina/phone    <- message seq=4 from=user-amit "slow client test"
+t+  59.1s  test          bina ka socket mid-write mar gaya (EPIPE)
+t+  59.1s  amit/phone    -> send "dead socket test"
+t+  59.1s  amit/phone    <- ack seq=5 -> ONE GREY TICK (sent)
+t+  59.1s  server        cleanup conn=c3 user=user-bina code=1011 (write failed); active=1
+t+  59.1s  push-notifier user-bina ka koi device online nahi -> FCM/APNs push for seq=5
+t+  60.1s  test          zombie device connect karta hai jo ping ka jawab nahi deta
+t+  60.1s  server        auth_ok user=user-chetan device=dev-chetan-tv -> registry conn:user-chetan:dev-chetan-tv=gw-07; active=2
+t+  90.1s  amit/phone    -> ping (client keepalive har 30 s)
+t+  90.1s  amit/phone    <- pong (connection alive)
+t+  90.1s  test          heartbeat tick #1 (30 s)
+t+  90.1s  server        heartbeat OK conn=c1 user=user-amit (0s silent), session TTL refreshed to 90 s
+t+  90.1s  server        heartbeat OK conn=c5 user=user-chetan (30s silent), session TTL refreshed to 90 s
+t+ 121.1s  test          heartbeat tick #2 (61 s silent)
+t+ 121.1s  server        heartbeat OK conn=c1 user=user-amit (31s silent), session TTL refreshed to 90 s
+t+ 121.1s  server        heartbeat timeout conn=c5 user=user-chetan (61s silent) -> close
+t+ 121.1s  server        cleanup conn=c5 user=user-chetan code=1001 (heartbeat timeout); active=1
+
+================ FINAL STATE ================
+sessions in registry: conn:user-amit:dev-amit-phone
+connections by user : user-amit=1
+metrics             : {"ws_connections_active":1,"deliveries_total":4,"offline_push_total":2,
+                       "slow_client_drops_total":1,"duplicate_send_total":1,
+                       "ws_write_error_total":1,"ws_heartbeat_timeout_total":1}
+conv-1 messages     : seq1:amit | seq2:amit | seq3:amit | seq4:amit | seq5:amit
+```
+
+**Code Explanation -- ye output kya prove karta hai:**
+
+- **t+2.4s** -- `ack` ki line `fan-out` ki line se **pehle** hai: sender ko tick tab mila jab message store ho chuka tha. Ack-after-persist ka proof.
+- **t+2.5s / t+6.5s** -- ek grey tick (`ack`) -> do grey tick (`delivered`) -> blue tick (`read`). Poora **tick state machine** teen alag frames se banta hai, ek se nahi.
+- **t+7.5s** -- disconnect par `cleanup ... active=1`. `ConnectionManager.remove` + session delete dono chale. Gauge 2 se 1 hua.
+- **t+9.5s** -- bina offline hai: `fan-out to 0 live device(s), 1 offline -> push`. Message phir bhi persist hua (`seq=2`) aur amit ko ack mila. **Message socket par nahi, store par tika hai.**
+- **t+54.5s** -- reconnect + `resume { conv-1: 1 }` -> sirf **seq 2** replay hui, seq 1 nahi. Delta sync kaam kar raha hai.
+- **t+55.6s** -- wahi `messageId` dobara: **same ack seq=2**, aur `NO second fan-out`. Idempotency. Note karo ki `seq` **consume nahi hui** -- agla message seq 3 hi hai.
+- **t+56.1s** -- `conv-9` (jiska amit member nahi) par send -> `NOT_A_MEMBER`. Authorization check zinda hai.
+- **t+56.6s** -- adha JSON -> `BAD_FRAME`, par connection **band nahi hui** (agli line par amit phir se kaam kar raha hai).
+- **t+57.1s** -- amit ka **doosra device** (web) connect hua; amit ne phone se bheja aur **web par bhi message aaya** (`amit/web <- message seq=3`), jabki bhejne wale phone par sirf `ack` aaya. Multi-device echo, bina duplicate ke.
+- **t+57.6s** -- `resume { conv-1: 0 }` = "mere paas kuch nahi hai" -> teeno messages wapas. Far-behind resume safe hai (aur `limit=500` se bounded).
+- **t+58.1s** -- purana `read seq=1` dobara aaya -> `ignored (not monotonic)`, koi broadcast nahi. Blue tick wapas grey nahi hua.
+- **t+58.6s** -- `amit/web` ka `bufferedAmount` 2 MB par tha -> `cleanup ... code=1013 (slow client)`. **Lekin usi fan-out mein bina ko message mil gaya** -- ek slow client ne baaki delivery nahi rokee.
+- **t+59.1s** -- bina ka socket mid-write mara (`EPIPE`) -> `code=1011 (write failed)` par exception loop se bahar nahi gaya; server ne use offline maan kar **push bhej diya**. Ye `try/catch` ka faayda.
+- **t+90.1s / t+121.1s** -- heartbeat: amit ne `ping` bheja toh `0s silent` (zinda), zombie TV 30 s par bacha, 61 s par **timeout -> close -> cleanup**.
+- **Final state** -- sirf ek session registry mein bachi, `byUser` mein sirf ek user. **Koi khaali `Set` nahi bachi** -- memory leak nahi hai. Yahi line interviewer ko dikhani hai.
+
+### Step 10 -- Edge cases (interviewer zaroor poochega)
+
+| Edge case | Humara code kya karta hai | Production (Parts 2-4) mein |
+|---|---|---|
+| Duplicate `messageId` (network retry) | `append` purana message return karta hai, `duplicate: true`; ack wahi `seq`, fan-out **nahi**, `seq` consume nahi hoti | `INSERT ... ON CONFLICT (conversation_id, message_id) DO NOTHING RETURNING seq`; Cassandra mein Redis `SETNX msgid:<id>` guard + client-side dedup |
+| Jis conversation ka member nahi, usme send | `isMember` -> `error NOT_A_MEMBER` (`403`) | Membership Redis mein cache (TTL 300 s), miss par Postgres. **Ye check skip karna sabse bada security hole hai** |
+| `resume` with seq bahut peeche | `after()` binary search + `limit = 500`; bounded replay | Baaki history REST `GET /conversations/:id/messages?afterSeq=..&limit=50` se, keyset pagination |
+| `resume` kisi aur ki conversation par | Har conversation par dobara `isMember`, warna `NOT_A_MEMBER` | Same -- resume bhi ek authorized operation hai |
+| Recipient ke zero devices online | `deliver` 0 return karta hai -> `onOffline` -> push | Kafka `chat-events` -> `push-notifier` consumer -> FCM/APNs [Notification lesson] |
+| Ek hi user ke do devices | `Map<userId, Set<Connection>>`; sender ke doosre device ko echo, bhejne wale socket ko nahi | Registry mein do keys: `conn:<u>:<phone>`, `conn:<u>:<web>` -- do alag gateway nodes par bhi ho sakte hain |
+| Frame valid JSON nahi | `error BAD_FRAME`, connection zinda | Per-connection rate limit; bad-frame rate high ho toh close |
+| Socket mid-write mar gaya | `try/catch` -> `close(1011)` -> cleanup; fan-out loop chalta rehta hai | Same + `ws_write_error_total` metric |
+| Slow client (2G) | `bufferedAmount > 1 MB` -> `close(1013)` -> client reconnect + resume | `slow_client_drops_total` alert; yahi node ke OOM se bachata hai |
+| Chup-chaap mara hua TCP (NAT/sleep) | 60 s silent -> heartbeat sweep -> close + registry delete | Plus Redis TTL 90 s (node crash par bhi entry saaf) |
+| Auth se pehle koi frame | `UNAUTHENTICATED` + close `4001` | JWT verify, expiry, revocation list |
+| Body > 4 KB | `MESSAGE_TOO_LARGE` (`413`) | Media S3 presigned upload se; frame mein sirf `mediaKey` |
+| Out-of-order / purana receipt | `markReceipt` monotonic, `false` -> koi broadcast nahi | `conversation_members.last_delivered_seq / last_read_seq` (per message row nahi) |
+| Do device ek saath same conversation mein bhej rahe hain | Single process, `++lastSeq` synchronous -- race nahi | `INCR seq:<conversationId>` Redis par atomic; Kafka key = `conversationId` se per-conversation order |
+| Multi-node (asli production) | **Handled nahi** -- ek process ka `Map` hai | Redis session registry `conn:<u>:<d> -> nodeId` + Pub/Sub `gw:<nodeId>`; ye is system ka core hai |
+
+> Interview line: "Ye in-memory version ek gateway node ke liye poora correct hai. Do node hote hi `ConnectionManager` ka `Map` adhoora ho jaata hai -- isliye production mein har node apne local `Map` ke saath ek **Redis session registry** rakhta hai (`conn:<userId>:<deviceId> -> nodeId`) aur apne `gw:<nodeId>` channel ko subscribe karta hai. Delivery worker registry se node dhoondh kar wahan `PUBLISH` karta hai. Baaki poora code same rehta hai -- sirf `deliver` local write ki jagah `publish` ban jaata hai."
+
+### Step 11 -- Isko test kaise karenge (unit-test sketch)
+
+**Testable banane wali do cheezein:** injected **fake clock** aur injected **fake socket**. Bas inhi do se poora server bina network aur bina `sleep` ke test ho jaata hai.
+
+```ts
+const makeSocket = () => {
+  const sent: ServerFrame[] = [];
+  const sock: Socket & { sent: ServerFrame[]; closed?: [number, string] } = {
+    readyState: 1, bufferedAmount: 0, sent,
+    send: (d) => { sent.push(JSON.parse(d)); },
+    close: (code, reason) => { sock.readyState = 3; sock.closed = [code, reason]; },
+  };
+  return sock;
+};
+let nowMs = 0;
+const clock = () => nowMs;
+
+test('ack persist ke baad aata hai aur duplicate par seq consume nahi hoti', () => {
+  const { server, conns, store } = setup({ now: clock });
+  const a = connectAndAuth(server, conns, 'tok-amit', 'dev-phone');
+  server.handleRaw(a.conn, JSON.stringify({ type: 'send', messageId: 'm1', conversationId: 'c1', body: 'hi' }));
+  server.handleRaw(a.conn, JSON.stringify({ type: 'send', messageId: 'm1', conversationId: 'c1', body: 'hi' }));
+  const acks = a.sock.sent.filter((f) => f.type === 'ack');
+  expect(acks.map((f: any) => f.seq)).toEqual([1, 1]);           // dono baar seq 1
+  expect(store.after('c1', 0)).toHaveLength(1);                  // ek hi message stored
+});
+
+test('slow client drop hota hai par baaki members ko delivery hoti hai', () => {
+  const { server, conns } = setup({ now: clock });
+  const a = connectAndAuth(server, conns, 'tok-amit', 'dev-phone');
+  const b = connectAndAuth(server, conns, 'tok-bina', 'dev-phone');
+  b.sock.bufferedAmount = 2 * 1024 * 1024;                       // 2 MB pending
+  server.handleRaw(a.conn, JSON.stringify({ type: 'send', messageId: 'm1', conversationId: 'c1', body: 'hi' }));
+  expect(b.sock.closed?.[0]).toBe(1013);
+  expect(conns.isOnline('user-bina')).toBe(false);                // cleanup ho gaya
+});
+
+test('60 s chup connection sweep hoti hai, 59 s wali nahi', () => {
+  const { server, conns } = setup({ now: clock });
+  connectAndAuth(server, conns, 'tok-amit', 'dev-phone');
+  nowMs = 59_000; server.heartbeat(); expect(conns.isOnline('user-amit')).toBe(true);
+  nowMs = 61_000; server.heartbeat(); expect(conns.isOnline('user-amit')).toBe(false);
+});
+```
+
+**Code Explanation:**
+
+- `makeSocket()` -- fake socket jo bheje gaye frames ek array mein rakhta hai. Assertions "kaunse frames gaye, kis order mein" par hote hain -- yahi protocol ka contract hai.
+- Test 1 -- **do baar wahi `messageId`**, dono baar `seq: 1`, aur store mein ek hi message. Ye idempotency ka poora proof hai. `[1, 1]` par assert karna `[1, 2]` se ek line mein bug pakad leta hai.
+- Test 2 -- `bufferedAmount` ko **manually 2 MB set** kar diya. Asli slow network simulate karne ki zarurat hi nahi -- yahi injection ka fayda hai. Assertions do hain: close code `1013`, aur cleanup hua ya nahi.
+- Test 3 -- `nowMs = 59_000` par zinda, `61_000` par nahi. **Boundary dono taraf se test karo** -- 60 s ke aas paas dono values. Bina fake clock ke is test ko 61 second lagte.
+- Jo cheezein aur test karni chahiye: non-member send par `NOT_A_MEMBER`, resume ka exact delta, multi-device echo mein sender ke socket par `message` **nahi** aana, monotonic receipt, aur `remove()` ke baad `byUser` map ka **size 0** hona (leak test).
+
+### Step 12 -- Complexity
+
+Symbols: **M** = conversation ke members, **D** = per member average devices, **N** = conversation mein total messages, **C** = is node par total connections.
+
+| Operation | Time | Kyun |
+|---|---|---|
+| `append` (persist + seq) | **O(1)** | `Map` lookup + push + counter increment |
+| `send` (poora path) | **O(1) + O(M x D)** | Validate/authorize/persist O(1); fan-out har member ke har device par ek write |
+| `deliver` (ek user) | **O(D)** | Uske devices par loop |
+| `receipt` | **O(M x D)** | Sab members ko batana padta hai (group mein "kisne padha") |
+| `resume` | **O(log N + k)** | Binary search se start index, phir k = `seq` ke baad wale messages (capped 500) |
+| `heartbeat` sweep | **O(C)** | Saare connections scan -- isliye har 30 s, request path par nahi |
+| `remove` (disconnect) | **O(1)** | `Set.delete` + shayad `Map.delete` |
+
+| Structure | Space | Kyun |
+|---|---|---|
+| `ConnectionManager` | **O(C)** | Per connection ~20 KB (socket buffers + TLS + JS object) -> 50,000 x 20 KB = **~1 GB per node** |
+| `MessageStore` | **O(sum of N)** | Production mein ye process mein hai hi nahi -- Postgres/Cassandra mein |
+| `typingSeen` | **O(active conversations)** | Ephemeral; TTL/periodic clear se bound karo |
+
+> **Ye line bol do:** "`send` ka kaam O(1) hai, lekin **fan-out O(M x D)** hai -- aur yahi poore system ka asli cost hai. 23,000 messages/sec hain par 153,000 deliveries/sec, kyunki group chat ~6.6x amplification deta hai. Capacity hamesha deliveries par plan hoti hai."
+
+---
+
+## PART 27 -- 30-Second Answer
+
+> "At a high level, main clients ko **WebSocket** par ek L4 load balancer ke peeche **stateful gateway nodes** se jodunga -- 10 million concurrent connections, 50,000 per node, yaani ~250 nodes. Ye hamara pehla stateful tier hai, toh 'kaun kis node par hai' ek **Redis session registry** mein rakhta hoon, `conn:userId:deviceId -> nodeId`, TTL 90 second. Message aane par stateless chat service authorize karti hai, `INCR seq:<conversationId>` se per-conversation sequence leti hai, persist karti hai -- Postgres v1, Cassandra v3 -- aur **tab** sender ko `sent` ack deti hai. Phir event `chat-events` Kafka par jaata hai, delivery workers members ke devices ka registry lookup karke `gw:<nodeId>` par publish karte hain, aur wahi gateway socket par push kar deta hai. Koi session nahi mili toh push notification. Ordering ke liye `seq`, idempotency ke liye client ka `messageId`. Important number: messages 23K per second hain, par **deliveries 153K per second** -- capacity deliveries par plan hoti hai. Aur sabse bada risk ek gateway node ka girna hai -- 50,000 clients ek saath reconnect karenge, isliye **full jitter backoff** zaruri hai."
+
+(Bolne mein ~45 seconds. Stateful shift, registry, seq vs messageId, ack-after-persist, ek amplification number, ek failure mode -- bas.)
+
+---
+
+## PART 28 -- 5-Minute Interview Answer (natural Hinglish)
+
+> Ise ratna nahi hai. Har minute ka **goal** yaad rakho. Beech beech mein check-in karo: "Is direction theek hai?"
+
+### **Minute 1 -- requirements clarify**
+
+"Main pehle requirements clarify karunga. 1:1 chat aur group -- dono? Group ka max size kya maanun? ... Theek hai, **256 members**. Delivery receipts chahiye -- sent, delivered, read, woh grey aur blue tick? Presence aur typing indicator? Multi-device -- phone aur web dono par same history? Media attachments?
+
+Main assume kar raha hoon: **50 million DAU**, har user ~40 messages per day, text max 4 KB, media S3 par.
+
+Non-functional mein mere liye chaar cheezein important hain. Latency -- p95 **500 millisecond se kam**, kyunki chat mein 2 second ka lag turant 'app hang ho gaya' feel deta hai. Availability 99.99 -- messaging down matlab product down. **Durability -- ek bhi accepted message kabhi na khoye**; ye hard requirement hai. Aur ordering -- mujhe global ordering **nahi** chahiye, sirf **per conversation** ordering chahiye, aur woh strong honi chahiye. Global ordering mehenga hai aur kisi ko dikhta bhi nahi."
+
+### **Minute 2 -- scale numbers aur stateful shift**
+
+"Numbers: 50 million into 40 = **2 billion messages per day**, divide by 86,400 = roughly **23,000 messages per second** average, peak 3x yaani **70,000**.
+
+Lekin asli number ye nahi hai. 80% messages 1:1 hain -- 1.6 billion deliveries. 20% group hain, average 30 members -- 0.4 billion into 29 = **11.6 billion deliveries**. Total **13.2 billion deliveries per day, yaani ~153,000 deliveries per second**, peak ~460,000. Matlab **group chat 6.6x amplification deta hai.** Capacity main hamesha **deliveries** par plan karunga, messages par nahi.
+
+Connections: DAU ka ~20% ek saath online = **10 million concurrent WebSocket connections**. Ek node par safely 50,000 -- yaani **200 nodes, headroom ke saath 250**. Per connection ~20 KB memory, toh 50,000 into 20 KB = ~1 GB per node sirf connections ke liye.
+
+Aur **yahan sabse badi baat ye hai ki ye hamara pehla stateful system hai.** Ab tak URL shortener, rate limiter, search -- sab stateless the: koi bhi request kisi bhi node par ja sakti thi. Yahan server ko client ko **khud se** message bhejna hai, toh connection khula rehna chahiye, toh user ka socket ek **specific node** par pada hai. 'Kaun kis node par hai' ab ek design problem hai."
+
+### **Minute 3 -- architecture aur routing**
+
+"Initially main simple architecture rakhunga. Client `wss://` par connect karta hai, **L4 load balancer** ke through -- L4 isliye ki connections long-lived hain, aur algorithm **least-connections**, round-robin nahi, warna naye node par load nahi jaayega jab connections ghanton chalti hain.
+
+LB ke peeche **gateway nodes** hain, 250, stateful. Connect par JWT auth, phir socket ko userId plus deviceId se bind.
+
+Ab main routing solve karunga. Amit ka socket node 7 par hai, Bina ka node 42 par. Amit ke message ko node 42 tak kaise pahunchayein? Teen options hain. Ek -- har node sabko broadcast kare: N-squared, bekaar. Do -- consistent hashing se user ko fixed node par map karo: theek hai par rebalance par sab connections toot-ti hain. Teen, **jo main lunga** -- ek **session registry**: Redis mein `conn:userId:deviceId` ka value `nodeId`, TTL 90 second, heartbeat par refresh. Aur har gateway apne channel `gw:<nodeId>` ko **Redis Pub/Sub** par subscribe karta hai.
+
+Flow: message chat service par aaya -- ye **stateless** hai -- woh membership authorize karti hai, `INCR seq:<conversationId>` se sequence leti hai, persist karti hai, sender ko ack deti hai, aur event **Kafka `chat-events`** par daal deti hai, 64 partitions, key `conversationId` -- taaki per-conversation ordering bani rahe. **Delivery workers** us event ko padhte hain, conversation ke members nikalte hain, har member ke devices nikalte hain, har device ka registry lookup karte hain, aur us node ke `gw:<nodeId>` channel par publish kar dete hain. Wahi node apne local `Map<userId, Set<Connection>>` se socket nikaal kar frame likh deta hai.
+
+Sticky sessions main **nahi** lunga -- registry already bata rahi hai ki user kahan hai, aur sticky sessions node restart par sab tod dete hain."
+
+### **Minute 4 -- seq vs messageId, ack-after-persist, offline**
+
+"Do cheezein alag hain aur ye confusion bahut common hai.
+
+**`seq`** server-assigned hai, **per conversation monotonic** -- Redis `INCR`. Ye **ordering** ke liye hai, gap detection ke liye, aur reconnect par delta sync ke liye. Ordering timestamp se **nahi** karunga -- client ki clock galat ho sakti hai, aur do servers mein bhi skew hota hai. `createdAt` sirf display ke liye hai.
+
+**`messageId`** client-generated UUID hai -- ye **idempotency** key hai. Network retry par server usi message ko dobara insert nahi karta, unique index `(conversation_id, message_id)` par, aur client apne side par bhi dedup kar leta hai. Hamari delivery semantics **at-least-once plus client-side dedup** hai -- exactly-once network par possible nahi hai. Duplicate dikhna galat hai par recoverable; message kho jaana nahi.
+
+Aur ek order jo main kabhi nahi todunga: **`sent` ack tabhi jab message persist ho chuka ho.** Pehle ack doge toh user ko grey tick dikhega, phir write fail hoga, aur message gayab. Ye durability requirement ka concrete roop hai.
+
+Recipient offline hai toh? Message phir bhi persist hota hai, registry mein session nahi milti, toh `push-notifier` consumer FCM/APNs par push bhejta hai -- woh hamara Notification System hai, dobara nahi banayenge. Reconnect par client `resume` frame bhejta hai apne `lastSeqByConversation` ke saath, aur server sirf **delta** bhejta hai."
+
+### **Minute 5 -- trade-offs aur failure**
+
+"At scale yahan **bottleneck connections hain, messages nahi.** 23,000 messages per second ek CPU problem nahi hai; 10 million open sockets ek **memory aur file descriptor** problem hai. Har node par `ulimit -n` kam se kam 200,000 chahiye -- default 1024 hai, aur ye production ka classic trap hai.
+
+Failure: sabse bada risk **ek gateway node ka girna** hai. 50,000 clients ek saath reconnect karenge, agle node ko maar denge, phir cascade. Isliye reconnect par **full jitter backoff** -- `random(0, min(30s, 2^attempt))`. **Reconnect storm is system ka signature failure hai.** Doosra risk ek **slow client** hai: 2G par uska socket buffer bharta jaata hai; main `bufferedAmount` 1 MB cross hone par usko **drop** kar deta hoon, close code 1013 -- woh reconnect karke resume kar lega, kyunki durability socket par nahi, store par tiki hai.
+
+**One trade-off here is** presence ka. Har user ke online hone par uske saare contacts ko batana 10 million into 200 contacts = 2 billion notifications per flip hai. Isliye presence **eventual** hai, Redis key TTL 90 second, aur sirf khuli hui chats ke liye subscribe hoti hai. 'Last seen 2 minutes ago' ka matlab hi yahi hai -- main ye confidently bolunga, ye bug nahi hai.
+
+Doosra trade-off: v1 mein **Postgres**, kyunki membership relational hai aur `ON CONFLICT` idempotency free deta hai. Lekin 600 GB per day, ek saal ka 219 TB, replication 3 ke saath 657 TB -- ye ek Postgres primary se nahi chalega. Toh v3 mein `messages` **Cassandra** par jaayega, partition key `conversationId`, clustering `seq DESC`; users aur membership Postgres mein hi rahenge.
+
+Teesra: **E2EE v1 mein nahi.** Uske baad server-side search, server-side fan-out of content, aur web multi-device -- teeno mushkil ho jaate hain. Ye product decision hai, technical nahi.
+
+Summary: WebSocket gateways, Redis session registry plus pub/sub routing, `seq` for ordering aur `messageId` for idempotency, ack-after-persist, aur reconnect storm ke liye jitter. Kisi part mein deep dive karein?"
+
+---
+
+## PART 29 -- Whiteboard Drawing Order
+
+**Rule:** diagram ek saath mat banao. Har box tab draw karo jab uska **reason** bol rahe ho. Chat system mein ek extra rule: **gateway tier ko ek row mein, multiple boxes mein draw karo** -- ek box mein nahi. Kyunki poora design hi is baat par tika hai ki gateways **kai hain aur user kisi ek par hai**.
+
+### Step 1 -- Clients
+
+```
+[Clients: phone (iOS/Android) | web | tablet]   ek user = 1-3 devices
+```
+
+> "Ek user ke **multiple devices** ho sakte hain -- phone aur web ek saath. Isliye har jagah key `userId + deviceId` hogi, sirf `userId` nahi. Ye chhoti si baat aage session registry aur fan-out dono ka shape decide karti hai."
+
+**Ye box invite karta hai:** "Multi-device sync kaise karoge?" -> `resume` + `lastSeqByConversation`.
+
+**Abhi mat draw karo:** CDN, DNS.
+
+### Step 2 -- L4 Load Balancer
+
+```
+[Clients]
+    |  wss://  (HTTP Upgrade -> 101 Switching Protocols), heartbeat 30 s
+    v
+[L4 LB -- TCP/TLS, least-connections]
+```
+
+> "L4 lunga, L7 nahi -- kyunki ye connections **ghanton** khuli rehti hain, per-request routing ka koi matlab nahi. Aur algorithm **least-connections**, round-robin **nahi**: round-robin naye node ko utna hi traffic deta hai jitna bhare hue node ko, jabki yahan purani connections jaati hi nahi."
+
+**Ye box invite karta hai:** "Sticky sessions chahiye?" -> "Nahi -- registry batati hai user kahan hai; sticky sessions node restart par sab tod dete hain."
+
+### Step 3 -- Gateway nodes (ek ROW mein, connection counts ke saath)
+
+```
+[L4 LB]
+   |
+   +----------+----------+----------+ ... +
+   v          v          v          v     v
+[gw-01]    [gw-02]    [gw-07]    [gw-42]  ...   250 nodes
+ 50K con    50K con    50K con    50K con       = 10M connections
+ ~1 GB      ~1 GB      ~1 GB      ~1 GB         (20 KB x 50K)
+ STATEFUL   STATEFUL   STATEFUL   STATEFUL      ulimit -n >= 200,000
+```
+
+> "Ye **hamara pehla stateful tier** hai. Har node par 50,000 open sockets, per connection ~20 KB, yaani ~1 GB sirf connections ke liye -- node ko 8 GB RAM. 10 million by 50,000 = 200 nodes, headroom ke saath **250**. Aur `ulimit -n` 200,000 rakhna padta hai; default 1024 par server 1024 connections ke baad mar jaata hai."
+
+**Ye box invite karta hai:** "Ek node gir gaya toh?" -> 50,000 reconnect -> **full jitter backoff** (yahi is system ka signature failure hai). Ye jawab abhi mat bolo, step 9 ke baad bolna zyada impact karta hai.
+
+Row ke neeche chhota likh do: `Map<userId, Set<Connection>>` -- local.
+
+### Stage A -- board abhi aisa dikhna chahiye
+
+```
+   [Clients: phone | web]
+            |  wss:// (Upgrade -> 101), heartbeat 30 s
+            v
+   [L4 LB -- TCP/TLS, least-connections]
+            |
+   +--------+--------+--------+ ... 250 nodes
+   v        v        v        v
+[gw-01]  [gw-02]  [gw-07]  [gw-42]      50K conns each = 10M
+                                        local Map<userId, Set<Connection>>
+```
+
+### Step 4 -- Redis session registry
+
+```
+[gw-07] --SET conn:<userId>:<deviceId> = gw-07  EX 90--> [Redis]
+[gw-42] --SET conn:<userId>:<deviceId> = gw-42  EX 90--> [Redis]
+                                                          conn:<u>:<d> -> nodeId (TTL 90 s)
+                                                          gw:<nodeId>   (Pub/Sub channel)
+                                                          seq:<conversationId> (INCR)
+                                                          presence:<userId> (TTL 90 s)
+```
+
+> "Ab asli problem: Amit gw-07 par hai, Bina gw-42 par. Amit ka message Bina tak kaise? Iske liye **session registry** -- Redis mein `conn:userId:deviceId` ka value `nodeId`, TTL 90 second, heartbeat par refresh. TTL isliye ki node **crash** ho jaaye toh entry khud saaf ho jaaye. Aur har gateway apne channel `gw:<nodeId>` ko subscribe karta hai."
+
+**Ye box invite karta hai:** "Consistent hashing kyun nahi?" -> "Kyunki rebalance par connections toot-ti hain. Registry lookup 1 ms ka hai aur node membership free mein badal sakti hai."
+
+### Step 5 -- Chat service (stateless)
+
+```
+[gw-07] --send frame--> [Chat Service (STATELESS)]
+                          1. authorize: member? (Redis cache 300 s -> Postgres)
+                          2. INCR seq:<conversationId>
+                          3. persist message
+                          4. ACK to sender  <-- persist ke BAAD
+                          5. produce to Kafka
+```
+
+> "Note karo ki ye tier **stateless** hai -- yahan koi socket nahi hai, isliye ye normal tarike se scale hoti hai. Iske paanch steps ka **order** hi poora design hai: authorize, seq, persist, **tab** ack, phir fan-out. Ack persist ke baad, warna user ko tick dikhega aur message gayab hoga."
+
+**Ye box invite karta hai:** "Ordering kaise?" -> `seq` per conversation, timestamp se nahi. "Retry par duplicate?" -> client ka `messageId`.
+
+Side mein likh do: `seq = ordering`, `messageId = idempotency`.
+
+### Step 6 -- Postgres / Cassandra
+
+```
+[Chat Service] --> [Postgres v1]  users, devices, conversations, conversation_members
+                                  messages PK (conversation_id, seq)
+                                  UNIQUE (conversation_id, message_id)
+               --> [Cassandra v3]  messages PRIMARY KEY ((conversation_id), seq) DESC
+                                   600 GB/day, 219 TB/year, x3 = 657 TB
+```
+
+> "v1 Postgres -- membership relational hai, transactions hain, aur `ON CONFLICT` se idempotency free milti hai. Lekin 600 GB per day aur saal ka 657 TB replication ke saath ek primary se nahi chalega. Toh v3 mein sirf `messages` Cassandra par -- append-only time-series, koi join nahi. **Users aur membership Postgres mein hi rehte hain.**"
+
+**Ye box invite karta hai:** "Cassandra mein fat partition?" -> "Ek badi group lakhs messages = ek fat partition; fix hai `((conversation_id, month_bucket), seq)`."
+
+### Stage B -- board ab aisa dikhna chahiye
+
+```
+   [Clients] -> [L4 LB] -> [gw-01] [gw-02] [gw-07] [gw-42] ... 250 x 50K
+                                      |
+                                      v
+                            [Chat Service -- STATELESS]
+                             authorize -> INCR seq -> persist -> ACK -> produce
+                               |                |
+                               v                v
+                  [Redis]                  [Postgres v1 / Cassandra v3]
+                  conn:<u>:<d> -> nodeId   messages PK (conv_id, seq)
+                  gw:<nodeId> pub/sub      UNIQUE (conv_id, message_id)
+                  seq:<convId> INCR
+```
+
+### Step 7 -- Kafka `chat-events`
+
+```
+[Chat Service] --produce--> [Kafka  chat-events]  64 partitions, key = conversationId
+                              consumer groups: delivery | unread-counter | push-notifier | archiver
+```
+
+> "Message persist ho gaya, sender ko ack mil gaya -- ab **delivery async** ho sakti hai. Kafka lagane ke teen kaaran: ek, key `conversationId` hone se per-conversation **ordering** partition ke andar bani rehti hai. Do, ek hi event ke **kai consumers** hain -- delivery, unread counts, push, archival, search indexing. Teen, koi consumer slow ho toh **send path slow nahi hota**."
+
+**Ye box invite karta hai:** "Kafka lag badh gaya toh?" -> "Messages kho nahi rahe, sirf late hain; alert `kafka_consumer_lag{group}` par, aur delivery workers ko scale karo -- 64 partitions tak."
+
+### Step 8 -- Delivery workers
+
+```
+[Kafka chat-events] --> [Delivery Workers  (consumer group 'delivery')]
+                          members(conversationId) -> devices(userId)
+                          -> GET conn:<userId>:<deviceId> -> nodeId
+                          -> PUBLISH gw:<nodeId>
+                          -> koi session nahi? -> push-notifier
+                        ~153,000 deliveries/sec avg, ~460,000 peak
+```
+
+> "Yahan **amplification** hoti hai. Ek message andar aata hai, M members x D devices baahar jaate hain. Hamare numbers mein 23,000 messages per second par **153,000 deliveries per second** -- 6.6x, group chat ki wajah se. **Capacity main yahan plan karta hoon, chat service par nahi.**"
+
+**Ye box invite karta hai:** "Ye number kahan se aaya?" -> 80% 1:1 = 1.6B, 20% group avg 30 members = 11.6B, total 13.2B/day.
+
+### Step 9 -- **THE MONEY MOMENT**: pub/sub arrow back into a DIFFERENT gateway
+
+```
+        Amit ka socket                                    Bina ka socket
+             |                                                  ^
+             v                                                  |
+        [gw-07] --> [Chat Service] --> [Kafka] --> [Delivery Worker]
+                                                         |
+                                            GET conn:user-bina:dev-phone
+                                                    = "gw-42"
+                                                         |
+                                                 PUBLISH gw:gw-42
+                                                         |
+                                                         v
+                                                     [gw-42]  <-- DIFFERENT node!
+                                                         |
+                                                         +--> socket.send(message)
+```
+
+> **Yahi woh moment hai.** Arrow ko **wapas gateway row mein** le jao, **lekin us node par nahi jahan se message aaya tha.** `gw-07` se andar gaya, `gw-42` se bahar nikla. Ye ek arrow interviewer ko batata hai ki tumne stateful routing ka problem sach mein samajha hai.
+>
+> Bolo: "Dhyaan dijiye -- message **gw-07** se andar aaya par **gw-42** se bahar gaya, kyunki Bina ka socket wahan hai. Yahi poore chat system ka dil hai. Stateless systems mein ye arrow hoti hi nahi -- response usi node se wapas jaata hai jisne request li thi. Yahan server ko **dhoondhna** padta hai ki user kahan baitha hai, aur wahan tak message **route** karna padta hai."
+
+**Ye box invite karta hai (teen sawaal, teeno acche hain):**
+- "Agar Bina ke do device do alag nodes par hon?" -> registry mein do keys, do publish.
+- "Agar publish ke beech mein Bina disconnect ho jaaye?" -> gateway ko socket nahi milti, delivery drop; message store mein hai, `resume` par mil jaayega.
+- "Redis Pub/Sub at-most-once hai na?" -> "Haan -- isliye durability Pub/Sub par nahi, **store + resume** par tiki hai. Pub/Sub sirf ek fast path hai."
+
+Arrow ke paas chhota likh do: **`at-most-once fast path; durability = store + resume`**.
+
+### Step 10 -- Push notification hand-off
+
+```
+[Delivery Worker] --no session found--> [push-notifier consumer] --> [Notification System]
+                                                                       FCM / APNs
+                                                                     (alag lesson,
+                                                                      dobara nahi banayenge)
+```
+
+> "Registry mein user ki koi session nahi mili = **offline**. Tab message push notification banta hai. Ye box main **jaan-boojh kar chhota** rakhta hoon aur clearly bolta hoon: ye **already ek existing system hai**, main ise call kar raha hoon, dobara design nahi kar raha. Interview mein scope ko is tarah cut karna ek plus point hai."
+
+**Ye box invite karta hai:** "Push aur socket dono se message aa gaya toh?" -> client `messageId` se dedup karta hai; push mein sirf `messageId` + preview jaata hai, poora content nahi.
+
+### Stage C -- final board
+
+```
+              [Clients: phone | web]   (userId + deviceId)
+                        |  wss://, heartbeat 30 s, reconnect w/ FULL JITTER
+                        v
+              [L4 LB -- TCP/TLS, least-connections]
+                        |
+      +--------+--------+--------+--------+ ... 250 nodes x 50K = 10M conns
+      v        v        v        v        v
+   [gw-01]  [gw-02]  [gw-07]  [gw-42]   ...     STATEFUL, ~1 GB conns, ulimit 200K
+                        |         ^
+              send      |         | socket.send()          <-- DIFFERENT gateway (step 9)
+                        v         |
+              [Chat Service -- STATELESS]      |
+               authorize -> INCR seq:<conv>    |
+               -> persist -> ACK -> produce    |
+                  |          |        |        |
+                  v          v        v        |
+          [Redis]    [Postgres/      [Kafka chat-events]
+          conn:<u>:<d> Cassandra]     64 parts, key=conversationId
+            -> nodeId  messages           |
+          gw:<nodeId>  PK(conv,seq)       +--> [delivery workers] --PUBLISH gw:<nodeId>--+
+          seq:<conv>   UNIQ(conv,msgid)   +--> [unread-counter]
+          presence:<u> 600 GB/day         +--> [push-notifier] --> [Notification System -> FCM/APNs]
+          unread:<u>:<c>                  +--> [archiver -> S3]
+          typing:<c>
+
+   Numbers: 23K msg/s in  ->  153K deliveries/s out  (6.6x, group chat)
+   Signature failure: gateway node dies -> 50K reconnects -> FULL JITTER backoff
+```
+
+### Kya **bilkul** draw nahi karna (jab tak pooche nahi)
+
+| Cheez | Kab draw karo |
+|---|---|
+| **Multi-region** (geo-routing, cross-region replication) | Jab interviewer bole "global users" ya "India-US latency" -- v3 discussion |
+| **Cassandra sharding detail** (partition key, month bucketing, fat partitions) | Jab "storage kaise scale karoge" aaye -- tab ek chhota side box |
+| **E2EE** (key exchange, Signal protocol, device keys) | Jab "WhatsApp jaisa encryption" pooche -- aur tab pehle bolo ki isse search aur server-side fan-out toot-te hain |
+| **Media / S3 / CloudFront** | Jab media attachments ka sawaal aaye -- tab client se seedha S3 presigned arrow, **chat servers ke through nahi** |
+| Elasticsearch / message search | v3 feature, aur woh alag lesson hai |
+| Socket.IO ki internals, protocol handshake bytes | Sirf agar transport par deep dive ho |
+
+> Board par **kam boxes, zyada arrows** rakho. Chat system mein interviewer arrows dekhta hai, boxes nahi -- khaas kar **step 9 wali wapas aane wali arrow.**
+
+---
+
+## PART 30 -- Final Cheat Sheet (5 minute revision)
+
+### Problem
+
+WhatsApp / Slack DM jaisa **real-time messaging app**: 1:1 + group chat (max **256** members), delivery receipts (sent -> delivered -> read), online/last-seen presence, typing indicator, offline par push notification, media attachments (S3), aur **multi-device sync**. Naya challenge: server ko client ko **khud se** message bhejna hai -> connection khuli rehti hai -> **system stateful ho jaata hai**.
+
+### Requirements
+
+| Type | Points |
+|---|---|
+| Functional | 1:1 + group (max 256), text max 4 KB; real-time delivery p95 < 500 ms; receipts `sent`/`delivered`/`read` (teen alag events); offline store + push + reconnect sync; history + multi-device delta sync (`afterSeq`); presence + typing (ephemeral); media via S3 presigned (`mediaKey` only); unread counts from `last_read_seq`; **per-conversation ordering** |
+| NFR | p95 < 500 ms (2 s lag = "app hang"); **99.99%** availability; **durability -- accepted message kabhi na khoye**; per-conversation ordering strong, **global ordering nahi chahiye**; 10M concurrent connections (memory + FD problem, CPU nahi); **at-least-once + client-side dedup** |
+| Clarify first | Group size? Multi-device? Receipts chahiye? Presence kitni accurate? Media? E2EE? History kitni purani? Ordering global ya per conversation? |
+
+### Key numbers (exact -- yaad rakho)
+
+| Metric | Value | Isse kya decide hua |
+|---|---|---|
+| DAU | **50M**, peak **10M concurrent connections** (~20%) | Gateway tier ka size |
+| Messages | 50M x 40 = **2B/day** -> **23,148 msg/sec** avg, peak 3x = **~70,000/sec** | Chat service + Kafka throughput |
+| **Deliveries** | 80% 1:1 = 1.6B; 20% group (avg 30) = 11.6B -> **13.2B/day = ~153,000/sec** avg, peak **~460,000/sec** | **Capacity yahan plan hoti hai. 6.6x amplification.** |
+| Connections | 10M / **50,000 per node** = **200 nodes (+headroom = 250)** | 250 gateway nodes |
+| Memory/conn | ~**20 KB** -> 50,000 x 20 KB = **~1 GB per node** | Node ko 8 GB RAM |
+| File descriptors | `ulimit -n` >= **200,000** per node | Default 1024 -> classic production trap |
+| Storage | ~300 B/msg -> **600 GB/day** -> **219 TB/year** -> x3 replication = **~657 TB** | Postgres nahi chalega -> Cassandra v3 |
+| Receipts | 13.2B x ~50 B = **660 GB/day** | **Receipts messages se zyada storage khaate hain** -> per-user `last_*_seq`, per-message row nahi |
+| Presence | 10M x heartbeat/30 s = **333,000/sec** = messaging se **14x zyada** | Presence throttle + scope karo |
+| Media | 5% x 300 KB = 100M/day = **30 TB/day** S3 par | Chat servers se hoke bilkul nahi |
+| Kafka | `chat-events`, **64 partitions**, key `conversationId` | Per-conversation ordering |
+
+### WebSocket frame protocol (skeleton)
+
+```ts
+// client -> server
+{ type:'auth', token, deviceId }
+{ type:'send', messageId, conversationId, body, mediaKey? }
+{ type:'receipt', conversationId, seq, state:'delivered'|'read' }
+{ type:'typing', conversationId }
+{ type:'resume', lastSeqByConversation: Record<string, number> }
+{ type:'ping' }
+// server -> client
+{ type:'auth_ok', userId }
+{ type:'ack', messageId, seq, serverTs }          // 'sent' tick
+{ type:'message', message: ChatMessage }
+{ type:'receipt', conversationId, seq, userId, state }
+{ type:'presence', userId, status:'online'|'offline', lastSeenAt? }
+{ type:'typing', conversationId, userId }
+{ type:'error', code, message }
+{ type:'pong' }
+// ChatMessage: { messageId, conversationId, seq, senderId, body, mediaKey?, createdAt }
+//              createdAt = display only, NEVER ordering
+```
+
+Close codes: **`4001`** auth failure, **`1013`** slow client (try again later), **`1011`** server error.
+
+### REST APIs (non-realtime)
+
+```
+WebSocket: wss://chat.example.com/ws
+GET  /api/v1/conversations?cursor=                                -> list + lastMessage + unreadCount
+GET  /api/v1/conversations/:id/messages?afterSeq=1200&limit=50    -> delta sync
+GET  /api/v1/conversations/:id/messages?beforeSeq=900&limit=50    -> scroll back (history)
+POST /api/v1/conversations            { type, memberIds } -> 201
+POST /api/v1/conversations/:id/members                    (admin only)
+POST /api/v1/media/presign            { contentType, sizeBytes } -> { uploadUrl, mediaKey }
+GET  /api/v1/users/:id/presence       -> { status, lastSeenAt }
+GET  /health   /ready
+```
+
+Errors: `401 UNAUTHENTICATED`, `403 NOT_A_MEMBER`, `413 MESSAGE_TOO_LARGE`, `429 RATE_LIMITED`.
+Pagination **hamesha keyset** (`afterSeq` / `beforeSeq`), offset kabhi nahi.
+
+### HLD one-liner
+
+```
+Client --wss--> L4 LB (least-connections) --> 250 STATEFUL gateway nodes (50K conns each)
+  --> Chat Service (stateless: authorize -> INCR seq -> persist -> ACK -> produce)
+  --> Kafka chat-events (64 parts, key=conversationId)
+  --> Delivery Workers (registry lookup -> PUBLISH gw:<nodeId>)
+  --> a DIFFERENT gateway --> recipient socket
+  (no session? -> push-notifier -> Notification System -> FCM/APNs)
+Support: Redis (sessions, seq, presence, unread, typing), Postgres/Cassandra, S3, Prometheus/OTel.
+```
+
+**Jaan-boojh kar nahi liya:** sticky sessions (registry hai), Socket.IO in v3 (raw `ws` lighter), E2EE in v1, CDN for messages (sirf media), Elasticsearch (v3 + alag lesson).
+
+### LLD folders
+
+```
+src/
+  gateway/        ws-server.ts, connection-manager.ts, frame-router.ts, heartbeat.ts, backpressure.ts
+  services/       chat.service.ts, presence.service.ts, receipt.service.ts,
+                  conversation.service.ts, sync.service.ts, typing.service.ts
+  repositories/   message.repository.ts, conversation.repository.ts, device.repository.ts,
+                  session.repository.ts (Redis), receipt.repository.ts
+  workers/        delivery.worker.ts, unread.worker.ts, push-notifier.worker.ts, archiver.worker.ts
+  routes/         conversations.routes.ts, sync.routes.ts, media.routes.ts
+  middleware/     auth.ts, rate-limit.ts, validate.ts
+  infra/          redis.ts, kafka.ts, postgres.ts, s3.ts, logger.ts, metrics.ts
+  app.ts  server.ts
+```
+
+### Database tables + **the two indexes that matter**
+
+```sql
+users(id PK, phone UNIQUE, display_name, last_seen_at, created_at)
+devices(id PK, user_id FK, platform CHECK(ios|android|web), push_token, last_active_at, UNIQUE(user_id,id))
+conversations(id PK, type CHECK(direct|group), title, last_message_seq DEFAULT 0, created_at)
+conversation_members(conversation_id, user_id, role, joined_at,
+                     last_read_seq DEFAULT 0, last_delivered_seq DEFAULT 0, muted,
+                     PRIMARY KEY (conversation_id, user_id))
+messages(conversation_id, seq, message_id, sender_id, type CHECK(text|media|system),
+         body, media_key, created_at, deleted_at,
+         PRIMARY KEY (conversation_id, seq))
+```
+
+| Index | Kya karta hai |
+|---|---|
+| **`PRIMARY KEY (conversation_id, seq)`** | "Last N messages of a conversation" aur "everything after seq X" -- **dono** ek range scan se. Hot path par doosra index chahiye hi nahi |
+| **`UNIQUE (conversation_id, message_id)`** | **Idempotency.** `INSERT ... ON CONFLICT DO NOTHING RETURNING seq` -- retry par duplicate message nahi |
+
+Support index: `conversation_members_by_user (user_id)` -- "mere saare chats". Aur `direct_pairs` par `UNIQUE (user_a, user_b)` (sorted) -- do logon ki duplicate direct conversation rokne ke liye.
+
+**Cassandra (v3):** `PRIMARY KEY ((conversation_id), seq) WITH CLUSTERING ORDER BY (seq DESC)` -- ek conversation ek partition, seq se sorted. Gotcha: **fat partition** (lakhs messages wali group) -> `((conversation_id, month_bucket), seq)`. **Membership aur users Postgres mein hi rehte hain.**
+
+### Redis keys
+
+| Key | Value | TTL | Kaam |
+|---|---|---|---|
+| `conn:<userId>:<deviceId>` | `nodeId` | **90 s** (heartbeat par refresh) | **Session registry** -- routing ka dil |
+| `gw:<nodeId>` | Pub/Sub channel | -- | Delivery worker -> gateway ka fast path (at-most-once) |
+| `seq:<conversationId>` | counter (`INCR`) | -- | **Per-conversation monotonic ordering.** Wipe par `conversations.last_message_seq` se rebuild; gap OK, reuse **kabhi nahi** |
+| `presence:<userId>` | `online` | **90 s** | Expire = offline. Eventual, 30-90 s stale OK |
+| `unread:<userId>:<conversationId>` | counter | -- | `INCR` on delivery, `SET 0` on read; source of truth `last_read_seq` |
+| `typing:<conversationId>` | set/flag | **5 s** | Ephemeral, kabhi persist nahi |
+| membership cache | member set | 300 s | Har send par authorization, DB hit ke bina |
+
+### Kafka
+
+**Topic `chat-events`, 64 partitions, key = `conversationId`** (per-conversation ordering partition ke andar).
+
+| Consumer group | Kaam |
+|---|---|
+| `delivery` | Members -> devices -> registry lookup -> `PUBLISH gw:<nodeId>` |
+| `unread-counter` | Redis `unread:<u>:<c>` INCR |
+| `push-notifier` | Offline recipients -> Notification System -> FCM/APNs |
+| `archiver` | S3 par cold storage |
+
+### Main mechanisms
+
+| Mechanism | Ek line mein |
+|---|---|
+| **Routing** | `conn:<userId>:<deviceId> -> nodeId` (Redis) + `gw:<nodeId>` Pub/Sub. Alternatives: broadcast (N^2), consistent hashing (rebalance dard), Kafka topic per node (partition explosion), direct gRPC (v3, fastest) |
+| **`seq` vs `messageId`** | `seq` = server-assigned, per-conversation monotonic -> **ordering + gap detection + delta sync**. `messageId` = client UUID -> **idempotency**. Timestamp ordering kabhi nahi (client clock + server skew) |
+| **Ack-after-persist** | `sent` ack tabhi jab message store ho chuka ho. Ye durability requirement ka concrete roop hai |
+| **Tick state machine** | `pending` (client) -> `sent` (server persisted, ack) -> `delivered` (recipient device ne receive kiya) -> `read` (chat khola). Har transition ek chhota event, monotonic, wapas sender tak |
+| **Resume / sync** | Reconnect par `{type:'resume', lastSeqByConversation}` -> server `seq > lastSeq` bhejta hai, bounded (500). Backoff **full jitter** `random(0, min(30s, 2^attempt))` |
+| **Backpressure** | `bufferedAmount > 1 MB` -> `close(1013)` -> client reconnect + resume. Safe kyunki durability socket par nahi, store par hai. **Ye production OOM ka asli ilaj hai** |
+| **Heartbeat** | Server 30 s, 2 miss (60 s) par close + registry delete. Redis TTL 90 s jaan-boojh kar bada (race na ho, aur node crash par bhi saaf ho) |
+| **Presence** | Pull on demand + subscribe only to open chats. Naive approach = 10M x 200 contacts = **2B notifications per flip**. Eventual, 30-90 s stale OK |
+| **Fan-out ka matlab** | News Feed mein fan-out-on-write (har follower ki timeline mein **copy**). Chat mein message **ek hi baar** conversation ke against store hota hai; **delivery** fan-out hoti hai. Alag cheez |
+
+### Scaling ladder + **teen scaling axes**
+
+| Stage | Kya badalta hai |
+|---|---|
+| **V1** | Ek Node process, `ws` server + Postgres, in-memory `Map<userId, Set<Connection>>`. 10-20K connections tak theek. Socket.IO bhi chalega (auto-reconnect free) |
+| **V2 (hamare numbers)** | 250 gateway nodes + L4 LB (least-connections) + **Redis session registry + Pub/Sub** + stateless chat service + **Kafka `chat-events`** + delivery workers + push-notifier. Raw `ws` (per-connection memory kam) |
+| **V3** | `messages` **Cassandra** par (657 TB), **multi-region** gateways + geo-routed LB, **direct gRPC node-to-node** delivery (Redis Pub/Sub hop bachao), Elasticsearch search indexer, E2EE discussion |
+
+**Teen scaling axes (ye alag alag scale karte hain -- yahi is system ki khaas baat hai):**
+
+| Axis | Bottleneck | Scale kaise |
+|---|---|---|
+| **1. Connections** | Memory + file descriptors (CPU nahi) | Aur gateway nodes. 50K/node, 20 KB/conn, `ulimit -n` 200K |
+| **2. Deliveries (fan-out)** | 153K/sec avg, 460K peak | Aur delivery workers + Kafka partitions (64 tak) |
+| **3. Storage** | 600 GB/day, 219 TB/year | Postgres -> Cassandra; receipts compact; media S3 par |
+
+### Consistency
+
+| Where | Level | Why OK |
+|---|---|---|
+| Per-conversation ordering | **Strong** (`INCR seq` + Kafka key = `conversationId`) | Yahi user ko dikhta hai |
+| Global ordering | **Nahi hai, aur chahiye bhi nahi** | Mehenga hai, kisi ko dikhta nahi |
+| Delivery | **At-least-once + client dedup** (`messageId`) | Exactly-once network par possible nahi. Duplicate recoverable, message loss nahi |
+| Presence | **Eventual, 30-90 s stale** | "Last seen 2 minutes ago" ka matlab hi yahi hai -- confidently bolo |
+| Typing | **No guarantee**, fire and forget, kabhi persist nahi | Ephemeral UI hint |
+| Unread counts | **Eventual** (Redis), source of truth `last_read_seq` | Redis khoye toh `lastMessageSeq - last_read_seq` se recompute |
+| `seq` continuity | **Gap allowed, reuse never** | Gap = "number skip"; reuse = do messages ek slot par |
+
+### Failure handling
+
+| Failure | Behaviour |
+|---|---|
+| **Gateway node dies** | 50,000 clients ek saath reconnect -> **thundering herd / reconnect storm** (is system ka signature failure). Fix: **full jitter** `random(0, min(30s, 2^attempt))`; registry entries 90 s TTL se apne aap saaf; LB least-connections se baantta hai |
+| **Slow client (2G)** | `bufferedAmount > 1 MB` -> `close(1013)` -> reconnect + resume. `slow_client_drops_total` alert. Bina iske: **node OOM** |
+| **Dead TCP (NAT/sleep)** | 60 s silent -> heartbeat sweep -> close + registry delete. Crash case ke liye Redis TTL 90 s |
+| **Redis session registry down** | Routing tootti hai -> messages persist hote rehte hain par realtime delivery nahi. Fallback: sab offline maano -> push notification, aur client reconnect + `resume` se sync. Redis replica + fast failover |
+| **Kafka lag** | Messages kho nahi rahe, sirf late. Alert `kafka_consumer_lag{group}`; delivery workers scale karo |
+| **Postgres/Cassandra down** | **Ack mat do** -- client `pending` dikhaye aur retry kare (`messageId` se safe). Jhootha ack durability tod deta hai |
+| **Push provider (FCM/APNs) down** | Retry with backoff in `push-notifier`; user reconnect par `resume` se sab mil jaata hai. Degraded, down nahi |
+| **Socket mid-write death** | `try/catch` -> `close(1011)` -> cleanup; fan-out loop chalta rehta hai (baaki members ko milta hai) |
+| **Duplicate delivery** | Client `messageId` se dedup -- design ka part hai, bug nahi |
+
+### Security
+
+- **Auth on connect** -- JWT verify, fail par close `4001`. Auth se pehle koi bhi frame reject.
+- **Authorization on EVERY send** -- `conversation_members` mein hai ya nahi (Redis cache 300 s). **Ye check skip karna is system ka sabse bada security hole hai** -- koi bhi kisi bhi `conversationId` par likh dega. `resume` par bhi yahi check.
+- **Message size cap 4 KB** (`413`), per-connection **rate limit** (spam/flood), bad-frame rate limit.
+- **Media** -- presigned S3 URL, short TTL, content-type + size validate; URL leak na ho isliye private bucket + signed GET.
+- **Group limit 256** -- fan-out aur receipts dono ko bounded rakhta hai.
+- **E2EE v1 mein nahi** -- aur bolo kyun: uske baad server-side search, server-side content fan-out, aur web multi-device teeno toot-te hain.
+- Abuse/spam control: report/block, new-account send limits.
+
+### Top 5 trade-offs
+
+| Decision | Chosen | Kyun | Kab badlega |
+|---|---|---|---|
+| Transport | **WebSocket** | Ek TCP connection, dono taraf; polling par 10M x 0.5 rps = 5M rps mostly-empty responses aur phir bhi 2 s lag | Sirf server->client chahiye aur text hai -> SSE. Corporate proxy problems -> Socket.IO fallback |
+| Routing | **Session registry + Pub/Sub** | Node membership free mein badal sakti hai; lookup ~1 ms | Consistent hashing (rebalance dard), direct gRPC mesh (v3, fastest par service discovery chahiye) |
+| Sticky sessions | **Nahi** | Registry already batati hai user kahan hai; sticky sessions node restart par sab tod dete hain | Kabhi nahi -- ye anti-pattern hai yahan |
+| Message store | **Postgres v1 -> Cassandra v3** | v1 mein membership relational + `ON CONFLICT` idempotency free; v3 mein 657 TB ek primary se nahi chalta | Volume 23K/s + 219 TB/year cross hote hi. **Membership phir bhi Postgres** |
+| E2EE | **v1 mein nahi** | Server-side search, server-side fan-out of content, web multi-device -- teeno mushkil ho jaate hain | Product requirement ho toh; tab search client-side aur multi-device key exchange design karo |
+
+### Top 10 follow-ups (one-line answers)
+
+| # | Question | One-line answer |
+|---|---|---|
+| 1 | User kis server par hai, ye kaise pata? | Redis session registry `conn:<userId>:<deviceId> -> nodeId`, TTL 90 s, heartbeat par refresh; gateway apne `gw:<nodeId>` channel par sunta hai |
+| 2 | Ek gateway node gir gaya? | 50,000 clients reconnect -> **full jitter backoff** `random(0, min(30s, 2^attempt))`; registry TTL se entries saaf; LB least-connections se re-balance |
+| 3 | Message do baar bhej diya (retry)? | Client ka `messageId` UUID = idempotency key; `UNIQUE (conversation_id, message_id)` -- wahi `seq` wapas, fan-out nahi |
+| 4 | Ordering kaise guarantee karoge? | `INCR seq:<conversationId>` per-conversation monotonic + Kafka key `conversationId`; timestamp se **kabhi nahi** (client clock + server skew) |
+| 5 | Offline user ko message? | Persist hota hai, registry mein session nahi milti -> `push-notifier` -> FCM/APNs; reconnect par `resume` se delta |
+| 6 | Multi-device sync? | Key `userId + deviceId`; fan-out sender ke **doosre** devices ko bhi; `resume` mein per-conversation `lastSeq` |
+| 7 | Ek slow client poore node ko maar sakta hai? | Haan -- isliye `bufferedAmount > 1 MB` par `close(1013)`; woh reconnect + resume kar lega, message store mein safe hai |
+| 8 | Presence sabko kaise batayein? | Naive = 10M x 200 contacts = 2B notifications per flip. Isliye pull on demand + sirf khuli chats subscribe; `presence:<userId>` TTL 90 s; 30-90 s stale OK |
+| 9 | 10M connections kaise handle karoge? | Ye CPU nahi, **memory + FD** problem hai: 50K/node x 20 KB = ~1 GB, 250 nodes, `ulimit -n` >= 200,000 |
+| 10 | Group 256 se bada kyun nahi? | Fan-out aur receipts dono phat-te hain (M x D deliveries + M receipts per message); badi broadcast ke liye alag design (read-only channel) |
+
+### 30-second answer
+
+PART 27 dekho. Skeleton: **WebSocket gateways (250 x 50K = 10M conns, STATEFUL) -> Redis session registry `conn:<u>:<d> -> nodeId` + `gw:<nodeId>` pub/sub -> stateless chat service: authorize -> INCR seq -> persist -> ACK -> Kafka -> delivery workers -> DIFFERENT gateway -> socket; offline -> push. `seq` ordering, `messageId` idempotency. 23K msg/s par 153K deliveries/s. Risk: reconnect storm -> full jitter.**
+
+### 5-minute answer (skeleton -- full text PART 28 mein)
+
+1. **Minute 1** -- Requirements: 1:1 + group 256, receipts, presence/typing, multi-device, media. NFR: p95 < 500 ms, 99.99%, **durability**, per-conversation ordering only.
+2. **Minute 2** -- Numbers: 2B msg/day = 23K/s; **13.2B deliveries/day = 153K/s (6.6x)**; 10M conns / 50K = 250 nodes. Aur: **"ye hamara pehla stateful system hai."**
+3. **Minute 3** -- L4 LB least-connections -> gateways -> **session registry + `gw:<nodeId>` pub/sub** (3 alternatives compare karo) -> stateless chat service -> Kafka -> delivery workers.
+4. **Minute 4** -- **`seq` = ordering, `messageId` = idempotency**; timestamp kabhi nahi; **ack-after-persist**; offline -> push; reconnect -> `resume` delta.
+5. **Minute 5** -- "At scale yahan bottleneck **connections hain, messages nahi**"; reconnect storm + full jitter; slow client drop; presence eventual; Postgres -> Cassandra; E2EE nahi. **"One trade-off here is..."** + "deep dive kahan?"
+
+### Most Important Things To Remember
+
+1. **Ye hamara pehla stateful system hai.** Server ko client ko khud se bhejna hai -> connection khuli rehti hai -> "user kis node par hai" ek design problem ban jaati hai. Baaki sab isi se nikalta hai.
+2. **Capacity deliveries par plan hoti hai, messages par nahi.** 23,148 msg/sec in, **153,000 deliveries/sec** out -- group chat 6.6x amplification deta hai.
+3. **Ack tabhi jab persist ho chuka ho.** Pehle ack = user ko tick dikha aur message gayab. Durability ka poora matlab ek line ke order mein hai.
+4. **`seq` ordering ke liye, `messageId` idempotency ke liye.** Do alag cheezein, do alag origin (server vs client), do alag kaam. Timestamp se ordering **kabhi nahi**.
+5. **Routing = session registry + pub/sub.** `conn:<userId>:<deviceId> -> nodeId` (TTL 90 s) + `gw:<nodeId>` channel. Sticky sessions nahi -- woh node restart par sab tod dete hain.
+6. **10M connections CPU problem nahi, memory + file descriptor problem hai.** 20 KB/conn, 50K/node = 1 GB, `ulimit -n` >= 200,000 (default 1024 wala trap).
+7. **Reconnect storm is system ka signature failure hai.** Ek node gira = 50,000 simultaneous reconnects. Ilaj: **full jitter backoff**.
+8. **Slow client ko drop karna safe hai** (`bufferedAmount > 1 MB` -> `1013`), kyunki durability socket par nahi, **store + resume** par tiki hai. Bina iske node OOM hota hai.
+9. **Presence messaging se mehenga hai** (333K heartbeats/sec = 14x), aur receipts messages se zyada storage khaate hain (660 GB vs 600 GB/day). Dono ko compact aur scoped rakho.
+10. **Disconnect par cleanup** -- connection hatao, khaali `Set` bhi hatao, registry entry bhi hatao. Ye teen lines na ho toh node dheere dheere mar jaata hai.
+
+---
+
+## Remember
+
+> **Chat system ka dil ek sawaal hai: "user ka socket kis node par pada hai?"** -- aur uska jawab session registry hai. Baaki sab uske aas paas ka plumbing hai: `seq` ordering deta hai, `messageId` idempotency, ack-after-persist durability, resume recovery, aur jitter zinda rehne ki tameez. Aur ek number hamesha yaad rakho: **23K messages in, 153K deliveries out.**
+
+## Quick Self-Test
+
+1. `ConnectionManager.remove()` mein `if (set.size === 0) this.byUser.delete(userId)` wali line hata do -- 50M DAU wale production node par exactly kya hoga, aur woh kitne din mein dikhega?
+2. Ek interviewer kehta hai: "ack pehle bhej do, persist baad mein -- latency kam ho jaayegi." Usko do line mein kyun mana karoge, aur user ko kya galat dikhega?
+3. `seq` aur `messageId` -- kaun sa kisne generate kiya, kaun sa kis problem ko solve karta hai, aur agar tum dono ki jagah `createdAt` timestamp use karte toh kaunse **do** alag bugs aate?
+4. Whiteboard ke step 9 mein arrow kis node par wapas jaati hai aur kyun? Wahi arrow agar `gw-07` par wapas jaati (jahan se message aaya tha) toh tumne kaunsi baat galat samajh li hoti?
+5. Ek gateway node gira, uske 50,000 clients turant reconnect karte hain. Bina jitter ke agle 60 second mein kya cascade hota hai, aur `random(0, min(30s, 2^attempt))` mein `random(0, ...)` wala part exactly kis cheez ko rokta hai?
+
+---
+
+**Chat System complete.** prompt.md ke saare systems cover ho gaye -- ab revision mode: har system ka Part 6 cheat sheet dobara padho. "next" bolo.

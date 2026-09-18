@@ -43,8 +43,8 @@ Rebuild HTML after editing any .md: `node systemdesign/build.mjs` (also rebuilds
    - [x] Part 6 -- Implement Twitter feed (pull vs hybrid), 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
 6. Chat System -- **read all parts in one place: [chat-system/index.html](chat-system/index.html)** (shared design decisions: [DESIGN-SPEC.md](chat-system/DESIGN-SPEC.md))
    - [x] Part 1 -- Polling se WebSocket tak, requirements, clarifying Qs, capacity (10M concurrent connections), HLD, Component WHY (1-6)
-   - [x] Part 2 -- 5 request flows, WebSocket frame protocol + REST APIs, Postgres v1 / Cassandra v3 schema, LLD, Node.js code (7-12)
-   - [x] Part 3 -- WebSocket internals, connection routing, seq vs messageId, tick state machine, presence N-squared problem, concurrency, Redis state (13-15)
+   - [ ] Part 2 -- 5 request flows, WebSocket frame protocol + REST APIs, Postgres v1 / Cassandra v3 schema, LLD, Node.js code (7-12)  <-- NOT WRITTEN YET
+   - [ ] Part 3 -- WebSocket internals, connection routing, seq vs messageId, tick state machine, presence N-squared problem, concurrency, Redis state (13-15)  <-- NOT WRITTEN YET
    - [x] Part 4 -- Scaling (teen alag scaling axes), Failures (reconnect storm), Consistency, Security (Origin check, membership), Observability (16-20)
    - [x] Part 5 -- Trade-offs (ws vs Socket.IO, pub/sub vs gRPC, E2EE ki keemat), V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js Qs (21-25)
    - [x] Part 6 -- Implement a chat server, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
