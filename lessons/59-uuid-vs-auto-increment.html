@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UUID vs Auto-Increment IDs</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Why Are UUIDs Preferred Over Auto-Increment IDs in Some Systems?
+
+## 1. Story
+
+Your app's order URLs look like `/orders/1042`. A curious user changes it to `/orders/1041` and sees someone else's order (an authorization bug - but the guessable ID made it trivial to find). A competitor notices your order IDs jumped by 3,000 this month and now knows your sales volume. Later, you split the database into shards, and two shards both create order `5000`.
+
+## 2. What Each One Is
+
+**Auto-increment ID** - the database hands out `1, 2, 3, ...`. Small, fast, naturally ordered.
+
+**Term: UUID** - a 128-bit identifier like `3f2b8c1e-9a4d-4e7f-b6a1-0c9d2e5f7a13`, generated so that collisions are practically impossible, **without asking anyone** for the next number.
+
+## 3. Why UUIDs Win in Some Systems
+
+- **Generated anywhere.** App servers, mobile clients (offline), or different shards can create IDs independently, with no central counter. That matters for distributed systems and sharding ([[21-database-partitioning]]).
+- **Not guessable.** You can't walk `/orders/1`, `/orders/2`, ... (still enforce authorization - a UUID is not a security control by itself - but it removes the easy enumeration).
+- **Doesn't leak business data.** Sequential IDs reveal how many users/orders you have and how fast you're growing.
+- **Easy merging.** Combining data from multiple databases, regions, or tenants doesn't cause ID clashes.
+- **ID known before insert.** The client can create the ID up front, which helps with idempotency and offline sync ([[32-payment-idempotency-double-click]]).
+
+## 4. Why Auto-Increment Is Still Often Better
+
+- **Smaller**: 8 bytes vs 16. Every index and foreign key referencing it is smaller too.
+- **Faster inserts**: new rows always go at the end of the B-tree index.
+- **Random UUIDs (v4) hurt write performance at scale**: inserts land at random places in the index, causing page splits and poor cache use.
+- **Human-friendly**: "order 1042" is easy to read over the phone.
+
+## 5. The Modern Middle Ground
+
+- **UUIDv7 / ULID**: time-ordered UUIDs. Globally unique and generated anywhere, **but** roughly sequential, so inserts stay index-friendly. This is often the best default today when you want UUIDs.
+- **Both**: an internal `BIGINT` primary key for joins and speed, plus a public UUID column used in URLs and APIs.
+
+## 6. Mental Model
+
+> Auto-increment is a ticket machine at one counter: tidy, small, ordered - but everyone must visit that one machine. UUIDs let everyone print their own ticket anywhere, at the cost of bigger, messier tickets. UUIDv7 prints tickets with a timestamp, so they still line up nicely.
+
+## 7. Trade-offs
+
+| | Auto-increment | UUIDv4 (random) | UUIDv7 / ULID |
+|---|---|---|---|
+| Generated without DB | No | Yes | Yes |
+| Guessable | Yes | No | Hard (time part visible) |
+| Size | 8 bytes | 16 bytes | 16 bytes |
+| Index insert performance | Best | Poor at scale | Good |
+
+## 8. 🧠 Remember
+
+> Use UUIDs when IDs must be created in many places, merged across systems, or kept unguessable; prefer time-ordered UUIDv7/ULID over random UUIDv4 to keep inserts fast; and remember an ID is never a replacement for authorization checks.
+
+## 9. Quick Self-Test
+
+1. Why do random UUIDs slow down inserts on large tables?
+2. What problem does a UUID solve when you shard a database?
+3. Why is "unguessable IDs" not enough to protect other users' data?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

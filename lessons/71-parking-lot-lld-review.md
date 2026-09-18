@@ -1,0 +1,92 @@
+# Parking Lot LLD: The Candidate Named the Right Patterns. Why Didn't the Interviewer Like It?
+
+## 1. The Candidate's Answer
+
+"I'll model `ParkingLot`, `Floor`, `Vehicle`, `ParkingSpot`, `Ticket`, and `Gate`. Allocation goes behind a `SpotAllocationStrategy`, pricing behind a `PricingStrategy`, so new spot types and pricing rules don't require changing existing classes."
+
+Nothing in that is *wrong*. That's the problem: it's a **list of nouns and pattern names**, not a design. An interviewer has heard this exact answer hundreds of times.
+
+## 2. What Was Missing
+
+**1. Requirements were never clarified.** How many floors and spots? Is allocation "nearest to the entry gate"? Can a motorcycle use a car spot? Is payment at exit or prepaid? What does "dynamic pricing" actually depend on - occupancy, time of day, events? The right design depends on these answers ([[30-workload-before-conclusion]]).
+
+**2. No flow was walked through.** The interviewer wants to see one car go: arrive at gate -> find a spot -> issue ticket -> park -> exit -> calculate fee -> pay -> free the spot. Walking the flow exposes the real methods and responsibilities.
+
+**3. No behavior - only names.** What are the methods? Who owns "is this spot free"? What does `Ticket` hold? Classes without method signatures and relationships aren't LLD yet.
+
+**4. Concurrency was ignored - the most important gap.** Two cars arrive at two different gates at the same moment. Both allocation calls see spot `F2-17` as free. Both get it. This is the same check-then-act race as [[26-duplicate-email-race-condition]]. A strong answer makes "reserve spot" atomic.
+
+**5. State wasn't modeled.** A spot is `FREE -> RESERVED -> OCCUPIED -> FREE` (plus `OUT_OF_SERVICE`). A ticket is `ACTIVE -> PAID -> CLOSED` (plus `LOST`). Explicit states make illegal transitions impossible.
+
+**6. Edge cases were skipped.** Lot full, lost ticket, payment failure at exit, car leaves without paying, a spot blocked for maintenance, the gate losing network.
+
+**7. Patterns came first instead of last.** Strategies are fine *where variation actually exists*. Leading with pattern names signals memorization. Let patterns appear when a requirement demands them ([[42-resilience-vs-overengineering]] - the same idea for code structure).
+
+## 3. A Stronger Sketch
+
+```java
+enum SpotType { MOTORCYCLE, COMPACT, LARGE, EV }
+enum SpotStatus { FREE, OCCUPIED, OUT_OF_SERVICE }
+
+class ParkingSpot {
+  final String id; final SpotType type; SpotStatus status;
+  boolean canFit(Vehicle v) { return v.getType().fitsIn(type); }
+}
+
+class Floor {
+  // one free-spot pool per type for O(1) allocation
+  Map<SpotType, Deque<ParkingSpot>> freeSpots;
+  synchronized Optional<ParkingSpot> reserve(VehicleType vt) {   // atomic: no double-assign
+    for (SpotType t : vt.compatibleSpotTypes()) {
+      ParkingSpot s = freeSpots.get(t).pollFirst();
+      if (s != null) { s.status = SpotStatus.OCCUPIED; return Optional.of(s); }
+    }
+    return Optional.empty();
+  }
+  synchronized void release(ParkingSpot s) { s.status = SpotStatus.FREE; freeSpots.get(s.type).addLast(s); }
+}
+
+class ParkingLot {
+  Ticket enter(Vehicle v, Gate gate) {
+    ParkingSpot spot = allocationStrategy.allocate(floors, v, gate)
+        .orElseThrow(LotFullException::new);
+    return ticketRepo.save(new Ticket(v, spot, clock.now()));
+  }
+  Receipt exit(String ticketId, Payment payment) {
+    Ticket t = ticketRepo.findActive(ticketId);              // lost ticket -> separate flow
+    Money fee = pricingStrategy.price(t, clock.now());
+    paymentService.charge(payment, fee, t.getId());          // ticket id as idempotency key
+    t.close(); floorOf(t.getSpot()).release(t.getSpot());
+    return new Receipt(t, fee);
+  }
+}
+```
+
+Now the Strategies earn their place: allocation genuinely varies (nearest to gate, fill lowest floor first, reserve EV spots), and so does pricing.
+
+**Beyond one process:** if there are many gates on different servers, the in-memory `synchronized` isn't enough. Reserve the spot in the database atomically (`UPDATE spots SET status='OCCUPIED' WHERE id=? AND status='FREE'`), the same pattern as [[60-cache-says-100-db-says-20]].
+
+## 4. What Actually Helps You Clear LLD Rounds
+
+1. **Clarify requirements and scope** for 3-5 minutes.
+2. **Identify entities and relationships**, then **responsibilities** ("who knows what, who does what").
+3. **Walk through the main use cases** and let method signatures come out of the flow.
+4. **Model state** with enums and valid transitions.
+5. **Handle concurrency** anywhere two actors compete for the same resource.
+6. **Cover edge cases** out loud.
+7. **Introduce patterns only to solve a stated variation**, and say why.
+8. **Write real code** for the core flow - many interviewers expect compilable-looking classes, not just a diagram.
+
+## 5. Mental Model
+
+> LLD isn't "which patterns do you know." It's "can you turn requirements into classes with clear responsibilities, correct state, and safe behavior under concurrency." Patterns are the seasoning, not the meal.
+
+## 6. 🧠 Remember
+
+> Clarify, walk the flow, give classes real methods and states, make shared-resource allocation atomic, cover edge cases - and only then reach for patterns where variation truly exists.
+
+## 7. Quick Self-Test
+
+1. How can two gates assign the same spot, and how do you prevent it in one process and across many servers?
+2. Why does leading with "Strategy pattern" often hurt instead of help?
+3. What states would you model for a Ticket, and which transitions are illegal?

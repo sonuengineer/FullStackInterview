@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Things I Wish I Knew Before My First Backend Job</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Blog: Things I Wish Someone Told Me Before My First Backend Job
+
+*Ten short lessons that usually take a year of production incidents to learn. Each one comes with a tiny real example and a link to go deeper.*
+
+---
+
+## 1. Logs Are Your Best Friend. Use Them.
+
+When something breaks in production, you can't attach a debugger. Logs are what you have.
+
+**Example:** "Payment failed for some users." With logs that include `requestId`, `userId`, and the error, you find the cause in 5 minutes. With `console.log("error")`, you're guessing for a day.
+
+Log with context, use structured (JSON) logs, and never log passwords or card numbers. -> [[02-debugging-random-500-errors]]
+
+## 2. Every Input Is a Potential Attack. Validate Everything.
+
+Query params, JSON bodies, headers, file uploads, even data from your own mobile app - all of it can be changed by an attacker.
+
+**Example:** A `quantity` field accepts `-5`, and a user gets a refund on an order they never paid for. Validate type, range, and length on the server, and use parameterized queries to prevent SQL injection. -> [[18-http-status-codes-400-404-409-422]]
+
+## 3. "Works in Dev" Means Nothing.
+
+Dev has 50 rows, one user, and a fast laptop. Production has 50 million rows, concurrent users, slow networks, and real failures.
+
+**Example:** A query that takes 5ms locally takes 45 seconds in production because the table is 10,000x bigger and has no index. -> [[50-slow-query-500m-rows]]
+
+## 4. Database Transactions Exist for a Reason.
+
+If two writes must both happen or neither happen, wrap them in a transaction.
+
+**Example:** You deduct money from wallet A, then the server crashes before adding it to wallet B. Without a transaction, the money just disappears. -> [[60-cache-says-100-db-says-20]]
+
+## 5. Never Store Passwords in Plain Text. Ever.
+
+And not as plain SHA-256 or MD5 either. Use Argon2id or bcrypt.
+
+**Example:** Databases leak. With plain text, every user's password (and likely their email password too) is exposed instantly. -> [[56-password-hashing-not-sha256]]
+
+## 6. Cache Invalidation Is Harder Than It Sounds.
+
+Adding a cache takes an hour. Keeping it correct takes forever.
+
+**Example:** A user updates their profile photo, but the old one keeps showing for 10 minutes because the cache wasn't cleared. Annoying for photos; dangerous for balances and permissions. Never make critical decisions from cached data. -> [[60-cache-says-100-db-says-20]]
+
+## 7. Your API Will Be Called in Ways You Never Imagined.
+
+Clients double-click, retry on timeout, send huge payloads, call endpoints out of order, and hammer you from scripts.
+
+**Example:** A mobile app retries every failed request 3 times. A slow payment endpoint now gets triple traffic and charges some users twice. Design for retries with idempotency keys. -> [[32-payment-idempotency-double-click]], [[48-huge-json-payloads]]
+
+## 8. Rate Limiting Is Not Optional.
+
+Without limits, one buggy client, scraper, or attacker can take down the service for everyone.
+
+**Example:** A partner's integration has a bug and sends 5,000 requests per second in a loop. Rate limiting returns `429` to them and keeps everyone else working. -> [[04-handling-traffic-spike-15k-rps]]
+
+## 9. Backups Mean Nothing If You've Never Tested Restoring Them.
+
+A backup you've never restored is a hope, not a backup.
+
+**Example:** A team discovers during a real outage that backups had been silently failing for 3 months, or that a restore takes 14 hours - longer than the business can survive. Practice restores regularly and time them.
+
+## 10. The Bug Is Always in the Last Place You Look.
+
+(Because you stop looking once you find it.) The real lesson: **debug systematically**, not randomly. Check what changed, follow one request end to end, and rule things out with data instead of hunches.
+
+-> [[20-sudden-latency-spike-checklist]]
+
+---
+
+## 🧠 Remember
+
+> Production is where your assumptions go to die: log with context, validate everything, use transactions, hash passwords properly, distrust caches, expect retries, rate limit, test restores, and debug with data.
+
+## Reflect
+
+Which of these ten has already bitten you? Which one do you think will bite you next?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

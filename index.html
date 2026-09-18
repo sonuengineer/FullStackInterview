@@ -246,6 +246,52 @@
     margin: 2px 2px;
   }
   #reader a.xref-link:hover { background: var(--accent); color: #fff; }
+  /* "Read next" suggestions at the bottom of every lesson/blog */
+  .suggest-box {
+    margin-top: 3em;
+    padding-top: 1.2em;
+    border-top: 2px solid var(--border);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  }
+  .suggest-box h2 { border: none; margin-top: 0; font-size: 1.15rem; }
+  .suggest-group { margin: 1em 0 1.4em; }
+  .suggest-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .suggest-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+  }
+  .suggest-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    font-size: 0.88rem;
+    line-height: 1.35;
+  }
+  .suggest-card:hover { border-color: var(--accent); }
+  .suggest-card .cat { font-size: 0.68rem; color: var(--accent); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .suggest-nav { display: flex; justify-content: space-between; gap: 10px; margin-top: 1.4em; }
+  .suggest-nav button {
+    flex: 1;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 8px;
+    padding: 10px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    text-align: left;
+  }
+  .suggest-nav button.next { text-align: right; }
+  .suggest-nav button:hover { border-color: var(--accent); }
 </style>
 </head>
 <body data-theme="sepia">
@@ -4116,6 +4162,1499 @@ await Promise.all(users.map(u => limit(() => sendNotification(u))));
 2. Why is a concurrency limit of 10-50 safer than sending all 5,000 at once?
 3. How would a provider's batch API change the math?
 </script>
+<script type="text/markdown" class="lesson-data" data-id="55" data-title="Engineering Is Getting Harder, Building Is Getting Easier" data-category="Blog" data-order="55">
+# Blog: Being a Software Engineer Is Getting Harder. Building Software Is Getting Easier.
+
+*An unpopular opinion, and why the gap between those two sentences is going to change who gets into tech.*
+
+---
+
+## Two Things Are True at Once
+
+**Building software is getting easier.** Ten years ago, a login page, a database, hosting, payments, and email took weeks of setup. Today:
+
+- AI writes the first version of most code in seconds.
+- Managed services handle auth (Clerk, Auth0), databases (Supabase, RDS), payments (Stripe), and hosting (Vercel, AWS).
+- A single person can ship a working product over a weekend.
+
+**Being a software engineer is getting harder.** The job didn't disappear. It moved:
+
+- The easy part (typing code) is now cheap, so the hard parts are what you're paid for: judgment, debugging, design, and owning production.
+- Systems are more distributed: more services, more queues, more third-party APIs, more ways to fail.
+- The bar for juniors went up. The tasks juniors used to learn on (simple CRUD, boilerplate, small bug fixes) are exactly what AI now does.
+
+## A Simple Example
+
+Ask an AI: "Build me an API that charges a customer."
+
+You'll get working code in 10 seconds. It will probably:
+
+- charge twice if the user double-clicks ([[32-payment-idempotency-double-click]])
+- break when two requests read a stale balance ([[60-cache-says-100-db-says-20]])
+- hang forever when the payment provider is slow ([[14-cascading-failure-recovery]])
+
+**Building** the endpoint took seconds. **Engineering** it - making it correct under retries, concurrency, and failure - is the part that still needs a person who understands what's happening underneath.
+
+## So What Changes About Who Gets Into Tech?
+
+**1. "I can build an app" is no longer a differentiator.** Almost anyone can. Bootcamp-style "I built a todo app" portfolios stop standing out.
+
+**2. Depth becomes the entry ticket.** People who understand *why* things break - databases, networking, concurrency, failure modes - become more valuable, because they can review and fix what AI produces.
+
+**3. Builders who aren't engineers will multiply.** Designers, founders, domain experts, and analysts will ship real software without calling themselves engineers. That's good. It also means "writing code" is no longer a gate that only engineers pass through.
+
+**4. The junior ladder needs a new first rung.** If AI does the beginner work, beginners must learn from the start by reading, debugging, and questioning code, not only by writing it.
+
+## What To Do About It (If You're Early in Your Career)
+
+- **Use AI to build fast, then ask "how does this break?"** about everything it produces.
+- **Go deep on fundamentals** that don't go out of date: how a request travels, how databases execute queries, what happens under concurrency and failure. That's what this whole lesson library is about.
+- **Own something in production**, even a small side project with real users. Production teaches what tutorials can't.
+- **Practice explaining trade-offs.** "Why this and not that?" is the question AI can't answer for your specific system ([[29-why-hire-you-over-ai]]).
+
+## 🧠 Remember
+
+> Building software is getting cheaper because the code is getting cheaper. Engineering is getting harder because what's left - judgment, correctness, and owning failure - is the part that was always hard.
+
+## Reflect
+
+1. What's one thing you built recently that AI could have written - and one thing about it that AI would likely have gotten wrong?
+2. Which fundamental topic would make you better at reviewing AI-generated code?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="56" data-title="Why Not SHA-256 for Passwords?" data-category="Security" data-order="56">
+# Why Not Store SHA-256(password)? What Should You Use Instead?
+
+> **Connects to**: [[27-cia-triad]] (this protects Confidentiality when - not if - the database leaks).
+
+## 1. Story
+
+Your users table leaks. It happens to big companies every year. The attacker now has every row, including the `password_hash` column. The only question that matters now: **how long until they turn those hashes back into real passwords?**
+
+## 2. The Surprise: SHA-256 Is Too *Fast*
+
+SHA-256 is a great hash for **file integrity and signatures**, where speed is a feature. For passwords, speed is exactly the problem.
+
+- A modern GPU can compute **billions** of SHA-256 hashes per second.
+- Passwords like `MyPassword@123` are not random. Attackers try leaked-password lists and common patterns first.
+- So the attacker hashes billions of guesses per second and compares against your leaked hashes. Weak and medium passwords fall in minutes or hours.
+
+**Other problems with plain SHA-256:**
+
+- **No salt** means two users with the same password have the **same hash**. One crack reveals both, and attackers can use **precomputed tables** (rainbow tables) of hashes for common passwords.
+- **Term: Salt** - a random value, unique per user, mixed into the password before hashing. Same password, different salt, completely different hash. It kills precomputed tables and forces attackers to crack each user separately.
+
+Even with a salt, SHA-256 is still billions-per-second fast. Salt fixes the "crack everyone at once" problem, but not the "guess very fast" problem.
+
+## 3. The Fix: A Slow, Salted Password-Hashing Function
+
+Use an algorithm **designed to be slow and memory-hungry on purpose**:
+
+| Algorithm | Notes |
+|---|---|
+| **Argon2id** | Modern first choice (winner of the Password Hashing Competition). Tunable CPU + memory cost, which hurts GPU attacks badly. |
+| **bcrypt** | Battle-tested, widely available. Tunable cost factor. Only uses the first 72 bytes of the password. |
+| **scrypt** | Memory-hard, good choice too. |
+| **PBKDF2** | Acceptable (and required in some compliance settings) with a high iteration count, but weaker against GPUs. |
+
+These have **salts built in** and a **cost factor** you tune so one hash takes around 100-500ms on your server. For one login that's unnoticeable. For an attacker trying billions of guesses, it turns minutes into centuries.
+
+## 4. Mental Model
+
+> A password hash should be like a heavy vault door: one legitimate opening a day is fine, but trying a billion keys becomes impossibly slow. SHA-256 is a revolving door - great for traffic, terrible for security.
+
+## 5. Code Example
+
+```javascript
+const argon2 = require('argon2');
+
+// Signup: hash with a built-in random salt and tuned cost
+const hash = await argon2.hash(password, { type: argon2.argon2id });
+// Stored value looks like: $argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>
+// Algorithm, cost settings, and salt are all stored inside the string.
+
+// Login: verify - never compare hashes yourself with ===
+const ok = await argon2.verify(storedHash, loginAttemptPassword);
+```
+
+## 6. Production Reality
+
+- **Raise the cost factor over time** as hardware gets faster; re-hash a user's password with new settings when they next log in successfully.
+- Optionally add a **pepper**: a server-side secret (kept outside the database, e.g. in a secrets manager) mixed in, so a database-only leak isn't enough.
+- **Rate-limit login attempts** - slow hashing also makes login a CPU target, so protect the endpoint.
+- Never write your own crypto. Use the library's `hash` and `verify`.
+
+## 7. Common Mistakes
+
+- "SHA-256 is secure, so it's fine for passwords." Secure for *integrity*, wrong tool for *passwords*.
+- Hashing many times with MD5/SHA in a homemade loop instead of using a proper algorithm.
+- Encrypting passwords (reversible) instead of hashing them (one-way). If you can decrypt them, so can an attacker who steals the key.
+
+## 8. 🧠 Remember
+
+> Passwords need a slow, salted, purpose-built hash - Argon2id or bcrypt - because the threat is billions of guesses per second after a leak, and SHA-256's speed is exactly what the attacker wants.
+
+## 9. Quick Self-Test
+
+1. Why is speed good for file hashing but bad for password hashing?
+2. What does a salt protect against, and what does it *not* protect against?
+3. Why is encrypting passwords worse than hashing them?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="57" data-title="Two Indexes, Still Slow (Composite Index)" data-category="Databases" data-order="57">
+# Index on user_id Exists. Index on created_at Added. Still 30 Seconds. What's Missing?
+
+> **Similar-question flag**: [[50-slow-query-500m-rows]] already covers the method (read `EXPLAIN ANALYZE`, then add the index that matches filter + sort). This lesson zooms in on one specific trap: **two separate single-column indexes are not the same as one composite index.**
+
+## 1. The Situation
+
+```sql
+SELECT * FROM orders
+WHERE user_id = 42
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+50 million rows. There's an index on `user_id` and another on `created_at`. Still 30 seconds.
+
+## 2. What's Missing: A Composite Index `(user_id, created_at)`
+
+A database usually uses **one** index per table access to do the heavy lifting. With two separate indexes it has to pick:
+
+- **Use `user_id` index**: finds all of user 42's rows fast - but if that user has 2 million orders, it must fetch all 2 million, then **sort them** by `created_at` to get the top 20.
+- **Use `created_at` index**: walks rows newest-first - but it has to check `user_id = 42` on each one, possibly reading millions of other users' rows before finding 20 matches.
+
+Either way, it reads a huge number of rows.
+
+A **composite index** on `(user_id, created_at)` stores the data already grouped by user **and** sorted by time inside each user. The database jumps straight to user 42 and reads the first 20 entries in order. No sort, no scanning other users.
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_user_created
+  ON orders (user_id, created_at DESC);
+```
+
+## 3. Mental Model
+
+> A phone book sorted by last name, then first name, lets you find "Sharma, Priya" instantly. Two separate books - one sorted by last name, one by first name - don't. Column **order** in a composite index matters the same way: put the equality filter first (`user_id`), then the sort/range column (`created_at`).
+
+## 4. Other Things to Check in the Plan
+
+If the composite index still doesn't fix it, `EXPLAIN ANALYZE` usually shows one of these:
+
+- **`SELECT *`** forces a lookup into the table for every row; selecting only needed columns (or a covering index with `INCLUDE`) avoids it.
+- **Type mismatch**: `user_id` is a string column but the query passes a number (or vice versa), so the index can't be used.
+- **Function on the column** (`WHERE DATE(created_at) = ...`) disables the index.
+- **Stale statistics**: run `ANALYZE` so the planner picks the right index.
+- **Skew**: one "whale" user with millions of rows behaves very differently from a typical user.
+
+## 5. 🧠 Remember
+
+> Two single-column indexes don't combine into one fast path - a query that filters on one column and sorts by another needs a composite index in that order: equality column first, then the sort/range column.
+
+## 6. Quick Self-Test
+
+1. Why can't the database efficiently use both single-column indexes together for this query?
+2. Why does `(user_id, created_at)` work but `(created_at, user_id)` is much worse here?
+3. What does a covering index add on top of a composite one?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="58" data-title="Less Traffic, More CPU" data-category="Production Debugging &amp; Incidents" data-order="58">
+# Traffic Dropped by Half, But CPU Went From 45% to 91% - How?
+
+## 1. Story
+
+Yesterday: 50,000 requests/min, CPU at 45%. Today: 25,000 requests/min, CPU at 91%. No deployment. Everyone's first instinct - "it must be more traffic" - is the one thing the numbers rule out.
+
+## 2. The Key Insight
+
+**Requests per minute is not load.** Load is:
+
+`load = number of requests x cost per request`
+
+If traffic halved but CPU doubled, then **each request got about 4x more expensive**. The question becomes: *what made each request cost more?*
+
+## 3. The Usual Suspects
+
+**1. Fewer servers.** The autoscaler saw lower traffic and **scaled in** from, say, 8 instances to 2. Total traffic halved, but traffic *per instance* doubled. Per-server CPU goes up even though the system as a whole is quieter. Check instance count first - it's the fastest thing to rule out. (Same "autoscaler reacts to symptoms" theme as [[39-autoscaling-amplifies-outage]].)
+
+**2. Cache hit rate collapsed.** A Redis restart, an eviction storm, a changed cache key format, or a TTL change means requests that used to be served from cache now hit the database and do full work. Fewer requests, far more work each.
+
+**3. The traffic mix changed.** Yesterday's traffic was mostly cheap reads (homepage, product page). Today's is mostly expensive calls: search, reports, exports - or a scraper/bot hammering one heavy endpoint. Same count, very different cost.
+
+**4. Retries and errors.** A downstream dependency started failing; clients and services now retry, so each user action produces several internal requests - and failed requests often cost more (timeouts, stack traces, logging).
+
+**5. Data grew past a tipping point.** A table crossed a size where the query plan changed (from index scan to full scan), or an unindexed query got 10x slower as rows piled up ([[50-slow-query-500m-rows]]).
+
+**6. Something else is using the CPU.** A cron job, a backup, a reindex, log shipping, or garbage-collection pressure from a slow memory leak ([[22-nodejs-memory-leak-debugging]]).
+
+**7. Lock contention and spinning.** Threads waiting on hot locks or retrying optimistic updates can burn CPU without doing useful work.
+
+## 4. How to Investigate
+
+1. **Instance count** - did the fleet scale in?
+2. **CPU per request** and **latency by endpoint** - which endpoint got expensive?
+3. **Cache hit rate** over the last 48 hours.
+4. **Traffic mix** by endpoint and by client/user agent - look for bots or one heavy customer.
+5. **Downstream error and retry rates.**
+6. **Profile the process** (CPU flame graph) to see where time is actually going.
+7. **What changed** even without a deploy: config, feature flags, cron schedules, data volume ([[20-sudden-latency-spike-checklist]]).
+
+## 5. Mental Model
+
+> Don't watch the number of cars - watch how heavy each truck is. Half the trucks, each four times heavier, will still break the bridge.
+
+## 6. Common Mistakes
+
+- Alerting and capacity planning purely on request count.
+- Assuming "no deploy" means "nothing changed" - caches, data size, traffic mix, and autoscaling all change without a deploy.
+
+## 7. 🧠 Remember
+
+> Less traffic can create more load when each request becomes more expensive - check fleet size, cache hit rate, traffic mix, retries, and data growth before blaming the code.
+
+## 8. Quick Self-Test
+
+1. How can scaling in make each server busier even though total traffic dropped?
+2. Why can a drop in cache hit rate increase CPU even with fewer requests?
+3. Which one metric would you add to dashboards so this is obvious next time?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="59" data-title="UUID vs Auto-Increment IDs" data-category="Databases" data-order="59">
+# Why Are UUIDs Preferred Over Auto-Increment IDs in Some Systems?
+
+## 1. Story
+
+Your app's order URLs look like `/orders/1042`. A curious user changes it to `/orders/1041` and sees someone else's order (an authorization bug - but the guessable ID made it trivial to find). A competitor notices your order IDs jumped by 3,000 this month and now knows your sales volume. Later, you split the database into shards, and two shards both create order `5000`.
+
+## 2. What Each One Is
+
+**Auto-increment ID** - the database hands out `1, 2, 3, ...`. Small, fast, naturally ordered.
+
+**Term: UUID** - a 128-bit identifier like `3f2b8c1e-9a4d-4e7f-b6a1-0c9d2e5f7a13`, generated so that collisions are practically impossible, **without asking anyone** for the next number.
+
+## 3. Why UUIDs Win in Some Systems
+
+- **Generated anywhere.** App servers, mobile clients (offline), or different shards can create IDs independently, with no central counter. That matters for distributed systems and sharding ([[21-database-partitioning]]).
+- **Not guessable.** You can't walk `/orders/1`, `/orders/2`, ... (still enforce authorization - a UUID is not a security control by itself - but it removes the easy enumeration).
+- **Doesn't leak business data.** Sequential IDs reveal how many users/orders you have and how fast you're growing.
+- **Easy merging.** Combining data from multiple databases, regions, or tenants doesn't cause ID clashes.
+- **ID known before insert.** The client can create the ID up front, which helps with idempotency and offline sync ([[32-payment-idempotency-double-click]]).
+
+## 4. Why Auto-Increment Is Still Often Better
+
+- **Smaller**: 8 bytes vs 16. Every index and foreign key referencing it is smaller too.
+- **Faster inserts**: new rows always go at the end of the B-tree index.
+- **Random UUIDs (v4) hurt write performance at scale**: inserts land at random places in the index, causing page splits and poor cache use.
+- **Human-friendly**: "order 1042" is easy to read over the phone.
+
+## 5. The Modern Middle Ground
+
+- **UUIDv7 / ULID**: time-ordered UUIDs. Globally unique and generated anywhere, **but** roughly sequential, so inserts stay index-friendly. This is often the best default today when you want UUIDs.
+- **Both**: an internal `BIGINT` primary key for joins and speed, plus a public UUID column used in URLs and APIs.
+
+## 6. Mental Model
+
+> Auto-increment is a ticket machine at one counter: tidy, small, ordered - but everyone must visit that one machine. UUIDs let everyone print their own ticket anywhere, at the cost of bigger, messier tickets. UUIDv7 prints tickets with a timestamp, so they still line up nicely.
+
+## 7. Trade-offs
+
+| | Auto-increment | UUIDv4 (random) | UUIDv7 / ULID |
+|---|---|---|---|
+| Generated without DB | No | Yes | Yes |
+| Guessable | Yes | No | Hard (time part visible) |
+| Size | 8 bytes | 16 bytes | 16 bytes |
+| Index insert performance | Best | Poor at scale | Good |
+
+## 8. 🧠 Remember
+
+> Use UUIDs when IDs must be created in many places, merged across systems, or kept unguessable; prefer time-ordered UUIDv7/ULID over random UUIDv4 to keep inserts fast; and remember an ID is never a replacement for authorization checks.
+
+## 9. Quick Self-Test
+
+1. Why do random UUIDs slow down inserts on large tables?
+2. What problem does a UUID solve when you shard a database?
+3. Why is "unguessable IDs" not enough to protect other users' data?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="60" data-title="Cache Says $100, DB Says $20 (Double Spend)" data-category="Distributed Systems" data-order="60">
+# Cache Says $100, Database Says $20, Two $80 Payments Both Succeed
+
+> **Similar-question flag**: the double payment is the same check-then-act race from [[26-duplicate-email-race-condition]] and [[32-payment-idempotency-double-click]]. What's new here is the **cache**: a stale copy of the balance was used to make a money decision.
+
+## 1. Story
+
+A user has $20 in the database. The cache still says $100 (it wasn't invalidated after an earlier purchase). Two $80 payment requests arrive at two different servers at the same moment. Both read $100 from the cache, both think "enough money," both succeed. The user spent $160 from a $20 balance.
+
+## 2. Two Separate Bugs
+
+**Bug 1 - The cache was used as the source of truth for money.** A cache is a *copy*, and copies go stale: a missed invalidation, a delayed update, a race between "update DB" and "update cache." That's fine for a product description. It's not fine for deciding whether money can move.
+
+**Bug 2 - Check-then-act across two servers.** Even with the correct balance, "read balance -> check -> write new balance" as separate steps lets two requests both pass the check before either writes. This is the TOCTOU race from [[26-duplicate-email-race-condition]].
+
+## 3. The Fix
+
+**1. Never authorize money from the cache.** Read the balance from the database (the primary, not a lagging replica - see [[28-scaling-database-reads]]). Use the cache for displaying the balance, not for deciding.
+
+**2. Make the check and the write one atomic operation.**
+
+```sql
+UPDATE accounts
+SET balance = balance - 80
+WHERE id = 7 AND balance >= 80;
+-- Returns 1 row updated -> payment allowed
+-- Returns 0 rows updated -> insufficient funds
+```
+
+The database applies the two updates one after the other on that row. With the real balance of $20, both are rejected (20 < 80). Even if the balance really were $100, the first would succeed (leaving $20) and the second would then find $20 and be rejected. There's no window where both see "enough."
+
+Alternatives: `SELECT ... FOR UPDATE` inside a transaction (row lock), or optimistic locking with a `version` column that must match on update.
+
+**3. Idempotency key per payment** so a retried request doesn't charge twice ([[32-payment-idempotency-double-click]]).
+
+**4. Better ledger design for real money**: record each movement as an immutable entry and derive the balance, as in [[30-workload-before-conclusion]].
+
+**5. Fix the cache invalidation too** - after a successful write, delete the cache key (don't just update it) so the next read reloads from the DB. But treat that as a UX fix, not the safety guarantee.
+
+## 4. Mental Model
+
+> The cache is a photo of the balance; the database is the bank vault. You can show customers the photo, but you only hand out money after checking the vault - and you check and take the money in one movement, so nobody can slip in between.
+
+## 5. Flow
+
+```mermaid
+sequenceDiagram
+  participant S1 as Server 1
+  participant S2 as Server 2
+  participant DB as Database (balance $20)
+  S1->>DB: UPDATE ... SET balance=balance-80 WHERE balance>=80
+  S2->>DB: UPDATE ... SET balance=balance-80 WHERE balance>=80
+  DB-->>S1: 0 rows (insufficient)
+  DB-->>S2: 0 rows (insufficient)
+  Note over DB: Both rejected. Row-level serialization,<br/>no stale cache involved.
+```
+
+## 6. 🧠 Remember
+
+> Never make a money decision from a cache, and never split "check balance" and "deduct balance" into separate steps - do both in one atomic conditional update on the source of truth.
+
+## 7. Quick Self-Test
+
+1. Why is using a cached balance acceptable for display but not for authorization?
+2. How does `WHERE balance >= 80` inside the `UPDATE` remove the race condition?
+3. Even with the correct DB balance, why do separate SELECT-then-UPDATE steps still allow a double spend?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="61" data-title="1,000 Requests 10x Faster" data-category="Core Concepts" data-order="61">
+# 1,000 Independent Requests x 500ms = 8.3 Minutes. One Change Makes It 10x Faster.
+
+> **Same-question flag**: this is exactly [[54-notify-5000-users-10x-faster]] with different numbers, and it rests on [[13-hidden-latency-bottleneck]] and [[01-concurrency-vs-parallelism]]. Short recap only.
+
+## The Answer
+
+The requests are **independent** and each one spends its 500ms **waiting** on I/O, not using CPU. Run them **concurrently with a limit** instead of one after another:
+
+- Sequential: `1,000 x 0.5s = 500s` (~8.3 min)
+- 10 in flight at once: `500s / 10 = 50s` -> **10x faster**
+- 50 in flight: ~10s
+
+```javascript
+const pLimit = require('p-limit');
+const limit = pLimit(10);
+const results = await Promise.all(urls.map(u => limit(() => fetch(u))));
+```
+
+## The Two Things Interviewers Listen For
+
+1. **"Bounded"** - not `Promise.all` on all 1,000 at once, which can hit rate limits, exhaust connections, and cause a retry storm ([[14-cascading-failure-recovery]]).
+2. **"Independent"** - if request B needs A's result, you can't overlap them; concurrency only helps work that doesn't depend on each other.
+
+Bonus: check for a **batch endpoint** (1 call for 100 items) - often a bigger win than concurrency.
+
+## 🧠 Remember
+
+> Independent, I/O-bound work should overlap: total time goes from the sum of all waits to roughly the sum divided by your concurrency limit.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="62" data-title="Top 10 Tips for Better Backend Engineering" data-category="Blog" data-order="62">
+# Blog: Top 10 Tips for Becoming Better at Backend Engineering
+
+*Backend skill is not knowing more tools. It's building systems that stay correct, fast, and debuggable under real traffic.*
+
+Each tip below has a simple explanation, a small real-world example, and links to lessons in this library that go deeper.
+
+---
+
+## 1. Learn How a Request Actually Travels
+
+`Client -> load balancer -> app -> database -> response`
+
+If you don't know where the time is spent, you can't make the system faster.
+
+**Example:** A page takes 3 seconds. Is it DNS, the network, the app, the database, or three API calls running one after another? Until you trace it, every fix is a guess.
+
+Go deeper: [[13-hidden-latency-bottleneck]], [[51-fast-api-slow-page]]
+
+## 2. Get Dangerous With Databases
+
+Indexes, transactions, query plans, connection pools, and locks matter more than learning another framework. **Most backend problems are data problems.**
+
+**Example:** A 45-second query becomes 5ms with one correct composite index. No new framework does that.
+
+Go deeper: [[50-slow-query-500m-rows]], [[57-two-indexes-still-slow-composite]], [[34-where-vs-having]]
+
+## 3. Design for Failure From Day One
+
+Timeouts, retries, idempotency, and fallbacks are not "later work." If a dependency dies and your service hangs, the design is incomplete.
+
+**Example:** The email provider hangs for 30 seconds. Without a timeout, every checkout hangs for 30 seconds too, and your servers run out of threads.
+
+Go deeper: [[14-cascading-failure-recovery]], [[19-idempotent-consumer-duplicate-events]], [[32-payment-idempotency-double-click]]
+
+## 4. Make Work Async When the User Doesn't Need to Wait
+
+Emails, reports, image processing, and third-party calls belong in queues. The request path should stay short.
+
+**Example:** "Place order" returns in 80ms. The confirmation email, invoice PDF, and analytics event happen in background workers.
+
+Go deeper: [[17-notification-system-design]], [[48-huge-json-payloads]]
+
+## 5. Master Observability
+
+Logs, metrics, traces, and request IDs are how you debug production. If you can't follow one request across services, you are guessing.
+
+**Example:** "Random 500s, logs look clean" is solved in minutes when every log line has a request ID you can search across the load balancer, app, and database.
+
+Go deeper: [[02-debugging-random-500-errors]], [[20-sudden-latency-spike-checklist]]
+
+## 6. Write APIs Like a Contract
+
+Clear status codes, pagination, validation, versioning, and idempotency keys. A messy API becomes a messy system.
+
+**Example:** Returning `200 OK` with `{"error": "not found"}` forces every client to parse your messages. A proper `404` lets them branch correctly.
+
+Go deeper: [[11-what-is-an-api]], [[18-http-status-codes-400-404-409-422]], [[25-api-styles-comparison]]
+
+## 7. Understand Trade-offs, Not Just Tools
+
+Redis, Kafka, and Postgres are easy to name. The skill is knowing **when not to use them**.
+
+**Example:** Adding Kafka to a system doing 50 events per second adds a cluster to operate, and a Postgres table as a job queue would have been fine.
+
+Go deeper: [[30-workload-before-conclusion]], [[42-resilience-vs-overengineering]]
+
+## 8. Read Production, Not Only Tutorials
+
+Watch slow queries, error rates, memory, and queue lag. Real systems teach faster than courses.
+
+**Example:** A memory graph slowly climbing for a week teaches you more about leaks than any article.
+
+Go deeper: [[22-nodejs-memory-leak-debugging]], [[58-less-traffic-more-cpu]]
+
+## 9. Keep the Design as Simple as the Scale Allows
+
+Don't shard, split into microservices, or add a cache because it sounds senior. Add complexity only when a simpler design is **actually** failing.
+
+**Example:** 120 writes/second is easy for one Postgres database. Sharding it would add months of work and new failure modes for no benefit.
+
+Go deeper: [[15-simple-vs-scalable-architecture]], [[24-kubernetes-pets-vs-cattle]], [[38-first-thing-to-scale]]
+
+## 10. Own the Full Path
+
+Good backend engineers don't stop at "code merged." They care about deploy, latency, cost, on-call, and what happens when it breaks at 2 AM.
+
+**Example:** Your feature works in staging but doubles the cloud bill in production because it calls an expensive API on every page view. Owning the full path means you catch that.
+
+Go deeper: [[46-build-vs-rent-infrastructure]], [[04-handling-traffic-spike-15k-rps]]
+
+---
+
+## 🧠 Remember
+
+> Backend skill is not knowing more tools. It's making systems that stay correct, fast, and debuggable under real traffic.
+
+## Self-Check
+
+Score yourself 1-5 on each tip. Pick your two lowest and spend the next month on those - reading the linked lessons, then finding one real example in the system you work on.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="63" data-title="Why Is a Query Faster the Second Time?" data-category="Databases" data-order="63">
+# Why Is the Same Query 10ms the First Time and 1ms the Second?
+
+## 1. Story
+
+You run a query: 10ms. You run the exact same query again: 1ms. Same data, same database, nothing changed. Where did the other 9ms go?
+
+## 2. The Short Answer
+
+The first run did work that the second run **didn't have to repeat**: mostly **reading data from disk into memory**, plus some one-time setup. The second run found everything already warm.
+
+## 3. Where the 9ms Went
+
+**1. Disk vs memory (the big one).**
+Databases store data in fixed-size **pages** (e.g. 8 KB in Postgres, 16 KB in MySQL InnoDB). To read a row, the database needs its page in memory.
+
+**Term: Buffer pool / shared buffers** - the database's own in-memory cache of pages.
+
+- First run: pages aren't in the buffer pool -> read from disk (or the OS page cache). That's the slow part.
+- Second run: pages are already in memory -> RAM access is orders of magnitude faster than disk.
+
+The operating system also keeps its own **page cache** of recently read file blocks, a second layer that makes repeated reads faster.
+
+**2. Query planning.**
+The database parses the SQL and builds a query plan the first time. With **prepared statements**, many databases can reuse a cached plan on the next run, skipping that work.
+
+**3. Index pages warmed up too.**
+The index's upper levels (root and branch pages) get loaded on the first run and stay hot, so the next lookup walks the tree in memory.
+
+**4. Connection and app-side warm-up.**
+If you're measuring from the application: the first request may pay for opening a DB connection, TLS handshake, JIT compilation, or ORM metadata loading. Later requests reuse the pooled connection.
+
+**5. Query result cache (rare today).**
+Some systems cache full results, but MySQL removed its query cache in 8.0 and Postgres never had one. Usually it's the **data pages**, not the result, that are cached.
+
+## 4. Mental Model
+
+> The first time, the librarian walks to the basement archive (disk) to fetch the book. The second time, it's already sitting on the front desk (memory). Same book, no walk.
+
+## 5. Why This Matters in Production
+
+- **Benchmarks lie if you only measure warm runs.** Test cold and warm, and look at p99, not just the fast repeat.
+- **After a restart or failover, the cache is cold.** Queries are slower until the buffer pool warms up - a real cause of latency spikes right after a deploy or DB failover.
+- **Working set vs RAM.** If your frequently used data (the working set) fits in memory, the database is fast. When it outgrows RAM, pages keep getting evicted and reloaded from disk, and performance falls off a cliff.
+- **Buffer cache hit ratio** is a key database metric - a drop usually means the working set outgrew memory or a query started scanning far more data.
+
+## 6. 🧠 Remember
+
+> The second run is faster because the data pages were already in memory (the buffer pool and OS cache), and planning and connections were already done - the first run paid for reading from disk.
+
+## 7. Quick Self-Test
+
+1. What is the buffer pool, and why does it make repeated queries faster?
+2. Why can a database be slow for a few minutes after a failover even with no code change?
+3. What happens to performance when the working set no longer fits in memory?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="64" data-title="500 MB Uploads Exploding Memory" data-category="System Design at Scale" data-order="64">
+# 100 Users Upload 500 MB Videos at Once and Memory Explodes
+
+> **Same-question flag**: this is [[49-large-file-upload-with-status]] (pre-signed URLs, direct-to-storage multipart upload) plus the "don't hold big payloads in memory" rule from [[48-huge-json-payloads]]. Short recap with the math.
+
+## Why Memory Explodes
+
+The API buffers the **whole file** before processing: `100 users x 500 MB = 50 GB` of memory. No normal server has that, so it swaps, slows down, and gets OOM-killed - taking every other request down with it.
+
+## The Fix, in Order of Preference
+
+**1. Don't let the bytes touch your API at all.** Return a **pre-signed URL**; the client uploads directly to object storage (S3/GCS) using **multipart upload** (e.g. 10 MB chunks, retry per chunk). Your API only stores metadata and status. Memory used by your API: close to zero. Full design: [[49-large-file-upload-with-status]].
+
+**2. If the file must pass through your server, stream it.** Pipe the incoming request straight to storage chunk by chunk, never collecting it in memory. Memory per upload becomes a small fixed buffer (a few MB), not 500 MB.
+
+```javascript
+// Streaming pass-through: memory stays at a small buffer per upload
+const { Upload } = require('@aws-sdk/lib-storage');
+app.post('/videos', async (req, res) => {
+  await new Upload({
+    client: s3,
+    params: { Bucket: 'videos', Key: crypto.randomUUID(), Body: req }, // req is a stream
+    partSize: 10 * 1024 * 1024,
+    queueSize: 2,
+  }).done();
+  res.status(202).json({ status: 'processing' });
+});
+```
+
+**3. Process asynchronously.** Transcoding and thumbnails run in background workers from a queue, never inside the upload request.
+
+**4. Add guardrails.** Max file size at the load balancer, per-user concurrent upload limits, and short-lived upload URLs.
+
+## 🧠 Remember
+
+> Never buffer large uploads in API memory: send clients straight to object storage with pre-signed multipart uploads, or at minimum stream the bytes through, and process the video in background workers.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="65" data-title="Design PagerDuty: One Incident, One Page" data-category="Distributed Systems" data-order="65">
+# Design PagerDuty: One Incident, Exactly One Page, Even When Things Crash
+
+> **Connects to**: [[19-idempotent-consumer-duplicate-events]] (at-least-once + idempotency), [[26-duplicate-email-race-condition]] (check-then-act races), [[44-distributed-locking-with-redis]] (why a Redis lock isn't enough under partitions). This question ties all three together.
+
+## 1. Story
+
+A monitoring system sends 50,000 alerts per minute. One service starts failing. The **same alert fires 400 times in 20 seconds from 80 replicas.**
+
+Your system creates an incident and pages the on-call engineer. The SMS is sent. Then, **before** the service records "notification sent" and starts the escalation timer, the process **crashes**.
+
+The alert keeps arriving. Another replica picks it up. It thinks nobody was paged. It pages the secondary, then the manager, then the director. Four people woken up for one incident.
+
+Or worse: the crash happened *before* the SMS went out, and **nobody** gets paged.
+
+## 2. Why the Easy Answers Fail
+
+- **"Use a unique alert key."** Good start, but if 80 replicas *check* for the key at the same time, they all see "not found" and all create one. Checking isn't the same as enforcing.
+- **"Put it in Redis with a TTL."** If Redis is partitioned from the notifier or fails over, two workers can both believe they own the incident (see [[44-distributed-locking-with-redis]]).
+- **"Check if an incident exists first."** Two requests check at the same instant, both see nothing, both create, both page. Classic check-then-act ([[26-duplicate-email-race-condition]]).
+
+## 3. The Concept Behind It
+
+**Exactly-once delivery is impossible across a crash.** Between "send SMS" and "record that we sent it," a crash can always happen. You can't make those two steps atomic, because the SMS provider isn't inside your database transaction.
+
+What you **can** build:
+
+> **At-least-once delivery + idempotency = effectively-once.**
+
+Make every step safe to retry, make the database the single source of truth for "what state is this incident in," and make the SMS send idempotent. This is the same idea as [[19-idempotent-consumer-duplicate-events]], applied end to end. The tool that connects your database to the outside world safely is the **transactional outbox**.
+
+## 4. The Design
+
+**Step 1 - Dedup at ingest with the database, not a pre-check.**
+Compute a **dedup key** from the alert (e.g. `service + check_name + environment`). Insert the incident with a **unique constraint** on `(dedup_key)` for open incidents:
+
+```sql
+INSERT INTO incidents (id, dedup_key, status, created_at)
+VALUES ($1, $2, 'triggered', now())
+ON CONFLICT (dedup_key) WHERE status IN ('triggered','acknowledged')
+DO UPDATE SET alert_count = incidents.alert_count + 1, last_seen = now()
+RETURNING id, (xmax = 0) AS created;
+```
+
+400 alerts from 80 replicas -> **one** row wins the insert; the other 399 just bump a counter. No race, because the database enforces uniqueness atomically.
+
+**Step 2 - Only the winner schedules the page, in the same transaction.**
+When the insert actually *created* the incident, write an **outbox row** in the **same transaction**:
+
+```sql
+INSERT INTO outbox (id, incident_id, action, target, idempotency_key, status)
+VALUES (gen_random_uuid(), $incident, 'page', 'primary_oncall',
+        $incident || ':page:level1', 'pending');
+```
+
+**Term: Transactional outbox** - instead of calling the SMS provider directly, you write "this message needs to be sent" into your own database in the same transaction as the state change. Either both are saved or neither is. A separate **dispatcher** reads pending outbox rows and does the actual sending.
+
+This fixes "crash before paging": if the incident exists, the page request **exists durably** too. Nobody gets silently skipped.
+
+**Step 3 - Dispatcher sends at least once, with an idempotency key.**
+The dispatcher picks pending rows (`SELECT ... FOR UPDATE SKIP LOCKED` so two dispatchers don't grab the same row), sends the SMS **with the idempotency key** `incident:page:level1`, then marks the row `sent`.
+
+If it crashes after sending but before marking `sent`, another dispatcher retries the same row with the **same idempotency key**. The provider (or your own "sent log" keyed by that key) recognizes it and doesn't send a second SMS. That fixes "crash mid-notify double-pages."
+
+**Step 4 - Escalation is state + time, stored in the database.**
+Store `escalation_level` and `next_escalation_at` on the incident. A scheduler finds incidents where `status = 'triggered' AND next_escalation_at <= now()` and, in one transaction, bumps the level **only if it's still the level it expected**:
+
+```sql
+UPDATE incidents
+SET escalation_level = 2, next_escalation_at = now() + interval '10 minutes'
+WHERE id = $1 AND status = 'triggered' AND escalation_level = 1
+RETURNING id;
+```
+
+...and writes the level-2 outbox row in that same transaction. If two schedulers race, only one update matches `escalation_level = 1`. The other gets 0 rows and does nothing.
+
+**Step 5 - Acknowledgement cancels escalation atomically.**
+`UPDATE incidents SET status = 'acknowledged' WHERE id = $1 AND status = 'triggered'`. From then on, escalation updates match 0 rows (they require `status = 'triggered'`), so nothing further is paged. Pending outbox rows for higher levels are cancelled in the same transaction.
+
+## 5. Flow
+
+```mermaid
+flowchart TB
+  A[400 alerts from 80 replicas] --> B["INSERT ... ON CONFLICT (dedup_key)"]
+  B -->|1 winner creates incident| C[(incidents + outbox row, one transaction)]
+  B -->|399 others| D[increment alert_count]
+  C --> E[Dispatcher: SKIP LOCKED]
+  E -->|SMS with idempotency key| F[SMS provider]
+  E -->|mark sent| C
+  G[Escalation scheduler] -->|"UPDATE ... WHERE status='triggered' AND level=N"| C
+  H[Engineer acks] -->|"status = acknowledged"| C
+```
+
+## 6. How This Meets Each Requirement
+
+| Requirement | How |
+|---|---|
+| 400 alerts -> 1 incident | Unique constraint on dedup key, atomic upsert |
+| Someone is definitely paged | Outbox row written in the same transaction as the incident |
+| Ack cancels escalation | Escalation updates are conditional on `status = 'triggered'` |
+| Crash doesn't double-page | Retries reuse the same idempotency key |
+| Crash doesn't drop the page | Pending outbox rows are retried until marked sent |
+
+## 7. Production Reality
+
+- The idempotency key must be honored somewhere real: the SMS/voice provider's idempotency support, or your own `sent_notifications` table with a unique key checked before calling the provider (with the tiny remaining window accepted and monitored).
+- Page through **multiple channels** (push, SMS, voice) and alert if the outbox has rows stuck in `pending` - that's your "nobody got paged" detector.
+- Keep the dedup window sensible: a resolved incident followed by the same alert 2 hours later should create a **new** incident.
+
+## 8. Mental Model
+
+> You can't make "send the SMS" and "remember you sent it" happen at the same instant. So make the database the single notebook of truth, write "page needed" into it atomically with the incident, and make sending safe to repeat.
+
+## 9. 🧠 Remember
+
+> Exactly-once delivery doesn't exist across crashes - build at-least-once delivery with idempotency keys, enforce uniqueness in the database instead of checking first, and use a transactional outbox so state changes and "messages to send" are saved together.
+
+## 10. Quick Self-Test
+
+1. Why does "check if an incident exists, then create it" fail with 80 replicas?
+2. What exactly does the transactional outbox guarantee, and what does it not guarantee?
+3. How does a conditional `UPDATE ... WHERE escalation_level = 1` stop two schedulers from double-escalating?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="66" data-title="Things I Wish I Knew Before My First Backend Job" data-category="Blog" data-order="66">
+# Blog: Things I Wish Someone Told Me Before My First Backend Job
+
+*Ten short lessons that usually take a year of production incidents to learn. Each one comes with a tiny real example and a link to go deeper.*
+
+---
+
+## 1. Logs Are Your Best Friend. Use Them.
+
+When something breaks in production, you can't attach a debugger. Logs are what you have.
+
+**Example:** "Payment failed for some users." With logs that include `requestId`, `userId`, and the error, you find the cause in 5 minutes. With `console.log("error")`, you're guessing for a day.
+
+Log with context, use structured (JSON) logs, and never log passwords or card numbers. -> [[02-debugging-random-500-errors]]
+
+## 2. Every Input Is a Potential Attack. Validate Everything.
+
+Query params, JSON bodies, headers, file uploads, even data from your own mobile app - all of it can be changed by an attacker.
+
+**Example:** A `quantity` field accepts `-5`, and a user gets a refund on an order they never paid for. Validate type, range, and length on the server, and use parameterized queries to prevent SQL injection. -> [[18-http-status-codes-400-404-409-422]]
+
+## 3. "Works in Dev" Means Nothing.
+
+Dev has 50 rows, one user, and a fast laptop. Production has 50 million rows, concurrent users, slow networks, and real failures.
+
+**Example:** A query that takes 5ms locally takes 45 seconds in production because the table is 10,000x bigger and has no index. -> [[50-slow-query-500m-rows]]
+
+## 4. Database Transactions Exist for a Reason.
+
+If two writes must both happen or neither happen, wrap them in a transaction.
+
+**Example:** You deduct money from wallet A, then the server crashes before adding it to wallet B. Without a transaction, the money just disappears. -> [[60-cache-says-100-db-says-20]]
+
+## 5. Never Store Passwords in Plain Text. Ever.
+
+And not as plain SHA-256 or MD5 either. Use Argon2id or bcrypt.
+
+**Example:** Databases leak. With plain text, every user's password (and likely their email password too) is exposed instantly. -> [[56-password-hashing-not-sha256]]
+
+## 6. Cache Invalidation Is Harder Than It Sounds.
+
+Adding a cache takes an hour. Keeping it correct takes forever.
+
+**Example:** A user updates their profile photo, but the old one keeps showing for 10 minutes because the cache wasn't cleared. Annoying for photos; dangerous for balances and permissions. Never make critical decisions from cached data. -> [[60-cache-says-100-db-says-20]]
+
+## 7. Your API Will Be Called in Ways You Never Imagined.
+
+Clients double-click, retry on timeout, send huge payloads, call endpoints out of order, and hammer you from scripts.
+
+**Example:** A mobile app retries every failed request 3 times. A slow payment endpoint now gets triple traffic and charges some users twice. Design for retries with idempotency keys. -> [[32-payment-idempotency-double-click]], [[48-huge-json-payloads]]
+
+## 8. Rate Limiting Is Not Optional.
+
+Without limits, one buggy client, scraper, or attacker can take down the service for everyone.
+
+**Example:** A partner's integration has a bug and sends 5,000 requests per second in a loop. Rate limiting returns `429` to them and keeps everyone else working. -> [[04-handling-traffic-spike-15k-rps]]
+
+## 9. Backups Mean Nothing If You've Never Tested Restoring Them.
+
+A backup you've never restored is a hope, not a backup.
+
+**Example:** A team discovers during a real outage that backups had been silently failing for 3 months, or that a restore takes 14 hours - longer than the business can survive. Practice restores regularly and time them.
+
+## 10. The Bug Is Always in the Last Place You Look.
+
+(Because you stop looking once you find it.) The real lesson: **debug systematically**, not randomly. Check what changed, follow one request end to end, and rule things out with data instead of hunches.
+
+-> [[20-sudden-latency-spike-checklist]]
+
+---
+
+## 🧠 Remember
+
+> Production is where your assumptions go to die: log with context, validate everything, use transactions, hash passwords properly, distrust caches, expect retries, rate limit, test restores, and debug with data.
+
+## Reflect
+
+Which of these ten has already bitten you? Which one do you think will bite you next?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="67" data-title="Scheduling Jobs Across DST (2:30 AM Doesn't Exist)" data-category="System Design at Scale" data-order="67">
+# 2M Users Schedule a Job for 2:30 AM Local Time. On DST Spring-Forward Day, 2:30 AM Doesn't Exist.
+
+## 1. Story
+
+Millions of users set "run my backup / send my report at 2:30 AM." In many regions (US, Europe), on the day clocks spring forward, local time jumps straight from **1:59:59 to 3:00:00**. There is no 2:30 AM that day. And on the fall-back day, **1:00-1:59 happens twice**.
+
+The options:
+- **A:** Skip the job.
+- **B:** Run it at 3:00 AM.
+- **C:** Convert the intended local time to UTC once, before scheduling.
+
+## 2. Why Option C Is a Trap
+
+C sounds the most "correct," because "always store times in UTC" is good general advice. But for a **recurring job defined in local time**, converting to UTC once is wrong:
+
+- In winter, 2:30 AM New York = 07:30 UTC. Store "07:30 UTC" forever.
+- After DST starts, 07:30 UTC = **3:30 AM** local. The user's job now runs an hour late every day for months.
+- Timezone rules also change by government decision (countries drop or move DST), so a UTC time computed today can be wrong next year.
+
+**UTC is right for moments that already happened** (event timestamps, logs). It's wrong for **future local-time intentions** ("2:30 every night in my city").
+
+## 3. Option A Is Usually Wrong Too
+
+Skipping silently means a user's daily backup or bill payment just doesn't happen that day. Silent data-loss-style behavior is worse than running a bit late.
+
+## 4. The Best Answer: Store the Intention, Resolve It at Run Time, and Apply B as the Policy
+
+**Store what the user actually meant:**
+- `local_time = 02:30`
+- `timezone = America/New_York` (an IANA timezone name, not a fixed offset like `-05:00`)
+- the recurrence rule (daily, weekly, ...)
+
+**Compute each next run time at scheduling time for that occurrence**, using an up-to-date timezone database, with an explicit policy for the two DST edge cases:
+
+| Case | What happens to 2:30 | Common policy |
+|---|---|---|
+| **Spring forward (gap)** | 2:30 doesn't exist | Run at the next valid time, **3:00** (option B) |
+| **Fall back (overlap)** | 1:30 happens twice | Run **once**, at the first occurrence |
+
+That's how cron-like systems and calendar apps (RFC 5545 / iCalendar) generally behave, and it matches what users expect: "run it, even if a little shifted, and never twice."
+
+So the interview answer is: **B as the behavior, but implemented by storing local time + timezone, not by pre-converting to UTC (C).**
+
+## 5. Don't Forget the Scale Problem
+
+2 million jobs mapped to the same wall-clock moment means **2M jobs fire at 3:00 AM at once** on DST day (and every night at 2:30). That's the synchronized-burst problem from [[16-synchronized-connection-pool-expiry]]. Add **jitter** (spread execution across a window, e.g. 2:30-2:45) and push jobs through a queue with bounded workers ([[23-queue-backlog-after-spike]]). Make each job **idempotent** so a retry or the fall-back hour never runs it twice ([[19-idempotent-consumer-duplicate-events]]).
+
+## 6. Code Example
+
+```javascript
+const { DateTime } = require('luxon');
+
+function nextRun(localTime, zone, afterUtc) {
+  const [h, m] = localTime.split(':').map(Number);
+  let day = DateTime.fromJSDate(afterUtc, { zone }).startOf('day');
+  for (let i = 0; i < 3; i++) {
+    let run = day.set({ hour: h, minute: m });   // Luxon shifts a nonexistent
+                                                  // 2:30 forward to 3:30 - normalize
+    if (run.hour !== h) run = run.set({ minute: 0 }); // policy: run at 3:00
+    if (run.toUTC() > DateTime.fromJSDate(afterUtc)) return run.toUTC();
+    day = day.plus({ days: 1 });
+  }
+}
+// Stored: { localTime: '02:30', zone: 'America/New_York' } - never a fixed UTC time
+```
+
+## 7. Mental Model
+
+> Store the user's **intention** ("2:30 at night where I live"), not your **translation** of it. Translate fresh each time, because the rules for translating can change.
+
+## 8. 🧠 Remember
+
+> For recurring local-time jobs, store local time + IANA timezone and compute each run at scheduling time: shift nonexistent times forward (3:00), run ambiguous times once, add jitter for the burst, and make the job idempotent - converting to UTC once breaks the moment DST changes.
+
+## 9. Quick Self-Test
+
+1. Why does storing "07:30 UTC" make a 2:30 AM job run at the wrong local time for half the year?
+2. What should happen to a 1:30 AM job on the fall-back day, and why?
+3. Why is 2M jobs at the same local time a problem even on normal days?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="68" data-title="Schema Change Broke the Pipeline: Producer or Consumer?" data-category="Distributed Systems" data-order="68">
+# An Upstream Team Added One Nullable Column and Broke the Pipeline. Who Owns the Failure?
+
+## 1. Story
+
+A production data pipeline fails at 2:17 AM. The code hasn't changed in 3 weeks. It normally processes 120M+ rows without trouble. Logs look clean, CPU and memory are fine.
+
+After hours of debugging: an **upstream team added one nullable column** without telling anyone. The pipeline broke - maybe it used `SELECT *` into a fixed-width target, maybe strict schema validation rejected the unknown field, maybe column positions shifted in a CSV export.
+
+One engineer blames the upstream team for changing the contract. Another blames the pipeline for not handling schema evolution. Both have a point.
+
+## 2. The Honest Answer: Both Own a Part
+
+**The producer owns the contract.** If other teams consume your data, its shape is a public API ([[11-what-is-an-api]]). Changing it without notice is like changing an API's response format without versioning. The producer should publish the schema, classify changes as compatible or breaking, and announce them.
+
+**The consumer owns its own robustness.** Adding an optional (nullable) column is widely considered a **backward-compatible** change. A consumer that crashes on an extra field it doesn't even use is brittle. The consumer should read only the columns it needs, ignore unknown fields, and fail loudly and early (not silently at 2 AM mid-run) when something is truly incompatible.
+
+**The system (both teams) owns the missing guardrail.** The real failure is that nothing checked the change *before* it reached production.
+
+## 3. The Fix: A Data Contract
+
+**Term: Data contract** - an explicit, versioned agreement about the shape and meaning of data between a producer and its consumers: field names, types, nullability, and which changes are allowed.
+
+- **Schema registry + compatibility rules** (e.g. Avro/Protobuf with Confluent Schema Registry): new schema versions are checked against the old ones. Adding an optional field passes; removing or retyping a field is rejected unless it's a new major version.
+- **Contract tests in CI**: the producer's pipeline runs the consumers' expectations before deploying a schema change.
+- **Schema validation at the boundary**: the consumer validates the incoming schema at the start of a run and alerts immediately, instead of failing halfway through 120M rows.
+- **Tolerant reader**: consumers select explicit columns, ignore unknown fields, and handle nulls.
+- **Change communication**: an owner, a changelog, and a deprecation period for breaking changes.
+
+## 4. Mental Model
+
+> Data between teams is an API without the API discipline. Treat the schema like a public contract: the producer promises not to break it without warning, the consumer promises not to break over harmless additions, and a machine checks both promises before deploy.
+
+## 5. Flow
+
+```mermaid
+flowchart LR
+  P[Producer changes schema] --> R{Schema registry<br/>compatibility check}
+  R -->|Compatible: add optional field| D[Deploy]
+  R -->|Breaking: remove/retype field| X[Blocked - needs new version + notice]
+  D --> C[Consumer: tolerant reader,<br/>validates schema at start]
+```
+
+## 6. How to Answer in an Interview
+
+"Both, but the more useful answer is that the **system** failed: there was no contract and no automated compatibility check. The producer should treat the schema as a public contract and version breaking changes; the consumer should be a tolerant reader and validate early. Then I'd add a schema registry and contract tests so this class of failure is caught before deploy, not at 2 AM."
+
+That answer avoids blame and fixes the process - which is what senior engineers are expected to do.
+
+## 7. 🧠 Remember
+
+> Schema changes between teams need a data contract: producers version and announce breaking changes, consumers tolerate harmless additions and validate early, and a registry enforces compatibility automatically.
+
+## 8. Quick Self-Test
+
+1. Why is adding a nullable column usually considered backward-compatible, and how could it still break a consumer?
+2. What does a schema registry check before allowing a new schema version?
+3. Why is "who's to blame" the less useful question in a postmortem?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="69" data-title="ORM save() in a Loop vs Bulk Insert" data-category="Databases" data-order="69">
+# ORM `.save()` Inside a Loop for 5,000 Records
+
+> **Similar-question flag**: this is the write-side version of the N+1 problem from [[52-orm-or-raw-sql]], and the same "stop paying the round-trip cost one at a time" idea as [[54-notify-5000-users-10x-faster]]. Short recap.
+
+## Why It's Slow
+
+```javascript
+for (const row of rows) {        // 5,000 iterations
+  await Order.create(row);       // 1 INSERT + 1 network round trip + 1 commit each
+}
+```
+
+- **5,000 round trips**: at ~2ms each, that's 10 seconds of pure waiting.
+- **5,000 commits**: each commit may force a disk flush.
+- **ORM overhead** per object: hooks, validation, change tracking.
+- **No atomicity**: if it fails at row 3,127, you have half the data saved.
+
+## The Fix
+
+**1. Bulk insert in batches** - one statement for many rows:
+
+```javascript
+// Sequelize: one INSERT ... VALUES (...), (...), ... per batch
+for (let i = 0; i < rows.length; i += 1000) {
+  await Order.bulkCreate(rows.slice(i, i + 1000));
+}
+```
+
+**2. Wrap it in a transaction** so it's all-or-nothing and commits once:
+
+```javascript
+await sequelize.transaction(async (t) => {
+  for (let i = 0; i < rows.length; i += 1000) {
+    await Order.bulkCreate(rows.slice(i, i + 1000), { transaction: t });
+  }
+});
+```
+
+**3. For very large loads**, use the database's bulk loader (`COPY` in Postgres, `LOAD DATA` in MySQL) - often 10-100x faster than even batched inserts.
+
+Typical result: **~10 seconds -> well under 1 second** for 5,000 rows.
+
+## Batch Size Matters
+
+Too small keeps the round-trip cost; too large can hit parameter limits (Postgres allows 65,535 bind parameters per statement) and long lock times. **500-5,000 rows per batch** is a common sweet spot.
+
+## 🧠 Remember
+
+> Don't pay a network round trip and a commit per row - batch inserts into multi-row statements, wrap them in one transaction, and use the database's bulk loader for really large imports.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="70" data-title="AI Built the Website: 20 Things It Forgot" data-category="Blog" data-order="70">
+# Blog: "AI Built the Website in 2 Hours." Now Check the 20 Things It Probably Forgot.
+
+*A working demo is not a production website. The boring 20% is what makes it real.*
+
+This connects to [[55-blog-engineering-harder-building-easier]]: building got easy, but making something production-ready is still engineering. Here's a checklist, grouped so it's easier to work through. Each item has a one-line "why it matters."
+
+---
+
+## Group 1 - When Things Go Wrong
+
+1. **Proper error handling** - a failed API call should show a helpful message, not a blank screen or a raw stack trace (which can also leak internals).
+2. **Empty states** - a new user with zero orders should see "No orders yet - start shopping," not an empty white box.
+3. **Loading states** - spinners or skeletons, so users don't click three times thinking nothing happened.
+4. **404 and 500 pages** - friendly pages with a way back home, instead of the hosting provider's default error.
+
+## Group 2 - Users and Devices
+
+5. **Mobile navigation** - most traffic is on phones; the menu must work on a small screen (we fixed exactly this on this dashboard).
+6. **Form validation** - on the client for UX, and **always on the server** for security ([[66-blog-before-first-backend-job]]).
+7. **Accessibility** - labels, alt text, keyboard navigation, and color contrast, so everyone can use it (and to avoid legal risk in some countries).
+8. **Image optimization** - compressed, modern formats (WebP/AVIF), correct sizes, lazy loading - often the biggest speed win ([[51-fast-api-slow-page]]).
+
+## Group 3 - Security and Abuse
+
+9. **Rate limiting** - on login, signup, contact forms, and APIs, or bots will find them within days.
+10. **Authentication edge cases** - password reset, expired sessions, logout on all devices ([[09-jwt-logout-invalidation]]), email change, brute-force protection.
+11. **Security headers** - HTTPS/HSTS, Content-Security-Policy, X-Frame-Options, and proper CORS ([[07-cors-error-fix]]).
+12. **Email confirmations** - verify addresses before trusting them, and send receipts for important actions.
+
+## Group 4 - Being Found and Shared
+
+13. **SEO metadata** - a unique title and description per page.
+14. **OG previews** - Open Graph tags so a shared link on WhatsApp/LinkedIn shows a title, image, and description instead of a bare URL.
+15. **Favicon** - small, but a site without one looks unfinished in every browser tab.
+16. **Sitemap** - helps search engines find all your pages.
+17. **robots.txt** - tells crawlers what to index (and make sure it isn't accidentally blocking the whole site).
+
+## Group 5 - Running It for Real
+
+18. **Analytics** - you can't improve what you can't see (and respect privacy/consent rules).
+19. **Privacy and terms pages** - legally required in many places, especially if you collect any personal data or take payments.
+20. **Backup and monitoring** - uptime checks, error tracking, and **tested** restores. A backup you've never restored is only a hope.
+
+---
+
+## Why AI Tends to Skip These
+
+AI optimizes for "the thing you asked for works." These 20 items are mostly about **what happens around the happy path**: failure, abuse, strangers finding the page, and the site still running next month. Nobody writes "remember robots.txt" in their prompt, so it doesn't get built.
+
+## How to Use This
+
+Before calling any AI-built project "done," go through the 20 items and mark each one: done, not needed, or todo. Most take minutes each. Together, they're the difference between a demo and a product.
+
+## 🧠 Remember
+
+> AI builds the 80% you asked for. The boring 20% - errors, edge cases, security, discoverability, and operations - is what makes it a real production website.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="71" data-title="Parking Lot LLD: What the Interviewer Wanted" data-category="Low-Level Design" data-order="71">
+# Parking Lot LLD: The Candidate Named the Right Patterns. Why Didn't the Interviewer Like It?
+
+## 1. The Candidate's Answer
+
+"I'll model `ParkingLot`, `Floor`, `Vehicle`, `ParkingSpot`, `Ticket`, and `Gate`. Allocation goes behind a `SpotAllocationStrategy`, pricing behind a `PricingStrategy`, so new spot types and pricing rules don't require changing existing classes."
+
+Nothing in that is *wrong*. That's the problem: it's a **list of nouns and pattern names**, not a design. An interviewer has heard this exact answer hundreds of times.
+
+## 2. What Was Missing
+
+**1. Requirements were never clarified.** How many floors and spots? Is allocation "nearest to the entry gate"? Can a motorcycle use a car spot? Is payment at exit or prepaid? What does "dynamic pricing" actually depend on - occupancy, time of day, events? The right design depends on these answers ([[30-workload-before-conclusion]]).
+
+**2. No flow was walked through.** The interviewer wants to see one car go: arrive at gate -> find a spot -> issue ticket -> park -> exit -> calculate fee -> pay -> free the spot. Walking the flow exposes the real methods and responsibilities.
+
+**3. No behavior - only names.** What are the methods? Who owns "is this spot free"? What does `Ticket` hold? Classes without method signatures and relationships aren't LLD yet.
+
+**4. Concurrency was ignored - the most important gap.** Two cars arrive at two different gates at the same moment. Both allocation calls see spot `F2-17` as free. Both get it. This is the same check-then-act race as [[26-duplicate-email-race-condition]]. A strong answer makes "reserve spot" atomic.
+
+**5. State wasn't modeled.** A spot is `FREE -> RESERVED -> OCCUPIED -> FREE` (plus `OUT_OF_SERVICE`). A ticket is `ACTIVE -> PAID -> CLOSED` (plus `LOST`). Explicit states make illegal transitions impossible.
+
+**6. Edge cases were skipped.** Lot full, lost ticket, payment failure at exit, car leaves without paying, a spot blocked for maintenance, the gate losing network.
+
+**7. Patterns came first instead of last.** Strategies are fine *where variation actually exists*. Leading with pattern names signals memorization. Let patterns appear when a requirement demands them ([[42-resilience-vs-overengineering]] - the same idea for code structure).
+
+## 3. A Stronger Sketch
+
+```java
+enum SpotType { MOTORCYCLE, COMPACT, LARGE, EV }
+enum SpotStatus { FREE, OCCUPIED, OUT_OF_SERVICE }
+
+class ParkingSpot {
+  final String id; final SpotType type; SpotStatus status;
+  boolean canFit(Vehicle v) { return v.getType().fitsIn(type); }
+}
+
+class Floor {
+  // one free-spot pool per type for O(1) allocation
+  Map<SpotType, Deque<ParkingSpot>> freeSpots;
+  synchronized Optional<ParkingSpot> reserve(VehicleType vt) {   // atomic: no double-assign
+    for (SpotType t : vt.compatibleSpotTypes()) {
+      ParkingSpot s = freeSpots.get(t).pollFirst();
+      if (s != null) { s.status = SpotStatus.OCCUPIED; return Optional.of(s); }
+    }
+    return Optional.empty();
+  }
+  synchronized void release(ParkingSpot s) { s.status = SpotStatus.FREE; freeSpots.get(s.type).addLast(s); }
+}
+
+class ParkingLot {
+  Ticket enter(Vehicle v, Gate gate) {
+    ParkingSpot spot = allocationStrategy.allocate(floors, v, gate)
+        .orElseThrow(LotFullException::new);
+    return ticketRepo.save(new Ticket(v, spot, clock.now()));
+  }
+  Receipt exit(String ticketId, Payment payment) {
+    Ticket t = ticketRepo.findActive(ticketId);              // lost ticket -> separate flow
+    Money fee = pricingStrategy.price(t, clock.now());
+    paymentService.charge(payment, fee, t.getId());          // ticket id as idempotency key
+    t.close(); floorOf(t.getSpot()).release(t.getSpot());
+    return new Receipt(t, fee);
+  }
+}
+```
+
+Now the Strategies earn their place: allocation genuinely varies (nearest to gate, fill lowest floor first, reserve EV spots), and so does pricing.
+
+**Beyond one process:** if there are many gates on different servers, the in-memory `synchronized` isn't enough. Reserve the spot in the database atomically (`UPDATE spots SET status='OCCUPIED' WHERE id=? AND status='FREE'`), the same pattern as [[60-cache-says-100-db-says-20]].
+
+## 4. What Actually Helps You Clear LLD Rounds
+
+1. **Clarify requirements and scope** for 3-5 minutes.
+2. **Identify entities and relationships**, then **responsibilities** ("who knows what, who does what").
+3. **Walk through the main use cases** and let method signatures come out of the flow.
+4. **Model state** with enums and valid transitions.
+5. **Handle concurrency** anywhere two actors compete for the same resource.
+6. **Cover edge cases** out loud.
+7. **Introduce patterns only to solve a stated variation**, and say why.
+8. **Write real code** for the core flow - many interviewers expect compilable-looking classes, not just a diagram.
+
+## 5. Mental Model
+
+> LLD isn't "which patterns do you know." It's "can you turn requirements into classes with clear responsibilities, correct state, and safe behavior under concurrency." Patterns are the seasoning, not the meal.
+
+## 6. 🧠 Remember
+
+> Clarify, walk the flow, give classes real methods and states, make shared-resource allocation atomic, cover edge cases - and only then reach for patterns where variation truly exists.
+
+## 7. Quick Self-Test
+
+1. How can two gates assign the same spot, and how do you prevent it in one process and across many servers?
+2. Why does leading with "Strategy pattern" often hurt instead of help?
+3. What states would you model for a Ticket, and which transitions are illegal?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="72" data-title="Secret Leaked to a Public Git Repo" data-category="Security" data-order="72">
+# You Pushed a Secret to a Public Git Repository. What Now?
+
+## 1. Story
+
+You push a commit. Two minutes later you notice `.env` was included: a production database password and an AWS access key, now sitting in a **public** repository.
+
+## 2. The Most Important Fact
+
+**Assume it's already stolen.** Bots scan public GitHub pushes continuously, and leaked cloud keys are often abused within **minutes** (commonly to spin up crypto-mining servers on your bill). Deleting the file or the commit does **not** undo that: the commit stays in history, forks and clones already have it, and scanners already copied it.
+
+So the order matters: **make the secret useless first, clean up second.**
+
+## 3. The Response, in Order
+
+**1. Revoke and rotate immediately.**
+- Cloud keys: deactivate/delete the key in AWS IAM (or equivalent), create a new one.
+- Database passwords, API tokens, OAuth secrets, webhook secrets: rotate them all.
+- Deploy the new secrets to the systems that need them.
+
+This is the step that actually stops the damage. Everything else is cleanup.
+
+**2. Check for misuse.**
+Look at cloud audit logs (e.g. CloudTrail), billing, database access logs, and API provider dashboards for activity since the push. If something was accessed, it becomes a security incident: follow your company's incident process.
+
+**3. Remove it from Git history.**
+- Use `git filter-repo` (or BFG Repo-Cleaner) to strip the file/string from **all** commits, then force-push.
+- Ask collaborators to re-clone.
+- Contact GitHub Support to purge cached views and pull-request references if needed.
+- Remember: this reduces future exposure, but **it doesn't un-leak** what's already copied.
+
+**4. If it was personal data, not just credentials**, involve security/legal: data-protection laws may require notifying users or regulators within a deadline.
+
+**5. Prevent it next time.**
+- `.gitignore` for `.env` and key files, plus a `.env.example` with fake values.
+- **Pre-commit secret scanning** (gitleaks, detect-secrets) and **GitHub push protection / secret scanning**, which block the push before it lands.
+- Store secrets in a **secrets manager** (AWS Secrets Manager, Vault, Doppler) instead of files.
+- Prefer **short-lived credentials** (IAM roles, OIDC for CI) over long-lived keys, so a leak expires by itself.
+
+## 4. Mental Model
+
+> A leaked secret is a lost house key. Deleting your photo of the key from Instagram doesn't help - someone already has a copy. Change the lock first, then clean up the photo.
+
+## 5. Common Mistakes
+
+- Deleting the file in a new commit and calling it fixed (it's still in history).
+- Rewriting history but never rotating the key.
+- Making the repo private and assuming that undoes the exposure.
+
+## 6. 🧠 Remember
+
+> Rotate first, investigate second, scrub history third, and prevent it with secret scanning, a secrets manager, and short-lived credentials - because a secret that hit a public repo must be treated as compromised.
+
+## 7. Quick Self-Test
+
+1. Why is rotating the secret more important than deleting the commit?
+2. Why doesn't making the repository private fix the leak?
+3. What two tools or practices stop this from happening again?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="73" data-title="URI vs URL" data-category="Web &amp; API Communication" data-order="73">
+# What's the Difference Between a URI and a URL?
+
+## 1. The Short Answer
+
+- **URI (Uniform Resource Identifier)** - a string that **identifies** a resource.
+- **URL (Uniform Resource Locator)** - a URI that also tells you **where the resource is and how to get it** (a scheme/protocol plus a location).
+- **URN (Uniform Resource Name)** - a URI that **names** a resource in a permanent way, without saying where it is.
+
+**Every URL is a URI. Not every URI is a URL.**
+
+## 2. Simple Analogy
+
+> Your **name** identifies you (like a URN). Your **home address** identifies you *and* says how to find you (like a URL). Both are "identifiers" (URIs), but only the address lets someone actually reach you.
+
+## 3. Examples
+
+| String | Is it a URI? | URL? | Why |
+|---|---|---|---|
+| `https://shop.com/orders/42?tab=items#summary` | Yes | Yes | Scheme + host tell you how and where to fetch it |
+| `mailto:help@shop.com` | Yes | Yes (commonly treated as one) | Scheme says how to reach it |
+| `urn:isbn:9780134685991` | Yes | No | Names a book, doesn't say where to get it |
+| `/orders/42` | A relative reference | Not by itself | Needs a base URL to become a full URL |
+
+## 4. Anatomy of a URL
+
+```
+https://user@shop.com:443/orders/42?tab=items#summary
+\___/   \__/ \______/ \_/\________/ \_______/ \_____/
+scheme  user   host   port  path      query   fragment
+```
+
+- **scheme**: how to access it (`https`, `ftp`, `mailto`)
+- **host + port**: where
+- **path**: which resource on that server
+- **query**: parameters
+- **fragment**: a spot inside the page - handled by the browser, **never sent to the server**
+
+## 5. Does It Matter in Practice?
+
+In everyday web development, people use "URL" for web addresses and nobody minds. The distinction matters in specs, APIs, and some library names (Java has both `java.net.URI` and `java.net.URL`; in the browser, `new URL(...)` parses full URLs). In an interview, the one-liner above plus one URN example is enough.
+
+## 6. 🧠 Remember
+
+> A URI identifies; a URL identifies and locates. Every URL is a URI, but a URN like `urn:isbn:...` is a URI that names something without telling you where to find it.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="74" data-title="Troubleshooting 502 Bad Gateway From Ingress" data-category="Infrastructure &amp; DevOps" data-order="74">
+# Troubleshooting a 502 Bad Gateway From a Kubernetes Ingress
+
+> **Connects to**: [[02-debugging-random-500-errors]] (the error may come from the layer *above* your app) and [[08-ec2-no-internet-troubleshooting]] (check each network layer in order).
+
+## 1. What 502 Actually Means
+
+**502 Bad Gateway** = the proxy (here, the Ingress controller, e.g. NGINX) tried to talk to the **upstream** (your Service/Pods) and got **no valid response**: connection refused, connection reset, or a garbage response.
+
+So your app might never have seen the request. The question is: **where between Ingress and container did the connection fail?**
+
+Related codes help narrow it down:
+- **502**: upstream refused/reset/returned something invalid.
+- **503**: no healthy upstream at all (often zero endpoints).
+- **504**: upstream accepted the connection but was too slow (timeout).
+
+## 2. The Path, and What to Check at Each Hop
+
+`Client -> Ingress controller -> Service -> Endpoints -> Pod -> container port -> app`
+
+**1. Are the pods running and ready?**
+```bash
+kubectl get pods -l app=myapp -o wide
+kubectl describe pod <pod>        # CrashLoopBackOff? OOMKilled? readiness failing?
+kubectl logs <pod> --previous     # logs from the crashed container
+```
+Crashing or restarting pods reset connections mid-request, a classic 502 cause.
+
+**2. Does the Service actually point at the pods?**
+```bash
+kubectl get endpoints myapp-svc   # empty = selector doesn't match pod labels
+kubectl describe svc myapp-svc
+```
+Compare the Service `selector` with the pod labels. One typo and there are no endpoints.
+
+**3. Do the ports line up?**
+Ingress `backend.service.port` -> Service `port` -> Service `targetPort` -> the port the container actually listens on. A mismatch anywhere means "connection refused."
+
+**4. Is the app listening on the right interface?**
+An app bound to `127.0.0.1` inside the container is unreachable from outside the pod. It must listen on `0.0.0.0`.
+
+**5. Test from inside the cluster, skipping the Ingress:**
+```bash
+kubectl run tmp --rm -it --image=curlimages/curl -- sh
+curl -v http://myapp-svc.<namespace>.svc.cluster.local:<port>/health
+```
+- Works here but fails via Ingress -> the problem is in Ingress config.
+- Fails here too -> the problem is the Service/pod/app.
+
+**6. Read the Ingress controller logs** - they usually say exactly what happened:
+```bash
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller | grep 502
+```
+Look for `connect() failed (111: Connection refused)`, `upstream prematurely closed connection`, or `upstream sent too big header`.
+
+**7. Protocol mismatch.** The backend serves HTTPS but the Ingress sends HTTP (or gRPC vs HTTP). Fix with the right backend-protocol annotation.
+
+**8. Keep-alive timeout mismatch (intermittent 502s).** If the app closes idle connections sooner than the Ingress expects, the Ingress sometimes reuses a connection the app just closed -> reset -> 502. Make the app's keep-alive timeout **longer** than the proxy's.
+
+**9. Headers too big.** Large cookies/JWTs overflow the proxy buffer -> "upstream sent too big header." Increase proxy buffer size.
+
+**10. Deployments and scaling.** 502s only during rollouts means pods are killed while still serving traffic: add readiness probes, a `preStop` sleep, and graceful shutdown so in-flight requests finish.
+
+## 3. Mental Model
+
+> A 502 is the Ingress saying "I called your service and got nonsense or nothing." Walk the chain hop by hop - pods, endpoints, ports, bind address, protocol, timeouts - and test from inside the cluster to split "Ingress problem" from "app problem."
+
+## 4. 🧠 Remember
+
+> For an Ingress 502, check pod health and restarts, Service endpoints and selectors, the full port chain, the app's bind address, and the controller logs - and if the 502s are intermittent, suspect keep-alive mismatches or ungraceful pod shutdowns during deploys.
+
+## 5. Quick Self-Test
+
+1. How do 502, 503, and 504 differ in what went wrong upstream?
+2. Why does an app listening on `127.0.0.1` cause failures only when called from outside the pod?
+3. Why can a keep-alive timeout mismatch cause random, occasional 502s?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="75" data-title="Top 10 Mistakes in System Design Interviews" data-category="Blog" data-order="75">
+# Blog: Top 10 Mistakes in System Design Interviews
+
+*Each mistake below comes with what it sounds like in the room, what to do instead, and the lessons in this library that teach the fix.*
+
+---
+
+## 1. Skipping Requirements
+
+**Sounds like:** "Okay, so we'll have a load balancer, then..." within the first 30 seconds.
+
+**Instead:** spend the first few minutes on numbers - QPS (peak, not average), p95 latency target, data size, retention, regions, and consistency needs. Every later decision depends on them.
+
+-> [[30-workload-before-conclusion]], [[15-simple-vs-scalable-architecture]]
+
+## 2. Drawing Boxes Before the API and Data Model
+
+**Sounds like:** a beautiful diagram that can't answer "how do I get a user's last 20 orders?"
+
+**Instead:** define the main API calls and the core tables/entities first. Then draw components that serve those calls.
+
+-> [[11-what-is-an-api]], [[71-parking-lot-lld-review]]
+
+## 3. Treating the Database as Infinite
+
+**Sounds like:** "and we store it in the database" - with no index plan, no hot-key discussion, no partitioning, no read-replica vs cache trade-off.
+
+**Instead:** say which queries matter, which index serves each one, and what happens when one key or tenant gets hot.
+
+-> [[57-two-indexes-still-slow-composite]], [[21-database-partitioning]], [[28-scaling-database-reads]]
+
+## 4. Ignoring Backpressure
+
+**Sounds like:** "we'll put it in a queue" - an unlimited queue with no load shedding and no timeouts, until every dependency gets dogpiled.
+
+**Instead:** bound your queues, set timeouts, shed load with `429`, and scale consumers carefully.
+
+-> [[04-handling-traffic-spike-15k-rps]], [[23-queue-backlog-after-spike]], [[39-autoscaling-amplifies-outage]]
+
+## 5. No Connection Pooling
+
+**Sounds like:** nothing - it simply never comes up. Then one request = one new DB connection, and the database melts at 2k RPS.
+
+**Instead:** mention pooled connections, pool size vs DB max connections, and what happens when the pool is exhausted.
+
+-> [[16-synchronized-connection-pool-expiry]], [[53-blog-senior-system-design-without-big-scale]]
+
+## 6. Retries Without Rules
+
+**Sounds like:** "and if it fails, we retry." No jitter, no max attempts, no idempotency key, no circuit breaker - a guaranteed retry storm.
+
+**Instead:** exponential backoff with jitter, a retry budget, idempotency keys, and a circuit breaker.
+
+-> [[14-cascading-failure-recovery]], [[32-payment-idempotency-double-click]]
+
+## 7. Assuming Exactly-Once
+
+**Sounds like:** "the consumer processes each message once." It won't: duplicates, reordering, and partial failures across services happen.
+
+**Instead:** design for at-least-once delivery with idempotent consumers, and use an outbox where state and messages must stay in sync.
+
+-> [[19-idempotent-consumer-duplicate-events]], [[65-pagerduty-incident-dedup-paging]]
+
+## 8. Observability as an Afterthought
+
+**Sounds like:** "we'll add monitoring." No SLIs/SLOs, no tracing, no plan for metric cardinality, no structured logs.
+
+**Instead:** name the 2-3 SLIs that define "working" (e.g. p99 latency, error rate, queue lag), and say how you'd trace one request across services.
+
+-> [[02-debugging-random-500-errors]], [[20-sudden-latency-spike-checklist]]
+
+## 9. Hand-Waving Deploys
+
+**Sounds like:** the design exists, but nobody knows how it changes. No migrations, rollbacks, versioning, dark launches, or capacity planning.
+
+**Instead:** mention backward-compatible schema changes, versioned APIs and events, feature flags, and rollback.
+
+-> [[68-schema-change-producer-vs-consumer]], [[18-http-status-codes-400-404-409-422]]
+
+## 10. Not Talking About Failure Modes
+
+**Sounds like:** a design that only works when everything is healthy.
+
+**Instead:** walk through what happens on an AZ outage, a cache stampede, clock skew, a poison message, and a slow dependency - and how you recover.
+
+-> [[12-multi-az-availability]], [[10-clock-skew-last-write-wins]], [[44-distributed-locking-with-redis]]
+
+---
+
+## The Pattern Behind All 10
+
+Every mistake is the same thing in different clothes: **describing the happy path of an imaginary system instead of the real behavior of a system under load and failure.** Interviewers aren't grading the boxes. They're grading whether you can predict what breaks.
+
+## 🧠 Remember
+
+> Clarify numbers first, define the API and data first, then design for limits, retries, duplicates, deploys, and failure - that's what separates a senior answer from a diagram.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="76" data-title="When Not to Use AI Coding Agents" data-category="Blog" data-order="76">
+# Blog: AI Coding Agents Are Great Tools - But Not for Every Job
+
+*Being a good engineer now includes knowing when to prompt and when to just write the code.*
+
+---
+
+## The Core Idea
+
+A quote (credited to Petar Dambovaliev) sums it up:
+
+> "The more precise you need to be, the more natural-language text you need to write to describe the same programming concept. So at some point it is actually faster to write the code than to try to explain to an LLM what the code should do. It is a spectrum, and you should at any moment be able to go from one to the other."
+
+Code is a precise language. English is not. When the thing you want is fuzzy, English is efficient. When the thing you want is exact, the code **is** the shortest description.
+
+## A Simple Example
+
+**Easy to prompt:** "Create an Express endpoint that returns a paginated list of orders, with validation and tests."
+Twelve words produce 150 lines. Huge win.
+
+**Hard to prompt:** "The balance update must be one atomic conditional statement, reject if the balance would go negative, use the account row as the only source of truth, and never read from the cache."
+You've now written a paragraph to describe what is literally one line:
+
+```sql
+UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1;
+```
+
+At that point, writing the line yourself is faster **and** you know it's exactly right ([[60-cache-says-100-db-says-20]]).
+
+## Where Agents Shine
+
+- **Boilerplate and scaffolding**: CRUD endpoints, DTOs, config, migrations for simple tables.
+- **Well-known patterns**: "add rate limiting with this library," "convert this to async/await."
+- **Exploration**: reading an unfamiliar codebase, summarizing a module, drafting options.
+- **Tests and refactors** with a clear target.
+- **Glue code** between well-documented APIs.
+
+## Where Writing It Yourself Is Often Faster (or Safer)
+
+- **Precise invariants**: concurrency, locking, money, idempotency ([[44-distributed-locking-with-redis]], [[65-pagerduty-incident-dedup-paging]]).
+- **Tiny, exact changes**: a one-line fix where describing it takes longer than typing it.
+- **Deep context**: behavior that depends on history nobody wrote down ("we do it this way because of the 2024 incident").
+- **Performance-critical paths** where the exact query plan matters ([[50-slow-query-500m-rows]]).
+- **Security-sensitive code**: auth flows, crypto, secret handling ([[56-password-hashing-not-sha256]], [[72-secret-leaked-to-public-git]]).
+
+## The Skill: Moving Along the Spectrum
+
+Good engineers switch modes constantly:
+
+1. Prompt the agent for the scaffold.
+2. Hand-write the one tricky function where correctness lives.
+3. Ask the agent to write tests for that function.
+4. Review everything like it came from a fast but new teammate.
+
+The mistake isn't using AI or refusing to. It's being stuck at one end of the spectrum: prompting for 20 minutes to avoid writing 3 lines, or hand-typing 300 lines of boilerplate out of pride.
+
+## Why This Matters for Your Career
+
+If you can only work through prompts, you can't tell when the output is subtly wrong - and the subtle bugs (races, retries, stale caches) are exactly the expensive ones. If you can read and write precise code, AI becomes a multiplier instead of a crutch. That's the same point as [[29-why-hire-you-over-ai]] and [[55-blog-engineering-harder-building-easier]].
+
+## 🧠 Remember
+
+> Use natural language when the idea is fuzzy and the pattern is common; write code when the idea is precise, because past a certain point the code is the shortest and most accurate description.
+
+## Reflect
+
+1. What was the last task where prompting took longer than writing it would have?
+2. Which parts of your current project would you never let an agent change without a line-by-line review?
+</script>
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
@@ -4248,12 +5787,69 @@ function renderHome() {
   closeMobileSidebar();
 }
 
+// ---- "Read next" suggestions -------------------------------------------
+// Built automatically from the lessons themselves, so every new lesson gets
+// suggestions with no extra work:
+//   1. lessons this one links to with [[NN-slug]]      -> "Builds on"
+//   2. lessons that link back to this one (backlinks)  -> "Related questions"
+//   3. other lessons in the same topic                 -> "More in <topic>"
+const outLinks = {};
+const backLinks = {};
+lessons.forEach(l => {
+  const ids = [...l.content.matchAll(/\[\[(\d{2})-[a-z0-9-]+\]\]/g)].map(m => m[1]);
+  outLinks[l.id] = [...new Set(ids)].filter(x => x !== l.id);
+});
+lessons.forEach(l => outLinks[l.id].forEach(t => {
+  (backLinks[t] = backLinks[t] || []).push(l.id);
+}));
+
+function suggestCard(l) {
+  return '<div class="suggest-card" data-target="' + l.id + '">' +
+    '<div class="cat">' + l.category + '</div>' + l.id + '. ' + l.title + '</div>';
+}
+
+function buildSuggestions(lesson) {
+  const used = new Set([lesson.id]);
+  const pick = (ids, max) => ids
+    .map(i => lessons.find(l => l.id === i))
+    .filter(l => l && !used.has(l.id))
+    .slice(0, max)
+    .map(l => { used.add(l.id); return l; });
+
+  const buildsOn = pick(outLinks[lesson.id] || [], 6);
+  const related = pick((backLinks[lesson.id] || []).slice().reverse(), 6);
+  const sameTopic = pick(
+    lessons.filter(l => l.category === lesson.category)
+      .sort((a, b) => Math.abs(a.order - lesson.order) - Math.abs(b.order - lesson.order))
+      .map(l => l.id),
+    4);
+
+  const group = (label, items) => items.length
+    ? '<div class="suggest-group"><div class="suggest-label">' + label + '</div>' +
+      '<div class="suggest-grid">' + items.map(suggestCard).join('') + '</div></div>'
+    : '';
+
+  const idx = lessons.indexOf(lesson);
+  const prev = lessons[idx - 1], next = lessons[idx + 1];
+  const isBlog = lesson.category === 'Blog';
+
+  return '<div class="suggest-box"><h2>&#128214; Read next</h2>' +
+    group(isBlog ? 'Lessons mentioned in this post' : 'Builds on', buildsOn) +
+    group(isBlog ? 'Questions that go deeper' : 'Related questions', related) +
+    group('More in ' + lesson.category, sameTopic) +
+    '<div class="suggest-nav">' +
+      (prev ? '<button data-target="' + prev.id + '">&larr; ' + prev.id + '. ' + prev.title + '</button>' : '<span></span>') +
+      (next ? '<button class="next" data-target="' + next.id + '">' + next.id + '. ' + next.title + ' &rarr;</button>' : '<span></span>') +
+    '</div></div>';
+}
+
 function openLesson(id) {
   const lesson = lessons.find(l => l.id === id);
   if (!lesson) return;
   currentId = id;
   document.title = lesson.title + ' - Learning Dashboard';
-  readerEl.innerHTML = marked.parse(linkifyCrossRefs(lesson.content), { renderer });
+  readerEl.innerHTML = marked.parse(linkifyCrossRefs(lesson.content), { renderer }) +
+    buildSuggestions(lesson);
   mermaid.run({ querySelector: '#reader .mermaid' });
   progressEl.textContent = 'Lesson ' + lesson.id + ' of ' + lessons.length + ' - ' + lesson.category;
   buildSidebar(document.getElementById('search').value);
@@ -4282,8 +5878,8 @@ sidebarBackdropEl.addEventListener('click', closeMobileSidebar);
 document.getElementById('btn-home').addEventListener('click', renderHome);
 document.getElementById('search').addEventListener('input', (e) => buildSidebar(e.target.value));
 readerEl.addEventListener('click', (e) => {
-  const link = e.target.closest('.xref-link');
-  if (link) { e.preventDefault(); openLesson(link.dataset.target); }
+  const link = e.target.closest('.xref-link, .suggest-card, .suggest-nav button');
+  if (link && link.dataset.target) { e.preventDefault(); openLesson(link.dataset.target); }
 });
 
 function setTheme(theme) {

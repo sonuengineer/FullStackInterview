@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>500 MB Uploads Exploding Memory</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# 100 Users Upload 500 MB Videos at Once and Memory Explodes
+
+> **Same-question flag**: this is [[49-large-file-upload-with-status]] (pre-signed URLs, direct-to-storage multipart upload) plus the "don't hold big payloads in memory" rule from [[48-huge-json-payloads]]. Short recap with the math.
+
+## Why Memory Explodes
+
+The API buffers the **whole file** before processing: `100 users x 500 MB = 50 GB` of memory. No normal server has that, so it swaps, slows down, and gets OOM-killed - taking every other request down with it.
+
+## The Fix, in Order of Preference
+
+**1. Don't let the bytes touch your API at all.** Return a **pre-signed URL**; the client uploads directly to object storage (S3/GCS) using **multipart upload** (e.g. 10 MB chunks, retry per chunk). Your API only stores metadata and status. Memory used by your API: close to zero. Full design: [[49-large-file-upload-with-status]].
+
+**2. If the file must pass through your server, stream it.** Pipe the incoming request straight to storage chunk by chunk, never collecting it in memory. Memory per upload becomes a small fixed buffer (a few MB), not 500 MB.
+
+```javascript
+// Streaming pass-through: memory stays at a small buffer per upload
+const { Upload } = require('@aws-sdk/lib-storage');
+app.post('/videos', async (req, res) => {
+  await new Upload({
+    client: s3,
+    params: { Bucket: 'videos', Key: crypto.randomUUID(), Body: req }, // req is a stream
+    partSize: 10 * 1024 * 1024,
+    queueSize: 2,
+  }).done();
+  res.status(202).json({ status: 'processing' });
+});
+```
+
+**3. Process asynchronously.** Transcoding and thumbnails run in background workers from a queue, never inside the upload request.
+
+**4. Add guardrails.** Max file size at the load balancer, per-user concurrent upload limits, and short-lived upload URLs.
+
+## 🧠 Remember
+
+> Never buffer large uploads in API memory: send clients straight to object storage with pre-signed multipart uploads, or at minimum stream the bytes through, and process the video in background workers.
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

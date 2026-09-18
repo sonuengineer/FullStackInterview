@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Two Indexes, Still Slow (Composite Index)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Index on user_id Exists. Index on created_at Added. Still 30 Seconds. What's Missing?
+
+> **Similar-question flag**: [[50-slow-query-500m-rows]] already covers the method (read `EXPLAIN ANALYZE`, then add the index that matches filter + sort). This lesson zooms in on one specific trap: **two separate single-column indexes are not the same as one composite index.**
+
+## 1. The Situation
+
+```sql
+SELECT * FROM orders
+WHERE user_id = 42
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+50 million rows. There's an index on `user_id` and another on `created_at`. Still 30 seconds.
+
+## 2. What's Missing: A Composite Index `(user_id, created_at)`
+
+A database usually uses **one** index per table access to do the heavy lifting. With two separate indexes it has to pick:
+
+- **Use `user_id` index**: finds all of user 42's rows fast - but if that user has 2 million orders, it must fetch all 2 million, then **sort them** by `created_at` to get the top 20.
+- **Use `created_at` index**: walks rows newest-first - but it has to check `user_id = 42` on each one, possibly reading millions of other users' rows before finding 20 matches.
+
+Either way, it reads a huge number of rows.
+
+A **composite index** on `(user_id, created_at)` stores the data already grouped by user **and** sorted by time inside each user. The database jumps straight to user 42 and reads the first 20 entries in order. No sort, no scanning other users.
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_user_created
+  ON orders (user_id, created_at DESC);
+```
+
+## 3. Mental Model
+
+> A phone book sorted by last name, then first name, lets you find "Sharma, Priya" instantly. Two separate books - one sorted by last name, one by first name - don't. Column **order** in a composite index matters the same way: put the equality filter first (`user_id`), then the sort/range column (`created_at`).
+
+## 4. Other Things to Check in the Plan
+
+If the composite index still doesn't fix it, `EXPLAIN ANALYZE` usually shows one of these:
+
+- **`SELECT *`** forces a lookup into the table for every row; selecting only needed columns (or a covering index with `INCLUDE`) avoids it.
+- **Type mismatch**: `user_id` is a string column but the query passes a number (or vice versa), so the index can't be used.
+- **Function on the column** (`WHERE DATE(created_at) = ...`) disables the index.
+- **Stale statistics**: run `ANALYZE` so the planner picks the right index.
+- **Skew**: one "whale" user with millions of rows behaves very differently from a typical user.
+
+## 5. 🧠 Remember
+
+> Two single-column indexes don't combine into one fast path - a query that filters on one column and sorts by another needs a composite index in that order: equality column first, then the sort/range column.
+
+## 6. Quick Self-Test
+
+1. Why can't the database efficiently use both single-column indexes together for this query?
+2. Why does `(user_id, created_at)` work but `(created_at, user_id)` is much worse here?
+3. What does a covering index add on top of a composite one?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>
