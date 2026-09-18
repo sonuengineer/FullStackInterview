@@ -305,6 +305,7 @@
   <div id="toolbar">
     <button id="sidebar-toggle" aria-label="Toggle topics">&#9776; Topics</button>
     <button id="btn-home">Home</button>
+    <button id="btn-prep" title="Private interview prep (password protected)">&#128274; Interview Prep</button>
     <button id="theme-sepia">Sepia</button>
     <button id="theme-light">Light</button>
     <button id="theme-dark">Dark</button>
@@ -6142,6 +6143,8 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
 sidebarBackdropEl.addEventListener('click', closeMobileSidebar);
 
 document.getElementById('btn-home').addEventListener('click', renderHome);
+// Relative link: works on GitHub Pages (/FullStackInterview/prep/) and when opened locally
+document.getElementById('btn-prep').addEventListener('click', () => { location.href = 'prep/index.html'; });
 document.getElementById('search').addEventListener('input', (e) => buildSidebar(e.target.value));
 readerEl.addEventListener('click', (e) => {
   const link = e.target.closest('.xref-link, .suggest-card, .suggest-nav button');

@@ -1,6 +1,7 @@
 // Builds the private interview-prep page and publishes ONLY an encrypted copy.
 //
-//   node tools/encrypt-prep.mjs
+//   node tools/encrypt-prep.mjs            (encrypt + commit + push)
+//   node tools/encrypt-prep.mjs --no-push  (encrypt only)
 //
 // 1. Rebuilds interview-prep/index.html from the .md notes (plaintext, never committed;
 //    interview-prep/ is in .gitignore).
@@ -41,8 +42,8 @@ function askHidden(question) {
           resolve(value);
           return;
         }
-        if (ch === '') { stdout.write('\n'); process.exit(1); } // Ctrl+C
-        if (ch === '' || ch === '') { value = value.slice(0, -1); continue; } // Backspace
+        if (ch === '\u0003') { stdout.write('\n'); process.exit(1); } // Ctrl+C
+        if (ch === '\u0008' || ch === '\u007f') { value = value.slice(0, -1); continue; } // Backspace
         value += ch;
       }
     };
@@ -117,6 +118,7 @@ const lockPage = `<!doctype html>
   button:disabled { opacity: .6; cursor: default; }
   #msg { min-height: 22px; margin: 10px 0 0; font-size: 14px; }
   #msg.err { color: var(--err); }
+  #back { display: block; margin-top: 16px; text-align: center; font-size: 14px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -126,6 +128,7 @@ const lockPage = `<!doctype html>
   <input id="pw" type="password" placeholder="Password" autofocus autocomplete="off">
   <button id="btn" type="submit">Unlock</button>
   <div id="msg" role="status"></div>
+  <a id="back" href="../index.html">&larr; Back to lessons</a>
 </form>
 <script id="payload" type="application/json">${payload}</script>
 <script>
@@ -167,4 +170,27 @@ const lockPage = `<!doctype html>
 
 mkdirSync(join(root, 'prep'), { recursive: true });
 writeFileSync(join(root, 'prep', 'index.html'), lockPage);
-console.log('Wrote prep/index.html (encrypted, ' + Math.round(encrypted.length / 1024) + ' KB of ciphertext). Safe to commit.');
+console.log('Wrote prep/index.html (encrypted, ' + Math.round(encrypted.length / 1024) + ' KB of ciphertext).');
+
+// 5. Publish: commit and push ONLY the encrypted file. Skip with --no-push.
+if (process.argv.includes('--no-push')) {
+  console.log('Skipped push (--no-push). Commit prep/index.html when ready.');
+} else {
+  const git = (...args) => execFileSync('git', args, { cwd: root, stdio: 'pipe' }).toString().trim();
+  try {
+    git('add', '--', 'prep/index.html');
+    if (!git('diff', '--cached', '--name-only', '--', 'prep/index.html')) {
+      console.log('No changes to publish.');
+    } else {
+      git('commit', '-m', 'Update encrypted interview-prep notes', '--', 'prep/index.html');
+      git('push', 'origin', 'HEAD');
+      console.log('Pushed. Live in about a minute at https://sonuengineer.github.io/FullStackInterview/prep/');
+    }
+  } catch (err) {
+    console.error('Encrypted file is written, but the git push failed:');
+    console.error(String(err.stderr || err.message).trim());
+    console.error('Fix the problem (e.g. run: gh auth switch --user sonuengineer), then run:');
+    console.error('  git add prep/index.html && git commit -m "Update prep" && git push');
+    process.exit(1);
+  }
+}
