@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Return 10,000, Show 20 (Pagination)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Your API Returns 10,000 Records but the Screen Shows 20 - What Do You Do?
+
+## 1. The Question
+
+The frontend displays 20 rows. The API sends 10,000. Options:
+- A) Return all 10,000
+- B) Add pagination
+- C) Add cursor pagination
+- D) Let the frontend handle it
+
+**Answer: paginate on the server - B for a simple admin table, C for large, growing or infinite-scroll lists.** A and D are the same mistake.
+
+## 2. Why "Return All 10,000" Hurts Everyone
+
+Every request pays for 9,980 rows nobody sees:
+
+- **Database:** reads and sorts 10,000 rows instead of 20.
+- **Server:** builds a huge object and serializes a multi-MB JSON (which blocks the Node event loop while it runs).
+- **Network:** megabytes per request - painful on mobile data.
+- **Browser:** parses it all and holds it in memory; rendering 10,000 rows freezes the page.
+
+And it gets worse every day as the table grows. "Let the frontend handle it" (D) means you already paid all of those costs - the frontend can only hide rows, not un-download them.
+
+## 3. Option B: Offset Pagination (page numbers)
+
+```javascript
+// GET /api/orders?page=3&limit=20
+app.get('/api/orders', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 100);   // cap it - never trust the client
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const { rows } = await db.query(
+    'SELECT id, customer, total, created_at FROM orders ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2',
+    [limit, (page - 1) * limit]);
+  res.json({ items: rows, page, limit });
+});
+```
+
+- **Good for:** admin tables where users jump to "page 7"; small or medium tables.
+- **Weak at depth:** `OFFSET 100000` makes the database walk and throw away 100,000 rows first. And if new rows arrive while the user pages, rows **shift** - duplicates or skipped items.
+
+## 4. Option C: Cursor (Keyset) Pagination
+
+Instead of "skip N rows", say "give me the 20 rows **after the last one I saw**".
+
+```javascript
+// GET /api/orders?limit=20&cursor=<opaque>
+app.get('/api/orders', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  let where = '', params = [limit + 1];                     // fetch one extra to know if there's more
+  if (req.query.cursor) {
+    const [ts, id] = Buffer.from(req.query.cursor, 'base64url').toString().split('|');
+    where = 'WHERE (created_at, id) < ($2, $3)';
+    params.push(ts, id);
+  }
+  const { rows } = await db.query(
+    `SELECT id, customer, total, created_at FROM orders ${where}
+     ORDER BY created_at DESC, id DESC LIMIT $1`, params);
+
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const last = items[items.length - 1];
+  res.json({
+    items,
+    nextCursor: hasMore
+      ? Buffer.from(`${last.created_at.toISOString()}|${last.id}`).toString('base64url')
+      : null,
+  });
+});
+// Index: CREATE INDEX ON orders (created_at DESC, id DESC);
+```
+
+- **Fast at any depth** - the index jumps straight to the cursor position.
+- **Stable** - new rows don't shift what you've already seen.
+- **Can't jump to page 50** - fine for feeds and infinite scroll.
+- The `id` tiebreaker handles rows with the same timestamp.
+
+## 5. How to Choose
+
+| Situation | Use |
+|---|---|
+| Admin table, "page 3 of 12", small data | Offset (B) |
+| Feed, infinite scroll, large or fast-growing table | Cursor (C) |
+| Export of all rows | A **background job** that streams a file (CSV) - not one API response |
+| Frontend truly needs everything (a tiny dropdown list) | Return it all - but only if it's small and bounded |
+
+## 6. Details That Show Seniority
+
+- **Cap `limit`** (e.g. max 100) - otherwise `?limit=1000000` brings the problem back.
+- **Return only needed columns**, not `SELECT *`.
+- **Avoid `COUNT(*)` on every page** - on big tables it's a full scan. Use `hasMore` (the `limit + 1` trick) or a cached/approximate total.
+- **Filter and sort on the server** with matching indexes; otherwise pagination returns the wrong 20.
+
+## 🧠 Remember
+
+> Never send what the user can't see. Paginate on the server: offset for small tables with page numbers, cursor for large lists and infinite scroll - cap the limit and index the sort order.
+
+## Self-Test
+
+1. Why is "let the frontend handle it" the same mistake as returning everything?
+2. Why does offset pagination get slower on deep pages?
+3. What does the `limit + 1` trick give you?
+
+Related: [[84-infinite-scroll-pagination-at-scale]], [[48-huge-json-payloads]]
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

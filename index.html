@@ -5990,6 +5990,1070 @@ For token/sliding-window versions in production, run the whole check as one **Lu
 2. Why does token bucket suit most APIs better than leaky bucket?
 3. What goes wrong if each server keeps its own counter?
 </script>
+<script type="text/markdown" class="lesson-data" data-id="80" data-title="Restart Logs Everyone Out" data-category="Security" data-order="80">
+# You Restart the Backend and Every User Is Logged Out - What Assumption Was Wrong?
+
+## 1. The Story
+
+Users log in and everything works. You deploy a small fix, the server restarts, and suddenly **every single user** is kicked back to the login page. Support tickets flood in. Nothing in the login code changed.
+
+## 2. The Wrong Assumption
+
+> **"The server process will live forever, so it can remember things."**
+
+Login state was stored somewhere that **dies with the process**. When the process restarts, that memory is gone, so every token or session the server issued is now meaningless to it.
+
+## 3. The Three Usual Culprits
+
+**1. Sessions stored in process memory**
+`express-session` uses an in-memory store by default (`MemoryStore`). Every session lives in a JavaScript object inside the Node process. Restart = empty object = everyone logged out.
+The docs even warn: MemoryStore is not for production - it also leaks memory and doesn't work with more than one server.
+
+**2. The JWT secret is generated at startup**
+```javascript
+// BAD - a new random secret on every boot
+const JWT_SECRET = crypto.randomBytes(32).toString('hex');
+```
+Every token signed before the restart was signed with the **old** secret. After the restart, verification fails for all of them.
+
+**3. Each server has its own secret or its own memory**
+With 3 servers behind a load balancer, even without a restart, a user logged in on server A is "unknown" on server B. A restart just makes the same bug obvious.
+
+## 4. The Fix: Keep Auth State Outside the Process
+
+| What you use | Where state must live |
+|---|---|
+| Server sessions | A **shared store**: Redis (`connect-redis`), or the database |
+| JWT | A **fixed secret from config** (env / Secrets Manager), the same on every server; refresh tokens stored in the DB/Redis |
+
+```javascript
+// Sessions in Redis - survive restarts and work across many servers
+const session = require('express-session');
+const { RedisStore } = require('connect-redis');
+const { createClient } = require('redis');
+
+const redisClient = createClient({ url: process.env.REDIS_URL });
+await redisClient.connect();
+
+app.use(session({
+  store: new RedisStore({ client: redisClient }),
+  secret: process.env.SESSION_SECRET,            // fixed, from config - never random at boot
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 },
+}));
+```
+
+```javascript
+// JWT - one stable secret from config, same on every instance
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error('JWT_SECRET missing - refusing to start');   // fail fast
+```
+
+## 5. The Principle Behind It
+
+**Term: Stateless server** - a server that keeps no user-specific data in its own memory between requests, so any instance can handle any request and restarts lose nothing.
+
+This is the same rule that makes **horizontal scaling** and **zero-downtime deploys** possible. If a restart logs everyone out, you also can't safely run two servers or do a rolling deploy.
+
+## 6. Related Traps
+
+- **Redis without persistence, or evicting keys:** sessions in Redis also vanish if Redis restarts with no persistence, or if Redis runs out of memory and evicts them. Give session keys their own Redis (or `noeviction`), separate from cache keys.
+- **Rotating the secret on purpose:** if you must rotate a JWT secret, support **two keys** for a while (verify with old or new, sign with new) - or everyone is logged out at the rotation.
+- **Cookie settings changed in the deploy:** a new cookie name, domain or `SameSite` value also makes old cookies useless.
+
+## 7. Real Example (ThePipingMart)
+
+ThePipingMart stores the session **in Redis** (the token is the Redis key), so a Node restart doesn't log anyone out - good. The remaining risk: cache keys share the same Redis and some have **no TTL**, so if memory fills up and Redis evicts keys, sessions can disappear, which looks like "random logouts". In an AWS lab with two containers each running their own Redis, logins broke across containers until Redis was shared - the same lesson at small scale.
+
+## 🧠 Remember
+
+> If a restart logs everyone out, your auth state lived inside the process. Move it out: sessions in a shared store, JWT secrets from config - and the same rule gives you safe scaling and zero-downtime deploys.
+
+## Self-Test
+
+1. Why does `express-session` with default settings log everyone out on restart?
+2. Why is `crypto.randomBytes()` at startup a bad JWT secret?
+3. How would you rotate a JWT secret without logging everyone out?
+
+Related: [[09-jwt-logout-invalidation]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="81" data-title="Delete 150M Rows Safely" data-category="Databases" data-order="81">
+# Delete 150 Million Rows From a Live 800M-Row Table - No Locks, No Lag, No Downtime
+
+*This is the "delete at scale" problem from [[03-ttl-deletion-at-scale]] under stricter rules: a busy table (3,000 writes/second), a replica that must not fall behind, and zero downtime.*
+
+## 1. Why One Big DELETE Is a Disaster
+
+```sql
+DELETE FROM events WHERE created_at < '2025-01-01';   -- 150 million rows
+```
+
+- **One giant transaction:** it runs for hours, holding locks on every row it touches, and if it fails at 90% everything rolls back.
+- **Huge log (WAL / binlog):** 150M row deletions flood the replica, so **replica lag** explodes.
+- **Table bloat:** in Postgres, deleted rows become dead tuples until vacuum cleans them; one big delete creates 150M at once.
+- **Blocks the 3,000 writes/second** hitting the same table and indexes.
+
+## 2. The Best Answer - If You Can: Don't Delete, Drop
+
+If the table is (or can become) **partitioned by time** ([[21-database-partitioning]]), deleting old data is:
+
+```sql
+ALTER TABLE events DETACH PARTITION events_2024_12;
+DROP TABLE events_2024_12;                              -- instant, no row-by-row work
+```
+
+Dropping a partition removes a whole file - no per-row locks, almost no log, no bloat. **Say this first in the interview** - then handle the case where the table isn't partitioned.
+
+## 3. If You Must Delete Rows: Small Batches, Throttled, Watched
+
+The idea: delete a **small batch** (e.g. 5,000 rows) by primary key, commit, **pause**, check the replica lag, repeat.
+
+```javascript
+// Batch delete by primary-key ranges - each batch is a short, cheap transaction
+const BATCH = 5000;
+const CUTOFF = '2025-01-01';
+
+async function purge() {
+  let lastId = 0;
+  const { rows: [{ max }] } = await db.query(
+    'SELECT max(id) FROM events WHERE created_at < $1', [CUTOFF]);   // the old rows' id boundary
+
+  while (lastId < max) {
+    // 1. Stop if the replica is falling behind
+    while ((await replicaLagSeconds()) > 5) await sleep(10_000);
+
+    // 2. Delete one small, index-backed slice
+    const res = await db.query(
+      `DELETE FROM events
+       WHERE id > $1 AND id <= $2 AND created_at < $3`,
+      [lastId, lastId + BATCH, CUTOFF]);
+
+    lastId += BATCH;
+    console.log(`up to id ${lastId}: deleted ${res.rowCount}`);   // resumable: log progress
+
+    // 3. Give live traffic and the replica room to breathe
+    await sleep(200);
+  }
+}
+
+async function replicaLagSeconds() {
+  // Postgres, run on the replica connection
+  const { rows } = await replica.query(
+    'SELECT EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp()) AS lag');
+  return Number(rows[0].lag || 0);
+}
+```
+
+**Why each detail matters:**
+- **Delete by primary-key range**, not `LIMIT` with a full scan - each batch finds its rows through the index instantly.
+- **Short transactions** - locks are held for milliseconds, so the 3,000 writes/second barely notice.
+- **Lag check before each batch** - the replica sets the pace (**backpressure**).
+- **Sleep between batches** - smooths the load; tune it while watching latency.
+- **Log the last id** - if the job stops, it resumes where it left off.
+- **Run off-peak** if possible, and make it **pausable** (a flag or a kill switch).
+
+## 4. After Deleting
+
+- **Postgres:** run `VACUUM` (autovacuum will be busy) so dead rows become reusable space. The file won't shrink by itself - that needs `pg_repack` (online) if you need the disk back.
+- **MySQL:** `OPTIMIZE TABLE` or `pt-online-schema-change` to reclaim space online.
+- **Then prevent it happening again:** partition the table by month so next year's cleanup is a `DROP` ([[21-database-partitioning]]).
+
+## 5. Alternative: Copy What You Keep
+
+When you're deleting **most** of a table (say 700M of 800M), it's often faster to copy the rows you **keep** into a new table and swap - using an online tool (`pg_repack`, `gh-ost`, `pt-online-schema-change`) that keeps both in sync while live writes continue. With 150M of 800M, batched deletes are usually the simpler choice.
+
+## 🧠 Remember
+
+> Never delete millions of rows in one statement. Best: drop a partition. Otherwise: small primary-key batches, short transactions, pause when the replica lags, log progress so it can resume - and partition the table so you never have to do it again.
+
+## Self-Test
+
+1. Why does one big `DELETE` cause replica lag?
+2. Why delete by primary-key range instead of `DELETE ... LIMIT 5000`?
+3. Why is dropping a partition so much cheaper than deleting its rows?
+
+Related: [[03-ttl-deletion-at-scale]], [[21-database-partitioning]], [[50-slow-query-500m-rows]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="82" data-title="Return 10,000, Show 20 (Pagination)" data-category="Web &amp; API Communication" data-order="82">
+# Your API Returns 10,000 Records but the Screen Shows 20 - What Do You Do?
+
+## 1. The Question
+
+The frontend displays 20 rows. The API sends 10,000. Options:
+- A) Return all 10,000
+- B) Add pagination
+- C) Add cursor pagination
+- D) Let the frontend handle it
+
+**Answer: paginate on the server - B for a simple admin table, C for large, growing or infinite-scroll lists.** A and D are the same mistake.
+
+## 2. Why "Return All 10,000" Hurts Everyone
+
+Every request pays for 9,980 rows nobody sees:
+
+- **Database:** reads and sorts 10,000 rows instead of 20.
+- **Server:** builds a huge object and serializes a multi-MB JSON (which blocks the Node event loop while it runs).
+- **Network:** megabytes per request - painful on mobile data.
+- **Browser:** parses it all and holds it in memory; rendering 10,000 rows freezes the page.
+
+And it gets worse every day as the table grows. "Let the frontend handle it" (D) means you already paid all of those costs - the frontend can only hide rows, not un-download them.
+
+## 3. Option B: Offset Pagination (page numbers)
+
+```javascript
+// GET /api/orders?page=3&limit=20
+app.get('/api/orders', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 100);   // cap it - never trust the client
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const { rows } = await db.query(
+    'SELECT id, customer, total, created_at FROM orders ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2',
+    [limit, (page - 1) * limit]);
+  res.json({ items: rows, page, limit });
+});
+```
+
+- **Good for:** admin tables where users jump to "page 7"; small or medium tables.
+- **Weak at depth:** `OFFSET 100000` makes the database walk and throw away 100,000 rows first. And if new rows arrive while the user pages, rows **shift** - duplicates or skipped items.
+
+## 4. Option C: Cursor (Keyset) Pagination
+
+Instead of "skip N rows", say "give me the 20 rows **after the last one I saw**".
+
+```javascript
+// GET /api/orders?limit=20&cursor=<opaque>
+app.get('/api/orders', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  let where = '', params = [limit + 1];                     // fetch one extra to know if there's more
+  if (req.query.cursor) {
+    const [ts, id] = Buffer.from(req.query.cursor, 'base64url').toString().split('|');
+    where = 'WHERE (created_at, id) < ($2, $3)';
+    params.push(ts, id);
+  }
+  const { rows } = await db.query(
+    `SELECT id, customer, total, created_at FROM orders ${where}
+     ORDER BY created_at DESC, id DESC LIMIT $1`, params);
+
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const last = items[items.length - 1];
+  res.json({
+    items,
+    nextCursor: hasMore
+      ? Buffer.from(`${last.created_at.toISOString()}|${last.id}`).toString('base64url')
+      : null,
+  });
+});
+// Index: CREATE INDEX ON orders (created_at DESC, id DESC);
+```
+
+- **Fast at any depth** - the index jumps straight to the cursor position.
+- **Stable** - new rows don't shift what you've already seen.
+- **Can't jump to page 50** - fine for feeds and infinite scroll.
+- The `id` tiebreaker handles rows with the same timestamp.
+
+## 5. How to Choose
+
+| Situation | Use |
+|---|---|
+| Admin table, "page 3 of 12", small data | Offset (B) |
+| Feed, infinite scroll, large or fast-growing table | Cursor (C) |
+| Export of all rows | A **background job** that streams a file (CSV) - not one API response |
+| Frontend truly needs everything (a tiny dropdown list) | Return it all - but only if it's small and bounded |
+
+## 6. Details That Show Seniority
+
+- **Cap `limit`** (e.g. max 100) - otherwise `?limit=1000000` brings the problem back.
+- **Return only needed columns**, not `SELECT *`.
+- **Avoid `COUNT(*)` on every page** - on big tables it's a full scan. Use `hasMore` (the `limit + 1` trick) or a cached/approximate total.
+- **Filter and sort on the server** with matching indexes; otherwise pagination returns the wrong 20.
+
+## 🧠 Remember
+
+> Never send what the user can't see. Paginate on the server: offset for small tables with page numbers, cursor for large lists and infinite scroll - cap the limit and index the sort order.
+
+## Self-Test
+
+1. Why is "let the frontend handle it" the same mistake as returning everything?
+2. Why does offset pagination get slower on deep pages?
+3. What does the `limit + 1` trick give you?
+
+Related: [[84-infinite-scroll-pagination-at-scale]], [[48-huge-json-payloads]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="83" data-title="Redis Down: Protect the Database" data-category="Production Debugging &amp; Incidents" data-order="83">
+# Redis Goes Down for 30 Seconds - How Do You Stop the Database From Collapsing?
+
+## 1. The Story
+
+Your API serves 20,000 requests per second. Redis answers 95% of reads, so the database only sees ~1,000 queries per second - and it's sized for that.
+
+Redis goes down for 30 seconds. Your code falls back to the database: **"cache miss? just query the DB."** Now the database gets **20,000 queries per second - 20x its normal load**. Queries slow down, connections pile up, timeouts start, clients **retry**... and the database collapses. When Redis comes back, the DB is still drowning ([[14-cascading-failure-recovery]]).
+
+**The cache wasn't just a speed-up. It was protecting the database.** Losing it removes the protection.
+
+## 2. The Defences (layer them)
+
+### 1. Don't wait on a dead Redis - short timeouts + circuit breaker
+If every Redis call waits 5 seconds to time out, your API is slow **and** threads/connections pile up. Set short timeouts (e.g. 50-100 ms). After several failures, **open a circuit breaker**: skip Redis entirely for a few seconds, then try again.
+
+### 2. Limit how hard you hit the database
+Put a **concurrency limit** in front of the fallback queries - e.g. at most 200 DB queries in flight per server. Requests beyond that **wait briefly or fail fast** with a friendly error. Better to fail some requests than to take the database (and everyone) down. This is **load shedding**.
+
+### 3. Collapse duplicate requests (request coalescing / single-flight)
+If 5,000 requests ask for the same hot key ("homepage products"), only **one** should query the database; the other 4,999 wait for that same promise.
+
+### 4. Serve stale data
+A small **in-process cache** (a few seconds to minutes) in each server keeps the hottest items available even when Redis is gone. Slightly stale data beats an outage for most reads (product lists, config) - not for money or permissions.
+
+### 5. Degrade features, not the whole site
+Turn off non-essential expensive features (recommendations, "people also viewed") while Redis is down, so core flows keep working.
+
+## 3. Code: All the Layers Together (Node.js)
+
+```javascript
+const pLimit = require('p-limit');                 // or your own limiter
+const dbLimit = pLimit(200);                        // max 200 DB fallback queries in flight
+const inFlight = new Map();                         // single-flight: key -> promise
+const local = new Map();                            // tiny stale cache: key -> { value, at }
+
+let redisDownUntil = 0;                             // simple circuit breaker
+
+async function cachedGet(key, loadFromDb, ttlSec = 60) {
+  // 1. Try Redis unless the breaker is open
+  if (Date.now() > redisDownUntil) {
+    try {
+      const hit = await withTimeout(redis.get(key), 80);       // don't wait on a dead Redis
+      if (hit) return JSON.parse(hit);
+    } catch {
+      redisDownUntil = Date.now() + 5000;                       // open the breaker for 5s
+    }
+  }
+
+  // 2. Serve slightly stale local data if we have it (fresh enough)
+  const stale = local.get(key);
+  if (stale && Date.now() - stale.at < 5 * 60_000) return stale.value;
+
+  // 3. Single-flight: only one DB query per key at a time
+  if (inFlight.has(key)) return inFlight.get(key);
+  const p = dbLimit(() => loadFromDb())              // 4. bounded DB load (load shedding)
+    .then((value) => {
+      local.set(key, { value, at: Date.now() });
+      if (Date.now() > redisDownUntil) {
+        redis.set(key, JSON.stringify(value), 'EX', ttlSec + Math.floor(Math.random() * 30)).catch(() => {});
+      }
+      return value;
+    })
+    .finally(() => inFlight.delete(key));
+  inFlight.set(key, p);
+  return p;
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+}
+```
+
+(In production, bound the `local` map with an LRU so it can't grow forever, and add a queue-wait timeout to the limiter.)
+
+## 4. When Redis Comes Back: Avoid the Second Wave
+
+- The cache is **empty** (cold). If every request rebuilds at once, you get a **stampede** again. Single-flight and TTL **jitter** (the `+ Math.random() * 30` above) spread the rebuilds out ([[16-synchronized-connection-pool-expiry]] - same "everything at once" trap).
+- **Pre-warm** the hottest keys before sending full traffic back.
+- Don't let the autoscaler add 10 more servers against the struggling DB - that makes it worse ([[39-autoscaling-amplifies-outage]]).
+
+## 5. Prevent It in the First Place
+
+- **Managed Redis with a replica and automatic failover** (e.g. ElastiCache Multi-AZ) - a 30-second outage becomes a few seconds.
+- **Size the database for "cache is gone" for at least a short time**, or know exactly how much it can take.
+- **Separate Redis roles:** sessions and queues shouldn't share an instance with a disposable cache.
+- **Alert** on cache hit ratio and DB connection usage - you'll see trouble before it becomes an outage.
+
+## 6. Real Example (ThePipingMart)
+
+ThePipingMart's supplier search already does the first step right: **a Redis error is treated as a cache miss**, the search falls back to MongoDB, and a failed cache write never fails the request. What it doesn't have yet is a limit on how many fallback queries hit MongoDB at once - that's the layer I'd add next.
+
+## 🧠 Remember
+
+> A cache protects the database, so plan for losing it: short timeouts and a circuit breaker, a cap on fallback DB queries, one query per hot key, stale data where it's safe - and jittered, gradual refill when Redis returns.
+
+## Self-Test
+
+1. Why can a 30-second cache outage keep the database down for much longer?
+2. What does single-flight (request coalescing) save you?
+3. Why add random jitter to TTLs when refilling the cache?
+
+Related: [[14-cascading-failure-recovery]], [[16-synchronized-connection-pool-expiry]], [[39-autoscaling-amplifies-outage]], [[44-distributed-locking-with-redis]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="84" data-title="Infinite Scroll Pagination at Scale" data-category="Web &amp; API Communication" data-order="84">
+# Millions of Records + Infinite Scroll - Which Pagination Strategy?
+
+*Same topic as [[82-return-10000-show-20]], asked from the design side. Short answer below; the full code is in lesson 82.*
+
+## 1. The Answer in One Line
+
+> **Cursor-based (keyset) pagination** on an indexed, stable sort order - because offset gets slower the deeper you scroll and shifts rows while new data arrives.
+
+## 2. Why Not Offset for Infinite Scroll?
+
+| Problem | Offset (`LIMIT 20 OFFSET 200000`) | Cursor (`WHERE (created_at, id) < (...)`) |
+|---|---|---|
+| Speed on deep scroll | Slower every page - the DB walks and discards all skipped rows | Same speed at any depth - the index jumps to the cursor |
+| New items arrive while scrolling | Rows shift: duplicates or missed items | Stable - you continue after the last item you saw |
+| Jump to page 500 | Possible | Not possible (not needed for infinite scroll) |
+
+## 3. How It Works
+
+1. The first request returns 20 items + a **`nextCursor`** (an encoded `created_at|id` of the last item).
+2. The client sends `?cursor=...` to get the next 20.
+3. The query uses `WHERE (created_at, id) < (cursor values) ORDER BY created_at DESC, id DESC LIMIT 21` on an index `(created_at DESC, id DESC)`.
+4. When `nextCursor` is `null`, the client shows "You're all caught up".
+
+## 4. Production Details
+
+- **Opaque cursor** (base64) - clients shouldn't build or depend on its format.
+- **Tiebreaker column (`id`)** - many rows can share a timestamp.
+- **Filters are part of the index** - e.g. a feed per tenant needs `(tenant_id, created_at DESC, id DESC)`.
+- **Cap the page size** and skip `COUNT(*)`; use `limit + 1` to know if there's more.
+- **Frontend:** an IntersectionObserver loads the next page before the user hits the bottom, and **virtualize** the list once it gets long so the DOM doesn't hold 10,000 nodes ([[33-react-performance-at-scale]]).
+- **Deletions are fine;** the cursor just continues from the last seen position.
+
+## 🧠 Remember
+
+> For infinite scroll over millions of rows: cursor pagination on an indexed, stable sort (timestamp + id), an opaque cursor, a capped page size - and a virtualized list on the frontend.
+
+## Self-Test
+
+1. What two problems does offset pagination cause in an infinite feed?
+2. Why must the cursor include `id` and not just `created_at`?
+
+Related: [[82-return-10000-show-20]], [[33-react-performance-at-scale]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="85" data-title="Authentication vs Authorization" data-category="Security" data-order="85">
+# Authentication vs Authorization - In One Sentence Each
+
+## 1. The One-Liners
+
+> **Authentication (AuthN)** answers **"Who are you?"** - proving your identity.
+>
+> **Authorization (AuthZ)** answers **"What are you allowed to do?"** - checking your permissions.
+
+**Authentication always comes first** - you can't decide what someone may do until you know who they are.
+
+## 2. The Everyday Picture
+
+At an office building:
+- Showing your **ID card at reception** = authentication (they know who you are).
+- Your card **opening only the 5th floor, not the server room** = authorization (what you may access).
+
+## 3. In a Real App
+
+| | Authentication | Authorization |
+|---|---|---|
+| Question | Who is this? | May they do this? |
+| Examples | Password, OTP / 2FA, SSO login, JWT or session check | Roles (admin, editor), permissions ("can delete supplier"), ownership ("only your own orders") |
+| Failure status | **401 Unauthorized** (really means "unauthenticated") | **403 Forbidden** |
+| Happens | Once at login, then verified on each request via the token/session | On every protected action |
+
+## 4. In Code (Express)
+
+```javascript
+// AUTHENTICATION - who is calling?
+function authenticate(req, res, next) {
+  const token = req.get('Authorization')?.replace('Bearer ', '');
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);   // identity proven
+    next();
+  } catch {
+    res.status(401).json({ error: 'Please log in' });         // we don't know who you are
+  }
+}
+
+// AUTHORIZATION - may they do THIS?
+const requirePermission = (perm) => (req, res, next) =>
+  req.user.permissions?.includes(perm) ? next()
+    : res.status(403).json({ error: 'You do not have access to this' });
+
+app.delete('/api/suppliers/:id',
+  authenticate,                          // 1. who are you?
+  requirePermission('supplier:delete'),  // 2. may you do this?
+  deleteSupplier);
+```
+
+## 5. Common Mistakes
+
+- **Returning 401 when it should be 403** (and the reverse). Logged in but not allowed = 403.
+- **Authorization only in the frontend** - hiding a button is not security. The server must check every request.
+- **Checking the role but not ownership** - a user may edit orders, but only **their own**: `WHERE id = $1 AND user_id = $2`. Missing this is an **IDOR** bug, one of the most common security holes.
+- **Trusting the user ID from the request body** instead of the verified token.
+
+## 6. Real Example (ThePipingMart admin panel)
+
+The admin panel has 24 permission keys (supplier access, RFQ access, Jamstack rebuild...). **Authentication** is the login token; **authorization** is the `PermissionRoute` guard in the UI plus a `checkPermission(key)` middleware on the API. The key lesson from that project: the UI check alone is not enough - the API must enforce the same permissions.
+
+## 🧠 Remember
+
+> Authentication proves who you are (401 if it fails); authorization decides what you may do (403 if it fails) - and authorization must always be enforced on the server.
+
+## Self-Test
+
+1. A logged-in user tries to open the admin page and isn't an admin. 401 or 403?
+2. Why isn't hiding a button in React a form of authorization?
+
+Related: [[09-jwt-logout-invalidation]], [[27-cia-triad]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="86" data-title="REST vs gRPC vs Kafka vs RabbitMQ" data-category="Distributed Systems" data-order="86">
+# REST vs gRPC vs Kafka vs RabbitMQ - Which One for Microservice Communication?
+
+*Don't pick one. Pick by the **problem**. Background on API styles: [[25-api-styles-comparison]].*
+
+## 1. The First Question: Does the Caller Need an Answer Right Now?
+
+- **Yes, now** -> **synchronous request/response**: REST or gRPC. The caller waits.
+- **No, just make it happen / tell others** -> **asynchronous messaging**: RabbitMQ or Kafka. The caller moves on.
+
+That one question removes half the options.
+
+## 2. Each Tool and the Problem It Fits
+
+### REST (HTTP + JSON)
+- **Choose when:** simple request/response, public or partner APIs, browser/mobile clients, teams that want easy debugging (`curl`, readable JSON).
+- **Example:** the mobile app asks the order service "give me order 123".
+- **Costs:** text JSON is bigger and slower to parse; no enforced contract unless you add OpenAPI.
+
+### gRPC (HTTP/2 + Protocol Buffers)
+- **Choose when:** **internal, service-to-service** calls that are frequent and latency-sensitive; you want a **strict typed contract** and generated clients; you need **streaming**.
+- **Example:** the pricing service calls the inventory service thousands of times per second.
+- **Costs:** not browser-friendly without a proxy; binary messages are harder to inspect; both sides need the `.proto` files.
+
+### RabbitMQ (message broker / task queue)
+- **Choose when:** you need to **hand off work** to be done once by a worker: send an email, resize an image, process a payment callback. Also flexible **routing** (send "order.cancelled.in" to certain queues only), per-message acks, retries, dead-letter queues, delayed messages.
+- **Example:** "user signed up" -> a worker sends the welcome email.
+- **Costs:** messages are **removed once consumed** - no replay; throughput is lower than Kafka at huge scale.
+
+### Kafka (distributed event log / stream)
+- **Choose when:** **many independent consumers** need the same stream of events; you need **replay** (reprocess last week's events, rebuild a read model); **very high throughput** (analytics, clickstream, activity tracking); **ordering per key** (all events for one order, in order).
+- **Example:** "order placed" -> billing, inventory, analytics, notifications and the search index each consume it separately, at their own speed.
+- **Costs:** the most operational weight (partitions, consumer groups, retention); overkill for a simple job queue.
+
+## 3. Decision Table
+
+| Your problem | Choose |
+|---|---|
+| Client needs an answer now; simple; public/mobile | **REST** |
+| Internal, high-frequency, low-latency calls with a strict contract or streaming | **gRPC** |
+| "Do this job once, reliably, in the background" + routing/retries | **RabbitMQ** (or SQS on AWS) |
+| "This happened" - many services react; replay; huge volume; per-key order | **Kafka** (or Kinesis / MSK on AWS) |
+
+## 4. Real Systems Use Several
+
+A typical e-commerce order flow:
+
+```
+Mobile app --REST--> API gateway --gRPC--> Order service
+Order service --publishes "OrderPlaced"--> Kafka
+   Kafka --> Billing, Inventory, Analytics, Search indexer (each its own consumer group)
+Notification service --puts "send email" job--> RabbitMQ --> Email workers
+```
+
+## 5. The Trade-off Nobody Should Skip
+
+- **Sync (REST/gRPC) couples services in time:** if the inventory service is down, the order service fails too. Needs timeouts, retries and circuit breakers ([[14-cascading-failure-recovery]]).
+- **Async (queues/streams) decouples them**, but brings **eventual consistency**, **duplicate messages** (make consumers idempotent - [[19-idempotent-consumer-duplicate-events]]), harder debugging, and more infrastructure.
+- **For a small team:** start with REST + one simple managed queue (SQS/RabbitMQ). Add gRPC or Kafka only when you have the problem they solve ([[77-blog-microservices-are-a-tax]]).
+
+## 6. In Node.js (tiny examples)
+
+```javascript
+// REST call with a timeout (sync)
+const res = await fetch(`${INVENTORY_URL}/stock/${sku}`, { signal: AbortSignal.timeout(2000) });
+
+// RabbitMQ: hand off a job (async, done once)
+channel.sendToQueue('emails', Buffer.from(JSON.stringify({ userId, template: 'welcome' })), { persistent: true });
+
+// Kafka: publish an event (async, many consumers, keyed for order)
+await producer.send({ topic: 'orders', messages: [{ key: orderId, value: JSON.stringify(orderPlaced) }] });
+```
+
+## 🧠 Remember
+
+> Ask "does the caller need the answer now?" Sync: REST for simple/public, gRPC for fast internal calls. Async: RabbitMQ to hand off a job once, Kafka when many consumers need a replayable event stream. Most real systems use more than one.
+
+## Self-Test
+
+1. Why would you choose Kafka over RabbitMQ for "OrderPlaced"?
+2. When is gRPC a bad choice?
+3. What new problems does async messaging bring?
+
+Related: [[25-api-styles-comparison]], [[19-idempotent-consumer-duplicate-events]], [[77-blog-microservices-are-a-tax]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="87" data-title="2 GB Upload Direct to S3" data-category="System Design at Scale" data-order="87">
+# Upload a 2 GB Video Without It Ever Touching Your Node.js Server
+
+*Same idea as [[49-large-file-upload-with-status]] and [[64-500mb-video-upload-memory]]. This one adds the code for **multipart presigned uploads**, which is what 2 GB files need.*
+
+## 1. The Answer in One Line
+
+> The backend doesn't receive the file. It hands the browser **presigned URLs**, and the browser uploads **directly to S3** - in parts, in parallel, resumable. The backend only deals with small JSON messages.
+
+## 2. Why Routing It Through Node Is Bad
+
+- 2 GB per upload in memory (or disk) - 10 concurrent uploads = 20 GB.
+- The request stays open for minutes, tying up connections.
+- You pay bandwidth **twice** (client -> you, you -> S3).
+- A dropped connection at 95% means starting again.
+
+## 3. The Flow
+
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant API as Node API
+  participant S3 as S3
+  B->>API: POST /uploads {fileName, size, type}
+  API->>API: auth, check size/type, create DB row (status=uploading)
+  API->>S3: CreateMultipartUpload
+  API-->>B: uploadId + presigned URL for each part
+  B->>S3: PUT part 1..N (parallel, directly)
+  S3-->>B: ETag per part
+  B->>API: POST /uploads/:id/complete {parts: [{PartNumber, ETag}]}
+  API->>S3: CompleteMultipartUpload
+  S3-->>API: event -> queue -> worker (scan, transcode)
+  API-->>B: status updates (poll / SSE)
+```
+
+## 4. Code (Node.js, AWS SDK v3)
+
+```javascript
+const { S3Client, CreateMultipartUploadCommand, UploadPartCommand,
+        CompleteMultipartUploadCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+const PART_SIZE = 100 * 1024 * 1024;                          // 100 MB parts -> 21 parts for 2 GB
+
+// 1. Start: validate, create the multipart upload, sign one URL per part
+app.post('/api/uploads', authenticate, async (req, res) => {
+  const { fileName, size, contentType } = req.body;
+  if (size > 5 * 1024 ** 3) return res.status(400).json({ error: 'Max 5 GB' });
+  if (!['video/mp4', 'video/quicktime'].includes(contentType)) return res.status(400).json({ error: 'Video only' });
+
+  const key = `uploads/${req.user.id}/${crypto.randomUUID()}.mp4`;   // never trust the client's file name as the key
+  const { UploadId } = await s3.send(new CreateMultipartUploadCommand({
+    Bucket: process.env.BUCKET, Key: key, ContentType: contentType }));
+
+  const partCount = Math.ceil(size / PART_SIZE);
+  const urls = await Promise.all(Array.from({ length: partCount }, (_, i) =>
+    getSignedUrl(s3, new UploadPartCommand({
+      Bucket: process.env.BUCKET, Key: key, UploadId, PartNumber: i + 1 }), { expiresIn: 3600 })));
+
+  const upload = await db.uploads.create({ userId: req.user.id, key, uploadId: UploadId, status: 'uploading' });
+  res.json({ id: upload.id, partSize: PART_SIZE, urls });
+});
+
+// 2. Finish: the browser sends back each part's ETag
+app.post('/api/uploads/:id/complete', authenticate, async (req, res) => {
+  const upload = await db.uploads.findOne({ id: req.params.id, userId: req.user.id });   // ownership check
+  if (!upload) return res.sendStatus(404);
+  await s3.send(new CompleteMultipartUploadCommand({
+    Bucket: process.env.BUCKET, Key: upload.key, UploadId: upload.uploadId,
+    MultipartUpload: { Parts: req.body.parts } }));
+  await db.uploads.update(upload.id, { status: 'processing' });
+  res.json({ status: 'processing' });
+});
+```
+
+**Browser side (short):** slice the file with `file.slice(start, end)`, `PUT` each slice to its URL (3-4 in parallel), read the `ETag` response header, retry a failed part on its own, and show progress per part. (The bucket's CORS must allow `PUT` and expose `ETag`.)
+
+## 5. After the Upload
+
+- An **S3 event** (via SQS) starts a **worker**: virus scan, transcode (e.g. MediaConvert), thumbnail. The worker updates the DB status (`processing` -> `ready` / `failed`) and the UI shows it.
+- A **lifecycle rule** aborts incomplete multipart uploads after a day, so abandoned parts don't cost money.
+- Serve the video through **CloudFront with signed URLs**, not a public bucket.
+
+## 6. Why This Is the Right Design
+
+| Concern | Result |
+|---|---|
+| Server memory / CPU | Only small JSON - the file never passes through Node |
+| Bandwidth cost | Paid once (client -> S3) |
+| Reliability | A failed part is retried alone; uploads can resume |
+| Speed | Parts upload in parallel |
+| Security | Short-lived URLs, one key per upload, auth + size/type checks before signing, private bucket |
+
+## 🧠 Remember
+
+> For big files, the backend signs and the browser uploads: presigned multipart URLs straight to S3, parts in parallel and retryable, an S3 event to kick off processing, and a status your UI can track.
+
+## Self-Test
+
+1. Why use multipart upload for a 2 GB file instead of one presigned PUT?
+2. What stops a user from uploading a 50 GB file with your presigned URLs?
+3. Why add a lifecycle rule for incomplete multipart uploads?
+
+Related: [[49-large-file-upload-with-status]], [[64-500mb-video-upload-memory]], [[48-huge-json-payloads]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="88" data-title="Why HTTP/3 Uses UDP" data-category="Networking" data-order="88">
+# Why Does HTTP/3 Use UDP Instead of TCP?
+
+## 1. The Puzzle
+
+TCP already gives reliability, ordering and congestion control - everything the web needs. So why would HTTP/3 build on **UDP**, which gives none of that?
+
+**Short answer:** HTTP/3 doesn't give up reliability. It runs on **QUIC**, a new transport built **on top of UDP** that re-implements reliability and congestion control - **but better for the web** - and adds things TCP can't. UDP is just the delivery envelope that every network already allows.
+
+## 2. Problem 1 - Head-of-Line Blocking (the big one)
+
+HTTP/2 sends many requests (HTML, CSS, JS, images) over **one TCP connection**. TCP guarantees **one ordered byte stream**. If a single packet is lost, TCP **holds back everything after it** until that packet is re-sent - even data for completely different files.
+
+```
+HTTP/2 over TCP:   [css][js][img][css][js] ... one packet of img lost
+                   -> css and js packets that arrived must WAIT too
+HTTP/3 over QUIC:  each file is its own stream
+                   -> only the img stream waits; css and js keep going
+```
+
+**QUIC knows about streams.** A lost packet only delays the stream it belongs to. On lossy mobile networks this makes a real difference.
+
+**Term: Head-of-line blocking** - one delayed item at the front of a queue holding up everything behind it.
+
+## 3. Problem 2 - Slow Connection Setup
+
+- **TCP + TLS 1.3:** a TCP handshake (1 round trip), then a TLS handshake (1 more) -> about **2 round trips** before any data.
+- **QUIC:** transport and TLS 1.3 handshakes are **combined** -> **1 round trip**, and **0 round trips** when resuming a recent connection (0-RTT).
+
+On a 150 ms mobile connection, saving a round trip or two is very noticeable.
+
+## 4. Problem 3 - Switching Networks Breaks TCP
+
+A TCP connection is identified by **IP address + port**. Walk out of Wi-Fi onto 4G and your IP changes, so every connection breaks and must start over.
+
+QUIC identifies a connection by a **connection ID**, not the IP. When your phone switches networks, the connection **continues**. This is called **connection migration**.
+
+## 5. Problem 4 - TCP Is Stuck ("Ossified")
+
+TCP is implemented inside **operating system kernels** and inspected by **middleboxes** (routers, firewalls, NATs) all over the internet. Changing TCP means waiting years for every OS and device to update - and many middleboxes break on anything unfamiliar.
+
+QUIC runs in **user space** (inside the browser/app) and is **encrypted**, so middleboxes can't meddle with it. Google, Cloudflare and browsers can improve it with a normal software update.
+
+## 6. So Why UDP Specifically?
+
+- **You can't invent a new transport protocol on the internet** - firewalls and NATs only let TCP and UDP through reliably.
+- UDP is **minimal**: it adds ports and a checksum and nothing else, so it doesn't get in QUIC's way.
+- Result: QUIC gets through existing networks **and** keeps full control over reliability, ordering and congestion.
+
+## 7. The Costs
+
+- **More CPU:** encryption and packet handling in user space cost more than kernel TCP (improving over time).
+- **Some networks block or throttle UDP** - so browsers **fall back to HTTP/2 over TCP** automatically. Servers advertise HTTP/3 with the `Alt-Svc` header.
+- **Harder to debug** - everything is encrypted, so classic packet inspection sees little.
+- **0-RTT data can be replayed** by an attacker - only safe for idempotent requests like GET.
+
+## 8. In Practice
+
+You rarely write QUIC code. You **turn it on at the edge**: CloudFront, Cloudflare and modern load balancers/servers support HTTP/3, and browsers use it automatically when available. Your Node.js app behind the CDN usually still speaks HTTP/1.1 or HTTP/2.
+
+## 🧠 Remember
+
+> HTTP/3 uses UDP only as an envelope; QUIC on top rebuilds reliability per stream (no head-of-line blocking), combines the handshakes (faster setup), survives network changes (connection migration), and can evolve without waiting for kernels and middleboxes.
+
+## Self-Test
+
+1. Why does one lost packet slow down every file in HTTP/2 but not HTTP/3?
+2. What lets a QUIC connection survive a switch from Wi-Fi to 4G?
+3. Why build on UDP instead of creating a brand-new protocol?
+
+Related: [[25-api-styles-comparison]], [[78-who-resolves-the-dns-server]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="89" data-title="The Modular Monolith" data-category="Blog" data-order="89">
+# Blog: The Modular Monolith - 90% of the Microservices Benefits, 0% of the Network Latency
+
+*A single backend codebase with strict, decoupled module boundaries gives you most of the organizational clean-code benefits of microservices, without the distributed-systems tax. Here's what that means in plain terms.*
+
+---
+
+## Why People Reach for Microservices
+
+Usually not for scale. Usually because the codebase became a **big ball of mud**:
+- Everything imports everything.
+- Changing billing breaks notifications.
+- Nobody knows who owns what.
+- Every change needs the whole team.
+
+Microservices **force** boundaries: another team's code is behind a network call, so you *can't* reach into it. That's the real benefit - **boundaries** - and you can get it **without the network**.
+
+## What a Modular Monolith Is
+
+One deployable app, split into **modules with hard walls**:
+
+```
+src/
+  modules/
+    orders/
+      index.js          <- the PUBLIC API of the module (the only thing others may import)
+      service.js
+      repository.js     <- only this module touches the orders tables
+      events.js
+    billing/
+      index.js
+      ...
+    notifications/
+      index.js
+      ...
+  shared/               <- tiny: logger, config, db connection
+```
+
+The rules:
+1. **Other modules may only import `modules/<name>/index.js`** - never its internal files.
+2. **Each module owns its tables.** Billing doesn't `SELECT` from the orders tables; it asks the orders module.
+3. **Modules talk through function calls or in-process events**, not by sharing internals.
+
+```javascript
+// modules/orders/index.js - the module's public contract
+const service = require('./service');
+module.exports = {
+  placeOrder: service.placeOrder,
+  getOrderSummary: service.getOrderSummary,   // returns plain data, not DB models
+};
+
+// modules/billing/service.js
+const orders = require('../orders');          // allowed: the public API only
+// const repo = require('../orders/repository'); // NOT allowed - breaks the boundary
+```
+
+**Enforce it with tools, not hope:** ESLint `no-restricted-imports` or `dependency-cruiser` in CI fails the build when someone imports another module's internals.
+
+## What You Get vs Microservices
+
+| Benefit | Microservices | Modular monolith |
+|---|---|---|
+| Clear ownership and boundaries | ✅ | ✅ (enforced by lint rules) |
+| Change one area without breaking others | ✅ | ✅ |
+| Function calls instead of network calls | ❌ (ms of latency, can fail) | ✅ (nanoseconds, can't time out) |
+| Database transactions across modules | ❌ (sagas, eventual consistency) | ✅ (one DB transaction when you really need it) |
+| One deploy, one CI pipeline, simple debugging | ❌ | ✅ |
+| Independent scaling of one part | ✅ | ❌ (you scale the whole app) |
+| Independent deploys per team | ✅ | ❌ |
+| Different languages per service | ✅ | ❌ |
+
+## The Honest "90%"
+
+It gives you the **organizational** benefits. It does **not** give you:
+- **independent scaling** (one module needs 50 servers, the rest need 2)
+- **fault isolation** (a memory leak in one module crashes the whole process)
+- **independent deploys** for many teams shipping all day
+
+When one of those becomes a real, measured problem, a clean module is **easy to extract** into a service - its boundary and public API already exist. That's the path: **start modular, extract when a module earns it** ([[77-blog-microservices-are-a-tax]]).
+
+## Signs Your Monolith Is NOT Modular (Yet)
+
+- A change in one feature regularly breaks another.
+- Modules query each other's tables directly.
+- There's a `utils/` or `common/` folder that everything depends on and nobody owns.
+- You can't answer "which module owns this table?"
+
+## 🧠 Remember
+
+> Most teams want microservices for the boundaries, not the network. A modular monolith gives you enforced boundaries, one deploy and in-process calls - and when a module truly needs to scale or deploy alone, it's already shaped to be extracted.
+
+## Self-Test
+
+1. What are the three rules that make a monolith "modular"?
+2. Which microservice benefits does a modular monolith NOT give you?
+3. How do you stop engineers from breaking the boundaries?
+
+Related: [[77-blog-microservices-are-a-tax]], [[24-kubernetes-pets-vs-cattle]], [[15-simple-vs-scalable-architecture]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="90" data-title="Expensive Work in an API Request" data-category="Blog" data-order="90">
+# Blog: How to Handle Expensive Work in an API Request
+
+*Some requests trigger work that takes seconds or minutes: generating a report, transcoding a video, calling a slow AI model, importing a big CSV, sending 10,000 emails. You can't keep an HTTP request open for that. Here's the pattern, simply.*
+
+---
+
+## The Problem
+
+A user clicks "Export last year's orders". The server starts building a 200 MB CSV... 90 seconds later:
+- The **load balancer times out** at 60 seconds, so the user sees an error - even though the work continues.
+- The user clicks again. Now **two** exports are running.
+- A deploy restarts the server halfway - the work is **lost**.
+- While it runs, the request holds memory and a connection; 50 users doing this take the API down.
+
+**The request/response cycle is for fast work.** Slow work needs a different shape.
+
+## The Pattern: Accept Now, Work Later, Tell Them When It's Done
+
+It's called **asynchronous request-reply**:
+
+```
+1. Client:  POST /api/exports            {range: "2025"}
+2. Server:  validate, save a job row (status=queued), put it on a queue
+            -> 202 Accepted   { jobId: "j_123", statusUrl: "/api/jobs/j_123" }     (in ~50 ms)
+3. Worker:  takes the job from the queue, does the heavy work, uploads the file to S3,
+            updates the job row: status=done, resultUrl=...
+4. Client:  finds out it's done (poll, push, or notification) and downloads the result
+```
+
+**Term: 202 Accepted** - the HTTP status that means "I've accepted your request, but the work isn't finished yet."
+
+## Code (Node.js)
+
+```javascript
+// API: accept quickly, never do the heavy work here
+app.post('/api/exports', authenticate, async (req, res) => {
+  const key = req.get('Idempotency-Key');                 // double-click = same job, not two
+  const existing = key && await db.jobs.findOne({ userId: req.user.id, idempotencyKey: key });
+  if (existing) return res.status(202).json({ jobId: existing.id, statusUrl: `/api/jobs/${existing.id}` });
+
+  const job = await db.jobs.create({ userId: req.user.id, type: 'export', params: req.body,
+                                     status: 'queued', idempotencyKey: key });
+  await queue.add('export', { jobId: job.id });            // BullMQ / SQS / RabbitMQ
+  res.status(202).json({ jobId: job.id, statusUrl: `/api/jobs/${job.id}` });
+});
+
+// Status endpoint the client can poll
+app.get('/api/jobs/:id', authenticate, async (req, res) => {
+  const job = await db.jobs.findOne({ id: req.params.id, userId: req.user.id });   // own jobs only
+  if (!job) return res.sendStatus(404);
+  res.json({ status: job.status, progress: job.progress, resultUrl: job.resultUrl, error: job.error });
+});
+
+// Worker: a separate process that does the slow part
+new Worker('export', async ({ data }) => {
+  await db.jobs.update(data.jobId, { status: 'running' });
+  const fileKey = await buildCsvAndUploadToS3(data.jobId, (p) =>
+    db.jobs.update(data.jobId, { progress: p }));           // progress for the UI
+  await db.jobs.update(data.jobId, { status: 'done', resultUrl: await presign(fileKey) });
+}, { concurrency: 3, connection: redis });                  // cap how many run at once
+```
+
+## How the Client Finds Out It's Done
+
+| Option | How | Good for |
+|---|---|---|
+| **Polling** | `GET /api/jobs/:id` every few seconds (with backoff) | Simplest; works everywhere |
+| **Server-Sent Events / WebSocket** | Server pushes progress to the open page | Live progress bars |
+| **Webhook** | Server calls the client's URL when done | Server-to-server integrations |
+| **Notification / email** | "Your export is ready" with a link | Long jobs the user won't wait for |
+
+Start with polling. Add push only when the UX needs it.
+
+## Details That Make It Production-Grade
+
+- **Idempotency key** so a double-click or retry doesn't start two jobs ([[32-payment-idempotency-double-click]]).
+- **Retries with backoff** for transient failures, a **dead-letter queue** for jobs that keep failing, and a clear `failed` status with an error message for the user.
+- **Workers are idempotent** - a job may run twice after a crash ([[19-idempotent-consumer-duplicate-events]]).
+- **Concurrency limits** on workers so heavy jobs don't overload the database.
+- **Results in object storage** (S3) with an expiry, not in the database or server memory.
+- **Timeouts per job** and a way to **cancel**.
+- **Monitor queue depth and job age** - a growing backlog is your early warning ([[23-queue-backlog-after-spike]]).
+
+## When NOT to Do This
+
+If the work reliably takes **under ~1-2 seconds**, just do it in the request. A queue, a worker and a status endpoint are real complexity - add them when the work is slow, unreliable, or needs retries.
+
+## 🧠 Remember
+
+> Keep the request path short: accept the job, return 202 with a status URL, let a worker do the heavy lifting, and let the client poll or get notified - with idempotency, retries and limits so it stays reliable.
+
+## Self-Test
+
+1. Why is doing a 90-second job inside an HTTP request dangerous even if it "works"?
+2. What does the 202 response contain, and why?
+3. Why does the job need an idempotency key?
+
+Related: [[23-queue-backlog-after-spike]], [[49-large-file-upload-with-status]], [[19-idempotent-consumer-duplicate-events]], [[32-payment-idempotency-double-click]]
+</script>
+<script type="text/markdown" class="lesson-data" data-id="91" data-title="1,000 Requests 10x Faster (Code)" data-category="Core Concepts" data-order="91">
+# 1,000 Independent Requests, 500 ms Each - the 10x Fix, With Code
+
+*Same question as [[61-1000-requests-10x-faster]] and [[54-notify-5000-users-10x-faster]]. This version is the **code**.*
+
+## 1. The Math
+
+- **Sequential:** 1,000 x 500 ms = **500 s (~8.3 min)**. The program spends almost all that time **waiting** on the network.
+- **The fix:** run them **concurrently** - many requests in flight at once.
+- **With 10 at a time:** 1,000 / 10 = 100 rounds x 500 ms = **50 s -> 10x faster.**
+- **With 50 at a time:** ~10 s -> 50x faster (if the other side can take it).
+
+Node.js is perfect for this: waiting on I/O doesn't block the event loop, so one process can have many requests in flight ([[01-concurrency-vs-parallelism]]).
+
+## 2. The Slow Version
+
+```javascript
+// ~500 seconds - each call waits for the previous one
+for (const id of ids) {
+  results.push(await fetchUser(id));
+}
+```
+
+## 3. The Wrong "Fast" Version
+
+```javascript
+// Fires all 1,000 at once
+const results = await Promise.all(ids.map(fetchUser));
+```
+
+It's fast on a laptop test, but in production it can:
+- **Overload the other service** (or get you rate-limited: 429s),
+- exhaust sockets / the connection pool,
+- and **fail everything** if one request rejects (`Promise.all` fails fast).
+
+## 4. The Right Version: Bounded Concurrency
+
+```javascript
+// Run at most `limit` tasks at the same time; keep results in the original order
+async function mapWithLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  async function runner() {
+    while (next < items.length) {
+      const i = next++;                         // safe: JS runs this synchronously between awaits
+      try {
+        results[i] = { ok: true, value: await worker(items[i], i) };
+      } catch (err) {
+        results[i] = { ok: false, error: err.message };   // one failure doesn't kill the batch
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results;
+}
+
+// Usage: 1,000 requests, 10 at a time -> ~50 s instead of ~500 s
+const results = await mapWithLimit(ids, 10, (id) =>
+  fetch(`https://api.example.com/users/${id}`, { signal: AbortSignal.timeout(3000) })   // always a timeout
+    .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }));
+
+const failed = results.filter((r) => !r.ok);
+console.log(`done: ${results.length - failed.length} ok, ${failed.length} failed`);
+```
+
+(The `p-limit` package does the same thing in one line: `const limit = pLimit(10); await Promise.all(ids.map((id) => limit(() => fetchUser(id))));`)
+
+## 5. Choosing the Limit
+
+- Start around **10-20** for a third-party API; respect its documented rate limit.
+- For your own internal service, raise it while watching **its** latency and error rate.
+- If you get **429 Too Many Requests**, lower the limit and retry with **backoff + jitter**.
+- **Batch endpoints beat concurrency:** if the API supports `GET /users?ids=1,2,3...` (100 per call), 1,000 requests become **10** ([[69-orm-save-in-loop-bulk-insert]] - the same "fewer round trips" idea).
+
+## 6. When It's Not a One-Off Script
+
+If this runs inside an API request or needs to survive restarts (e.g. notifying 100,000 users), move it to a **queue with workers**, where concurrency is set per worker and failures retry ([[90-blog-expensive-work-in-api-lifecycle]]).
+
+## 🧠 Remember
+
+> Independent I/O calls shouldn't wait in line: run them concurrently, but bounded - 10x faster at 10 in flight, with a timeout per call, per-item errors, and a limit the other side can handle.
+
+## Self-Test
+
+1. Why is sequential `await` in a loop slow for independent calls?
+2. Why is `Promise.all` over 1,000 calls risky?
+3. How long would 1,000 x 500 ms take with a limit of 25?
+
+Related: [[61-1000-requests-10x-faster]], [[54-notify-5000-users-10x-faster]], [[01-concurrency-vs-parallelism]]
+</script>
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>

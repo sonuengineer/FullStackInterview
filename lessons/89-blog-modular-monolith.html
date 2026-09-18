@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Modular Monolith</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Blog: The Modular Monolith - 90% of the Microservices Benefits, 0% of the Network Latency
+
+*A single backend codebase with strict, decoupled module boundaries gives you most of the organizational clean-code benefits of microservices, without the distributed-systems tax. Here's what that means in plain terms.*
+
+---
+
+## Why People Reach for Microservices
+
+Usually not for scale. Usually because the codebase became a **big ball of mud**:
+- Everything imports everything.
+- Changing billing breaks notifications.
+- Nobody knows who owns what.
+- Every change needs the whole team.
+
+Microservices **force** boundaries: another team's code is behind a network call, so you *can't* reach into it. That's the real benefit - **boundaries** - and you can get it **without the network**.
+
+## What a Modular Monolith Is
+
+One deployable app, split into **modules with hard walls**:
+
+```
+src/
+  modules/
+    orders/
+      index.js          <- the PUBLIC API of the module (the only thing others may import)
+      service.js
+      repository.js     <- only this module touches the orders tables
+      events.js
+    billing/
+      index.js
+      ...
+    notifications/
+      index.js
+      ...
+  shared/               <- tiny: logger, config, db connection
+```
+
+The rules:
+1. **Other modules may only import `modules/<name>/index.js`** - never its internal files.
+2. **Each module owns its tables.** Billing doesn't `SELECT` from the orders tables; it asks the orders module.
+3. **Modules talk through function calls or in-process events**, not by sharing internals.
+
+```javascript
+// modules/orders/index.js - the module's public contract
+const service = require('./service');
+module.exports = {
+  placeOrder: service.placeOrder,
+  getOrderSummary: service.getOrderSummary,   // returns plain data, not DB models
+};
+
+// modules/billing/service.js
+const orders = require('../orders');          // allowed: the public API only
+// const repo = require('../orders/repository'); // NOT allowed - breaks the boundary
+```
+
+**Enforce it with tools, not hope:** ESLint `no-restricted-imports` or `dependency-cruiser` in CI fails the build when someone imports another module's internals.
+
+## What You Get vs Microservices
+
+| Benefit | Microservices | Modular monolith |
+|---|---|---|
+| Clear ownership and boundaries | ✅ | ✅ (enforced by lint rules) |
+| Change one area without breaking others | ✅ | ✅ |
+| Function calls instead of network calls | ❌ (ms of latency, can fail) | ✅ (nanoseconds, can't time out) |
+| Database transactions across modules | ❌ (sagas, eventual consistency) | ✅ (one DB transaction when you really need it) |
+| One deploy, one CI pipeline, simple debugging | ❌ | ✅ |
+| Independent scaling of one part | ✅ | ❌ (you scale the whole app) |
+| Independent deploys per team | ✅ | ❌ |
+| Different languages per service | ✅ | ❌ |
+
+## The Honest "90%"
+
+It gives you the **organizational** benefits. It does **not** give you:
+- **independent scaling** (one module needs 50 servers, the rest need 2)
+- **fault isolation** (a memory leak in one module crashes the whole process)
+- **independent deploys** for many teams shipping all day
+
+When one of those becomes a real, measured problem, a clean module is **easy to extract** into a service - its boundary and public API already exist. That's the path: **start modular, extract when a module earns it** ([[77-blog-microservices-are-a-tax]]).
+
+## Signs Your Monolith Is NOT Modular (Yet)
+
+- A change in one feature regularly breaks another.
+- Modules query each other's tables directly.
+- There's a `utils/` or `common/` folder that everything depends on and nobody owns.
+- You can't answer "which module owns this table?"
+
+## 🧠 Remember
+
+> Most teams want microservices for the boundaries, not the network. A modular monolith gives you enforced boundaries, one deploy and in-process calls - and when a module truly needs to scale or deploy alone, it's already shaped to be extracted.
+
+## Self-Test
+
+1. What are the three rules that make a monolith "modular"?
+2. Which microservice benefits does a modular monolith NOT give you?
+3. How do you stop engineers from breaking the boundaries?
+
+Related: [[77-blog-microservices-are-a-tax]], [[24-kubernetes-pets-vs-cattle]], [[15-simple-vs-scalable-architecture]]
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>
