@@ -309,6 +309,19 @@
   .link-card .ttl { font-size: 1rem; font-weight: 600; }
   .link-card .desc { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
   .link-card .url { color: var(--accent); font-size: 0.78rem; margin-top: 6px; overflow-wrap: anywhere; }
+  /* Images page */
+  .img-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin: 20px 0 28px;
+  }
+  .img-card h2 { margin-top: 0 !important; border: none !important; }
+  .img-card a.img-link { display: block; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #fff; }
+  .img-card img { display: block; width: 100%; height: auto; }
+  .img-hint { font-size: 0.78rem; color: var(--muted); margin: 6px 0 14px; font-family: -apple-system, "Segoe UI", Arial, sans-serif; }
+  .img-card .read-along { margin-top: 12px; }
   /* Long unbroken strings (e.g. "REST/SOAP/GraphQL/gRPC") must wrap instead of widening the page */
   .home-card .ttl, .toc-item, .suggest-card, .suggest-nav button, #reader h1, #reader h2, #reader h3,
   #reader p, #reader li, #reader td, #reader th { overflow-wrap: anywhere; }
@@ -347,6 +360,7 @@
     <button id="btn-home">Home</button>
     <button id="btn-prep" title="Private interview prep (password protected)">&#128274; Interview Prep</button>
     <button id="btn-links" title="Useful learning links">&#128279; Links</button>
+    <button id="btn-images" title="System design diagrams with notes">&#128444;&#65039; Images</button>
     <button id="theme-sepia">Sepia</button>
     <button id="theme-light">Light</button>
     <button id="theme-dark">Dark</button>
@@ -6213,6 +6227,75 @@ function renderLinks() {
   closeMobileSidebar();
 }
 
+// ---- Images page: drop the file in Images/ and add an entry here ----
+const IMAGES = [
+  {
+    file: 'Images/Notification system.png',
+    title: 'Notification System for 1 Million Users',
+    notes: [
+      '**In one line:** one request comes in, the app says "got it" right away, and background workers deliver the message on the right channels (push, email, SMS, in-app) without making anyone wait.',
+      '',
+      '**How to read it (left to right):**',
+      '1. **Clients** (mobile app, web app, or another backend service) ask to send a notification.',
+      '2. **API Gateway** checks who is asking (auth) and stops floods (rate limiting).',
+      '3. **Notification Service** saves the notification, asks the **User Service** which channels this user allows, then drops an event on the **queue** and immediately replies "success". It doesn\'t wait for delivery.',
+      '4. **Message queue (Kafka/SQS)** holds the work safely, so a traffic spike or a slow provider never slows down the API.',
+      '5. **Workers**, one per channel, pick up events and call the outside providers: FCM/APNs for push, SendGrid/SES for email, Twilio for SMS.',
+      '6. **In-app** notifications are saved to the database and pushed live over **WebSocket/SSE** to users who are online. Offline users get them when they come back.',
+      '7. **Redis cache** keeps fast data like the unread count and recent notifications, so the database isn\'t hit on every page load.',
+      '',
+      '**The numbers:** 1M users x 100 notifications/day = 100M a day, about **1,160 per second** on average and **~10,000/sec at peak**.',
+      '',
+      '**Remember:** accept fast, deliver in the background, retry with backoff, and make sending safe to repeat so nobody gets the same message twice.',
+      '',
+      '**Read along with:** [[17-notification-system-design]] [[19-idempotent-consumer-duplicate-events]] [[14-cascading-failure-recovery]] [[79-blog-rate-limiting]] [[54-notify-5000-users-10x-faster]] [[65-pagerduty-incident-dedup-paging]]',
+    ],
+  },
+  {
+    file: 'Images/Photo_sharing_system.png',
+    title: 'Photo Sharing System (Instagram-style)',
+    notes: [
+      '**In one line:** photos live in cheap, durable **object storage** and are served from a **CDN**; the database only keeps small details (who posted, likes, comments); anything slow happens in the background through a **queue**.',
+      '',
+      '**The three main flows:**',
+      '1. **Upload a photo:** API Gateway -> Load Balancer -> Post Service. The photo file goes to **S3**, and its details (owner, caption, time) go to the **database**. Then an event is published so the feed and notifications update in the background.',
+      '2. **Open the feed:** Feed Service checks **Redis** first (fast). On a miss it reads the database. It returns the list of posts, and the phone loads the actual photos **directly from the CDN**, not through your servers.',
+      '3. **Like / comment:** Like/Comment Service updates the database, then publishes an event. The Feed and Notification services handle it later, so the tap feels instant.',
+      '',
+      '**Why each piece is there:**',
+      '- **CDN**: photos load fast everywhere in the world and your servers don\'t pay for the bandwidth.',
+      '- **S3 + replication**: photos are never lost (copies across data centres).',
+      '- **Read replicas**: a feed is read far more often than it is written, so reads are spread over copies of the database.',
+      '- **Load balancer + stateless services**: add more servers when traffic grows.',
+      '- **Queue (Kafka)**: slow work (building feeds, notifying followers) never blocks the user.',
+      '',
+      '**Remember:** big files go to object storage + CDN, small data goes to the database + cache, and slow work goes to a queue.',
+      '',
+      '**Read along with:** [[49-large-file-upload-with-status]] [[64-500mb-video-upload-memory]] [[28-scaling-database-reads]] [[38-first-thing-to-scale]] [[06-ec2-autoscaling]] [[15-simple-vs-scalable-architecture]]',
+    ],
+  },
+];
+
+function renderImages() {
+  currentId = null;
+  document.title = 'Images - Learning Dashboard';
+  progressEl.textContent = IMAGES.length + ' diagrams';
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  readerEl.innerHTML = '<h1>&#128444;&#65039; System Design Diagrams</h1>' +
+    '<p style="color:var(--muted)">Each diagram with short, simple notes. Tap an image to open it full size (you can zoom on your phone).</p>' +
+    IMAGES.map((img) => {
+      const src = encodeURI(img.file);
+      return '<div class="img-card"><h2>' + esc(img.title) + '</h2>' +
+        '<a class="img-link" href="' + src + '" target="_blank" rel="noopener"><img src="' + src + '" alt="' + esc(img.title) + '" loading="lazy"></a>' +
+        '<div class="img-hint">Tap the image to open it full size</div>' +
+        marked.parse(linkifyCrossRefs(img.notes.join('\n')), { renderer }) + '</div>';
+    }).join('');
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+
+document.getElementById('btn-images').addEventListener('click', renderImages);
 document.getElementById('btn-links').addEventListener('click', renderLinks);
 document.getElementById('btn-home').addEventListener('click', renderHome);
 // Relative link: works on GitHub Pages (/FullStackInterview/prep/) and when opened locally
