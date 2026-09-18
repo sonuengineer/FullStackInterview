@@ -6274,6 +6274,32 @@ const IMAGES = [
       '**Read along with:** [[49-large-file-upload-with-status]] [[64-500mb-video-upload-memory]] [[28-scaling-database-reads]] [[38-first-thing-to-scale]] [[06-ec2-autoscaling]] [[15-simple-vs-scalable-architecture]]',
     ],
   },
+  {
+    file: 'Images/URl_shortner.png',
+    title: 'URL Shortener (like bit.ly / tiny.com)',
+    notes: [
+      '**In one line:** save a long URL once, give back a short code, and when anyone opens the short link, look up the long URL (from cache first) and redirect them there.',
+      '',
+      '**The three flows:**',
+      '1. **Create a short URL** (`POST /shorten`): API Gateway checks auth and rate limits -> URL Shortener Service makes a unique short code -> saves `short_code -> long_url` in the database -> returns `tiny.com/abc123`.',
+      '2. **Redirect** (`GET /abc123`): Redirect Service checks **Redis** first. Found? Redirect straight away. Not found? Read the database, put it in the cache, then redirect.',
+      '3. **Analytics (in the background):** every click is sent to a **queue** and counted later, so tracking never slows down the redirect.',
+      '',
+      '**How the short code is made (base62):** take a unique number ID from the database and write it using 62 characters (0-9, a-z, A-Z) instead of 10 digits. Example: ID `1001` becomes `g9`. Even 1 billion links fit in about 6 characters.',
+      '',
+      '**Why each piece is there:**',
+      '- **Cache (Redis):** most traffic is people *opening* links, not creating them, so the same lookups repeat all day. Serve them from memory.',
+      '- **Read replicas:** extra copies of the database to spread out redirect lookups.',
+      '- **301 vs 302 redirect:** 301 ("moved permanently") lets browsers remember it, so there are fewer hits on your servers but you miss click counts. 302 ("temporary") sends every click through you, which is better for analytics.',
+      '- **Rate limiting:** stops spammers from creating millions of links.',
+      '',
+      '**The numbers:** 1M new links/day is only ~12 writes/sec (120/sec at peak). Reads (redirects) are usually 10-100x more, so **this is a read-heavy system**, and caching matters most.',
+      '',
+      '**Remember:** the write side is simple; the design is really about fast reads, so cache first, and keep click tracking async.',
+      '',
+      '**Read along with:** [[40-short-url-expiry-cron-vs-redis-ttl]] [[59-uuid-vs-auto-increment]] [[28-scaling-database-reads]] [[38-first-thing-to-scale]] [[79-blog-rate-limiting]] [[18-http-status-codes-400-404-409-422]]',
+    ],
+  },
 ];
 
 function renderImages() {
