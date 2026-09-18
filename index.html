@@ -292,6 +292,29 @@
   }
   .suggest-nav button.next { text-align: right; }
   .suggest-nav button:hover { border-color: var(--accent); }
+  /* Long unbroken strings (e.g. "REST/SOAP/GraphQL/gRPC") must wrap instead of widening the page */
+  .home-card .ttl, .toc-item, .suggest-card, .suggest-nav button, #reader h1, #reader h2, #reader h3,
+  #reader p, #reader li, #reader td, #reader th { overflow-wrap: anywhere; }
+  #reader .mermaid { overflow-x: auto; }
+  #reader img, #reader svg { max-width: 100%; height: auto; }
+  /* Phone layout - kept LAST in the stylesheet so it wins over the desktop rules above */
+  @media (max-width: 768px) {
+    #reader { padding: 20px 16px 90px; font-size: 1rem; line-height: 1.7; }
+    #reader.font-sm { font-size: 0.92rem; }
+    #reader.font-lg { font-size: 1.12rem; }
+    #reader h1 { font-size: 1.55rem; }
+    #reader h2 { font-size: 1.2rem; margin-top: 1.8em; }
+    #reader pre { font-size: 0.8rem; padding: 12px; }
+    #reader table { display: block; overflow-x: auto; font-size: 0.85rem; }
+    #toolbar { padding: 8px 10px; gap: 6px; flex-wrap: wrap; }
+    #toolbar button { padding: 6px 9px; font-size: 0.78rem; }
+    #toolbar .spacer { display: none; }
+    #progress { width: 100%; font-size: 0.72rem; }
+    .home-grid { grid-template-columns: 1fr; gap: 10px; }
+    .suggest-grid { grid-template-columns: 1fr; }
+    .suggest-nav { flex-direction: column; }
+    .suggest-nav button.next { text-align: left; }
+  }
 </style>
 </head>
 <body data-theme="sepia">
