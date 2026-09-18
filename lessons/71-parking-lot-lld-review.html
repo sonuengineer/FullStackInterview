@@ -103,47 +103,79 @@ Nothing in that is *wrong*. That's the problem: it's a **list of nouns and patte
 
 ## 3. A Stronger Sketch
 
-```java
-enum SpotType { MOTORCYCLE, COMPACT, LARGE, EV }
-enum SpotStatus { FREE, OCCUPIED, OUT_OF_SERVICE }
+```javascript
+const SpotType = Object.freeze({ MOTORCYCLE: 'MOTORCYCLE', COMPACT: 'COMPACT', LARGE: 'LARGE', EV: 'EV' });
+const SpotStatus = Object.freeze({ FREE: 'FREE', OCCUPIED: 'OCCUPIED', OUT_OF_SERVICE: 'OUT_OF_SERVICE' });
+
+// Which spot types each vehicle can use, in order of preference
+const COMPATIBLE = {
+  MOTORCYCLE: [SpotType.MOTORCYCLE, SpotType.COMPACT, SpotType.LARGE],
+  CAR: [SpotType.COMPACT, SpotType.LARGE],
+  TRUCK: [SpotType.LARGE],
+};
 
 class ParkingSpot {
-  final String id; final SpotType type; SpotStatus status;
-  boolean canFit(Vehicle v) { return v.getType().fitsIn(type); }
+  constructor(id, type) { this.id = id; this.type = type; this.status = SpotStatus.FREE; }
 }
 
 class Floor {
-  // one free-spot pool per type for O(1) allocation
-  Map<SpotType, Deque<ParkingSpot>> freeSpots;
-  synchronized Optional<ParkingSpot> reserve(VehicleType vt) {   // atomic: no double-assign
-    for (SpotType t : vt.compatibleSpotTypes()) {
-      ParkingSpot s = freeSpots.get(t).pollFirst();
-      if (s != null) { s.status = SpotStatus.OCCUPIED; return Optional.of(s); }
-    }
-    return Optional.empty();
+  constructor(spots) {
+    // one free-spot pool per type -> O(1) allocation instead of scanning every spot
+    this.freeSpots = new Map(Object.values(SpotType).map((t) => [t, []]));
+    spots.forEach((s) => this.freeSpots.get(s.type).push(s));
   }
-  synchronized void release(ParkingSpot s) { s.status = SpotStatus.FREE; freeSpots.get(s.type).addLast(s); }
+  // Node runs this on one thread with no await inside, so check + mark happen
+  // together within this process - no two gates handled here get the same spot.
+  reserve(vehicleType) {
+    for (const t of COMPATIBLE[vehicleType]) {
+      const spot = this.freeSpots.get(t).shift();
+      if (spot) { spot.status = SpotStatus.OCCUPIED; return spot; }
+    }
+    return null;
+  }
+  release(spot) { spot.status = SpotStatus.FREE; this.freeSpots.get(spot.type).push(spot); }
 }
 
 class ParkingLot {
-  Ticket enter(Vehicle v, Gate gate) {
-    ParkingSpot spot = allocationStrategy.allocate(floors, v, gate)
-        .orElseThrow(LotFullException::new);
-    return ticketRepo.save(new Ticket(v, spot, clock.now()));
+  constructor({ floors, allocationStrategy, pricingStrategy, ticketRepo, paymentService }) {
+    Object.assign(this, { floors, allocationStrategy, pricingStrategy, ticketRepo, paymentService });
   }
-  Receipt exit(String ticketId, Payment payment) {
-    Ticket t = ticketRepo.findActive(ticketId);              // lost ticket -> separate flow
-    Money fee = pricingStrategy.price(t, clock.now());
-    paymentService.charge(payment, fee, t.getId());          // ticket id as idempotency key
-    t.close(); floorOf(t.getSpot()).release(t.getSpot());
-    return new Receipt(t, fee);
+  async enter(vehicle, gate) {
+    const { spot, floor } = this.allocationStrategy.allocate(this.floors, vehicle, gate) ?? {};
+    if (!spot) throw new Error('LOT_FULL');
+    return this.ticketRepo.save({ id: crypto.randomUUID(), vehicle, spot, floor, status: 'ACTIVE', enteredAt: new Date() });
+  }
+  async exit(ticketId, payment) {
+    const ticket = await this.ticketRepo.findActive(ticketId);   // lost ticket -> separate flow
+    const fee = this.pricingStrategy.price(ticket, new Date());
+    await this.paymentService.charge(payment, fee, { idempotencyKey: ticket.id });
+    await this.ticketRepo.close(ticket.id);
+    ticket.floor.release(ticket.spot);
+    return { ticketId: ticket.id, fee };
   }
 }
+
+// A strategy is just an object with one method - swap it without touching ParkingLot
+const nearestToGate = {
+  allocate(floors, vehicle, gate) {
+    for (const floor of floors.slice().sort((a, b) => gate.distanceTo(a) - gate.distanceTo(b))) {
+      const spot = floor.reserve(vehicle.type);
+      if (spot) return { spot, floor };
+    }
+    return null;
+  },
+};
 ```
 
-Now the Strategies earn their place: allocation genuinely varies (nearest to gate, fill lowest floor first, reserve EV spots), and so does pricing.
+Now the strategies earn their place: allocation genuinely varies (nearest to gate, fill lowest floor first, reserve EV spots), and so does pricing.
 
-**Beyond one process:** if there are many gates on different servers, the in-memory `synchronized` isn't enough. Reserve the spot in the database atomically (`UPDATE spots SET status='OCCUPIED' WHERE id=? AND status='FREE'`), the same pattern as [[60-cache-says-100-db-says-20]].
+**Beyond one process:** a single Node process is safe here only because `reserve()` has no `await` between checking and marking the spot. With many gates handled by **different servers**, in-memory state isn't shared at all, so reserve the spot in the database atomically, the same pattern as [[60-cache-says-100-db-says-20]]:
+
+```javascript
+const { rowCount } = await db.query(
+  `UPDATE spots SET status = 'OCCUPIED' WHERE id = $1 AND status = 'FREE'`, [spotId]);
+if (rowCount === 0) { /* someone else took it - try the next spot */ }
+```
 
 ## 4. What Actually Helps You Clear LLD Rounds
 
