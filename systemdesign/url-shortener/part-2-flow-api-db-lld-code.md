@@ -1,0 +1,837 @@
+# URL Shortener -- HLD + LLD (Part 2: Request Flow -> API -> Database -> LLD -> Code)
+
+> Is file mein prompt ke **Parts 7-12** hain: request flow, API design, database design, LLD folder structure, Node.js/TypeScript code, aur code ka line-by-line explanation.
+> Part 1 mein humne decide kiya tha: **~100 writes/sec, ~10K reads/sec (peak ~35K), Postgres = source of truth, Redis = cache, counter-based ID + Base62.** Ab wahi design code tak le jaayenge.
+
+---
+
+## PART 7 -- HLD Request Flow (shuru se end tak)
+
+Do flows hain. Pehle **redirect** (kyunki 99% traffic wahi hai), phir **create**.
+
+### Flow A -- User short URL open karta hai (redirect)
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant LB as Load Balancer
+    participant N as Node.js API
+    participant R as Redis
+    participant DB as Postgres (replica)
+    B->>LB: GET https://sho.rt/aB92xK
+    LB->>N: forward (healthy instance)
+    N->>R: GET url:aB92xK
+    alt Cache hit
+        R-->>N: https://amazon.in/...
+    else Cache miss
+        R-->>N: nil
+        N->>DB: SELECT long_url WHERE short_code = 'aB92xK'
+        DB-->>N: https://amazon.in/...
+        N->>R: SET url:aB92xK ... EX 86400
+    end
+    N-->>B: 302 Found, Location: https://amazon.in/...
+    B->>B: follow Location -> amazon.in
+```
+
+**Step by step (Hinglish mein):**
+
+1. **User click karta hai** `https://sho.rt/aB92xK`. Browser ko pata hai ki `sho.rt` ka IP chahiye.
+2. **DNS lookup** -- DNS `sho.rt` ko load balancer ke IP mein convert karta hai. Ye result browser/OS cache kar leta hai, toh har click par DNS nahi hota.
+3. **TCP + TLS handshake** -- HTTPS hai, toh pehle secure connection banta hai. TLS usually **load balancer par terminate** hota hai (LB decrypt karta hai), toh Node.js ko plain HTTP milta hai -- Node ka CPU bachta hai.
+4. **Load balancer** request ko kisi bhi **healthy** Node.js instance ko bhej deta hai (round robin / least connections). Koi bhi instance chalega kyunki servers stateless hain.
+5. **Node.js** URL path se `shortCode = "aB92xK"` nikaalta hai. Basic check: sirf Base62/alias characters, sahi length. Kachra input (`/wp-admin.php`) ko turant 404 -- DB tak bhejne ka matlab nahi.
+6. **Redis lookup** -- `GET url:aB92xK`.
+7. **Cache hit** (90%+ cases) -- long URL mil gaya. Seedha step 10.
+8. **Cache miss** -- Redis mein nahi hai (naya link, ya TTL khatam). Ab **Postgres read replica** se query: `WHERE short_code = $1`. Unique index ki wajah se ye ~1-5 ms mein milta hai, chahe 18B rows hon.
+9. **Cache fill** -- DB se jo mila woh Redis mein `SET ... EX 86400` (24 ghante TTL) ke saath daal do. Agli baar ye link cache se aayega. Nahi mila toh **404**; expire ho gaya toh **410 Gone**.
+10. **Response** -- `302 Found` + header `Location: https://amazon.in/...`. Body khaali ya bahut chhoti.
+11. **Browser** `Location` header padh ke khud original URL par chala jaata hai. Hamara kaam khatam.
+12. **(Optional) Analytics** -- response bhejne ke **saath hi** ek click event queue mein fire-and-forget. User ko uska wait nahi karna padta.
+
+**Latency budget (server side):**
+
+| Step | Approx time |
+|---|---|
+| LB forward | ~1 ms |
+| Node.js processing | < 1 ms |
+| Redis GET (hit) | ~1 ms |
+| Postgres query (miss) | ~2-10 ms |
+| **Total on cache hit** | **~2-3 ms** |
+| **Total on cache miss** | **~5-15 ms** |
+
+> User ko jo latency dikhti hai usme network (DNS, TLS, distance) sabse bada hissa hai. Server ka hissa hum cache se chhota rakhte hain.
+
+### Flow B -- User short URL banata hai (create)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N as Node.js API
+    participant G as IdGenerator (in memory)
+    participant DB as Postgres (primary)
+    C->>N: POST /api/v1/urls { longUrl }
+    N->>N: rate limit + validate body
+    N->>G: nextId()
+    Note over G: block khatam? tab hi DB se naya block (1000 IDs)
+    G-->>N: 56800236123
+    N->>N: Base62(56800236123) = "100008H"
+    N->>DB: INSERT INTO urls (...)
+    DB-->>N: OK (unique index ne duplicate check kar diya)
+    N-->>C: 201 { shortUrl: "https://sho.rt/100008H" }
+```
+
+1. Client `POST /api/v1/urls` bhejta hai `{ "longUrl": "..." }` ke saath.
+2. **Rate limiter** check -- ek IP/user kitne links bana sakta hai (spam se bachne ke liye).
+3. **Validation** -- valid URL hai? `http/https` hi hai? 2048 chars se chhota? Hamara hi domain toh nahi (warna redirect loop)?
+4. **ID generator** se unique number -- zyada tar memory se (block already reserved hai), DB hit sirf har 1000 IDs mein ek baar.
+5. **Base62 encode** -> short code.
+6. **Postgres primary** mein `INSERT`. `short_code` par UNIQUE index hai, toh duplicate kabhi save nahi ho sakta.
+7. **201 Created** + short URL return.
+
+> Create par hum Redis mein kuch nahi daal rahe. Kyun? Bahut saare links kabhi click hi nahi hote. Unko cache mein daalna memory waste hai. Link pehli baar click hoga tab cache mein aayega (**lazy loading / cache-aside**). Detail Part 3 mein.
+
+---
+
+## PART 8 -- API Design
+
+### API 1: Short URL banao
+
+```
+POST /api/v1/urls
+Content-Type: application/json
+Authorization: Bearer <token>        (optional -- anonymous bhi allowed, strict limits ke saath)
+```
+
+**Request:**
+
+```json
+{
+  "longUrl": "https://www.amazon.in/dp/B0CHX1W1XY?ref=sr_1_3",
+  "customAlias": "priya-deal",
+  "expiresAt": "2026-12-31T23:59:59Z"
+}
+```
+
+**Response -- 201 Created:**
+
+```json
+{
+  "shortCode": "priya-deal",
+  "shortUrl": "https://sho.rt/priya-deal",
+  "longUrl": "https://www.amazon.in/dp/B0CHX1W1XY?ref=sr_1_3",
+  "expiresAt": "2026-12-31T23:59:59.000Z"
+}
+```
+
+**Ye endpoint kyun hai?** System ka write path -- naya mapping banana.
+
+**Request mein kya hai?**
+
+- `longUrl` (required) -- jahan redirect karna hai.
+- `customAlias` (optional) -- user ka apna code.
+- `expiresAt` (optional) -- is time ke baad link band.
+
+**Response mein kya hai?** Poora `shortUrl` (client ko khud join na karna pade) + `shortCode` (baad mein delete/stats ke liye) + wapas `longUrl` (client confirm kar sake ki normalized URL kya save hua).
+
+**`/api/v1` kyun?** Versioning. Kal response format badalna pade toh `/api/v2` bana denge, purane clients nahi tootenge.
+
+**Validation kya hogi?**
+
+| Field | Rule | Kyun |
+|---|---|---|
+| `longUrl` | Required, valid URL, max 2048 chars | Browsers/servers bahut lambe URL handle nahi karte; DB bloat |
+| `longUrl` | Sirf `http:` / `https:` | `javascript:alert(1)` ya `file://` jaise dangerous schemes block |
+| `longUrl` | Hostname hamara domain (`sho.rt`) nahi | `sho.rt/a` -> `sho.rt/b` -> `sho.rt/a` = infinite redirect loop |
+| `customAlias` | 4-30 chars, sirf `a-z A-Z 0-9 _ -` | URL-safe, readable |
+| `customAlias` | Reserved words nahi (`api`, `admin`, `health`, `login`) | Warna alias hamare apne routes se takra jaayega |
+| `expiresAt` | Future date | Past expiry ka koi matlab nahi |
+
+**Authentication chahiye ya nahi?** Requirement par depend. Common approach:
+
+- **Anonymous allowed** -- lekin strict rate limit (e.g. 10 links/hour per IP), custom alias aur expiry disabled.
+- **Logged-in (JWT / API key)** -- zyada quota, custom alias, apne links dekhna/delete karna.
+
+**Error cases:**
+
+| Status | Kab | Body example |
+|---|---|---|
+| `400 Bad Request` | Invalid URL, bad alias format, past expiry | `{ "error": "VALIDATION_ERROR", "details": {...} }` |
+| `401 Unauthorized` | Token invalid (jab auth required ho) | `{ "error": "UNAUTHORIZED" }` |
+| `409 Conflict` | Custom alias pehle se liya hua | `{ "error": "ALIAS_TAKEN" }` |
+| `429 Too Many Requests` | Rate limit cross | `Retry-After: 60` header ke saath |
+| `500 Internal Server Error` | DB down, unexpected bug | Generic message -- internal details leak mat karo |
+
+### API 2: Redirect
+
+```
+GET /{shortCode}
+```
+
+Ye `/api/v1` ke neeche **nahi** hai, kyunki short URL chhota dikhna chahiye: `sho.rt/aB92xK`.
+
+| Status | Kab |
+|---|---|
+| `302 Found` + `Location` | Link mila (analytics ke liye 302; bina analytics 301 ho sakta hai -- Part 1) |
+| `404 Not Found` | Aisa code hai hi nahi |
+| `410 Gone` | Code tha, lekin expire ho gaya. (Deleted/blocked link hamare code mein 404 deta hai, kyunki query `is_active = true` filter karti hai) |
+
+> Browser user ke liye 404/410 par JSON ki jagah ek simple HTML page dikhana better hai ("This link has expired").
+
+### API 3 & 4: Management (logged-in users ke liye)
+
+```
+GET    /api/v1/urls/{shortCode}    -> link ki details (owner only)
+DELETE /api/v1/urls/{shortCode}    -> 204 No Content (owner only)
+```
+
+**Authorization** yahan important hai: token valid hona kaafi nahi, **ye link isi user ka hai** ye check karna zaruri hai. Warna koi bhi doosre ka link delete kar dega. (Authentication = "tum kaun ho", Authorization = "tum ye kar sakte ho ya nahi".)
+
+Delete par **Redis se bhi key hatani** padegi, warna cache 24 ghante tak purana redirect deta rahega (cache invalidation -- Part 3).
+
+---
+
+## PART 9 -- Database Design
+
+### Kaunsa DB? Compare karke samjho
+
+Pehle **access pattern** dekho -- DB choice isi se hoti hai:
+
+1. `short_code` se ek row laao (bahut zyada -- ~10K/sec).
+2. Ek row insert karo (~100/sec).
+3. Ek user ke links laao (kabhi kabhi).
+
+Koi joins nahi, koi complex transactions nahi. Basically ek **key-value lookup** hai.
+
+| DB | Fit | Kab choose karunga |
+|---|---|---|
+| **PostgreSQL** | Bahut achha | Default choice. Unique constraint, mature, replicas easy, team jaanti hai. ~10 TB tak ek primary + partitioning se manage ho jaata hai |
+| **MySQL** | Bahut achha | Postgres jaisa hi. Team MySQL jaanti hai toh MySQL -- farak yahan negligible hai |
+| **MongoDB** | Theek | Schema flexible chahiye (e.g. har link ke saath alag metadata). Sharding built-in. Lekin yahan schema fixed hai, toh special fayda nahi |
+| **DynamoDB / Cassandra** | Scale par best | Jab data 10s of TB aur reads 100K+/sec ho jaayein. Pure key lookup, automatic sharding. Trade-off: flexible queries (jaise "user ke links by date") ke liye alag index/table design karna padta hai; vendor lock-in (DynamoDB) |
+
+**Main kya bolunga:**
+
+> "Main **PostgreSQL** choose kar raha hoon kyunki access pattern simple hai, short_code par unique constraint chahiye, aur ~100 writes/sec aur replicas ke saath reads ye aaram se handle kar lega. Hot reads Redis serve karega, toh DB par load kam hai."
+>
+> "Agar scale bahut zyada ho jaaye -- jaise 100s of TB ya multi-region writes -- toh main `short_code` ko partition key banake **DynamoDB/Cassandra** par shift karunga, ya Postgres ko `short_code` hash se shard karunga. Access pattern key-value hai, isliye ye migration natural hai."
+>
+> "**MongoDB** tab choose karunga jab har link ke saath variable structure ka data ho, ya team pehle se Mongo par ho. Yahan wo zarurat nahi hai."
+
+### Schema
+
+```sql
+-- ID blocks ke liye sequence (Part 11 ka IdGenerator isse use karega)
+-- 56800236 x 1000 >= 62^6, toh pehla code hi 7 characters ka hoga (Part 3)
+CREATE SEQUENCE url_id_block_seq START WITH 56800236;
+
+CREATE TABLE urls (
+  id          BIGINT       PRIMARY KEY,           -- IdGenerator se aata hai
+  short_code  VARCHAR(32)  NOT NULL,              -- generated (7 chars) ya custom alias (<= 30)
+  long_url    TEXT         NOT NULL,              -- max 2048, app mein validate
+  user_id     BIGINT       NULL,                  -- anonymous links ke liye NULL
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ  NULL,                  -- NULL = kabhi expire nahi
+  is_active   BOOLEAN      NOT NULL DEFAULT true  -- soft delete / abuse block
+);
+
+-- 1. Redirect lookup + uniqueness guarantee
+CREATE UNIQUE INDEX ux_urls_short_code ON urls (short_code);
+
+-- 2. "Mere links" page: user ke links, newest first
+CREATE INDEX ix_urls_user_created ON urls (user_id, created_at DESC)
+  WHERE user_id IS NOT NULL;
+
+-- 3. Cleanup job: expire ho chuke links dhundhna
+CREATE INDEX ix_urls_expires_at ON urls (expires_at)
+  WHERE expires_at IS NOT NULL;
+```
+
+`users` table normal hoti hai (`id, email, password_hash, plan, created_at`) -- yahan focus nahi.
+
+**Kuch decisions ke WHY:**
+
+- **`id BIGINT` alag se, `short_code` primary key kyun nahi?** Custom alias bhi `short_code` mein aata hai, aur numeric id se sharding/ordering easy hai. Waise `short_code` ko PK banana bhi valid design hai -- interviewer ko dono batao.
+- **`is_active` (soft delete) kyun?** Abuse report aaye toh link turant band kar sakte hain, aur record rehta hai (audit, "ye code dobara kisi ko mat do").
+- **`long_url` par index kyun nahi?** Humne dedup ("same long URL = same short URL") nahi maana. Lambe TEXT par index bada aur mehenga hai. Agar dedup chahiye toh `long_url_hash` (SHA-256) column banao aur uspe index -- poore URL pe nahi.
+
+### Index kyun banaya? Agar nahi hota toh?
+
+**Index ka mental model:** kitaab ke peeche wala index. "Redis" dhundhna hai toh poori kitaab nahi padhte -- index mein dekha "page 243", seedha wahan gaye.
+
+- **Index nahi hai** -> `WHERE short_code = 'aB92xK'` ke liye Postgres ko **har row padhni padegi** (full table scan). 18 billion rows = minutes. 10K requests/sec par DB turant mar jaayega.
+- **B-tree index hai** -> sorted tree mein ~30-35 steps mein row mil jaati hai (log2 of 18B), chahe table kitni bhi badi ho. Practically ~1-5 ms.
+- **UNIQUE index ka double fayda** -> fast lookup **+** database level par guarantee ki do rows ka same `short_code` nahi ho sakta. App mein bug ho, ya do servers same time par same alias daalein -- DB doosre insert ko reject kar dega (error code `23505`). Ye concurrency ka last line of defence hai (Part 3 mein detail).
+
+**Index ki keemat:** har INSERT par index bhi update hota hai (thoda slow write) aur disk space lagta hai. 100 writes/sec par ye bilkul fine hai -- isliye sirf zaruri 3 indexes, extra nahi.
+
+---
+
+## PART 10 -- LLD (Low-Level Design): Node.js project structure
+
+```
+url-shortener/
++-- src/
+|   +-- config/
+|   |   +-- index.ts              # env vars padhna + validate karna
+|   +-- infra/
+|   |   +-- postgres.ts           # pg Pool (connection pool)
+|   |   +-- redis.ts              # ioredis client
+|   |   +-- logger.ts             # structured logger (pino)
+|   +-- routes/
+|   |   +-- url.routes.ts         # URL -> middleware -> controller mapping
+|   +-- middleware/
+|   |   +-- validate.ts           # zod schema se body validate
+|   |   +-- rate-limit.ts         # create API par limit
+|   |   +-- error-handler.ts      # saare errors ka ek jagah response
+|   +-- controllers/
+|   |   +-- url.controller.ts     # HTTP layer: req -> service -> res
+|   +-- services/
+|   |   +-- url.service.ts        # business logic: create, resolve
+|   |   +-- id-generator.ts       # block-based unique ID
+|   +-- repositories/
+|   |   +-- url.repository.ts     # sirf SQL queries
+|   +-- schemas/
+|   |   +-- url.schema.ts         # request validation rules (zod)
+|   +-- utils/
+|   |   +-- base62.ts             # number -> short code
+|   |   +-- errors.ts             # AppError (status + code)
+|   +-- app.ts                    # express app + wiring (dependencies jodna)
+|   +-- server.ts                 # app.listen + graceful shutdown
++-- migrations/
+|   +-- 001_create_urls.sql
++-- tests/
+```
+
+**Har folder ka kaam:**
+
+| Folder | Kaam | Kya yahan NAHI hona chahiye |
+|---|---|---|
+| `config/` | `process.env` ek hi jagah padho, missing value par app start hi na ho | Business logic |
+| `infra/` | DB / Redis connections banana | Queries |
+| `routes/` | Kaunsa URL kaunse controller par, beech mein kaunse middleware | Logic |
+| `middleware/` | Har request par lagne wale cross-cutting kaam: validation, rate limit, errors, auth | Business rules |
+| `controllers/` | HTTP ko samajhna: `req` se data nikalo, service call karo, status code + response bhejo | SQL, Redis calls |
+| `services/` | **Asli logic**: code generate karna, cache-aside, expiry check | `req`/`res` objects |
+| `repositories/` | Sirf database se baat -- SQL yahan, kahin aur nahi | Business decisions |
+| `schemas/` | Input ka shape aur rules | -- |
+| `utils/` | Chhote pure functions (Base62) aur error classes | State |
+
+**Dependency direction (ek taraf hi chalti hai):**
+
+```
+routes -> controller -> service -> repository -> Postgres
+                            |
+                            +----> Redis (cache)
+                            +----> IdGenerator
+```
+
+**Kyun aise layers?**
+
+- **Testable** -- service ko test karne ke liye fake repository de do, DB ki zarurat nahi.
+- **Replaceable** -- kal Postgres se DynamoDB jaana hai toh sirf `url.repository.ts` badlega. Service ko pata bhi nahi chalega.
+- **Readable** -- bug SQL mein hai toh repository dekho, status code galat hai toh controller.
+
+> Interview tip: "Ye structure over-engineering nahi hai? " -- Chhoti service ke liye 3 layers (controller / service / repository) kaafi hain. Main isse zyada abstraction (factories, interfaces for everything) nahi daalunga.
+
+---
+
+## PART 11 + 12 -- Node.js / TypeScript Code (line-by-line explanation ke saath)
+
+Stack: **Express 5** (async errors khud error handler tak pahunchata hai), **pg** (Postgres), **ioredis**, **zod** (validation).
+
+Order wahi rakhenge jisme request travel karti hai: chhote building blocks pehle, phir service, phir controller, phir wiring.
+
+### 1. `utils/base62.ts` -- number ko short code banana
+
+```ts
+const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+export function encodeBase62(num: bigint): string {
+  if (num === 0n) return ALPHABET[0];
+  let code = '';
+  while (num > 0n) {
+    code = ALPHABET[Number(num % 62n)] + code;
+    num = num / 62n;
+  }
+  return code;
+}
+```
+
+**Code Explanation:**
+
+- `const ALPHABET = '0123...XYZ'` -- 10 digits + 26 small + 26 capital = **62 characters**. Sab URL-safe hain, koi encoding nahi chahiye.
+- `num: bigint` -- IDs billions mein jaayengi. JS `number` 2^53 tak hi exact hai; `bigint` safe hai aur Postgres `BIGINT` se match karta hai.
+- `if (num === 0n) return ALPHABET[0];` -- 0 ka edge case, warna loop chalega hi nahi aur empty string milegi.
+- `num % 62n` -- last "digit" nikaalo (jaise decimal mein `% 10` karte ho).
+- `ALPHABET[...] + code` -- us digit ka character **aage** jodo, kyunki hum right se left digits nikaal rahe hain.
+- `num = num / 62n` -- bigint division automatically integer hota hai (floor). Agle digit par jao.
+
+> Example: `125` -> `125 % 62 = 1` ("1"), `125 / 62 = 2` -> `2 % 62 = 2` ("2") -> result `"21"`. Full algorithm, decode, aur collisions Part 3 (Algorithms) mein.
+
+### 2. `services/id-generator.ts` -- block-based unique IDs
+
+```ts
+import type { Pool } from 'pg';
+
+const BLOCK_SIZE = 1000n;
+
+export class IdGenerator {
+  private next = 0n;
+  private end = 0n;
+  private refill: Promise<void> | null = null;
+
+  constructor(private readonly db: Pool) {}
+
+  async nextId(): Promise<bigint> {
+    while (this.next >= this.end) {
+      this.refill ??= this.reserveBlock().finally(() => { this.refill = null; });
+      await this.refill;
+    }
+    return this.next++;
+  }
+
+  private async reserveBlock(): Promise<void> {
+    const { rows } = await this.db.query<{ block: string }>(
+      "SELECT nextval('url_id_block_seq') AS block"
+    );
+    const start = BigInt(rows[0].block) * BLOCK_SIZE;
+    this.next = start;
+    this.end = start + BLOCK_SIZE;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `BLOCK_SIZE = 1000n` -- har Node.js instance ek baar mein 1000 IDs reserve karta hai. Matlab 1000 creates mein sirf **1 DB call** ID ke liye.
+- `private next / end` -- current block ka range. `next` = agli dene wali ID, `end` = block ki limit (exclusive).
+- `private refill: Promise | null` -- agar block refill chal raha hai toh uska promise yahan rakhte hain. **Kyun?** Neeche dekho.
+- `while (this.next >= this.end)` -- block khatam? Tab hi naya block lo. `if` ki jagah `while` isliye ki await ke baad dobara check karna hai -- ho sakta hai jab tak hum wait kar rahe the, doosri requests ne naya block bhi khatam kar diya.
+- `this.refill ??= this.reserveBlock()...` -- **ye concurrency ka important point hai.** Node.js single-threaded hai, lekin `await` par doosri requests chal jaati hain. Agar block khatam hote hi 50 requests ek saath aayein, toh bina is line ke 50 alag DB calls hongi aur 49 blocks waste. `??=` ka matlab: "refill already chal raha hai toh wahi promise use karo, nahi toh naya shuru karo." 50 requests, 1 DB call.
+- `.finally(() => { this.refill = null; })` -- refill khatam (success ya fail) toh reset, taaki next time naya refill ho sake. Fail hua toh agli request retry karegi.
+- `return this.next++` -- current ID do aur counter badhao. `await` ke beech mein nahi hai, toh ye step **atomic** hai (event loop isko beech mein nahi todta) -- do requests ko kabhi same ID nahi milegi.
+- `nextval('url_id_block_seq')` -- Postgres sequence **atomic** hai: 10 servers ek saath maangein toh bhi sabko alag number milta hai. Yahi distributed servers mein uniqueness ki guarantee hai.
+- `BigInt(rows[0].block) * BLOCK_SIZE` -- block 1000000 -> IDs 1,000,000,000 se 1,000,000,999. `pg` BIGINT ko string mein deta hai (precision bachane ke liye), isliye `BigInt(...)`.
+
+> Trade-off: server crash hua toh uske block ki bachi IDs waste. 1000 IDs, 3.5 trillion space mein -- koi farak nahi. Codes mein gaps aayenge, jo bilkul theek hai.
+
+### 3. `utils/errors.ts` -- ek jaisa error format
+
+```ts
+export class AppError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+
+  static notFound()          { return new AppError(404, 'NOT_FOUND', 'Short URL not found'); }
+  static gone()              { return new AppError(410, 'GONE', 'Short URL has expired'); }
+  static conflict(msg: string) { return new AppError(409, 'ALIAS_TAKEN', msg); }
+}
+
+export class DuplicateShortCodeError extends Error {}
+```
+
+**Code Explanation:**
+
+- `AppError` -- "expected" errors (user ki galti, missing link) jinka status code hume pata hai. Error handler inko seedha client ko bhejega.
+- `status` + `code` -- status HTTP ke liye, `code` client ke liye (`ALIAS_TAKEN` par frontend "try another alias" dikha sakta hai; message text par depend nahi karna padta).
+- `static notFound()` -- har jagah `new AppError(404, ...)` likhne ki jagah ek naam. Consistent messages.
+- `DuplicateShortCodeError` -- repository isko throw karega jab DB unique constraint todega. Service decide karegi ki iska matlab "alias taken" (409) hai ya "retry".
+
+### 4. `repositories/url.repository.ts` -- sirf SQL
+
+```ts
+import type { Pool } from 'pg';
+import { DuplicateShortCodeError } from '../utils/errors';
+
+export interface UrlRecord {
+  id: bigint;
+  shortCode: string;
+  longUrl: string;
+  userId: string | null;
+  expiresAt: Date | null;
+}
+
+const UNIQUE_VIOLATION = '23505';
+
+export class UrlRepository {
+  constructor(private readonly db: Pool) {}
+
+  async insert(url: UrlRecord): Promise<void> {
+    try {
+      await this.db.query(
+        `INSERT INTO urls (id, short_code, long_url, user_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [url.id.toString(), url.shortCode, url.longUrl, url.userId, url.expiresAt],
+      );
+    } catch (err: any) {
+      if (err.code === UNIQUE_VIOLATION) throw new DuplicateShortCodeError(url.shortCode);
+      throw err;
+    }
+  }
+
+  async findByShortCode(shortCode: string): Promise<UrlRecord | null> {
+    const { rows } = await this.db.query(
+      `SELECT id, short_code, long_url, user_id, expires_at
+         FROM urls
+        WHERE short_code = $1 AND is_active = true`,
+      [shortCode],
+    );
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      id: BigInt(r.id),
+      shortCode: r.short_code,
+      longUrl: r.long_url,
+      userId: r.user_id,
+      expiresAt: r.expires_at,
+    };
+  }
+}
+```
+
+**Code Explanation:**
+
+- `constructor(private readonly db: Pool)` -- repository ko pool **bahar se** milta hai (dependency injection). Test mein fake pool de sakte hain.
+- `Pool` -- har query ke liye naya connection banana mehenga hai (~20-50 ms TCP + auth). Pool kuch connections khule rakhta hai aur reuse karta hai.
+- `VALUES ($1, $2, ...)` + array -- **parameterized query.** Values SQL string mein jodte nahi, alag bhejte hain. Isse **SQL injection impossible** ho jaata hai -- chahe `longUrl` mein `'; DROP TABLE urls; --` ho, DB usko sirf text samjhega.
+- `url.id.toString()` -- bigint ko string mein bhejo; `pg` BIGINT column mein sahi convert kar deta hai bina precision loss ke.
+- `err.code === '23505'` -- Postgres ka "unique violation" code. DB ki language (`23505`) ko **domain ki language** (`DuplicateShortCodeError`) mein translate karna repository ka kaam hai. Service ko Postgres error codes pata hone ki zarurat nahi.
+- `throw err` -- baaki errors (DB down, timeout) upar jaane do; error handler 500 dega.
+- `WHERE short_code = $1` -- unique index use hoga -> ~ms mein row.
+- `AND is_active = true` -- soft-deleted/blocked links redirect nahi honge.
+- `return { shortCode: r.short_code, ... }` -- DB ka `snake_case` app ke `camelCase` mein. Ye mapping bhi yahin rehti hai, service ko DB column names nahi pata.
+
+> Production note: `findByShortCode` ke liye **read replica ka pool** use kar sakte hain aur `insert` ke liye primary. Isse primary par load kam. Lekin tab "abhi banaya aur turant click kiya -> 404" ka risk hai (replica lag). Uska solution Part 4 (Consistency) mein.
+
+### 5. `services/url.service.ts` -- asli business logic
+
+```ts
+import type Redis from 'ioredis';
+import { UrlRepository } from '../repositories/url.repository';
+import { IdGenerator } from './id-generator';
+import { encodeBase62 } from '../utils/base62';
+import { AppError, DuplicateShortCodeError } from '../utils/errors';
+
+const CACHE_TTL_SEC = 24 * 60 * 60;
+const MAX_ATTEMPTS = 3;
+
+export interface CreateUrlInput {
+  longUrl: string;
+  customAlias?: string;
+  expiresAt?: Date;
+  userId?: string;
+}
+
+export class UrlService {
+  constructor(
+    private readonly repo: UrlRepository,
+    private readonly cache: Redis,
+    private readonly ids: IdGenerator,
+    private readonly baseUrl: string,
+  ) {}
+
+  async createShortUrl(input: CreateUrlInput) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const id = await this.ids.nextId();
+      const shortCode = input.customAlias ?? encodeBase62(id);
+      try {
+        await this.repo.insert({
+          id,
+          shortCode,
+          longUrl: input.longUrl,
+          userId: input.userId ?? null,
+          expiresAt: input.expiresAt ?? null,
+        });
+        return {
+          shortCode,
+          shortUrl: `${this.baseUrl}/${shortCode}`,
+          longUrl: input.longUrl,
+          expiresAt: input.expiresAt ?? null,
+        };
+      } catch (err) {
+        if (!(err instanceof DuplicateShortCodeError)) throw err;
+        if (input.customAlias) throw AppError.conflict('This alias is already taken');
+      }
+    }
+    throw new Error('Could not generate a unique short code');
+  }
+
+  async resolve(shortCode: string): Promise<string> {
+    const key = `url:${shortCode}`;
+
+    const cached = await this.cache.get(key).catch(() => null);
+    if (cached) return cached;
+
+    const url = await this.repo.findByShortCode(shortCode);
+    if (!url) throw AppError.notFound();
+    if (url.expiresAt && url.expiresAt <= new Date()) throw AppError.gone();
+
+    const ttl = url.expiresAt
+      ? Math.max(1, Math.min(CACHE_TTL_SEC, Math.floor((url.expiresAt.getTime() - Date.now()) / 1000)))
+      : CACHE_TTL_SEC;
+    this.cache.set(key, url.longUrl, 'EX', ttl).catch(() => {});
+
+    return url.longUrl;
+  }
+}
+```
+
+**Code Explanation -- `createShortUrl`:**
+
+- `constructor(repo, cache, ids, baseUrl)` -- service ko saari dependencies bahar se milti hain. Service khud `new Pool()` ya `new Redis()` nahi karti -- isliye test mein sab fake kar sakte hain.
+- `for (let attempt = 1; attempt <= MAX_ATTEMPTS; ...)` -- retry loop. Kab retry chahiye? Neeche wala edge case dekho.
+- `const id = await this.ids.nextId()` -- har URL ko unique numeric ID (primary key), chahe custom alias ho ya nahi.
+- `input.customAlias ?? encodeBase62(id)` -- user ne alias diya toh wahi, warna ID ka Base62.
+- `await this.repo.insert({...})` -- DB mein save. Unique index yahan final judge hai.
+- ``shortUrl: `${this.baseUrl}/${shortCode}` `` -- `baseUrl` config se aata hai (`https://sho.rt`), hardcode nahi -- staging/prod alag domain.
+- `if (!(err instanceof DuplicateShortCodeError)) throw err;` -- DB down jaisi errors retry nahi karte; turant upar bhejo.
+- `if (input.customAlias) throw AppError.conflict(...)` -- alias ke case mein duplicate = kisi aur ne le liya -> **409**. Retry ka matlab nahi, user ko naya alias chahiye.
+- **Generated code duplicate kaise ho sakta hai?** Counter toh unique hai! Edge case: kisi user ne pehle custom alias `100008H` le liya tha, aur ab counter ka Base62 bhi `100008H` aa gaya. Tab loop agla ID lekar retry karta hai. (Better fix: custom alias exactly 7 alphanumeric characters ka allowed hi mat karo, taaki generated codes se kabhi takraye nahi -- Part 3.)
+- `throw new Error('Could not generate...')` -- 3 baar fail = kuch serious gadbad hai. 500 do aur log karo; infinite loop kabhi nahi.
+
+**Code Explanation -- `resolve` (redirect path, sabse hot code):**
+
+- ``const key = `url:${shortCode}` `` -- key mein **prefix** (`url:`). Same Redis mein rate-limit keys (`rl:...`) bhi hongi; prefix se collision nahi aur debugging easy.
+- `await this.cache.get(key)` -- pehle Redis. Hit hua toh DB ko chhua bhi nahi.
+- `.catch(() => null)` -- **bahut important line.** Redis down hai ya timeout? Error throw mat karo, bas "cache miss" maan lo aur DB se serve karo. Redis cache hai, source of truth nahi -- uske girne se redirect nahi girna chahiye.
+- `if (cached) return cached;` -- cache hit: ~1 ms mein kaam khatam.
+- `this.repo.findByShortCode(shortCode)` -- cache miss: DB se laao.
+- `if (!url) throw AppError.notFound();` -- 404. Error handler isko response mein badal dega.
+- `if (url.expiresAt && url.expiresAt <= new Date()) throw AppError.gone();` -- expiry check. Cleanup job row baad mein hataayega; tab tak app level par block.
+- `const ttl = ...` -- normal case 24 ghante. Lekin link 2 ghante mein expire hone wala hai toh cache bhi 2 ghante ka, warna expire ke baad bhi cache redirect karta rahega. `Math.max(1, ...)` -- TTL 0 ya negative Redis reject karta hai.
+- `this.cache.set(key, url.longUrl, 'EX', ttl)` -- **cache fill**, `EX` = seconds mein expiry.
+- `await` nahi lagaya + `.catch(() => {})` -- **fire-and-forget.** User ka redirect cache write ka wait kyun kare? Aur cache write fail ho toh bhi redirect sahi hai. `.catch` isliye ki unhandled promise rejection se process crash na ho.
+- `return url.longUrl` -- controller isko redirect mein badlega.
+
+> Ye pattern **cache-aside** hai: app pehle cache dekhti hai, miss par DB se laati hai aur cache bharti hai. Viral link par ek saath 10K misses (cache stampede) ka problem Part 3 mein solve karenge.
+
+### 6. `schemas/url.schema.ts` + `middleware/validate.ts` -- input validation
+
+```ts
+// schemas/url.schema.ts
+import { z } from 'zod';
+
+const RESERVED = new Set(['api', 'admin', 'health', 'login', 'signup', 'static']);
+const OWN_HOST = 'sho.rt';
+
+export const createUrlSchema = z.object({
+  longUrl: z.string().trim().max(2048).url()
+    .refine((u) => ['http:', 'https:'].includes(new URL(u).protocol), 'Only http/https URLs are allowed')
+    .refine((u) => new URL(u).hostname !== OWN_HOST, 'Cannot shorten a sho.rt link'),
+  customAlias: z.string().regex(/^[a-zA-Z0-9_-]{4,30}$/)
+    .refine((a) => !RESERVED.has(a.toLowerCase()), 'This alias is reserved')
+    .optional(),
+  expiresAt: z.coerce.date()
+    .refine((d) => d > new Date(), 'expiresAt must be in the future')
+    .optional(),
+});
+```
+
+```ts
+// middleware/validate.ts
+import type { Request, Response, NextFunction } from 'express';
+import type { ZodTypeAny } from 'zod';
+
+export const validateBody = (schema: ZodTypeAny) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    req.body = parsed.data;
+    next();
+  };
+```
+
+**Code Explanation:**
+
+- `RESERVED` -- ye words alias nahi ban sakte, warna `sho.rt/api` hamare API route se takrayega.
+- `z.string().trim().max(2048).url()` -- string ho, aage-peeche spaces hatao, 2048 se lamba nahi, aur valid URL format.
+- `.refine(... protocol ...)` -- `javascript:` / `data:` / `file:` schemes block. Warna koi hamare domain ke through malicious script chala sakta hai.
+- `.refine(... hostname !== OWN_HOST ...)` -- redirect loop se bachao.
+- `regex(/^[a-zA-Z0-9_-]{4,30}$/)` -- alias mein sirf URL-safe characters, 4-30 length. `^...$` poori string match karta hai, beech ka hissa nahi.
+- `z.coerce.date()` -- JSON mein date string aati hai (`"2026-12-31T..."`); `coerce` usko `Date` object bana deta hai.
+- `.optional()` -- field na bheje toh bhi valid.
+- `validateBody(schema)` -- ek **function jo middleware return karta hai**. Isse har route apna schema de sakta hai: `validateBody(createUrlSchema)`.
+- `schema.safeParse(req.body)` -- `parse` error throw karta; `safeParse` result object deta hai, try/catch nahi chahiye.
+- `res.status(400).json({ details: ...fieldErrors })` -- client ko batao **kaunsa field** galat hai: `{ longUrl: ["Only http/https URLs are allowed"] }`.
+- `req.body = parsed.data` -- aage **cleaned** data jaata hai (trimmed, Date object, unknown fields removed). Controller ko dobara validate nahi karna padta.
+- `next()` -- sab theek, agle middleware/controller par jao.
+
+> Validation **controller mein kyun nahi?** Har controller mein same if-else repeat hota. Middleware mein ek baar likho, har route par lagao. Aur controller sirf happy path dekhta hai.
+
+### 7. `controllers/url.controller.ts` -- HTTP layer
+
+```ts
+import type { Request, Response } from 'express';
+import { UrlService } from '../services/url.service';
+
+const SHORT_CODE_PATTERN = /^[a-zA-Z0-9_-]{1,30}$/;
+
+export class UrlController {
+  constructor(private readonly service: UrlService) {}
+
+  create = async (req: Request, res: Response) => {
+    const { longUrl, customAlias, expiresAt } = req.body;
+    const result = await this.service.createShortUrl({
+      longUrl,
+      customAlias,
+      expiresAt,
+      userId: res.locals.userId,
+    });
+    res.status(201).json(result);
+  };
+
+  redirect = async (req: Request, res: Response) => {
+    const { shortCode } = req.params;
+    if (!SHORT_CODE_PATTERN.test(shortCode)) {
+      return res.status(404).send('Not found');
+    }
+    const longUrl = await this.service.resolve(shortCode);
+    res.set('Cache-Control', 'private, max-age=0');
+    res.redirect(302, longUrl);
+  };
+}
+```
+
+**Code Explanation:**
+
+- `constructor(private readonly service: UrlService)` -- controller sirf service jaanta hai; DB/Redis ke baare mein kuch nahi.
+- `create = async (req, res) => {...}` -- **arrow function as class property**. Kyun? Router mein `controller.create` pass karte hain; normal method ho toh `this` undefined ho jaata. Arrow function `this` ko bind rakhta hai.
+- `const { longUrl, customAlias, expiresAt } = req.body;` -- request body se fields nikaal rahe hain. Ye already validated hain (middleware ne kiya).
+- `const result = await this.service.createShortUrl({...})` -- controller khud business logic nahi karega. Woh service ko call karega. Isse code clean aur testable rehta hai.
+- `userId: res.locals.userId` -- auth middleware (agar laga hai) logged-in user ka ID `res.locals` mein daalta hai. Anonymous request par `undefined`.
+- `res.status(201).json(result)` -- **201 Created**, 200 nahi -- kyunki naya resource bana. Correct status codes interview mein notice hote hain.
+- `try/catch` kyun nahi hai? -- **Express 5** async handler ka rejected promise automatically error handler ko bhej deta hai. (Express 4 mein ek `asyncHandler` wrapper chahiye hota.)
+- `const { shortCode } = req.params;` -- `/:shortCode` route se code.
+- `SHORT_CODE_PATTERN.test(shortCode)` -- bots `/wp-login.php`, `/.env` try karte rehte hain. Aise kachre ko **cache/DB tak jaane se pehle** 404. Sasta filter.
+- `await this.service.resolve(shortCode)` -- cache -> DB wala saara kaam service mein. Not found hua toh service `AppError` throw karegi -> error handler -> 404/410.
+- `res.set('Cache-Control', 'private, max-age=0')` -- browser/proxy is 302 ko cache na kare, taaki har click hamare paas aaye (analytics, link disable). Analytics na chahiye toh yahan 301 + lamba cache.
+- `res.redirect(302, longUrl)` -- `302` status + `Location: longUrl` header set karta hai. Browser baaki kaam khud karta hai.
+
+### 8. `middleware/error-handler.ts` -- saare errors ek jagah
+
+```ts
+import type { Request, Response, NextFunction } from 'express';
+import { AppError } from '../utils/errors';
+import { logger } from '../infra/logger';
+
+export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction) {
+  if (err instanceof AppError) {
+    return res.status(err.status).json({ error: err.code, message: err.message });
+  }
+  logger.error({ err, method: req.method, path: req.path }, 'Unhandled error');
+  res.status(500).json({ error: 'INTERNAL_ERROR', message: 'Something went wrong' });
+}
+```
+
+**Code Explanation:**
+
+- `(err, req, res, _next)` -- Express error middleware ko **4 parameters** se pehchaanta hai. `_next` use nahi ho raha, phir bhi likhna zaruri hai.
+- `if (err instanceof AppError)` -- expected errors (404, 409, 410): status aur code seedha client ko. Inko error log karne ki zarurat nahi -- ye normal business flow hai.
+- `logger.error({ err, method, path }, ...)` -- **unexpected** errors (DB down, bug) ko structured log karo -- stack trace + kaunsa route. Isi se alert aur debugging hoti hai.
+- `res.status(500).json({ message: 'Something went wrong' })` -- client ko **internal details mat bhejo** (SQL, stack trace, hostnames). Ye security leak hai.
+
+### 9. `routes/url.routes.ts` + `app.ts` -- sab jodna (wiring)
+
+```ts
+// routes/url.routes.ts
+import { Router } from 'express';
+import { UrlController } from '../controllers/url.controller';
+import { validateBody } from '../middleware/validate';
+import { createUrlLimiter } from '../middleware/rate-limit';
+import { createUrlSchema } from '../schemas/url.schema';
+
+export function urlRoutes(controller: UrlController) {
+  const router = Router();
+  router.post('/api/v1/urls', createUrlLimiter, validateBody(createUrlSchema), controller.create);
+  router.get('/:shortCode', controller.redirect);
+  return router;
+}
+```
+
+```ts
+// app.ts
+import express from 'express';
+import { Pool } from 'pg';
+import Redis from 'ioredis';
+import { config } from './config';
+import { UrlRepository } from './repositories/url.repository';
+import { IdGenerator } from './services/id-generator';
+import { UrlService } from './services/url.service';
+import { UrlController } from './controllers/url.controller';
+import { urlRoutes } from './routes/url.routes';
+import { errorHandler } from './middleware/error-handler';
+
+export function buildApp() {
+  const db = new Pool({ connectionString: config.databaseUrl, max: 20 });
+  const redis = new Redis(config.redisUrl, {
+    maxRetriesPerRequest: 1,
+    enableOfflineQueue: false,
+    commandTimeout: 50,
+  });
+
+  const service = new UrlService(new UrlRepository(db), redis, new IdGenerator(db), config.baseUrl);
+  const controller = new UrlController(service);
+
+  const app = express();
+  app.use(express.json({ limit: '10kb' }));
+  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+  app.use(urlRoutes(controller));
+  app.use(errorHandler);
+
+  return { app, db, redis };
+}
+```
+
+**Code Explanation -- routes:**
+
+- `router.post('/api/v1/urls', createUrlLimiter, validateBody(...), controller.create)` -- request **left to right** chalti hai: pehle rate limit (sasta check, spam turant roko), phir validation, phir controller. Order matter karta hai -- mehenga kaam sabse last.
+- `router.get('/:shortCode', ...)` -- catch-all jaisa route hai, isliye `/api/...` aur `/health` routes **isse pehle** register hone chahiye, warna `/health` ko short code samajh lega.
+
+**Code Explanation -- app.ts:**
+
+- `buildApp()` -- ye **composition root** hai: yahi ek jagah hai jahan objects `new` hote hain aur ek doosre se jodte hain. Baaki sab code sirf dependencies receive karta hai.
+- `new Pool({ ..., max: 20 })` -- is instance se max 20 DB connections. **Kyun limit?** 12 Node instances x 20 = 240 connections. Postgres ki `max_connections` (default 100!) ke hisaab se set karna padta hai, warna "too many connections" error. Bade scale par beech mein **PgBouncer**.
+- `new Redis(url, {...})` -- ek hi Redis connection poore process ke liye kaafi hai (ioredis commands ko pipeline karta hai).
+- `maxRetriesPerRequest: 1` -- Redis command fail ho toh baar baar retry mat karo.
+- `enableOfflineQueue: false` -- Redis disconnected hai toh commands ko queue mein **mat rakho**, turant fail karo. Default mein ioredis commands queue kar leta hai -> redirect Redis ke wapas aane tak latak jaata. Hum chahte hain turant fail -> `.catch(() => null)` -> DB fallback.
+- `commandTimeout: 50` -- Redis slow hai (50 ms se zyada) toh bhi wait mat karo. Cache ka poora point speed hai.
+- `new UrlService(new UrlRepository(db), redis, new IdGenerator(db), config.baseUrl)` -- dependency wiring. Kal repository badalni ho toh sirf ye line badlegi.
+- `express.json({ limit: '10kb' })` -- JSON body parse karo, lekin max 10 KB. Koi 100 MB body bhej ke memory na bhar de.
+- `app.get('/health', ...)` -- load balancer isko ping karta hai; jawab nahi aaya toh instance ko traffic band.
+- `app.use(errorHandler)` -- **sabse last** register hota hai, taaki upar ke kisi bhi route/middleware ki error yahan aaye.
+- `return { app, db, redis }` -- `server.ts` ko `db`/`redis` chahiye taaki shutdown par connections band kar sake (graceful shutdown -- Part 4/5).
+
+### Poora code ek line mein
+
+```
+Request -> rate limit -> validate -> Controller (HTTP) -> Service (logic, cache-aside, IDs)
+        -> Repository (SQL) -> Postgres     |    errors -> errorHandler -> clean JSON
+```
+
+---
+
+## Remember
+
+> **Redirect path = "Redis se pucho, na mile toh Postgres se, aur Redis ki galti ko kabhi user ki galti mat banao."** Layers isliye hain taaki har cheez ki ek hi jagah ho: HTTP controller mein, logic service mein, SQL repository mein.
+
+## Quick Self-Test
+
+1. `resolve()` mein `this.cache.get(key).catch(() => null)` hata dein toh Redis down hone par kya hoga?
+2. `IdGenerator` mein `this.refill ??= ...` kyun zaruri hai jab Node.js single-threaded hai?
+3. `short_code` par UNIQUE index na ho toh do cheezein kya toot jaayengi?
+4. Create par Redis mein cache kyun nahi kiya?
+5. `/:shortCode` route ko `/health` se pehle register kar diya toh kya bug aayega?
+
+---
+
+**Next (Part 3):** Algorithms (Base62 full calculation + decode, auto-increment vs random vs hash vs UUID vs Snowflake, predictable codes), Concurrency (race conditions, unique constraint, atomic ops, distributed locks, Node.js event loop), Caching deep dive (TTL, invalidation, hot keys, stampede, Redis failure). "next" bolo.

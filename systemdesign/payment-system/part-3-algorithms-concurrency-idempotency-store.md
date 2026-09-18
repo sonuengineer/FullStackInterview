@@ -1,0 +1,1100 @@
+# Payment System -- HLD + LLD (Part 3: Algorithms -> Concurrency -> Idempotency Store)
+
+> Is file mein prompt ke **Parts 13-15** hain: payment system ke important algorithms (zero se), concurrency (race conditions across Node instances), aur caching ki jagah **idempotency store ka deep dive** (payment system mein "caching" ka asli sawaal yahi hai).
+> Part 1-2 recap: ShopKart ka **Payment Service** -- N stateless Node.js (Express 5) instances, ek **PostgreSQL primary** (payments, refunds, idempotency_keys, ledger_entries, webhook_events, outbox), bahar ek **PSP** (Razorpay/Stripe style) jo card/UPI charge karta hai. `POST /v1/payments` par `Idempotency-Key` header required hai. Payment **3 atomic phases** mein chalta hai (Tx 1 -> PSP call -> Tx 2), har step par ek `recovery_point`. Rule: **correctness over availability -- fail closed**. Ab dekhenge ye choices **kyun** sahi hain, naive approaches kahan tootti hain, aur do servers ek saath same payment ko chhuein toh kya hota hai.
+> Honest note: Stripe, Razorpay, Adyen ke internal systems isse kahin bade hain. Ye woh **merchant-side payment service** hai jo interviewer expect karta hai.
+
+---
+
+## PART 13 -- Important Algorithms: "paisa exactly ek baar move ho" kaise guarantee karein
+
+### Problem kya hai?
+
+Priya ne ShopKart par Rs 499 ka order kiya. "Pay" dabaya. Ab kya kya ho sakta hai:
+
+1. Network slow tha, app ne 10 sec baad **timeout** dekha aur khud **retry** kar diya.
+2. Priya ne **double-tap** kar diya.
+3. Hamara server PSP ko call karke, response aane se pehle **crash** ho gaya.
+4. PSP ka **webhook** 2 baar aaya, ya late aaya, ya ulte order mein aaya.
+5. Payment hua, lekin Order Service ko "payment.succeeded" event **pahuncha hi nahi**.
+
+Har case mein ek hi sawaal: **card ek hi baar charge ho, hamare books (ledger) sahi rahein, aur baaki services ko sahi khabar mile.** Ye 7 algorithms milke ye kaam karte hain:
+
+| # | Algorithm | Kaunsa problem solve karta hai |
+|---|---|---|
+| 1 | Idempotency key lifecycle | Same request dobara aaye toh dobara charge nahi |
+| 2 | Atomic phases + recovery points | Beech mein crash ho toh safely resume |
+| 3 | Payment state machine | Webhook + sync response + retries -- status kabhi galat direction mein nahi |
+| 4 | Double-entry ledger | Paisa kahan se kahan gaya -- hamesha balanced, auditable |
+| 5 | Retries + backoff + jitter + circuit breaker | PSP flaky ho toh smart retry, down ho toh fail fast |
+| 6 | Transactional outbox | DB commit aur event publish dono -- ya dono, ya koi nahi |
+| 7 | Reconciliation | Hamare records vs PSP ke records -- roz milao |
+
+---
+
+### Algorithm 1 -- Idempotency Key Lifecycle
+
+**Idempotency ka simple matlab:** same request accidentally 2 baar (ya 10 baar) aaye, toh business operation (charge) sirf **1 baar** ho, aur har baar client ko **same answer** mile.
+
+#### Naive approach -- "is order ka payment already hai kya?"
+
+Sabse pehla idea:
+
+```ts
+// BUGGY -- sirf samajhne ke liye
+async function pay(orderId: string, pmToken: string) {
+  const existing = await db.query('SELECT * FROM payments WHERE order_id = $1', [orderId]);
+  if (existing.rowCount > 0) throw new HttpError(409, 'ORDER_ALREADY_PAID');
+  const payment = await createPaymentRow(orderId);
+  return psp.charge({ ... });
+}
+```
+
+Chaar problem:
+
+- **Check-then-act race:** do requests ek saath aayin, dono ne `SELECT` kiya, dono ko 0 rows mile, dono ne charge kiya. Classic race (URL Shortener Part 3 wala "read phir write" pattern).
+- **Retry ko galat jawab:** app ne timeout ke baad retry kiya -- asal mein pehla payment SUCCEEDED ho chuka tha. Retry ko "409 already paid" mila. App confuse: "fail hua ya pass?" Retry ko **original response** chahiye tha (`201 SUCCEEDED`), error nahi.
+- **Legit dobara payment block:** card decline hua (FAILED). Priya doosra card try karti hai -- ye **naya logical operation** hai, allow hona chahiye. "Order ka payment hai kya" logic isse bhi rok dega (ya FAILED ko ignore karo toh race wapas).
+- **Har operation par kaam nahi karta:** refunds? "Is payment ka refund hai kya?" -- partial refunds mein ek payment ke kai legit refunds hote hain. Business field se "duplicate" pehchanna har API ke liye alag, fragile logic hai.
+
+**Asli insight:** server khud nahi pehchan sakta ki ye "wahi request dobara" hai ya "nayi request jo same dikhti hai". **Client ko batana padega.** Isliye `Idempotency-Key`.
+
+#### Key + request fingerprint
+
+- Client ek **UUID v4** banata hai har *logical operation* ke liye ("order ord_123 ka payment, attempt 1") aur **har retry par wahi key** bhejta hai. Naya card try = nayi key.
+- Scope: `(customer_id, key)` -- do customers ki keys kabhi collide nahi karengi, aur ek customer doosre ki key "guess" karke uska response replay nahi kar sakta.
+- Server key ke saath **request fingerprint** store karta hai: `SHA-256(method + path + canonical JSON body)`.
+
+**Fingerprint kyun?** Client bug: same key galti se doosre order ke liye reuse kar di. Bina fingerprint ke hum pehle order ka response replay kar dete -- client sochta doosra order paid hai. Fingerprint match nahi hua -> **422 `IDEMPOTENCY_KEY_REUSED`**. Path fingerprint mein isliye hai ki same key `/v1/payments` aur `/refunds` par alag operation hai.
+
+#### Canonical JSON -- kyun zaruri?
+
+**Canonical JSON ka matlab:** same data ka hamesha **ek hi string form** -- object keys sorted, koi extra whitespace nahi.
+
+Problem: `JSON.stringify` keys ko **insertion order** mein likhta hai:
+
+```
+{"orderId":"ord_123","paymentMethodToken":"pm_abc"}
+{"paymentMethodToken":"pm_abc","orderId":"ord_123"}
+```
+
+Data same, string alag -> hash alag -> retry (jiska SDK ne keys doosre order mein bheji) ko galti se 422. (node mein check kiya: dono `JSON.stringify` equal nahi.)
+
+```ts
+// src/services/idempotency.service.ts (helper)
+import { createHash } from 'node:crypto';
+
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const parts = Object.keys(obj)
+      .filter((k) => obj[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
+    return `{${parts.join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function requestHash(method: string, path: string, body: unknown): string {
+  return createHash('sha256').update(`${method} ${path} ${canonicalJson(body)}`).digest('hex');
+}
+```
+
+**Code Explanation:**
+
+- `Array.isArray` -- array ka order **meaningful** hai (`[1,2]` != `[2,1]`), isliye array sort nahi karte, sirf har element ko canonical banate hain.
+- `typeof value === 'object'` -- object ke keys `.sort()` karo. Recursion se nested objects bhi sorted.
+- `.filter(k => obj[k] !== undefined)` -- `JSON.stringify` bhi undefined fields chhod deta hai; hum bhi same karte hain taaki `{a: undefined}` aur `{}` same hash dein.
+- `JSON.stringify(k)` / `JSON.stringify(value)` -- strings ko sahi quotes + escaping ke saath; numbers/booleans/null as-is.
+- Body ko hum `express.json()` ke **parse ke baad** hash karte hain -- toh whitespace, `49900` vs `49900.0` jaise raw-text farak khud gayab.
+- `requestHash('POST', '/v1/payments', body)` -- example body ka hash `53b2c4c47c8413fb...` aaya; `orderId` badal ke `ord_999` kiya toh `50912ebbff043963...` (node se verify). Ek character badla, poora hash alag.
+
+#### Claim step -- decision table
+
+Tx 1 ke andar pehla statement (spec ka canonical SQL):
+
+```sql
+INSERT INTO idempotency_keys (customer_id, key, request_path, request_hash, status, recovery_point, locked_until)
+VALUES ($1, $2, $3, $4, 'IN_PROGRESS', 'STARTED', now() + interval '60 seconds')
+ON CONFLICT (customer_id, key) DO NOTHING
+RETURNING *;
+```
+
+Row wapas aaya = **hum owner hain**. Row nahi aaya = key pehle se hai -> `SELECT` karke decide:
+
+| Existing row ki haalat | Jawab | Kyun |
+|---|---|---|
+| Row nahi tha (INSERT ne row return kiya) | **Proceed** (hum owner) | Pehli baar ye operation dekh rahe hain |
+| `request_hash` alag | **422 `IDEMPOTENCY_KEY_REUSED`** | Same key, alag request = client bug. Kuch execute mat karo |
+| `status = 'COMPLETED'` | **Replay** stored `response_code` + `response_body`, header `Idempotent-Replayed: true` | Kaam ho chuka. Retry ko wahi jawab do jo pehli baar diya |
+| `IN_PROGRESS` aur `locked_until > now()` | **409 `IDEMPOTENCY_IN_PROGRESS`** | Koi doosra instance abhi isi par kaam kar raha hai. Client thodi der baad retry kare |
+| `IN_PROGRESS` aur lock expire (`locked_until < now()`) | **Take over** + `recovery_point` se resume | Pichla owner crash hua (ya lock release kiya). Kaam wahin se aage badhao |
+
+Take-over SQL:
+
+```sql
+UPDATE idempotency_keys SET locked_until = now() + interval '60 seconds'
+WHERE customer_id = $1 AND key = $2 AND locked_until < now()
+RETURNING *;
+```
+
+```ts
+type ClaimResult =
+  | { kind: 'owner'; row: IdempotencyRow }
+  | { kind: 'resume'; row: IdempotencyRow }
+  | { kind: 'replay'; row: IdempotencyRow }
+  | { kind: 'reused' }
+  | { kind: 'in_progress' };
+
+export async function claim(client: PoolClient, customerId: string, key: string, path: string, hash: string): Promise<ClaimResult> {
+  const ins = await idempotencyRepo.insertIfAbsent(client, customerId, key, path, hash);
+  if (ins) return { kind: 'owner', row: ins };
+
+  const row = await idempotencyRepo.find(client, customerId, key);
+  if (!row) throw new RetryableConflict();            // cleanup ne beech mein delete kiya (bahut rare) -> dobara try
+  if (row.request_hash !== hash) return { kind: 'reused' };
+  if (row.status === 'COMPLETED') return { kind: 'replay', row };
+
+  const taken = await idempotencyRepo.takeOverIfExpired(client, customerId, key);
+  return taken ? { kind: 'resume', row: taken } : { kind: 'in_progress' };
+}
+```
+
+**Code Explanation:**
+
+- `insertIfAbsent` -- upar wala `INSERT ... ON CONFLICT DO NOTHING RETURNING *`. Row mila -> `owner`.
+- `find` -- `SELECT * FROM idempotency_keys WHERE customer_id = $1 AND key = $2`. READ COMMITTED mein har statement naya snapshot leta hai, toh doosre transaction ka **committed** row yahan dikhega (Part 14 Scenario 1 mein detail).
+- `request_hash !== hash` -- **pehle** hash check, phir status. Warna galat request ko bhi purana response replay ho jaata.
+- `COMPLETED` -> `replay`. Controller `res.status(row.response_code).set('Idempotent-Replayed', 'true').json(row.response_body)`. Metric `idempotency_replays_total` badhao.
+- `takeOverIfExpired` -- take-over UPDATE. Humne pehle `locked_until` ko JS mein check nahi kiya -- **seedha conditional UPDATE** chalaya. Ye race-safe hai: do log ek saath try karein toh sirf ek jeetega (Scenario 5). Mila -> `resume`, nahi -> `in_progress` (409, metric `idempotency_conflicts_total{reason="in_progress"}`).
+
+**Kya store hota hai, kya nahi (Stripe ka bhi yahi public rule hai: result tabhi save jab execution shuru ho chuka ho):**
+
+- `400` validation / missing key -> claim se **pehle** reject. Kuch store nahi.
+- `404` order nahi mila, `403` order tumhara nahi, `409 ORDER_ALREADY_PAID` -> Tx 1 ke andar pata chalta hai -> Tx 1 **rollback** -> key ka claim bhi rollback. Client order fix karke same key se retry kar sakta hai.
+- `201` (SUCCEEDED / FAILED / REQUIRES_ACTION) -> Tx 2 mein key `COMPLETED` + response store. **Decline bhi replay hota hai** -- `201 status: FAILED` ek valid, final answer hai.
+- `202 PROCESSING` -> key **COMPLETED nahi**, `IN_PROGRESS` + `recovery_point = 'PSP_CALLED'`, lock release. Retry aayega toh resume karke asli result nikaalega.
+
+#### 24 hours expiry -- forever kyun nahi?
+
+- **Retries minutes mein hote hain, din mein nahi.** App timeout ke baad seconds mein retry karta hai; offline phone max kuch ghante baad. 24 hours kaafi margin hai.
+- **Storage:** ~1 KB per key (response body ke saath) x 5M/day = **~5 GB/day**. Forever rakha toh ~1.8 TB/year sirf keys -- bina kisi fayde ke. 24h -> hamesha **~5 GB live**.
+- **24h ke baad bhi safety net hai:** partial unique index `ux_payments_one_active_per_order` -- ek order ka ek hi active/successful payment. 3 din purani key se retry aaya toh key nahi milegi, naya claim hoga, lekin payment insert par **409 ORDER_ALREADY_PAID**. Double charge phir bhi nahi.
+- Stripe bhi publicly yahi bolta hai: keys kam se kam 24 hours ke baad prune ho sakti hain; purani key = nayi request.
+
+> **Interview line:** "Naive 'order ka payment hai kya' check race-prone hai aur retry ko original response nahi de sakta. Main client-generated Idempotency-Key lunga, scope (customer_id, key), plus SHA-256 fingerprint of method + path + canonical JSON. Claim ek `INSERT ... ON CONFLICT DO NOTHING` se -- row mila toh owner; warna hash alag -> 422, completed -> replay, in progress with live lock -> 409, expired lock -> conditional UPDATE se take over karke recovery point se resume. Keys 24 hours rakhta hoon; uske baad order-level partial unique index backstop hai."
+
+---
+
+### Algorithm 2 -- Atomic Phases + Recovery Points
+
+#### Naive approach -- sab kuch ek transaction mein
+
+```ts
+// BUGGY -- mat karna
+await withTransaction(async (tx) => {
+  await claimKey(tx, ...);
+  const payment = await insertPayment(tx, ...);
+  const result = await psp.charge({ ... });        // 300 ms - 10 s ka HTTP call, transaction KHULA hai
+  await updatePayment(tx, payment.id, result);
+  await insertLedger(tx, ...);
+});
+```
+
+Lagta hai "sab atomic" ho gaya. Asal mein do bade problem:
+
+1. **Rollback card ko un-charge nahi karta.** PSP ne charge kar diya, phir `insertLedger` fail hua -> DB rollback -> hamare DB mein payment ka **naam-o-nishaan nahi**, lekin Priya ke account se Rs 499 kat gaye. DB transaction sirf **DB** ko atomic banata hai, bahar ki duniya (PSP) ko nahi.
+2. **Connections aur locks bahut der tak pakde rehte hain.** Transaction ke dauraan ek pool connection busy aur idempotency key + payment row par locks. Little's law: in-flight = rate x time = **1,000 TPS x 3 s = 3,000 connections** ek saath khule. Postgres usually kuch sau connections par comfortable hai. PSP slow hua (10 s timeout) -> pool khatam -> **GET status bhi fail** -- ek slow dependency poori service le doobi. Aur long transactions `VACUUM` ko bhi rokti hain.
+
+**Rule:** kabhi bhi network call (PSP, Kafka, doosri service) **DB transaction ke andar** mat karo.
+
+#### Solution -- chhote atomic phases, beech mein checkpoint
+
+Kaam ko todo: har DB phase chhota aur atomic, PSP call beech mein **bina transaction ke**. Har phase ke end par `recovery_point` likho -- "yahan tak kaam pakka ho chuka". Crash hua toh agla owner wahin se shuru kare. (Ye pattern Stripe engineer Brandur Leach ke public blog "Implementing Stripe-like Idempotency Keys in Postgres" se famous hua.)
+
+```
+Tx 1 (few ms)          claim key; load order (amount ORDER se, client se kabhi nahi);
+                       INSERT payments (pay_<ULID>, CREATED);
+                       recovery_point = 'PAYMENT_CREATED', payment_id set          -> COMMIT
+
+Tx (tiny)              payments.status CREATED -> PROCESSING;
+                       recovery_point = 'PSP_CALLED'                                -> COMMIT
+
+No transaction         psp.charge({ idempotencyKey: payment.id, amountMinor, currency, paymentMethodToken })
+
+Tx 2 (few ms)          conditional UPDATE -> SUCCEEDED / FAILED / REQUIRES_ACTION;
+                       ledger entries (success par); outbox event;
+                       key COMPLETED + response; recovery_point = 'FINISHED'       -> COMMIT
+```
+
+Isliye spec kehta hai "~3 DB transactions per payment".
+
+**"PSP_CALLED" call se PEHLE kyun likhte hain?** Kyunki crash call ke dauraan bhi ho sakta hai -- PSP ko request pahunchi ya nahi, hum nahi jaante. `PSP_CALLED` ka matlab hai "shayad call hua ho" -> resume karne wala **PSP se poochhe bina dobara charge nahi karega**. Ulta kiya (call ke baad likha) toh crash par hum sochte "call hua hi nahi" -- wahi galti.
+
+#### Crash at each point -- resume kya karta hai?
+
+Resume = client ka retry (same key) **ya** recovery worker (har 1 min). Dono lock expire hone ke baad take-over karte hain.
+
+| Crash kab hua | DB mein kya hai | Resume kya karega |
+|---|---|---|
+| Tx 1 commit se pehle | Kuch nahi (rollback) | Key hi nahi hai -> fresh claim, sab naye sire se |
+| Tx 1 ke baad, PROCESSING mark se pehle | Key `IN_PROGRESS`, `PAYMENT_CREATED`; payment `CREATED` | PSP ko call hua hi nahi. Payment ko PROCESSING mark karo, PSP call karo (same payment id = same PSP key) |
+| PSP_CALLED ke baad (call se pehle, dauraan, ya response ke baad Tx 2 se pehle) | Key `PSP_CALLED`; payment `PROCESSING` | **Pehle poochho:** `psp.getPaymentByIdempotencyKey(payment.id)`. Result mila -> Tx 2 apply. PSP ko pata hi nahi -> `charge` dobara same key se (safe). |
+| Tx 2 ke baad | Key `COMPLETED` + response | Kuch karna nahi. Retry ko stored response replay |
+
+PSP timeout (unknown result) bhi teesri row jaisa hai: payment `PROCESSING`, client ko **202**, key `IN_PROGRESS` + `PSP_CALLED`, lock release (`locked_until = now()`) taaki agla retry turant resume kar sake. **Timeout par kabhi FAILED mark mat karo** -- ho sakta hai PSP ne charge kar diya ho; FAILED dikha ke Priya dobara pay karegi = double charge.
+
+**60 second ka lock kyun?** PSP call ka timeout 10 s + do chhote retries -> worst case ~15 s. Lock usse kaafi zyada hona chahiye, warna original owner abhi kaam kar raha hai aur doosra take over kar leta. (Aur agar phir bhi ho jaaye -- GC pause, bahut slow call -- toh Algorithm 3 ka conditional update aur PSP key bachate hain.)
+
+#### Two-level idempotency
+
+```
+Client --(Idempotency-Key: 7f3c...uuid)--> Payment Service --(PSP idempotency key: pay_01J8...)--> PSP
+          protects OUR API                                      protects the CHARGE
+```
+
+- **Level 1 -- hamari key:** client ke retries ko ek hi `payments` row aur ek hi response par map karti hai.
+- **Level 2 -- PSP key = hamara payment id:** hamare apne retries (HTTP retry, crash ke baad resume, recovery worker, take-over race) PSP par **ek hi charge** banayein.
+
+Level 2 kyun alag chahiye? Hamara server khud PSP ka "client" hai aur wahi saari problems face karta hai (timeout, crash). Agar PSP key har call par naya UUID hota, toh resume karte waqt naya charge ban jaata. **Payment id stable hai** -- Tx 1 mein ek baar bana, DB mein pakka -- isliye perfect PSP key.
+
+> **Interview line:** "PSP call ko DB transaction mein wrap nahi karunga -- rollback card ko un-charge nahi karta, aur 1000 TPS x 3 s ka matlab 3000 connections khule. Main kaam ko atomic phases mein todta hoon -- Tx 1 payment create, phir PSP call bina transaction, phir Tx 2 result + ledger + outbox + key complete -- aur har phase ke baad recovery point. PSP call se pehle PSP_CALLED likhta hoon, toh crash ke baad resume pehle PSP se status poochta hai. Aur PSP idempotency key hamara payment id hai, toh hamare apne retries bhi double charge nahi kar sakte."
+
+---
+
+### Algorithm 3 -- Payment State Machine
+
+**Problem:** ek payment ko teen log update karte hain -- sync PSP response (instance A), PSP webhook (instance B), recovery worker (instance C). Order ki koi guarantee nahi. Naive `UPDATE payments SET status = $2 WHERE id = $1` karo toh:
+
+```
+10:00:01  webhook: payment.succeeded     -> status = SUCCEEDED
+10:00:02  late webhook: payment.pending   -> status = PROCESSING   (!!)  paisa kat chuka, UI "processing" dikhata hai
+10:00:03  recovery worker ne stale data dekha -> status = FAILED   (!!)  customer ko "failed" mail, order cancel
+```
+
+**State machine ka matlab:** allowed transitions ki fixed list. Jo list mein nahi, woh **hota hi nahi**.
+
+```
+CREATED -> PROCESSING -> SUCCEEDED -> PARTIALLY_REFUNDED -> REFUNDED
+                      -> REQUIRES_ACTION -> SUCCEEDED | FAILED
+                      -> FAILED
+SUCCEEDED -> REFUNDED (full refund)
+```
+
+```ts
+// src/domain/payment-state.ts
+export type PaymentStatus =
+  'CREATED' | 'PROCESSING' | 'REQUIRES_ACTION' | 'SUCCEEDED' | 'FAILED' | 'PARTIALLY_REFUNDED' | 'REFUNDED';
+
+export const TRANSITIONS: Record<PaymentStatus, readonly PaymentStatus[]> = {
+  CREATED: ['PROCESSING'],
+  PROCESSING: ['SUCCEEDED', 'FAILED', 'REQUIRES_ACTION'],
+  REQUIRES_ACTION: ['SUCCEEDED', 'FAILED'],
+  SUCCEEDED: ['PARTIALLY_REFUNDED', 'REFUNDED'],
+  PARTIALLY_REFUNDED: ['PARTIALLY_REFUNDED', 'REFUNDED'],
+  FAILED: [],
+  REFUNDED: [],
+};
+
+export function allowedFrom(target: PaymentStatus): PaymentStatus[] {
+  return (Object.keys(TRANSITIONS) as PaymentStatus[]).filter((from) => TRANSITIONS[from].includes(target));
+}
+// allowedFrom('SUCCEEDED') -> ['PROCESSING', 'REQUIRES_ACTION']
+```
+
+**Code Explanation:**
+
+- `TRANSITIONS` -- har status se kahan ja sakte hain. `Record<PaymentStatus, ...>` -- TypeScript force karta hai ki har status ki entry ho; naya status add kiya aur map bhool gaye -> compile error.
+- `FAILED: []`, `REFUNDED: []` -- **terminal**, yahan se kahin nahi. `SUCCEEDED` charge ke liye terminal hai -- wapas `PROCESSING`/`FAILED` kabhi nahi, sirf aage refund ki taraf.
+- `PARTIALLY_REFUNDED -> PARTIALLY_REFUNDED` -- doosra partial refund; status same, `refunded_minor` badhta hai.
+- `allowedFrom(target)` -- ulta sawaal: "`SUCCEEDED` par kin states se aa sakte hain?" Ye list SQL ke `$4` mein jaati hai.
+
+#### Conditional UPDATE -- check aur write ek hi statement mein
+
+```sql
+UPDATE payments SET status = $2, psp_payment_id = COALESCE($3, psp_payment_id), version = version + 1, updated_at = now()
+WHERE id = $1 AND status = ANY($4::text[])
+RETURNING *;
+```
+
+- `status = ANY($4::text[])` -- update **tabhi** jab current status allowed "from" list mein ho. Check aur write ek atomic statement -- beech mein koi nahi ghus sakta (Postgres row lock).
+- `COALESCE($3, psp_payment_id)` -- naya PSP id aaya toh set, warna purana rakho (late webhook null bheje toh id na mite).
+- `version = version + 1` -- har transition ka counter; debugging aur optimistic checks ke liye.
+- **`rowCount = 0`** -> matlab kisi aur ne pehle hi move kar diya (usually webhook). **Error nahi** -- re-read karo aur current state ko jawab maano. Idempotent apply ka matlab hi yahi hai: "desired state already hai? badhiya."
+
+#### Out-of-order webhooks
+
+Upar wala scenario ab:
+
+```
+10:00:01  payment.succeeded   PROCESSING -> SUCCEEDED     rowCount 1  (ledger + outbox likha)
+10:00:02  payment.pending     target PROCESSING, allowedFrom = ['CREATED'], current SUCCEEDED -> rowCount 0 -> ignore
+10:00:03  worker: FAILED      allowedFrom('FAILED') = ['PROCESSING','REQUIRES_ACTION'], current SUCCEEDED -> rowCount 0 -> ignore
+```
+
+Hum **timestamps par bharosa nahi karte** (PSP ke events ke timestamps aur hamari clock alag), **state machine par** karte hain. Terminal state ek "one-way door" hai.
+
+(Ek honest edge case: agar PSP khud bole "pehle succeeded bola tha, ab reversed/charged back" -- woh ek **naya business event** hai (dispute/chargeback), purane transition ka ulta nahi. Usko reversing ledger entries ke saath alag flow chahiye. Scope se bahar.)
+
+> **Interview line:** "Status ek state machine hai aur har transition ek conditional UPDATE hai -- `WHERE id = $1 AND status = ANY(allowedFrom)`. rowCount 0 ka matlab kisi aur ne pehle move kiya; main re-read karke usi ko jawab maanta hoon. Terminal states kabhi peeche nahi jaate, isliye late ya out-of-order webhooks khud ignore ho jaate hain -- mujhe timestamps compare nahi karne padte."
+
+---
+
+### Algorithm 4 -- Double-Entry Ledger
+
+#### Naive approach -- ek balance column
+
+```sql
+UPDATE merchant_accounts SET balance = balance + 499.00 WHERE id = 'shopkart';
+```
+
+Kya galat hai?
+
+- **History nahi:** balance 10,00,000 hai. Kyun? Kaunse payments, kaunse refunds, kaunsi fees? Koi jawab nahi. Auditor aur finance team ka pehla sawaal yahi hoga.
+- **Bug silently sab bigaad deta hai:** kisi code path ne do baar `+499` kar diya -> balance galat, aur pakadne ka koi tareeka nahi (koi doosra record jisse compare karein).
+- **Correction = overwrite:** galti theek karne ke liye number badal diya -> purana sach gaya. Finance mein ye illegal-level bura hai.
+
+#### Double-entry -- 500 saal purana accounting ka idea
+
+**Simple idea:** paisa kabhi "paida" ya "gayab" nahi hota, sirf **ek account se doosre** mein jaata hai. Har money movement = ek `transaction_id` ke andar kam se kam 2 entries: ek **DEBIT**, ek **CREDIT**, aur **sum(DEBIT) = sum(CREDIT)** hamesha.
+
+**Real-life analogy:** ghar ki diary jismein har line do jagah likhi jaati hai: "Rs 500 wallet se gaye" **aur** "Rs 500 sabzi mein aaye". Kabhi wallet aur kharche ka total match na ho -> galti turant dikhti hai.
+
+Hamare accounts (spec):
+
+| Account | Matlab |
+|---|---|
+| `psp_clearing` | Woh paisa jo PSP ne customer se le liya aur hamein settle karna hai (PSP par hamara "lena") |
+| `sales_revenue` | ShopKart ki kamaai |
+| `psp_fees` | PSP ki fee (hamara kharcha) |
+
+#### Worked example -- Rs 499 payment, Rs 100 refund, PSP fee
+
+Amounts **paise** mein (integer minor units). Fee rate 2% sirf example ke liye maana hai (asli rate PSP contract par depend karta hai).
+
+```
+t1  payment.succeeded  (49,900)
+    DEBIT   psp_clearing    49900
+    CREDIT  sales_revenue   49900
+
+t2  partial refund     (10,000)
+    DEBIT   sales_revenue   10000
+    CREDIT  psp_clearing    10000
+
+t3  PSP fee on settlement (2% of 49,900 = 998)
+    DEBIT   psp_fees          998
+    CREDIT  psp_clearing      998
+```
+
+Har transaction apne andar balanced (49900 = 49900, 10000 = 10000, 998 = 998). Ab accounts ka final hisaab:
+
+| Account | Debits | Credits | Net |
+|---|---|---|---|
+| `psp_clearing` | 49,900 | 10,000 + 998 = 10,998 | **38,902 debit** (PSP hamein Rs 389.02 dega) |
+| `sales_revenue` | 10,000 | 49,900 | **39,900 credit** (kamaai Rs 399.00) |
+| `psp_fees` | 998 | 0 | **998 debit** (kharcha Rs 9.98) |
+
+Check: net debits 38,902 + 998 = **39,900** = net credits 39,900. Balanced. (node se verify kiya.) Aur sense bhi banta hai: Rs 399 ki sale mein se Rs 9.98 fee kati, PSP Rs 389.02 bhejega.
+
+**Rules (spec):**
+
+- **Append-only:** `ledger_entries` par UPDATE/DELETE ki **DB grant hi nahi** (app user ke paas sirf INSERT, SELECT). Galti hui? **Reversing entry** likho (ulti direction, same amount) -- history poori rehti hai.
+- Ledger entries **usi transaction** mein likhi jaati hain jisne payment ko SUCCEEDED kiya (Tx 2 ya webhook ka tx) -- ya dono commit, ya koi nahi. (Exactly-once kaise, Part 14 Scenario 3.)
+
+#### Invariant check -- ledger kabhi unbalanced nahi
+
+```sql
+SELECT transaction_id,
+       sum(amount_minor) FILTER (WHERE direction = 'DEBIT')  AS debits,
+       sum(amount_minor) FILTER (WHERE direction = 'CREDIT') AS credits
+FROM ledger_entries
+WHERE created_at > now() - interval '1 day'
+GROUP BY transaction_id
+HAVING sum(CASE WHEN direction = 'DEBIT'  THEN amount_minor ELSE 0 END)
+    <> sum(CASE WHEN direction = 'CREDIT' THEN amount_minor ELSE 0 END);
+```
+
+**Code Explanation:**
+
+- `GROUP BY transaction_id` -- har money movement ka ek group.
+- `FILTER (WHERE ...)` -- Postgres ka clean aggregate filter; report ke liye debits/credits alag dikhao.
+- `HAVING ... <> ...` -- sirf woh transactions jinke debit aur credit barabar nahi. `CASE ... ELSE 0` isliye ki kisi transaction mein sirf ek side ho (bug) toh `FILTER` wala sum NULL deta aur `NULL <> x` NULL hota -- row chhoot jaati. CASE wala 0 deta hai, toh one-sided transaction bhi pakdi jaati hai.
+- `created_at > now() - interval '1 day'` -- har baar 25 TB scan mat karo; recent window check karo (`ix_ledger_account_time` aur monthly partitions help karte hain).
+- Result rows ki count -> metric `ledger_imbalance_total`. **Hamesha 0 hona chahiye**; 1 bhi aaya -> page on-call.
+
+#### Money = integer minor units, floats kabhi nahi
+
+**Minor unit ka matlab:** currency ki sabse chhoti unit. INR mein paise (1 rupee = 100 paise). Rs 499.00 = **49900**.
+
+Floats kyun tootte hain -- node mein khud chala ke dekho:
+
+```
+> 0.1 + 0.2
+0.30000000000000004
+> 0.1 + 0.2 === 0.3
+false
+> 19.99 * 100
+1998.9999999999998
+> Math.floor(19.99 * 100)
+1998                          // 1 paisa gaya
+```
+
+JS `number` binary floating point (IEEE 754 double) hai -- `0.1` binary mein exactly represent hi nahi hota (jaise 1/3 decimal mein 0.333...). Rs 19.99 ko paise mein badla aur `floor` kiya -> **1998**. Lakhon transactions par ye paise judte hain, aur ledger ka `debit = credit` check toot jaata hai.
+
+Rules:
+
+- DB: `amount_minor BIGINT` + `currency CHAR(3)`. Kabhi `FLOAT`/`REAL` nahi.
+- JS: `number` theek hai **jab tak integer hai** -- `Number.isSafeInteger(x)` se check karo. Safe limit `9,007,199,254,740,991` paise = ~**90 lakh crore rupees** -- ek payment ke liye kaafi.
+- **Trap:** `node-postgres` BIGINT ko by default **string** mein deta hai (`"49900"`), kyunki int8 JS number mein safe fit ki guarantee nahi. `money.ts` mein parse karo aur `Number.isSafeInteger` check karo -- string ko seedha `+` kiya toh `"49900" + 100 = "49900100"`.
+- Percentages (fee) ka math integer par karo aur **rounding rule explicit** rakho (`Math.round`, ya jo PSP contract kahe).
+- **Currency:** sab currencies mein 2 decimal nahi hote -- JPY mein 0, KWD/BHD mein 3. Isliye "divide by 100" hardcode mat karo; display ke waqt currency ke exponent se format karo. Aur alag currencies ke amounts **kabhi add mat karo** -- ledger check bhi per currency.
+
+> **Interview line:** "Ek balance column mein history nahi hoti aur bug silently balance bigaad deta hai. Main append-only double-entry ledger rakhunga -- har movement ek transaction_id ke andar debit aur credit entries, jinka sum barabar. Rs 499 payment = debit psp_clearing, credit sales_revenue; refund ulta; fee settlement par. Ek `GROUP BY transaction_id HAVING debits <> credits` check continuously chalta hai aur uska metric hamesha 0 hona chahiye. Amounts BIGINT paise mein, floats kabhi nahi -- 19.99 * 100 JS mein 1998.9999 aata hai."
+
+---
+
+### Algorithm 5 -- Retries: Exponential Backoff + Full Jitter + Circuit Breaker
+
+#### Naive approach -- fail hua? turant dobara
+
+```ts
+// BUGGY
+for (let i = 0; i < 5; i++) {
+  try { return await psp.charge(input); } catch { /* turant dobara */ }
+}
+```
+
+- PSP overloaded hai (isliye fail hua). Hum turant 5x maar rahe hain -> load **5x** -> PSP aur zyada girta hai. Retry storm.
+- 1,000 requests ek saath fail hui -> sab ek saath retry -> sab ek saath fail. **Thundering herd.**
+- Card decline par bhi retry -> bank 5 baar decline, customer ko 5 SMS, kuch banks fraud flag laga dete hain.
+
+#### Exponential backoff + full jitter
+
+**Exponential backoff:** har retry se pehle wait **double** karo (200 ms, 400, 800...) -- PSP ko saans lene ka time.
+**Jitter:** us wait mein **randomness** -- taaki sab clients ek hi pal par wapas na aayein.
+
+Formula (AWS Architecture Blog ka "full jitter"):
+
+```
+ceiling(n) = min(cap, base x 2^(n-1))        n = retry number (1, 2, 3, ...)
+delay(n)   = random(0, ceiling(n))
+base = 200 ms, cap = 5000 ms
+```
+
+| Retry # | base x 2^(n-1) | Ceiling (cap 5 s) | Actual delay (full jitter) |
+|---|---|---|---|
+| 1 | 200 | 200 ms | 0 - 200 ms |
+| 2 | 400 | 400 ms | 0 - 400 ms |
+| 3 | 800 | 800 ms | 0 - 800 ms |
+| 4 | 1600 | 1600 ms | 0 - 1600 ms |
+| 5 | 3200 | 3200 ms | 0 - 3200 ms |
+| 6 | 6400 | **5000 ms** (capped) | 0 - 5000 ms |
+
+(Values node se verify kiye.) Example: retry 2 par random = 0.9 aaya -> `floor(0.9 x 400)` = **360 ms**.
+
+**Jitter ka asar (node simulation, 1,000 clients, retry 3):**
+
+- Bina jitter: saare **1,000 ek hi pal (800 ms)** par wapas -> fir spike.
+- Full jitter: 0-800 ms mein faile -> har 100 ms ke bucket mein ~108-142 requests. Peak **~7x kam**.
+
+**Inline retry budget:** user request ke andar sirf **2 retries** (max ~600 ms extra wait). Kyunki user wait kar raha hai aur p99 ~2-3 s ka target hai. Uske baad bhi unknown -> payment `PROCESSING`, client ko **202**, aur recovery worker (har 1 min) apne relaxed backoff se kaam poora karta hai.
+
+#### Kaunse errors retryable hain?
+
+| Error | Retry? | Kyun |
+|---|---|---|
+| Connection error (`ECONNREFUSED`, `ECONNRESET`, DNS `EAI_AGAIN`) | **Haan** | Network hiccup. Same idempotency key -> safe |
+| `500`, `502`, `503`, `504` | **Haan** | PSP side temporary problem |
+| `429 Too Many Requests` | **Haan, `Retry-After` ke baad** | PSP ka rate limit -- uska bataya wait respect karo (Rate Limiter se yaad hai: `Retry-After` = minimum wait) |
+| Hamara 10 s timeout | **Inline nahi** | Budget khatam. Result unknown -> `PROCESSING`/202, resume baad mein (PSP se status poochh ke) |
+| `400` bad request, `401` (hamari API key galat) | **Nahi** | Retry se theek nahi hoga. 401 = config bug -> alert |
+| Card declined / insufficient funds (4xx ya `outcome: 'failed'`) | **Kabhi nahi** | Ye **business answer** hai, error nahi -> payment `FAILED`, `201` |
+
+Aur **har retry mein same PSP idempotency key (= payment id)**. Isliye "network error par retry" safe hai -- request pehli baar pahunch gayi thi toh PSP pehla result hi lautayega.
+
+```ts
+// src/psp/razorpay.client.ts (helper)
+const RETRYABLE_NET = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'EAI_AGAIN']);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function classify(err: any): { retryable: boolean; retryAfterMs?: number } {
+  if (err.code && RETRYABLE_NET.has(err.code)) return { retryable: true };
+  const s = err.status as number | undefined;
+  if (s === 429) return { retryable: true, retryAfterMs: Number(err.headers?.['retry-after'] ?? 1) * 1000 };
+  if (s !== undefined && s >= 500) return { retryable: true };
+  return { retryable: false };                       // 4xx, timeout, unknown
+}
+
+export async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2, baseMs = 200, capMs = 5000): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const c = classify(err);
+      if (!c.retryable || attempt > maxRetries) throw err;
+      if (c.retryAfterMs !== undefined && c.retryAfterMs > capMs) throw err;
+      const ceiling = Math.min(capMs, baseMs * 2 ** (attempt - 1));
+      await sleep(Math.max(c.retryAfterMs ?? 0, Math.floor(Math.random() * ceiling)));
+    }
+  }
+}
+
+// use: withRetry(() => http.post('/payments', body, { headers: { 'Idempotency-Key': input.idempotencyKey }, timeout: 10_000 }))
+```
+
+**Code Explanation:**
+
+- `RETRYABLE_NET` -- Node ke socket error codes jahan retry sense banata hai.
+- `classify` -- ek jagah decide karo "retry karein?". Default **no** -- unknown cheez par retry mat karo (fail closed).
+- `429` -> PSP ka `Retry-After` (seconds) -> ms. Header na ho toh 1 s.
+- `for (let attempt = 1; ; attempt++)` -- attempt 1 pehli try hai; `attempt > maxRetries` par haar maano -> total 1 + 2 = 3 calls max.
+- `retryAfterMs > capMs` -> PSP 30 s wait bol raha hai -- user request mein itna nahi rukenge; error upar jaaye, payment `PROCESSING` + 202, worker baad mein.
+- `Math.min(capMs, baseMs * 2 ** (attempt - 1))` -- exponential ceiling, cap ke saath. `Math.random() * ceiling` -- full jitter.
+- `Math.max(retryAfterMs, jitter)` -- PSP ka bataya minimum kabhi todo mat.
+- Usage line -- `Idempotency-Key` header **loop ke bahar** fix hai (`input.idempotencyKey` = payment id). Har retry mein same key. Yahi poora safety ka base hai.
+
+#### Circuit breaker -- PSP down hai toh maarte mat raho
+
+**Problem:** PSP poora down. Har request 10 s timeout tak latakti hai. 1,000 TPS x 10 s = **10,000 requests in-flight** -- sockets, memory, event loop sab bhar jaate hain; hamari service bhi girti hai.
+
+**Circuit breaker ka matlab:** ghar ka MCB -- short circuit hua toh bijli kaat do, baar baar spark mat hone do.
+
+```
+CLOSED  --(last 20 PSP calls mein >= 50% fail)-->  OPEN
+OPEN    --(30 s baad)-->                            HALF_OPEN   (ek trial call jaane do)
+HALF_OPEN --(trial pass)--> CLOSED        --(trial fail)--> OPEN
+```
+
+(Numbers example hain; tune karo.)
+
+- **OPEN mein:** PSP ko call hi nahi -> turant **`503 PSP_UNAVAILABLE`**. Ye check **Tx 1 se pehle** karo -- toh na key claim hui, na payment bana, **kuch charge nahi hua**, client same key se baad mein safely retry kare.
+- Breaker **per instance** memory mein hota hai (har Node process apna) -- simple, aur kaafi. Metric `psp_errors_total{op,reason}` se dikhta hai.
+- Rate Limiter se contrast: wahan limiter gire toh **fail open** (API chalne do). Yahan PSP pe shak ho toh **fail closed** -- "abhi try nahi ho sakta" bolna, double charge ke risk se behtar.
+
+> **Interview line:** "PSP calls par exponential backoff with full jitter -- delay = random(0, min(cap, base x 2^n)) -- taaki retry storm aur thundering herd na ho. Retry sirf network errors, 5xx aur 429 par (Retry-After respect karke); declines aur 4xx par kabhi nahi. Har retry mein same PSP idempotency key. User request mein sirf 2 retries, phir 202 PROCESSING aur recovery worker. PSP down ho toh circuit breaker open -- Tx 1 se pehle hi 503, kuch charge nahi hota."
+
+---
+
+### Algorithm 6 -- Transactional Outbox
+
+**Problem (dual write):** payment SUCCEEDED hone par do jagah likhna hai -- **Postgres** (state + ledger) aur **Kafka** (`payment.succeeded` for Order + Notification services). Do alag systems, ek transaction nahi.
+
+#### Naive 1 -- pehle DB commit, phir Kafka publish
+
+```
+Tx 2 COMMIT (payment SUCCEEDED)   OK
+--- process crash / Kafka down ---
+kafka.send('payment.succeeded')   KABHI NAHI HUA
+```
+
+**Lost event:** paisa kat gaya, lekin Order Service ko khabar nahi -> order "pending payment" mein atka, customer ko confirmation nahi, shayad order auto-cancel.
+
+#### Naive 2 -- pehle Kafka publish, phir DB commit
+
+```
+kafka.send('payment.succeeded')   OK -> Order Service ne order confirm kar diya
+Tx 2 ...                          FAIL (constraint / crash) -> ROLLBACK
+```
+
+**Phantom event:** Order Service ne ek aise payment ke basis par order ship kar diya jo hamare DB mein SUCCEEDED hai hi nahi.
+
+(Kafka transactions bhi DB + Kafka ko ek atomic unit nahi banate -- woh Kafka ke andar ka atomicity hai.)
+
+#### Solution -- outbox row usi transaction mein
+
+**Outbox ka matlab:** "bhejne wali chitthiyon ki tray" -- event ko DB ki ek table mein likho, **business data ke saath usi transaction mein**. Commit hua toh event bhi pakka; rollback hua toh event bhi gayab. Phir ek alag **relay worker** tray se utha ke Kafka mein daalta hai.
+
+```
+Tx 2:  UPDATE payments -> SUCCEEDED
+       INSERT ledger_entries (2 rows)
+       INSERT outbox (event_id 'evt_<ULID>', event_type 'payment.succeeded', payload)
+       UPDATE idempotency_keys -> COMPLETED
+       COMMIT    <- sab ek saath, ya kuch nahi
+
+Relay (src/workers/outbox-relay.ts), loop:
+```
+
+```sql
+BEGIN;
+SELECT id, event_id, aggregate_id, event_type, payload
+FROM outbox
+WHERE published_at IS NULL
+ORDER BY id
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+-- app: kafka.send(topic 'payments.events', key = aggregate_id, value = payload + event_id), acks = all
+UPDATE outbox SET published_at = now() WHERE id = ANY($1::bigint[]);
+COMMIT;
+```
+
+**Code Explanation:**
+
+- `WHERE published_at IS NULL` -- abhi tak na bheje gaye events. Partial index `ix_outbox_unpublished` sirf inhi rows ka hai, toh ye query table kitni bhi badi ho, fast hai.
+- `FOR UPDATE SKIP LOCKED` -- **multiple relay instances** (HA ke liye 2-3) ek hi rows na uthayein. Jo rows kisi aur relay ne lock ki hain, unhe **skip** karo, wait mat karo. Har relay ko alag batch milta hai.
+- `key = aggregate_id` (payment id) -- Kafka same key ko same partition par rakhta hai -> ek payment ke events ka order usi partition mein bana rehta hai.
+- `acks = all` -- Kafka ne durably likh liya, tabhi aage badho.
+- `UPDATE ... published_at = now()` + `COMMIT` -- tray se hatao. Transaction sirf ek Kafka send jitna (few ms) khula hai -- PSP jaisa 10 s ka call nahi, isliye acceptable.
+- **"`id > lastSeenId`" cursor kyun nahi?** BIGSERIAL id insert ke waqt milta hai, commit baad mein. Tx with id 101 pehle commit ho gaya, id 100 wala baad mein -> cursor 101 par aage badh gaya -> **100 hamesha ke liye chhoot gaya**. `published_at IS NULL` flag ye problem nahi rakhta.
+
+#### At-least-once + consumer dedupe
+
+Relay ne Kafka mein bhej diya, `COMMIT` se pehle crash -> rows abhi bhi unpublished -> agla relay **dobara bhejega**. Toh delivery **at-least-once** hai: event kabhi khoega nahi, lekin **duplicate ho sakta hai**.
+
+Isliye consumers idempotent hain (spec):
+
+```sql
+-- Order Service, apne DB mein, ek hi transaction:
+INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING;
+-- rowCount 0 -> pehle process ho chuka -> skip (commit, ack)
+-- rowCount 1 -> UPDATE orders SET status = 'PAID' ... ; COMMIT
+```
+
+Dedupe row aur business update **ek transaction** mein -- warna wahi dual-write problem consumer side par.
+
+**Honest caveat -- ordering:** 2 relays `SKIP LOCKED` se alag batches uthate hain. Payment X ka `payment.succeeded` relay A ke batch mein aur `refund.succeeded` relay B ke batch mein -- B pehle bhej de toh Kafka mein ulta order. Fix options: consumers apne side bhi state machine rakhein (refund aaya aur order abhi PAID nahi -> retry later), ya payload mein `version` bhejein. Ya simple: ek hi active relay (leader) -- 1,000 TPS ke events ek relay aaram se bhej leta hai.
+
+Cleanup: published rows ko kuch din baad batch mein delete / partition drop.
+
+> **Interview line:** "DB commit aur Kafka publish do alag systems hain -- commit ke baad publish se pehle crash = lost event, pehle publish = phantom event. Main outbox pattern use karunga: event ko payment + ledger ke saath usi Postgres transaction mein outbox table mein likhta hoon, aur relay worker `FOR UPDATE SKIP LOCKED` se batch utha ke Kafka mein bhejta hai, phir published mark karta hai. Ye at-least-once hai, isliye consumers event_id par `processed_events` table se dedupe karte hain."
+
+---
+
+### Algorithm 7 -- Reconciliation
+
+**Problem:** saari upar ki mehnat ke baad bhi, hamare records aur PSP ke records alag ho sakte hain -- bug, missed webhook, manual PSP dashboard action, crash ka koi edge case. **Reconciliation ka matlab:** roz hamare records ko PSP ke **settlement report** (PSP ki official list: kaunse payments, kitne amount, kitni fee, kab settle) se line by line milana.
+
+**Real-life analogy:** mahine ke end mein apni passbook ko bank statement se milana.
+
+#### Algorithm
+
+1. PSP ka daily settlement file download karo (`src/jobs/reconciliation.job.ts`), rows ko ek staging table mein load karo (`psp_payment_id`, amount, fee, status, date).
+2. **Match key = `psp_payment_id`** (hamare paas `ux_payments_psp_id` unique index hai). Ek `FULL OUTER JOIN`:
+
+```sql
+SELECT p.id, p.status, p.amount_minor, s.psp_payment_id, s.status AS psp_status, s.amount_minor AS psp_amount
+FROM (SELECT * FROM payments WHERE psp = 'razorpay' AND updated_at >= $1 AND updated_at < $2) p
+FULL OUTER JOIN psp_settlement_rows s ON s.psp_payment_id = p.psp_payment_id
+WHERE p.id IS NULL                                  -- missing on our side
+   OR s.psp_payment_id IS NULL                      -- missing at PSP
+   OR p.amount_minor <> s.amount_minor              -- amount mismatch
+   OR p.status IS DISTINCT FROM map_status(s.status); -- status mismatch
+```
+
+(`psp_settlement_rows` aur `map_status` illustrative hain -- staging table aur PSP status ko hamare status mein map karne ka function.)
+
+3. Har mismatch ko categorize karo, review queue mein daalo, `reconciliation_mismatches_total` badhao, alert.
+4. Matched rows par **fee entries** likho: DEBIT `psp_fees` / CREDIT `psp_clearing`.
+
+| Category | Matlab | Kaise hua hoga | Action |
+|---|---|---|---|
+| **Missing on our side** | PSP ne charge kiya, hamare paas us `psp_payment_id` ka payment nahi | Crash/timeout ke baad `psp_payment_id` record nahi hua | PSP row ke merchant reference (agar report deta hai) se hamara payment dhoondho -> stuck `PROCESSING` hai toh recovery chalao. Kuch nahi mila -> **customer charged, order nahi** -> review + refund |
+| **Missing at PSP** | Hum `SUCCEEDED` bolte hain, PSP report mein nahi | Settlement timing (T+1/T+2), ya galat success mark | Pehle 1-2 din wait (next file). Phir bhi nahi -> high-priority alert; order shayad bina paise ship hua |
+| **Amount mismatch** | Dono mein hai, amount alag | Bug, currency/rounding galti, partial capture | Kabhi auto-fix nahi -> manual review, correction = reversing + new ledger entries |
+| **Status mismatch** | Hum `FAILED`, PSP `captured` (ya ulta) | Missed/late webhook, galat timeout handling | Customer ka paisa kata, order failed -> state machine se nahi (terminal), review queue se fix / refund |
+
+- Recon **ledger ko UPDATE nahi karta** -- hamesha naye (correcting) entries.
+- Metric `reconciliation_mismatches_total` roz ~0 hona chahiye; spike = kahin systematic bug.
+
+> **Interview line:** "Kitna bhi idempotency ho, main roz PSP ke settlement report se reconcile karunga -- psp_payment_id par full outer join. Chaar categories: humare yahan missing, PSP par missing, amount mismatch, status mismatch. Har mismatch review queue mein jaata hai aur alert hota hai; fixes hamesha naye ledger entries se, kabhi overwrite nahi. Fee entries bhi yahi job likhta hai."
+
+---
+
+## PART 14 -- Concurrency: same payment ko do Node instances ek saath chhuein
+
+### Pehle: race kahan se aata hai?
+
+Pichle systems se yaad karo:
+
+1. Node.js mein **do `await` ke beech ka code atomic** hai (single thread, ek process ke andar).
+2. **`await` ke aar-paar koi guarantee nahi**, aur N Node processes ek doosre ki memory dekhte hi nahi.
+
+Rate limiter mein atomicity **Redis Lua script** deta tha. Payment system mein wahi kaam **Postgres** karta hai -- teen tools se:
+
+- **Unique constraints / indexes** -- "do rows same key ke saath exist nahi kar sakti".
+- **Conditional UPDATE** (`WHERE status = ANY(...)`, `WHERE locked_until < now()`) -- check + write ek statement.
+- **Transactions** -- kai writes ek saath commit ya rollback.
+
+Ek Postgres detail jo neeche har scenario mein kaam aayegi: **READ COMMITTED** mein jab do transactions **same row** ko UPDATE karti hain, doosri **row lock par ruk jaati hai**. Pehli commit ho -> doosri row ka **naya version** dekh ke apna `WHERE` **dobara evaluate** karti hai. Condition ab false -> 0 rows update. Isi se conditional updates race-safe hain.
+
+### Scenario 1 -- Same Idempotency-Key, ek saath do requests (double-tap / aggressive retry)
+
+App ne 1 s timeout rakha tha aur turant retry kiya -- pehli request abhi chal hi rahi hai. LB ne dono alag instances par bheji:
+
+```
+Time   Instance A                                      Instance B
+t1     BEGIN; INSERT key K ... ON CONFLICT DO NOTHING
+       -> row mila (uncommitted)  => owner
+t2                                                     BEGIN; INSERT key K ... ON CONFLICT DO NOTHING
+                                                       -> A ka uncommitted row dikha -> WAIT (A commit/rollback tak)
+t3     load order, INSERT payment, COMMIT (Tx 1)
+t4                                                     A committed -> conflict -> DO NOTHING, 0 rows
+t5                                                     SELECT key K -> IN_PROGRESS, locked_until = t1 + 60s
+t6                                                     UPDATE ... WHERE locked_until < now() -> 0 rows
+                                                       -> 409 IDEMPOTENCY_IN_PROGRESS
+t7     PSP call, Tx 2 -> COMPLETED
+t8                                                     (client retry ke baad) -> replay stored 201
+```
+
+- **t2 ka wait** asli magic hai: `INSERT ... ON CONFLICT` ko unique index mein kisi aur transaction ka **uncommitted** row mile toh Postgres **ruk ke dekhta hai** ki woh commit hoga ya rollback. Commit -> conflict (DO NOTHING). Rollback (e.g. A ko 404 mila) -> B ka insert ho jaata hai aur **B owner** ban jaata hai. Dono cases sahi.
+- Tx 1 chhota hai (few ms), isliye ye wait bhi few ms ka.
+- t5 par `SELECT` A ka committed row dekh leta hai -- READ COMMITTED mein har statement ka naya snapshot.
+- **Exactly one owner.** Koi lock service nahi, bas primary key `(customer_id, key)`.
+
+### Scenario 2 -- Double-click, do ALAG keys
+
+Buggy frontend: har click par naya UUID. Do requests, keys K1 aur K2, same `ord_123`:
+
+```
+Time   Instance A (K1)                                 Instance B (K2)
+t1     claim K1 -> owner                               claim K2 -> owner       (alag keys, koi conflict nahi)
+t2     INSERT payments (ord_123, CREATED)
+t3                                                     INSERT payments (ord_123, CREATED)
+                                                       -> ux_payments_one_active_per_order par A ka uncommitted row -> WAIT
+t4     COMMIT
+t5                                                     unique_violation (23505) -> ROLLBACK (K2 claim bhi gaya)
+                                                       -> 409 ORDER_ALREADY_PAID
+```
+
+- **Partial unique index** `ON payments (order_id) WHERE status IN ('CREATED','PROCESSING','REQUIRES_ACTION','SUCCEEDED','PARTIALLY_REFUNDED','REFUNDED')` -- ek order ki **ek hi active/successful** payment. Idempotency keys se **independent** doosra safety net.
+- `FAILED` list mein **nahi** hai -- decline ke baad nayi key se naya payment allowed. Yahi naive "order check" nahi kar pata tha.
+- Controller Postgres error code `23505` + constraint name `ux_payments_one_active_per_order` ko map karta hai -> 409. Tx 1 poora rollback, toh K2 ka key row bhi nahi bacha.
+
+### Scenario 3 -- Webhook sync response se pehle aa gaya
+
+PSP ne charge kiya, **webhook turant bheja** (instance B par gaya), aur A ka HTTP response network mein 2 s latak gaya:
+
+```
+Time   Instance A (sync path)                          Instance B (webhook)
+t1     psp.charge(...) ... waiting
+t2                                                     verify signature; INSERT webhook_events ON CONFLICT DO NOTHING
+                                                       BEGIN
+                                                       UPDATE payments SET status='SUCCEEDED' WHERE id=pay_X AND status = ANY('{PROCESSING,REQUIRES_ACTION}')
+                                                       -> rowCount 1  (B ne transition kiya)
+                                                       INSERT ledger_entries (2 rows); INSERT outbox payment.succeeded
+                                                       COMMIT; respond 200
+t3     response aaya: succeeded
+       BEGIN (Tx 2)
+       UPDATE ... WHERE status = ANY(...) -> rowCount 0
+       re-read -> SUCCEEDED  => ledger/outbox SKIP
+       key COMPLETED with response 201 SUCCEEDED
+       COMMIT
+```
+
+**Ledger exactly once kaise?** Rule: **ledger entries aur outbox event sirf wahi transaction likhti hai jiska conditional UPDATE rowCount 1 laaya** -- yaani jisne *sach mein* transition kiya. Dono paths yahi ek shared function use karte hain:
+
+```ts
+// src/services/payment.service.ts
+export async function applyPspResult(tx: PoolClient, paymentId: string, r: PspChargeResult) {
+  if (r.outcome === 'unknown') return { transitioned: false, payment: await paymentRepo.findById(tx, paymentId) };
+  const target: PaymentStatus =
+    r.outcome === 'succeeded' ? 'SUCCEEDED' : r.outcome === 'failed' ? 'FAILED' : 'REQUIRES_ACTION';
+
+  const updated = await paymentRepo.transition(tx, paymentId, target, r.pspPaymentId ?? null, allowedFrom(target));
+  if (!updated) {
+    return { transitioned: false, payment: await paymentRepo.findById(tx, paymentId) };
+  }
+  if (target === 'SUCCEEDED') {
+    await ledgerService.recordPaymentSucceeded(tx, updated);          // DEBIT psp_clearing / CREDIT sales_revenue
+    await outboxRepo.insert(tx, 'payment.succeeded', updated);
+  } else if (target === 'FAILED') {
+    await outboxRepo.insert(tx, 'payment.failed', updated);
+  }
+  return { transitioned: true, payment: updated };
+}
+```
+
+**Code Explanation:**
+
+- `outcome === 'unknown'` -- timeout: koi transition nahi, payment `PROCESSING` hi rahega (202 path).
+- `target` -- PSP ka outcome hamare status mein map.
+- `paymentRepo.transition(...)` -- spec ka conditional UPDATE; `RETURNING *` se row ya `null`.
+- `if (!updated)` -- rowCount 0: kisi aur ne pehle transition kiya. Current row re-read karke lautao. **Ledger/outbox nahi likhte.** Error bhi nahi.
+- `if (target === 'SUCCEEDED')` -- sirf transition karne wale ke paas ye branch aati hai -> ledger ki 2 entries + event **ek hi baar**, usi transaction mein (atomic).
+- `tx` parameter -- caller transaction deta hai; A ke case mein wahi Tx 2 key ko bhi COMPLETED karta hai.
+
+Agar **dono ek saath** UPDATE karein (t2 aur t3 overlap)? Doosra row lock par rukega, pehla commit hoga, doosra naye version par `status = ANY('{PROCESSING,REQUIRES_ACTION}')` dobara check karega -> ab `SUCCEEDED` -> 0 rows. Same result.
+
+Webhook path idempotency key ko nahi chhoota. Agar A crash ho jaata, toh client ka retry / recovery worker key resume karta, payment already `SUCCEEDED` dekhta, aur bas key ko COMPLETED kar deta.
+
+### Scenario 4 -- Do partial refunds ek saath, total amount se zyada
+
+Payment 49,900. Support agent aur customer dono ne ek saath 30,000 ka refund maanga (alag keys):
+
+**Naive (read-check-write):**
+
+```
+Time   Instance A                              Instance B
+t1     SELECT refunded_minor -> 0
+t2                                             SELECT refunded_minor -> 0
+t3     0 + 30000 <= 49900 OK -> UPDATE = 30000
+t4                                             0 + 30000 <= 49900 OK -> UPDATE = 30000   (lost update!)
+       Dono ne PSP se 30,000 refund kara diya = 60,000 refund on a 49,900 payment
+```
+
+**Atomic conditional UPDATE (reserve):**
+
+```sql
+UPDATE payments SET refunded_minor = refunded_minor + $2, version = version + 1, updated_at = now()
+WHERE id = $1 AND status IN ('SUCCEEDED', 'PARTIALLY_REFUNDED') AND refunded_minor + $2 <= amount_minor
+RETURNING *;
+```
+
+```
+t1   A: UPDATE (+30000) -> 0 + 30000 <= 49900 -> refunded_minor = 30000 (row locked)
+t2   B: UPDATE (+30000) -> row lock par WAIT
+t3   A: INSERT refunds (PENDING) ... COMMIT
+t4   B: naya version: 30000 + 30000 = 60000 <= 49900? NO -> 0 rows -> 422 REFUND_EXCEEDS_AMOUNT
+```
+
+- Check aur increment **ek statement** -- bich mein koi nahi ghus sakta.
+- **Last line of defence:** `CHECK (refunded_minor >= 0 AND refunded_minor <= amount_minor)`. Kal kisi naye code path ne condition bhool ke seedha `+ $2` kiya, tab bhi DB 60,000 likhne se mana kar dega (`check_violation`). App bug ho, data phir bhi sahi.
+- Is reserve ke baad PSP refund call (idempotency key = refund id `re_<ULID>`), bina transaction. PSP ne refund FAIL kiya toh reservation wapas: `refunded_minor = refunded_minor - $2` + refund `FAILED`. Success par refund `SUCCEEDED`, ledger (DEBIT sales_revenue / CREDIT psp_clearing), outbox `refund.succeeded`, payment status transition.
+
+**`SELECT ... FOR UPDATE` se compare:**
+
+| | Atomic conditional UPDATE | `SELECT ... FOR UPDATE` then UPDATE |
+|---|---|---|
+| Statements | 1 | 2 (+ JS mein check) |
+| Lock kab tak | Statement + commit tak | SELECT se commit tak (JS logic ke dauraan bhi) |
+| Complex rules (e.g. "refund 30 din ke andar, fraud check") | Mushkil -- sab SQL mein | Aasaan -- row lock ke andar JS mein kuch bhi check |
+| Risk | Kam | Koi `await psp.refund()` lock ke andar daal de -> 10 s lock (Algorithm 2 wali galti) |
+
+Simple numeric rule hai toh **atomic UPDATE**. Complex multi-field rules ho toh `FOR UPDATE` bhi theek -- bas **PSP call kabhi lock ke andar nahi**.
+
+### Scenario 5 -- Crash takeover race
+
+Instance A ne key claim ki, PSP_CALLED ke baad crash. 60 s baad lock expire. Ab **client ka retry (B)** aur **recovery worker (C)** dono ek saath aaye:
+
+```
+Time   B                                              C (recovery worker)
+t1     UPDATE idempotency_keys SET locked_until = now()+60s
+       WHERE ... AND locked_until < now()  -> row lock, 1 row
+t2                                                    same UPDATE -> row lock par WAIT
+t3     COMMIT
+t4                                                    naya version: locked_until = t1+60s < now()? NO -> 0 rows
+                                                      -> C chhod deta hai (worker next item)
+t5     resume from PSP_CALLED -> getPaymentByIdempotencyKey(pay_X) -> Tx 2
+```
+
+- **Ek hi jeetta hai** -- wahi READ COMMITTED re-check.
+- **Zombie case:** A mara nahi tha, bas 70 s ke GC pause / slow network mein tha, aur baad mein jaag ke Tx 2 chalata hai. Ab A aur B dono "owner" samajhte hain. Kya bigda? **Kuch nahi**: dono PSP ko same PSP key (payment id) bhejte hain -> PSP ek hi charge; Tx 2 ka conditional UPDATE sirf ek ko rowCount 1 deta hai -> ledger/outbox ek baar. Lock sirf **efficiency** ke liye hai (duplicate kaam kam), **correctness** ke liye nahi. Correctness constraints + conditional updates + PSP key se aati hai.
+
+### Scenario 6 -- Distributed lock (Redlock) kyun nahi?
+
+"Race hai -> Redis lock lagao `lock:pay:<orderId>`" pehla instinct hai. Dekho:
+
+- **Lock DB se bahar hai:** lock lo -> DB mein likho -> lock chhodo. Lock TTL expire ho gaya (GC pause / slow PSP) aur doosre ne le liya -> dono andar. Distributed lock ko safe banane ke liye **fencing token** chahiye jo DB check kare -- toh asli guarantee phir bhi DB hi de raha hai.
+- **Ek aur system jo gir sakta hai:** Redis down = payments down (fail closed) ya bina lock (unsafe). Dono bure.
+- **Extra round trips** har payment par.
+
+Hamare paas already jo hai:
+
+| Race | Kaun rokta hai |
+|---|---|
+| Same key, do requests | PK `(customer_id, key)` + `ON CONFLICT` |
+| Do keys, same order | Partial unique index `ux_payments_one_active_per_order` |
+| Webhook vs sync response | Conditional UPDATE on status |
+| Refund over-amount | Conditional UPDATE + CHECK constraint |
+| Takeover | Conditional UPDATE on `locked_until` |
+| PSP par double charge | PSP idempotency key = payment id |
+| Duplicate webhook | PK `(psp, psp_event_id)` + `ON CONFLICT DO NOTHING` |
+
+Rule wahi purana: **distributed lock last option -- pehle dekho DB constraint ya atomic operation kaam kar sakta hai kya.** Yahan har jagah kar sakta hai. **Yahan Redis ki zarurat nahi.**
+
+### Scenario 7 -- Node.js event loop: in-process state lock nahi hai
+
+Koi likhta hai:
+
+```ts
+// BUGGY across instances
+const inFlight = new Set<string>();
+app.post('/v1/payments', async (req, res) => {
+  const k = `${req.user.id}:${req.get('Idempotency-Key')}`;
+  if (inFlight.has(k)) return res.status(409).end();
+  inFlight.add(k);
+  try { /* ... await psp.charge ... */ } finally { inFlight.delete(k); }
+});
+```
+
+**Code Explanation:**
+
+- `has` -> `add` ke beech `await` nahi hai, toh **ek process ke andar** ye check atomic hai (event loop ek callback poora chalata hai).
+- Lekin LB ne retry ko **doosre instance** par bheja -> uska `inFlight` khaali -> dono charge karne chale. N instances = N alag Sets.
+- Process crash -> Set gaya -> koi recovery point nahi.
+- Isliye: in-process Map/Set ek **optimization** ho sakta hai (same instance par duplicate ko jaldi 409), **lock kabhi nahi**. Truth Postgres mein.
+
+### Scenario 8 -- READ COMMITTED vs SERIALIZABLE
+
+**Isolation level ka matlab:** ek transaction doosri concurrent transactions ke changes kitna "dekhti" hai.
+
+- **READ COMMITTED** (Postgres default): har statement committed data ka naya snapshot. Plus upar wala "row lock -> re-check WHERE" behaviour.
+- **SERIALIZABLE:** Postgres guarantee karta hai ki result aisa hoga jaise transactions ek-ek karke chali. Conflict dikhe toh ek transaction **abort** (`40001 serialization_failure`) aur app ko **retry** karni padti hai.
+
+**Hamein SERIALIZABLE kyun nahi chahiye?** SERIALIZABLE ka asli use hai "maine kuch **padha**, us basis par kuch aur **likha**" jaise patterns (write skew). Hamare saare critical decisions **single statement** mein hain -- `INSERT ... ON CONFLICT`, `UPDATE ... WHERE <condition>` -- aur unique/CHECK constraints. Ye READ COMMITTED mein bhi atomic hain. SERIALIZABLE lagate toh 1,000 TPS par abort + retry ka overhead aur complexity milti, extra safety nahi.
+
+Kab zarurat padegi? Agar rule aisa ho jo ek row par fit na ho -- "customer ke aaj ke saare refunds ka total 50,000 se kam" (kai rows padh ke decide). Tab SERIALIZABLE, ya ek aggregate row par conditional UPDATE, ya `FOR UPDATE` on a parent row.
+
+> **Interview line:** "Concurrency ke liye main distributed lock nahi lunga. Same key ke do requests -- primary key par `INSERT ... ON CONFLICT` exactly ek owner banata hai, doosre ko 409. Alag keys se double-click -- partial unique index one-active-payment-per-order. Webhook aur sync response ki race -- conditional UPDATE on status; ledger aur outbox sirf woh transaction likhta hai jisne asli transition kiya. Refunds -- `refunded_minor + amount <= amount_minor` wala atomic UPDATE plus CHECK constraint. Takeover -- `WHERE locked_until < now()`. Ye sab READ COMMITTED mein safe hai kyunki har decision ek statement hai; SERIALIZABLE ki zarurat nahi."
+
+---
+
+## PART 15 -- Idempotency Store Deep Dive (caching ki jagah)
+
+### Pehle farak samjho
+
+URL Shortener mein Redis **cache** tha (copy of truth). Rate Limiter mein Redis **ephemeral state** tha (kho jaaye toh ek baar ka burst, chalta hai). Payment system mein sawaal ulta hai:
+
+| | URL Shortener | Rate Limiter | Payment (idempotency store) |
+|---|---|---|---|
+| Data ka role | Cache (copy) | Ephemeral state | **Correctness record** |
+| Kho gaya toh | DB se wapas | Thodi der zyada allow | **Double charge ka risk** |
+| Stale chalega? | Thoda | Nahi (har baar compute) | **Bilkul nahi** |
+| Kahan | Redis | Redis | **Postgres (same DB as payments)** |
+
+Idempotency key "ye request pehle aayi thi, iska ye jawab tha" ka **saboot** hai. Saboot kho gaya = system bhool gaya ki charge ho chuka hai.
+
+### Option A -- Postgres (hamara choice)
+
+- Key claim, payment row, aur baad mein key `COMPLETED` + response -- sab **usi DB** ke transactions mein. **Key aur payment kabhi out of sync nahi ho sakte:** Tx 1 rollback -> key bhi gayi; Tx 2 commit -> payment state, ledger, outbox aur key completion ek saath.
+- Durability: WAL + replica, jo payments ke liye already chahiye. Koi naya system nahi.
+- Cost: ek extra INSERT per request -- 1,000 TPS peak par Postgres ke liye kuch nahi (spec: ~10K row writes/sec peak, ek primary par fit).
+
+### Option B -- Redis `SET NX`
+
+```
+SET idem:<customerId>:<key> <requestHash> NX EX 86400    -> OK = owner, nil = duplicate
+```
+
+Fast (sub-ms), simple. **Lekin Redis alag system hai**, DB ke saath ek transaction mein nahi:
+
+```
+Failure 1 -- crash between Redis and DB
+t1  Redis SET NX OK (key claimed)
+t2  DB Tx 1 ... process crash
+    Redis bolta hai "in progress/done", DB mein kuch nahi. Retry ko kya jawab dein? Replay karne ko response nahi,
+    aur kab tak rukein? Truth do jagah bant gaya.
+
+Failure 2 -- Redis ne key kho di
+t1  Redis SET NX OK, payment SUCCEEDED, response Redis mein store
+t2  Redis failover (async replication, last writes gaye) ya maxmemory eviction
+t3  Client retry -> SET NX OK (key "nayi" lagi) -> naya payment id -> naya PSP key -> DOUBLE CHARGE attempt
+```
+
+Failure 2 mein hamara order-level partial unique index phir bhi bacha leta hai (pehla payment `SUCCEEDED` hai toh 409) -- lekin retry ko ab original `201` ki jagah `409 ORDER_ALREADY_PAID` mila, idempotency ka promise toot gaya. Aur refunds par aisa koi order-level backstop nahi -- ek payment par kai legit refunds hote hain -> **double refund**.
+
+### Option C -- dono (Redis fast path + Postgres truth)
+
+Redis ko pre-filter bana do: duplicates ko Postgres tak pahunchne se pehle rok lo. Decision phir bhi Postgres karta hai.
+
+- Fayda tab hai jab duplicate traffic bahut zyada ho (millions of retries/sec). Hamare 1,000 TPS peak par Postgres ka ek PK insert ~ms hai -- **bachat negligible**.
+- Cost: ek aur system, do jagah consistency, Redis down ho toh kya (fallback logic), aur Redis ka stale "done" galat 409 de sakta hai.
+
+| | Postgres only | Redis only | Both |
+|---|---|---|---|
+| Atomic with payment | **Haan (same tx)** | Nahi | Postgres side haan |
+| Key loss risk | Nahi (WAL + replica) | Haan (failover/eviction) | Postgres bachata hai |
+| Latency | ~1-2 ms | <1 ms | <1 ms duplicates ke liye |
+| Moving parts | 1 | 2 (DB + Redis) | 2 + sync logic |
+| Verdict | **Hamara** | Payments ke liye nahi | Sirf bahut bade scale par socho |
+
+**Yahan Redis ki zarurat nahi.** Redis sirf gateway par rate limiting ke liye hai (Rate Limiter system).
+
+### Storage math aur TTL
+
+- ~1 KB per key (request hash, path, stored `response_body` JSONB) x 5M/day = **~5 GB/day**.
+- 24 hours retention -> kisi bhi pal **~5 GB live** (plus cleanup lag). Ek Postgres ke liye chhota; index `(customer_id, key)` PK + `ix_idem_created`.
+- Postgres mein TTL built-in nahi (Redis `EX` jaisa nahi) -> **cleanup job** chahiye.
+
+#### Cleanup option 1 -- batched DELETE (hamara default)
+
+```sql
+DELETE FROM idempotency_keys
+WHERE (customer_id, key) IN (
+  SELECT customer_id, key FROM idempotency_keys
+  WHERE created_at < now() - interval '24 hours'
+  ORDER BY created_at
+  LIMIT 5000
+);
+-- loop until rowCount = 0; har minute chalao
+```
+
+**Code Explanation:**
+
+- Subquery `ix_idem_created` index se sabse purani 5,000 rows dhoondhta hai.
+- **Batch kyun?** Ek hi `DELETE ... WHERE created_at < ...` jo lakhs rows chhoye -> lamba transaction, bahut saara WAL ek saath, replica lag, aur bloat. Chhote batches = chhote transactions.
+- Average rate: 5M/day = ~58 rows/sec -> har minute ~3,470 rows. Ek batch mein ho jaata hai. Sale ke din zyada, loop sambhal lega.
+- Deleted rows **dead tuples** bante hain -> autovacuum saaf karega. Is table par autovacuum thoda aggressive tune karo.
+- Chhota edge: agar kisi key ka payment 24h baad bhi `PROCESSING` hai toh woh bug hai jo `payments_stuck_processing` (10 min se purana) alert pehle hi pakad chuka hota. Optional guard: `AND status = 'COMPLETED'`.
+
+#### Cleanup option 2 -- daily partitions, DROP
+
+```
+idempotency_keys PARTITION BY RANGE (created_at)
+  idempotency_keys_2026_09_17, idempotency_keys_2026_09_18, ...
+DROP TABLE idempotency_keys_2026_09_16;    -- instant, koi dead tuples nahi, koi vacuum nahi
+```
+
+Bahut clean -- **lekin ek Postgres trap:** partitioned table par PRIMARY KEY / UNIQUE mein **partition key (`created_at`) shamil karna padta hai**. Toh PK `(customer_id, key, created_at)` banega -> **`(customer_id, key)` ki uniqueness ab global nahi** -- same key raat 23:59:59 aur 00:00:01 par do alag partitions mein insert ho sakti hai. Hamara poora claim algorithm isi uniqueness par khada hai.
+
+Isliye hamare scale (~58 deletes/sec) par **batched DELETE**. Partitions tab jab delete rate sach mein problem bane, aur tab uniqueness ke liye extra design (e.g. key mein date encode karna, ya claim par dono partitions check) chahiye.
+
+### Kya cache kar sakte hain, kya kabhi nahi?
+
+Prompt ka Part 15 cache-aside, TTL, invalidation, stampede poochta hai. Payment path par honest jawab: **zyadatar "cache mat karo"**.
+
+**`GET /v1/payments/:id` status ko cache karein (2-5 sec)?** Nahi.
+
+```
+t0  client ko 202 PROCESSING mila
+t1  webhook -> SUCCEEDED (DB mein)
+t2  client poll -> cache se "PROCESSING" (2 s purana)
+    UI "processing..." dikhata rehta hai, ya app "phir se pay karo" button dikha deta hai
+```
+
+Ye **read-after-write** problem hai: user ne abhi kuch badla/ho gaya aur use turant naya state dikhna chahiye. Spec: GET **primary se** padho (replica bhi nahi -- replication lag wahi bug deta hai). Load? ~5K peak reads/sec PK lookups -- Postgres ke liye aaram se. Cache ka fayda nahi, bug pakka.
+
+**Order data (amount) cache karein?** **Kabhi nahi.** Amount order se aata hai aur charge usi par hota hai. Stale cache -> order edit hua (coupon laga, item hata) aur hum purana amount charge kar dein. Tx 1 mein fresh padho.
+
+**Kya cache karna theek hai** (payment decision se bahar ki cheezein):
+
+- PSP ki public config / JWKS (JWT verify ke keys) -- minutes/hours ka TTL.
+- Feature flags, merchant config (kaunsa PSP, kaunse methods enabled) -- short TTL, change rare.
+- Circuit breaker state -- per instance memory (upar).
+
+**Kabhi cache nahi:**
+
+| Cheez | Kyun |
+|---|---|
+| Idempotency decisions (sirf Redis mein) | Key kho gayi = double charge/refund |
+| Payment status for decisions (refund allowed? already paid?) | Stale status = galat decision; conditional UPDATE hi truth |
+| Balances / `refunded_minor` | Stale balance par refund = over-refund |
+| Order amount | Galat amount charge |
+| Ledger totals | Finance ko hamesha exact chahiye; report ke liye alag read-model theek, decision ke liye nahi |
+
+Cache stampede, hot key jaise problems yahan isliye aate hi nahi -- critical path par cache hai hi nahi. Load ko hum **rate limiting** (gateway) se control karte hain, cache se nahi.
+
+### Real-world reference -- Stripe
+
+Stripe ki public API docs mein "Idempotent requests" section hai: client `Idempotency-Key` header bhejta hai, Stripe pehle request ka result (status code + body, errors samet) save karta hai aur same key par wahi lautata hai; same key ke saath alag parameters bheje toh error; aur keys ~24 hours ke baad prune ho sakti hain. Hamara design wahi contract follow karta hai. Aur Stripe engineer Brandur Leach ka public blog post "Implementing Stripe-like Idempotency Keys in Postgres" -- atomic phases aur recovery points isi se aaye hain. Stripe andar kya chalata hai, uske details public nahi -- hum sirf public contract copy kar rahe hain.
+
+> **Interview line:** "Idempotency key cache nahi, correctness record hai, isliye main use Postgres mein payments ke saath rakhunga -- claim, payment aur completion same transactions mein, toh kabhi out of sync nahi. Redis SET NX fast hai lekin alag system hai: Redis aur DB ke beech crash ya failover/eviction mein key kho jaaye toh retry naya payment bana deta -- double charge risk. 5M keys x 1 KB = ~5 GB live with 24h TTL, batched delete se cleanup; daily partitions mein Postgres ka unique constraint partition key maangta hai, jo global uniqueness tod deta hai. Payment status ya order amount main cache nahi karta -- read-after-write chahiye, GET primary se."
+
+---
+
+## Remember
+
+> **Paisa exactly once = client ki Idempotency-Key + Postgres ki uniqueness + conditional UPDATEs + PSP ki idempotency key (= payment id).** PSP call kabhi DB transaction ke andar nahi -- chhote atomic phases aur recovery points; ledger double-entry aur integer paise mein; events outbox se; aur roz reconciliation, kyunki "kabhi galat nahi hoga" koi nahi keh sakta.
+
+## Quick Self-Test
+
+1. "Is order ka payment hai kya?" wala check idempotency ke liye kyun kaafi nahi? Same key par alag body aaye toh kya response doge, aur canonical JSON kyun chahiye?
+2. PSP call ko DB transaction ke andar kyun nahi rakhte? Server `PSP_CALLED` ke baad crash hua -- resume exactly kya karega, aur double charge kyun nahi hoga?
+3. Webhook aur sync response dono SUCCEEDED lekar ek saath aaye. Ledger entries exactly ek baar kaise likhi jaati hain? (Postgres READ COMMITTED ka behaviour bhi batao.)
+4. Rs 499 payment, Rs 100 refund, Rs 9.98 fee -- ledger entries likho aur `psp_clearing` ka final balance nikaalo. `19.99 * 100` JS mein kya deta hai?
+5. Idempotency keys Redis `SET NX` mein kyun nahi? Aur idempotency table ko daily partitions mein todne mein kaunsa Postgres trap hai?
+
+---
+
+**Next (Part 4):** Scaling, Failures (PSP down, timeouts, crashes, duplicate webhooks), Consistency, Security (PCI, webhook signatures), Observability. "next" bolo.

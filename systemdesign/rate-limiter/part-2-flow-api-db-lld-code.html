@@ -1,0 +1,1297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rate Limiter -- HLD + LLD (Part 2: Request Flow - API - Database - LLD - Code)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root { --bg:#fafafa; --fg:#1f2328; --muted:#57606a; --border:#d0d7de; --code-bg:#f6f8fa; --accent:#0969da; --callout-bg:#fff8c5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --border:#30363d; --code-bg:#161b22; --accent:#58a6ff; --callout-bg:#3b3410; }
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.65; max-width:900px; margin:0 auto; padding:40px 24px 100px; }
+  h1,h2,h3 { line-height:1.3; }
+  h1 { font-size:2rem; border-bottom:2px solid var(--border); padding-bottom:10px; }
+  h2 { font-size:1.45rem; margin-top:2.4em; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  h3 { font-size:1.1rem; color:var(--accent); margin-top:1.8em; }
+  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; font-size:0.9em; }
+  pre { background:var(--code-bg); padding:14px 16px; border-radius:8px; overflow-x:auto; border:1px solid var(--border); }
+  pre code { background:none; padding:0; }
+  blockquote { border-left:4px solid var(--accent); background:var(--callout-bg); margin:1.2em 0; padding:0.6em 1em; border-radius:0 6px 6px 0; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:1.2em 0; }
+  th,td { border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul,ol { padding-left:1.4em; }
+  li { margin:0.35em 0; }
+  .mermaid { background:white; border-radius:8px; padding:12px; margin:1.2em 0; }
+  a { color:var(--accent); }
+  hr { border:none; border-top:1px solid var(--border); margin:2.5em 0; }
+  @media (max-width:600px) { body { padding:24px 16px 80px; } h1 { font-size:1.5rem; } }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Rate Limiter -- HLD + LLD (Part 2: Request Flow -> API -> Database -> LLD -> Code)
+
+> Is file mein prompt ke **Parts 7-12** hain: request flow, API design (429 + headers), database design, LLD folder structure, Node.js/TypeScript code, aur code ka line-by-line explanation.
+> Part 1 mein humne decide kiya tha: **~23K RPS average, ~100K RPS peak, har request = 1 rate-limit check = 1 Redis round trip. Ye system read-heavy nahi hai -- har check read + write hai. Algorithm = token bucket (atomic Lua script), counters Redis Cluster mein (3 primaries), rules Postgres mein (RuleCache har 30s refresh). Limiter girne se API nahi girni chahiye (fail open + local fallback).** Ab wahi design code tak le jaayenge.
+
+---
+
+## PART 7 -- HLD Request Flow (shuru se end tak)
+
+Pehle ek baat clear karo: rate limiter **khud koi endpoint nahi hai** (v1 mein). Ye ek **middleware** hai jo har API request ke raaste mein baitha hai -- jaise building ke gate par guard. Guard har aane wale ko check karta hai, andar ka kaam (business logic) nahi karta.
+
+Isliye "request flow" ka matlab: ek normal API request (jaise `GET /api/v1/orders`) aati hai, aur beech mein limiter kya karta hai.
+
+Do flows dekhenge: **allowed** (99% traffic) aur **rejected** (429). Phir teesra: **Redis down** hai tab kya.
+
+### Flow A -- Request allowed (normal case)
+
+Scenario: Priya ki company ka script `api-free` plan par hai (100 requests/min). Uska API key id `ak_live_9f2c` hai. Script `GET /api/v1/orders` call karta hai.
+
+```mermaid
+sequenceDiagram
+    participant C as Client script
+    participant LB as Load Balancer
+    participant N as Node.js (middleware)
+    participant RC as RuleCache (memory)
+    participant R as Redis Cluster
+    participant H as Auth + Route handler
+    participant DB as Postgres
+    C->>LB: GET /api/v1/orders (Authorization: Bearer sk_live_...)
+    LB->>N: forward + X-Forwarded-For
+    N->>N: requestId, parse body, identifyClient (apiKey id = ak_live_9f2c, plan free)
+    N->>RC: resolve(GET, /api/v1/orders, plan free)
+    RC-->>N: rule api-free (capacity 100, refill 1.67/s)
+    N->>R: EVALSHA tokenBucket rl:api-free:ak_live_9f2c 100 1.67 1
+    R-->>N: [1, 99, 0] allowed, 99 left
+    N->>H: next() - auth, validation, business logic
+    H->>DB: SELECT orders ...
+    DB-->>H: rows
+    H-->>C: 200 OK + RateLimit-Limit 100, Remaining 99, Reset 1
+```
+
+**Step by step (Hinglish mein):**
+
+1. **Client request bhejta hai** -- `GET /api/v1/orders` with header `Authorization: Bearer sk_live_...` (API key ka secret).
+2. **DNS + TLS** -- URL shortener jaisa hi. DNS load balancer ka IP deta hai, TLS usually **LB par terminate** hota hai.
+3. **Edge / Load Balancer** -- yahan ek **coarse per-IP limit** ho sakti hai (nginx `limit_req` / gateway) jo sirf bade floods rokti hai (jaise ek IP se 10K RPS). Fine-grained plan-wise limits hamara Node middleware karega. LB request ko kisi bhi healthy Node instance ko bhejta hai aur `X-Forwarded-For` header mein client ka asli IP daalta hai.
+4. **Node.js: `requestId`** -- har request ko ek unique id (logs trace karne ke liye).
+5. **`identifyClient` (sasta identification)** -- API key secret ka SHA-256 hash banao, in-memory cache (ya Redis) se key ka **id aur plan** nikaalo: `{ id: 'ak_live_9f2c', plan: 'free' }`. Isko `res.locals.apiKey` mein rakh do. Yahan **heavy auth nahi** hota (permissions, DB se user load karna) -- sirf "ye kaun hai" jitna zaruri hai.
+6. **Rule resolve** -- `RuleCache` (process memory) se pucho: `GET /api/v1/orders` + plan `free` par kaunsa rule? Jawab: `api-free`. **Koi DB call nahi** -- rules memory mein hain, har 30s refresh hote hain.
+7. **Redis check (asli kaam)** -- ek hi command: `EVALSHA` of token bucket Lua script, key `rl:api-free:ak_live_9f2c`. Script Redis ke andar **atomically** chalti hai: tokens refill karo, 1 token kaato, state save karo, TTL lagao. Jawab: `[allowed=1, remaining=99, retryAfterMs=0]`.
+8. **Headers set** -- `RateLimit-Limit: 100`, `RateLimit-Remaining: 99`, `RateLimit-Reset: 1` (1 token refill hone mein ~0.6s, round up = 1s; bucket phir full).
+9. **`next()`** -- request aage jaati hai: full auth, validation, controller, DB query.
+10. **Response** -- `200 OK` + data + upar wale RateLimit headers. Client ko pata chalta hai ki kitna quota bacha hai.
+
+> Key point: limiter ne request mein sirf **1 Redis round trip** joda. Rules memory se aaye, identity memory/cache se. Isi wajah se "< 2 ms p99" possible hai.
+
+### Flow B -- Request rejected (429)
+
+Scenario: Raat 2 baje ek attacker `POST /auth/login` par `priya@example.com` ke password guess kar raha hai, IP `203.0.113.7` se. `login` rule = 5 attempts/min per (IP + username).
+
+```mermaid
+sequenceDiagram
+    participant A as Attacker
+    participant LB as Load Balancer
+    participant N as Node.js (middleware)
+    participant RC as RuleCache (memory)
+    participant R as Redis Cluster
+    participant H as Auth + Login handler
+    A->>LB: POST /auth/login (6th attempt in a minute)
+    LB->>N: forward + X-Forwarded-For 203.0.113.7
+    N->>N: requestId, parse body, identifyClient (anonymous)
+    N->>RC: resolve(POST, /auth/login)
+    RC-->>N: rule login (capacity 5, refill 5 per 60s, failMode closed)
+    N->>R: EVALSHA tokenBucket rl:login:203.0.113.7:priya@example.com capacity 5, rate 5/60, cost 1
+    R-->>N: [0, 0, 12000] rejected, retry after 12s
+    N-->>A: 429 + Retry-After 12 + RateLimit-Remaining 0
+    Note over H: Handler tak request pahunchi hi nahi. bcrypt nahi chala, DB query nahi hui.
+```
+
+**Step by step:**
+
+1. Attacker ki 6th request aati hai. LB forward karta hai.
+2. `identifyClient` -- koi API key nahi, koi valid token nahi -> anonymous. `express.json` ne body parse kar di hai, toh `username` available hai.
+3. **Rule resolve** -- `POST /auth/login` exact match -> rule `login`. (Ye rule `/*` wale `anon-ip` se **zyada specific** hai, isliye jeetta hai.)
+4. **Key banao** -- `rl:login:203.0.113.7:priya@example.com` (IP + lowercased username). Attacker doosra username try kare toh doosri bucket -- lekin ek username par password guessing 5/min tak simit.
+5. **Redis Lua** -- bucket mein 0 tokens (pichhle 5 attempts ne khatam kar diye). Script bolti hai: `allowed=0`, `retryAfterMs = 12000` (1 token refill hone mein 60/5 = 12 second).
+6. **429 Too Many Requests** -- headers `Retry-After: 12`, `RateLimit-Limit: 5`, `RateLimit-Remaining: 0`, `RateLimit-Reset: 60` (poori bucket bharne mein 60s), body `{ "error": "RATE_LIMITED", ... }`.
+7. **Sabse important:** request **handler tak gayi hi nahi**. Password hash compare (bcrypt, ~100 ms CPU) nahi chala, DB query nahi hui. Rejection ka cost = ~1 ms. Yahi limiter ka poora point hai: **mehenga kaam shuru hone se pehle sasta "no".**
+8. Metric `rate_limit_checks_total{rule="login",result="rejected"}` +1. Log **sampled** (har 429 log karoge toh ~20M log lines/day -- attack ke time log system bhi doob jaayega).
+
+### Flow C -- Redis down ya slow (fallback)
+
+```
+Node middleware -> Redis EVALSHA ... 20 ms mein jawab nahi (commandTimeout) / connection down
+        |
+        +--> error catch -> metric rate_limiter_fallback_total +1 -> warn log (sampled)
+        |
+        +--> MemoryTokenBucketStore (isi process ki memory)
+                capacity / instanceCount, refill / instanceCount
+                e.g. 10 instances: api-free 100 -> 10 per instance
+        |
+        +--> decision mil gaya -> normal headers / 429
+```
+
+- `enableOfflineQueue: false` ki wajah se Redis disconnected ho toh command **turant fail** hoti hai (queue mein latakti nahi).
+- `commandTimeout: 20` -- Redis slow hai toh max 20 ms wait, phir fallback. (URL shortener mein 50 ms tha; yahan budget tight hai kyunki limiter **har** request par chalta hai.)
+- Local bucket approximate global limit deta hai: 10 instances x 10 = ~100/min. Load balancer traffic barabar baantta hai toh ye kaafi close hai. **Exact nahi, lekin API zinda hai aur abuse phir bhi ruka hua hai.**
+- `login` jaisa `closed` rule bhi yahan local fallback use karta hai -- kyunki fallback abhi bhi **limit** kar raha hai. `failMode` sirf tab kaam aata hai jab **koi decision possible hi nahi** (rules kabhi load nahi hue, ya limiter code mein bug). Detail Part 4 (failures) mein.
+
+### Latency budget (limiter ka hissa)
+
+| Step | Approx time | Kyun itna |
+|---|---|---|
+| `identifyClient` (hash + in-memory lookup) | ~0.05 ms | SHA-256 chhote string par + Map lookup |
+| Rule resolve (memory) | ~0.01 ms | Few hundred rules ka array, koi I/O nahi |
+| Key build | ~0.001 ms | String concat |
+| Redis `EVALSHA` round trip (same AZ) | ~0.3-1 ms | Network hop + Lua ~20 microseconds |
+| Headers set | ~0.01 ms | -- |
+| **Total added (p50)** | **~0.5-1 ms** | |
+| **Target (p99)** | **< 2 ms** | Requirement |
+| **Worst case (Redis slow)** | **20 ms, phir fallback** | `commandTimeout: 20` ek hard ceiling hai |
+
+> Interview line: "Limiter ka latency budget basically **ek Redis round trip** hai. Isliye Redis app ke **same region/AZ** mein hona chahiye, aur rules/identity kabhi DB se hot path par nahi aate."
+
+**Budget kahan toot sakta hai?**
+
+- Redis doosre region mein -> 30-80 ms per request. Kabhi mat karo.
+- Rules har request par Postgres se -> +2-5 ms aur Postgres par 100K QPS. Isliye RuleCache.
+- API key validation har request par DB se -> same problem. Isliye `identifyClient` cache use karta hai.
+- Ek request par 3 alag rules check (per-second + per-minute + per-day) -> 3 round trips. Chahiye toh ek hi Lua call mein multiple buckets check karo (Part 3).
+
+---
+
+## PART 8 -- API Design
+
+Rate limiter ki "API" teen hisson mein hai:
+
+1. **Client-facing contract** -- har limited response par headers + 429 ka format. Ye sabse important hai kyunki customers iske against code likhte hain.
+2. **Admin rules API** -- internal team rules/overrides badal sake bina redeploy.
+3. **(Later, Version 3) Standalone check API** -- jab limiter alag service ban jaaye.
+
+### 8.1 Client-facing contract: headers + 429
+
+**Allowed response (har limited endpoint par):**
+
+```
+HTTP/1.1 200 OK
+RateLimit-Limit: 100
+RateLimit-Remaining: 99
+RateLimit-Reset: 1
+Content-Type: application/json
+```
+
+**Rejected response:**
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+RateLimit-Limit: 5
+RateLimit-Remaining: 0
+RateLimit-Reset: 60
+Content-Type: application/json
+
+{ "error": "RATE_LIMITED", "message": "Too many requests", "retryAfterSec": 12 }
+```
+
+**Har header ka matlab:**
+
+| Header | Matlab | Hamari value kahan se |
+|---|---|---|
+| `RateLimit-Limit` | Bucket ki capacity (max burst) | `rule.capacity` |
+| `RateLimit-Remaining` | Abhi kitne tokens bache (kitni requests turant kar sakte ho) | Lua ka `math.floor(tokens)` |
+| `RateLimit-Reset` | Kitne **seconds** mein bucket poori bhar jaayegi | `ceil((capacity - remaining) / refillPerSec)` |
+| `Retry-After` | Sirf 429 par: kitne seconds baad **agli** request allowed hogi | Lua ka `retryAfterMs`, seconds mein round up |
+
+**Kuch zaruri baatein:**
+
+- **`429` hi kyun, `403` ya `503` kyun nahi?** `403` = "tumhe permission nahi" (hamesha). `503` = "server ki problem". `429` = "tum **abhi** zyada bhej rahe ho, thoda ruko" -- client ki galti, temporary. Sahi status code se client ka retry logic sahi chalta hai.
+- **`Retry-After` seconds mein, integer** -- HTTP standard (RFC 9110) mein ye seconds ya HTTP date hota hai. Hum seconds bhejte hain aur **round up** karte hain (0.6s -> 1s), kabhi 0 nahi -- 0 ka matlab client turant retry karega aur phir 429 khaayega.
+- **Body mein bhi `retryAfterSec`** -- kuch HTTP clients headers aasani se nahi dikhate; body mein hona debugging easy banata hai.
+- **Header naming:** `RateLimit-*` IETF draft ka naam hai (bina `X-`). Purane APIs (GitHub) `X-RateLimit-*` use karte hain. Naye drafts ek combined `RateLimit` + `RateLimit-Policy` header propose karte hain. Interview mein bolo: "Main standard draft follow karunga aur **docs mein clearly** likhunga -- consistency zyada important hai exact naam se."
+- **Token bucket mein "Reset" thoda alag hai** -- fixed window mein "window kab reset hogi" clear hota hai. Token bucket mein koi window nahi, tokens lagatar refill hote hain. Isliye humne `RateLimit-Reset` = "bucket full hone mein kitna time" rakha, aur "agli request kab" ke liye `Retry-After`.
+
+### Client ko in headers ke saath kya karna chahiye? (Docs mein likhna)
+
+Customer ka script agar 429 par turant retry kare toh wo **retry storm** bana deta hai -- aur wahi problem jisse bachne ke liye limiter hai. Isliye docs mein clear guidance:
+
+1. **429 mila -> `Retry-After` seconds ruko**, phir retry. Turant retry kabhi nahi.
+2. **Retry-After na ho** (jaise 503) -> **exponential backoff + jitter**: 1s, 2s, 4s, 8s... har wait mein thoda random add karo taaki 1000 clients ek hi second par wapas na aayein.
+3. **Proactive throttle** -- `RateLimit-Remaining` 0 ke paas hai toh request bhejne ki speed khud kam karo. Achhe SDKs (Stripe, GitHub clients) ye khud karte hain.
+4. **Max retries** rakho (e.g. 5), phir error surface karo -- infinite loop nahi.
+5. **Non-GET retry** (jaise `POST /payments`) sirf `Idempotency-Key` ke saath -- warna duplicate operation. (Payment System wala topic -- next system.)
+
+```ts
+// Client SDK side (customer ka code) -- sirf idea
+async function callWithRetry(doRequest: () => Promise<Response>, maxRetries = 5): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await doRequest();
+    if (res.status !== 429 || attempt >= maxRetries) return res;
+    const retryAfterSec = Number(res.headers.get('Retry-After')) || 2 ** attempt;
+    const jitterMs = Math.random() * 250;
+    await new Promise((r) => setTimeout(r, retryAfterSec * 1000 + jitterMs));
+  }
+}
+```
+
+**Code Explanation:**
+
+- `for (let attempt = 0; ; attempt++)` -- loop tab tak jab tak success ya retries khatam.
+- `if (res.status !== 429 || attempt >= maxRetries) return res;` -- 429 nahi hai toh result wapas. Retries khatam toh bhi wapas (caller error handle kare) -- infinite retry nahi.
+- `Number(res.headers.get('Retry-After')) || 2 ** attempt` -- server ne `Retry-After` diya toh wahi maano (server ko sabse achhe se pata hai). Nahi diya toh exponential backoff: 1, 2, 4, 8 sec.
+- `Math.random() * 250` -- **jitter.** Agar 1000 clients ko same `Retry-After: 12` mila, toh sab exactly 12s baad ek saath aayenge (thundering herd). Thoda random spread karta hai.
+- `setTimeout` promise -- non-blocking wait; Node event loop free rehta hai.
+
+### 8.2 Admin rules API (internal)
+
+Requirement 4 aur 5: rules bina redeploy badalne hain, aur enterprise customer ko custom limit deni hai.
+
+```
+GET  /admin/v1/rate-limit-rules                          -> saare rules
+PUT  /admin/v1/rate-limit-rules/:id                      -> rule create/update
+PUT  /admin/v1/rate-limit-overrides/:clientId/:ruleId    -> ek client ka custom limit
+```
+
+**Example -- free plan ko thoda badhana:**
+
+```
+PUT /admin/v1/rate-limit-rules/api-free
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{
+  "identifier": "apiKey",
+  "routePattern": "/api/v1/*",
+  "plan": "free",
+  "capacity": 100,
+  "refillPerSec": 1.6667,
+  "failMode": "open",
+  "enabled": true,
+  "description": "Free plan: 100 requests/min per API key"
+}
+```
+
+**Response -- 200 OK:** updated rule + `updatedAt`. Note: **effect ~30 second mein** aayega (RuleCache refresh interval). Response mein ye batana achha hai: `"effectiveWithinSec": 30`.
+
+**Example -- enterprise override:**
+
+```
+PUT /admin/v1/rate-limit-overrides/ak_live_ent_77aa/api-pro
+{ "capacity": 5000, "refillPerSec": 83.3333, "expiresAt": "2026-12-31T23:59:59Z" }
+```
+
+Ab `ak_live_ent_77aa` par `api-pro` rule ki jagah 5000 burst + ~83/s (5000/min) lagega, 31 Dec tak. `expiresAt` isliye ki "Black Friday ke liye temporary badha do" jaise cases mein koi yaad se wapas kam karna na bhoole.
+
+**`PUT` kyun, `POST` kyun nahi?** Rule ka id (`api-free`) humein pata hai aur same PUT do baar bhejo toh result same -- **idempotent**. Admin tool retry kare toh koi duplicate nahi.
+
+**Validation kya hogi?**
+
+| Field | Rule | Kyun |
+|---|---|---|
+| `id` | `^[a-z0-9-]{2,50}$` | Ye Redis key ka hissa banta hai (`rl:<id>:...`) -- spaces, `:`, weird chars nahi |
+| `identifier` | `apiKey` / `userId` / `ip` | Middleware ko pata hona chahiye kisko count karna hai |
+| `routePattern` | `METHOD /path` ya `/path/*`, `/` se shuru | Matcher inhi 2 shapes ko samajhta hai |
+| `plan` | `free` / `pro` / `enterprise` / `null` | `null` = har plan par |
+| `capacity` | Integer, `> 0`, upper cap (e.g. 1,000,000) | 0 = sab block; galti se 10^12 = limiter bekaar |
+| `refillPerSec` | `> 0` | 0 hota toh bucket kabhi refill nahi hoti, aur Lua mein divide by zero |
+| `failMode` | `open` / `closed` | Security routes (`login`) ke liye `closed` |
+| override `capacity/refillPerSec` | `> 0` | Same |
+| override `ruleId` | Existing rule | Warna 404 |
+
+**Auth:** `/admin/*` sirf internal network / VPN se reachable, **authentication** (admin SSO/JWT) + **authorization** (role `rate-limit-admin`). Galat rule = poori API down (capacity 0 kar di) ya DDoS open (capacity bahut badi) -- isliye ye powerful endpoint hai.
+
+**Audit:** har change ka log (kaun, kab, purani value -> nayi value). `updated_at` column + ek `rule_audit` table ya structured log. "Kal raat free users ko 429 kyun aane lage?" ka jawab yahin se milega.
+
+**Error cases (admin API):**
+
+| Status | Kab |
+|---|---|
+| `400 Bad Request` | Validation fail (`capacity: 0`, unknown `identifier`) |
+| `401 Unauthorized` | Token nahi / invalid |
+| `403 Forbidden` | Token valid, lekin admin role nahi |
+| `404 Not Found` | Override ke liye `ruleId` exist nahi karta |
+| `500` | DB down -- **existing limits chalte rahenge** (RuleCache last good copy rakhta hai), sirf update nahi hoga |
+
+### 8.3 Error cases jo limiter khud return karta hai (public API par)
+
+| Status | Kab | Body |
+|---|---|---|
+| `429 Too Many Requests` | Bucket khaali | `{ "error": "RATE_LIMITED", "message": "Too many requests", "retryAfterSec": 12 }` + `Retry-After` |
+| `503 Service Unavailable` | Koi decision possible nahi **aur** rule `failMode: closed` (e.g. login) | `{ "error": "RATE_LIMITER_UNAVAILABLE", ... }` |
+| (kuch nahi, request aage) | Koi decision possible nahi aur `failMode: open` | Normal response, bina RateLimit headers |
+
+> Redis down hona "decision possible nahi" **nahi** hai -- tab local fallback decision deta hai. 503 ek rare case hai.
+
+### 8.4 Version 3 (later): standalone check API
+
+Abhi limiter ek **library/middleware** hai jo har Node service mein import hota hai. Jab company mein Go, Java, Python services bhi aa jaayein, ya limiter logic central chahiye, tab ek alag **rate-limit service**:
+
+```
+POST /v1/ratelimit/check
+{ "ruleId": "api-free", "identity": "ak_live_9f2c", "cost": 1 }
+
+-> 200 { "allowed": true, "remaining": 99, "retryAfterMs": 0 }
+```
+
+Ya gRPC (jaise **Envoy global rate limit service**) -- har request par extra network hop hai, toh gRPC + persistent connections better. **v1 mein nahi** -- ek extra hop (+~1 ms), ek extra service ko chalana aur scale karna. Jab tak sab services Node hain aur ek hi Redis share karti hain, library kaafi hai. (Version 1/2/3 ka poora comparison Part 5/6 mein.)
+
+---
+
+## PART 9 -- Database Design
+
+Is system mein **do alag tarah ka data** hai, aur dono ki zarurat bilkul alag hai. Yahi samajhna is part ka core hai.
+
+| | Rules (config) | Counters (bucket state) |
+|---|---|---|
+| Example | "api-free = 100/min" | "ak_live_9f2c ke paas abhi 99.4 tokens" |
+| Size | Few hundred rows, KBs | 10M keys, ~1.5 GB |
+| Write rate | Din mein kuch baar (admin) | **~100K/sec peak** (har request) |
+| Read rate | Har 30s ek baar per instance | ~100K/sec peak |
+| Durability | Zaruri (audit, kisne kya badla) | **Zaruri nahi** -- kho gaye toh limits thodi der reset, bas |
+| Latency need | Koi nahi (background refresh) | **< 1 ms** |
+| Store | **PostgreSQL** | **Redis (Cluster)** |
+
+### Rules ke liye Postgres kyun?
+
+> "Main rules **PostgreSQL** mein rakhunga kyunki ye chhota, relational, rarely-changing config hai. Mujhe constraints chahiye (`capacity > 0`, `fail_mode IN (...)`), foreign key chahiye (override ek existing rule ka hi ho), aur audit trail chahiye. Hot path par Postgres nahi aata -- rules memory mein cached hain."
+
+- Company ke paas Postgres **pehle se** hai (users, API keys, billing). Naya DB laane ka koi fayda nahi.
+- `CHECK` constraints = galat config DB level par reject. Admin API mein bug ho toh bhi `capacity = 0` save nahi hoga.
+- **MySQL** bhi utna hi achha -- team jo jaanti hai.
+- **MongoDB** -- rules document jaise dikhte hain, chal jaayega. Lekin koi fayda nahi: schema fixed hai, constraints/FK chahiye, aur ek aur DB operate karna padega. Tab choose karunga jab company ka poora stack Mongo par ho.
+- **Config file (YAML in git)** -- chhoti company ke liye ye bhi valid hai! Rules git mein, PR se change, deploy se apply. Trade-off: requirement "**bina redeploy** badalna" aur "per-customer overrides admin panel se" tootti hai. Isliye DB.
+
+### Counters ke liye Redis kyun? Aur "counters SQL mein" kyun fail hota hai
+
+Tempting approach: "Ek `rate_limit_counters` table bana dete hain, har request par `UPDATE ... SET tokens = tokens - 1`." Chalo dekhte hain kya hoga:
+
+```sql
+-- MAT KARO: har API request par ye
+UPDATE rate_limit_counters
+   SET tokens = LEAST(capacity, tokens + ...) - 1, ts = now()
+ WHERE key = 'rl:api-free:ak_live_9f2c' AND tokens >= 1;
+```
+
+1. **Throughput** -- 100K UPDATE/sec peak. Har UPDATE = row lock + WAL write + (durability ke liye) disk fsync. Ek Postgres primary pe ye bahut bhaari hai -- aur ye writes **sirf limiter ke** hain, business queries alag.
+2. **Hot row lock contention** -- ek busy API key ki 500 requests/sec **same row** par line lagayengi. Row lock ek time par ek transaction ko. Queue banegi, latency 1 ms se 50+ ms.
+3. **Latency** -- network + parse + lock + WAL = kuch ms minimum. Budget 2 ms ka hai.
+4. **Durability bekaar ka kharcha** -- counter ka data 60 second mein waise bhi "full bucket" ban jaata hai. Usko disk par durable likhna = paisa aur latency, fayda zero.
+5. **Dead tuples** -- Postgres MVCC mein har UPDATE ek nayi row version banata hai. 100K/sec = VACUUM par bahut pressure, table bloat.
+6. **Ironic failure** -- limiter ka kaam DB ko bachana tha. Counters DB mein daale toh **limiter khud DB ka sabse bada load** ban gaya.
+
+**Redis kyun fit hai:**
+
+- **In-memory** -- EVALSHA ~microseconds mein, network mila ke ~0.3-1 ms.
+- **Atomic Lua script** -- "read tokens -> refill -> subtract -> write" ek hi atomic step. Do Node servers ek saath ek hi key par race nahi kar sakte (Part 3 mein detail).
+- **TTL built-in** -- idle keys khud delete. Cleanup job nahi chahiye.
+- **Ephemeral OK** -- Redis restart hua toh counters gaye -> sab buckets full se start -> ek minute thoda zyada allow. Requirement mein "small over-admission OK" hai.
+- **Scale** -- ~50K Lua ops/sec per primary safe budget -> 100K peak ke liye **3 primaries** (~33K each) + 1 replica each.
+
+**Aur options?**
+
+| Option | Counters ke liye? | Kyun |
+|---|---|---|
+| **Redis / Redis Cluster** | **Haan (hamari choice)** | Fast, atomic Lua, TTL, industry standard |
+| **Memcached** | Weak | `incr` atomic hai, lekin multi-field token bucket logic (tokens + ts) ek atomic step mein nahi hota; Lua nahi |
+| **DynamoDB** | Possible, lekin nahi | Atomic counters + conditional writes hain, lekin latency single-digit **ms** (budget se zyada), aur 2B writes/day = bahut bada per-write bill. Cross-region replicated limits ke liye kabhi socha ja sakta hai |
+| **MongoDB** | Nahi | `$inc` atomic hai, lekin disk-backed, per-write durability cost, 100K writes/sec ke liye bada sharded cluster |
+| **Postgres/MySQL** | Nahi | Upar dekha: locks, WAL, VACUUM, latency |
+| **Node process memory only** | Sirf fallback | Fast, lekin har instance ka alag counter -> 10 instances = 10x limit. Global limit ke liye shared store chahiye |
+
+### Schema (Postgres -- sirf rules)
+
+```sql
+CREATE TABLE rate_limit_rules (
+  id              TEXT PRIMARY KEY,                 -- 'api-free', 'login'
+  description     TEXT,
+  identifier      TEXT NOT NULL CHECK (identifier IN ('apiKey','userId','ip')),
+  route_pattern   TEXT NOT NULL,                    -- '/api/v1/*', 'POST /auth/login'
+  plan            TEXT NULL,                        -- 'free' | 'pro' | 'enterprise' | NULL
+  capacity        INT NOT NULL CHECK (capacity > 0),
+  refill_per_sec  NUMERIC(12,4) NOT NULL CHECK (refill_per_sec > 0),
+  fail_mode       TEXT NOT NULL DEFAULT 'open' CHECK (fail_mode IN ('open','closed')),
+  enabled         BOOLEAN NOT NULL DEFAULT true,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE rate_limit_overrides (
+  client_id       TEXT NOT NULL,                    -- API key id or user id
+  rule_id         TEXT NOT NULL REFERENCES rate_limit_rules(id),
+  capacity        INT NOT NULL,
+  refill_per_sec  NUMERIC(12,4) NOT NULL,
+  expires_at      TIMESTAMPTZ NULL,
+  PRIMARY KEY (client_id, rule_id)
+);
+```
+
+**Default rules (seed data):**
+
+| id | identifier | route_pattern | plan | capacity | refill_per_sec | fail_mode | Matlab |
+|---|---|---|---|---|---|---|---|
+| `api-free` | apiKey | `/api/v1/*` | free | 100 | 1.6667 | open | 100/min per API key |
+| `api-pro` | apiKey | `/api/v1/*` | pro | 1000 | 16.6667 | open | 1000/min per API key |
+| `anon-ip` | ip | `/*` | NULL | 60 | 1 | open | 60/min per IP (anonymous) |
+| `login` | ip | `POST /auth/login` | NULL | 5 | 0.0833 | **closed** | 5/min per (IP + username) |
+
+**Kuch decisions ke WHY:**
+
+- **`id TEXT` (jaise `api-free`), number kyun nahi?** Ye id Redis key mein jaata hai (`rl:api-free:...`) aur metrics label mein (`rule="api-free"`). Readable id se dashboard aur `redis-cli` debugging easy. Rules sirf kuch sau hain, TEXT PK ka koi cost nahi.
+- **`capacity` aur `refill_per_sec` alag kyun, "100 per minute" jaisa ek column kyun nahi?** Token bucket ke do knobs hain: **burst** (capacity) aur **steady rate** (refill). "100/min" ek hi number hai; lekin enterprise ko "burst 500, lekin average 100/min" dena ho toh do columns chahiye.
+- **`NUMERIC(12,4)` kyun, `FLOAT` kyun nahi?** Admin UI mein `1.6667` likha toh wahi save ho -- float rounding surprises nahi. (Note: 5/60 = 0.08333... 4 decimal mein `0.0833` ban jaata hai -- effectively ~4.998/min. Asar: login ka `retryAfterMs` 12000 ki jagah 12005 aata hai, toh header `Retry-After: 13` aur `RateLimit-Reset: 61` dikhega (is file ke examples exact 5/60 maan ke 12 aur 60 dikhate hain). Limit ke liye ye farak negligible hai; exact chahiye toh zyada decimals rakho.)
+- **`fail_mode` per rule** -- har route ka risk alag. Public search `open` (thoda zyada traffic chalega), login `closed` (brute force ka risk nahi le sakte).
+- **`enabled` flag** -- rule delete karne ki jagah band karo. Galti se band kiya toh ek click mein wapas.
+- **`updated_at`** -- audit + "kaunsa rule recently badla" debugging.
+- **Overrides alag table kyun, rules mein `client_id` column kyun nahi?** Rules = plan-level policy (kuch sau). Overrides = per-customer exceptions (kuch hazaar ho sakte hain). Mix karoge toh rule matching complex aur table messy.
+- **`expires_at` override par** -- temporary badhotri khud khatam ho jaaye.
+- **`REFERENCES rate_limit_rules(id)`** -- override kisi non-existent rule ka nahi ho sakta (typo `api-fre` DB reject karega).
+
+### Indexes -- kaunse aur kyun?
+
+| Index | Kyun |
+|---|---|
+| `rate_limit_rules (id)` PRIMARY KEY | Admin API `PUT /rate-limit-rules/:id` ek row dhundhta hai; uniqueness guarantee |
+| `rate_limit_overrides (client_id, rule_id)` PRIMARY KEY | Ek client ka ek rule par ek hi override; admin lookup fast; `PUT` idempotent upsert (`ON CONFLICT`) |
+| **Aur kuch nahi** | Neeche dekho |
+
+**Extra index kyun nahi?** Ye URL shortener se ulta hai, aur interview mein ye point impress karta hai:
+
+- RuleCache har 30s **poori table** load karta hai (`WHERE enabled = true`). Few hundred rows ke liye Postgres **sequential scan** hi fastest hai -- index use karna ulta slow hoga (index + table dono padhne padenge).
+- Hot path (100K/sec) par Postgres **aata hi nahi**. Index ka fayda tab hai jab bahut rows mein se kuch dhundhni hon, bahut baar.
+- Overrides hazaaron mein ho jaayein toh bhi 30s mein ek full load = milliseconds.
+- **Kab index lagega?** Agar overrides lakhon mein ho jaayein aur full reload mehenga ho, toh **incremental refresh**: `WHERE updated_at > $lastLoadedAt` + index on `updated_at`. Ya Postgres `LISTEN/NOTIFY` se change hone par hi reload. Abhi zarurat nahi.
+
+> Interview line: "Index tab banata hoon jab koi query bahut data mein se thoda data bahut baar dhundhti ho. Yahan rules table chhoti hai aur memory mein cached hai, toh primary keys ke alawa index ka koi fayda nahi."
+
+### Redis key design + TTL (counters)
+
+**Key format:** `rl:<ruleId>:<identifierValue>`
+
+| Request | Key |
+|---|---|
+| Free API key `ak_live_9f2c` | `rl:api-free:ak_live_9f2c` |
+| Pro API key `ak_live_pro_31bd` | `rl:api-pro:ak_live_pro_31bd` |
+| Anonymous IP `198.51.100.23` | `rl:anon-ip:198.51.100.23` |
+| Login attempt | `rl:login:203.0.113.7:priya@example.com` |
+
+**Value:** Redis **hash** with 2 fields:
+
+```
+HGETALL rl:api-free:ak_live_9f2c
+1) "tokens"   2) "99.41666"
+3) "ts"       4) "1789712345123"      (Redis server time, milliseconds)
+```
+
+**Key design ke WHY:**
+
+- **`rl:` prefix** -- same Redis cluster mein doosre features (cache `url:...`, sessions) bhi ho sakte hain. Prefix se collision nahi, aur `SCAN MATCH rl:*` se sirf limiter keys dekh sakte ho.
+- **`ruleId` key mein** -- ek hi client ke alag rules ki alag buckets (e.g. `anon-ip` aur `login` dono ek IP par). Rule ka naam key mein nahi hota toh dono ek hi bucket kha jaate.
+- **API key ka `id`, secret nahi** -- `sk_live_...` secret kabhi key mein nahi. Redis `MONITOR`, slowlog, backups, debugging screenshots -- sab jagah key names dikhte hain. Secret leak = customer ka account leak.
+- **Username lowercase** -- `Priya@Example.com` aur `priya@example.com` ek hi account hai. Lowercase na karo toh attacker case badal ke 5 ki jagah unlimited guesses le lega.
+- **Username length cap (254)** -- attacker 1 MB ka username bheje toh Redis key 1 MB ki. Cap lagao (ya hash karo).
+- **PII note** -- email key mein hai. Strict privacy requirement ho toh `sha256(ip + username)` ka short hash use karo; debugging thoda mushkil, privacy better.
+- **Hash tag `{...}` ki zarurat nahi** -- Redis Cluster mein multi-key script ke liye saari keys ek slot mein honi chahiye, isliye `{...}` hash tag lagate hain. Hamari Lua script **ek hi key** touch karti hai, toh koi problem nahi -- keys apne aap 3 primaries par spread ho jaati hain (achha load distribution).
+
+**TTL kyun aur kitna?**
+
+Script har call par `PEXPIRE key (capacity * 1000 / rate) + 1000` lagati hai = "bucket khaali se full hone ka time + 1 second".
+
+```
+api-free : 100 * 1000 / 1.6667 ~= 60,000 ms  + 1000 = ~61 s
+api-pro  : 1000 * 1000 / 16.667 ~= 60,000 ms + 1000 = ~61 s
+anon-ip  : 60 * 1000 / 1         = 60,000 ms + 1000 = 61 s
+login    : 5 * 1000 / 0.0833    ~= 60,000 ms + 1000 = ~61 s
+```
+
+(Saare rules "per minute" hain, isliye sabka TTL ~61 s.)
+
+**Ye TTL "lossless" kyun hai?** Beautiful trick: agar koi client 61 s tak kuch na bheje, toh uski bucket waise bhi **full** ho chuki hoti. Aur script missing key ko "full bucket" treat karti hai (`tokens == nil -> tokens = capacity`). Matlab key delete karne se **koi information nahi khoyi** -- aur memory free ho gayi.
+
+- TTL na lagao -> 10M daily identities, har din nayi IPs -> keys kabhi delete nahi -> Redis memory bharti rahegi -> eviction ya OOM.
+- **Memory:** ~150 bytes per key x 10M active = **~1.5 GB**. Chhota hai. Isliye Part 1 mein bola tha: **memory bottleneck nahi, throughput hai.**
+- `maxmemory-policy`: limiter keys ke liye `volatile-ttl` ya `allkeys-lru` theek hai -- worst case koi bucket evict hui toh wo "full" ho gayi (thoda over-admission), crash nahi.
+
+---
+
+## PART 10 -- LLD (Low-Level Design): Node.js project structure
+
+```
+rate-limited-api/
++-- src/
+|   +-- config/
+|   |   +-- index.ts                    # env vars (REDIS_URL, INSTANCE_COUNT...) padho + validate
+|   +-- infra/
+|   |   +-- redis.ts                    # ioredis client / Redis.Cluster (limiter options ke saath)
+|   |   +-- postgres.ts                 # pg Pool
+|   |   +-- logger.ts                   # pino structured logger
+|   |   +-- metrics.ts                  # prom-client counters/histograms
+|   +-- types/
+|   |   +-- rate-limit.ts               # RateLimitRule, RateLimitDecision, ClientContext...
+|   +-- lua/
+|   |   +-- token-bucket.lua            # atomic token bucket script (Part 3 line by line)
+|   +-- stores/
+|   |   +-- redis-token-bucket.store.ts # Redis + Lua se consume()
+|   |   +-- memory-token-bucket.store.ts# same algorithm, process memory (fallback)
+|   +-- services/
+|   |   +-- rate-limiter.service.ts     # check(): Redis try, fail -> fallback, metrics
+|   +-- rules/
+|   |   +-- rule.repository.ts          # Postgres se rules + overrides (sirf SQL)
+|   |   +-- rule-cache.ts               # memory cache, 30s refresh, rule matching
+|   +-- middleware/
+|   |   +-- request-id.ts
+|   |   +-- identify-client.ts          # sasta: API key id + plan, JWT se userId
+|   |   +-- rate-limit.ts               # rateLimit(): identity -> rule -> check -> headers/429
+|   |   +-- authenticate.ts             # heavy auth / permissions (limiter ke BAAD)
+|   |   +-- error-handler.ts
+|   +-- admin/
+|   |   +-- rules.routes.ts             # /admin/v1/rate-limit-rules...
+|   |   +-- rules.controller.ts
+|   |   +-- rules.schema.ts             # zod validation
+|   +-- utils/
+|   |   +-- key-builder.ts              # identityFor() + bucketKey()
+|   +-- app.ts                          # composition root: sab objects yahan jodte hain
+|   +-- server.ts                       # listen + graceful shutdown
++-- migrations/
+|   +-- 001_rate_limit_rules.sql
++-- tests/
+    +-- memory-token-bucket.test.ts     # fake clock ke saath algorithm test
+    +-- rate-limit.integration.test.ts  # real Redis (docker) ke saath
+```
+
+**Har folder ka kaam:**
+
+| Folder | Kaam | Kya yahan NAHI hona chahiye |
+|---|---|---|
+| `config/` | `process.env` ek jagah padho; `INSTANCE_COUNT`, `REDIS_URL` missing ho toh app start hi na ho | Business logic |
+| `infra/` | Redis / Postgres connections, logger, metrics objects banana | Rate-limit logic, SQL |
+| `types/` | Shared TypeScript types -- sab layers ek hi "language" bolein | Implementation code |
+| `lua/` | Redis ke andar chalne wala atomic script | JS logic; secrets |
+| `stores/` | "Bucket se `cost` tokens kaato" -- sirf **algorithm + storage**. Dono stores same interface (`TokenBucketStore`) | HTTP (`req`/`res`), rule matching, fallback decision |
+| `services/` | **Policy**: kaunsa store, Redis fail hua toh kya, metrics | Express objects; SQL; Lua details |
+| `rules/` | Rules kahan se aaye (repository) aur kaunsa rule kis request par lage (cache + matching) | Redis counters; HTTP responses |
+| `middleware/` | HTTP ki duniya: request se identity nikaalo, headers set karo, 429/503 bhejo | Token bucket math; SQL |
+| `admin/` | Rules/overrides badalne ki internal API | Hot path ka code |
+| `utils/` | Chhote pure functions (key banana) | State, I/O |
+
+**Dependency direction:**
+
+```
+middleware/rate-limit.ts
+   |-- rules/rule-cache.ts  --(har 30s)-->  rules/rule.repository.ts --> Postgres
+   |-- services/rate-limiter.service.ts
+          |-- stores/redis-token-bucket.store.ts  --> Redis (lua/token-bucket.lua)
+          |-- stores/memory-token-bucket.store.ts --> process memory (fallback)
+```
+
+**Kyun aise layers?**
+
+- **Store interface** (`TokenBucketStore`) -- Redis store aur memory store same shape ke hain. Service ko farak nahi padta kaunsa hai. Kal token bucket ki jagah sliding window chahiye? Naya store likho, service same.
+- **Testable** -- `RateLimiterService` ko ek fake store do jo hamesha throw kare -> fallback path test ho gaya, bina Redis band kiye.
+- **Middleware sirf HTTP** -- kal yahi limiter ek gRPC service ya Kafka consumer mein chahiye (Version 3), toh service + stores as-is reuse, sirf naya "adapter".
+- **Rules alag** -- rule kahan store hai (Postgres, YAML, config service) ye limiter ko pata nahi hona chahiye.
+
+> Interview tip: Agar interviewer bole "itne layers kyun?" -- "Main kam se kam 3 cheezein alag rakhunga: **HTTP (middleware)**, **policy (service)**, **storage/algorithm (store)**. Isse fallback aur algorithm dono swap/test ho sakte hain. Isse zyada abstraction ki zarurat nahi."
+
+---
+
+## PART 11 + 12 -- Node.js / TypeScript Code (line-by-line explanation ke saath)
+
+Stack: **Express 5**, **ioredis** (Redis + Cluster, `defineCommand`), **pg**, **pino** (logs), **prom-client** (metrics).
+
+Order: pehle types, phir chhote building blocks (key, stores), phir service, phir rules, phir middleware, phir wiring. Yahi order request ke andar se bahar ka hai.
+
+### 0. `types/rate-limit.ts` -- shared types
+
+```ts
+export type Identifier = 'apiKey' | 'userId' | 'ip';
+
+export interface RateLimitRule {
+  id: string;               // 'api-free'
+  identifier: Identifier;
+  routePattern: string;     // '/api/v1/*' or 'POST /auth/login'
+  plan: 'free' | 'pro' | 'enterprise' | null;
+  capacity: number;         // max burst
+  refillPerSec: number;     // steady rate
+  failMode: 'open' | 'closed';
+  enabled: boolean;
+}
+
+export interface RateLimitDecision {
+  allowed: boolean;
+  limit: number;            // capacity
+  remaining: number;
+  retryAfterMs: number;     // 0 when allowed
+  resetSec: number;         // seconds until bucket full again
+}
+
+export interface ClientContext {
+  method: string;           // 'GET', 'POST'
+  path: string;             // '/api/v1/orders'
+  ip: string;
+  apiKeyId?: string;        // 'ak_live_9f2c' -- id, secret nahi
+  userId?: string;
+  plan?: NonNullable<RateLimitRule['plan']>;
+  username?: string;        // sirf login route ke liye
+}
+
+export interface TokenBucketStore {
+  consume(key: string, rule: RateLimitRule, cost: number): Promise<RateLimitDecision>;
+}
+
+export interface RuleResolver {
+  resolve(ctx: ClientContext): RateLimitRule | null;
+}
+```
+
+**Code Explanation:**
+
+- `RateLimitRule` -- DB ki ek row ka TypeScript roop (camelCase). Rule batata hai **kisko** (`identifier`), **kahan** (`routePattern` + `plan`), **kitna** (`capacity` + `refillPerSec`), aur **fail hone par kya** (`failMode`).
+- `RateLimitDecision` -- limiter ka jawab. Middleware isi se headers banata hai: `limit` -> `RateLimit-Limit`, `remaining` -> `RateLimit-Remaining`, `resetSec` -> `RateLimit-Reset`, `retryAfterMs` -> `Retry-After`.
+- `ClientContext` -- request ka woh hissa jo limiter ko chahiye. Express ka `req` poora pass nahi karte -- rules layer ko Express pata hi nahi hona chahiye (testable, reusable).
+- `plan?: NonNullable<RateLimitRule['plan']>` -- client ka plan `'free' | 'pro' | 'enterprise'` (rule mein `null` = "har plan", lekin client ka plan `null` nahi hota).
+- `TokenBucketStore` -- **interface**. Redis store aur memory store dono isko implement karte hain. Service sirf interface jaanti hai.
+- `RuleResolver` -- middleware ko sirf `resolve()` chahiye. Test mein ek fake resolver de sakte ho.
+
+### 1. `utils/key-builder.ts` -- identity aur Redis key
+
+```ts
+import type { ClientContext, RateLimitRule } from '../types/rate-limit';
+
+const MAX_USERNAME_LEN = 254; // email ki max length
+
+export function identityFor(rule: RateLimitRule, ctx: ClientContext): string | null {
+  switch (rule.identifier) {
+    case 'apiKey':
+      return ctx.apiKeyId ?? null;
+    case 'userId':
+      return ctx.userId ?? null;
+    case 'ip':
+      if (rule.id === 'login') {
+        const username = (ctx.username ?? '').trim().toLowerCase().slice(0, MAX_USERNAME_LEN);
+        return `${ctx.ip}:${username}`;
+      }
+      return ctx.ip;
+  }
+}
+
+export function bucketKey(ruleId: string, identityValue: string): string {
+  return `rl:${ruleId}:${identityValue}`;
+}
+```
+
+**Code Explanation:**
+
+- `identityFor(rule, ctx)` -- "is rule ke hisaab se is client ko kaise pehchaanein?" Rule bolta hai `identifier: 'apiKey'` toh API key id, `'ip'` toh IP.
+- `return ctx.apiKeyId ?? null;` -- rule API key wala hai lekin request mein key nahi (anonymous)? `null` -> ye rule is request par lagta hi nahi. RuleCache phir agla rule dekhega (jaise `anon-ip`).
+- `ctx.apiKeyId` -- **id** (`ak_live_9f2c`), secret (`sk_live_...`) nahi. `identifyClient` middleware ne secret ko hash karke id nikaali thi. Secret kabhi Redis key, log ya metric label mein nahi jaana chahiye.
+- `if (rule.id === 'login')` -- login ke liye sirf IP kaafi nahi: (a) office ke 500 log ek hi NAT IP se aate hain -- sirf IP par limit lagao toh ek ki galti se sab block; (b) attacker botnet se IP badalta hai. **IP + username** dono combine karke ek account par ek IP se guessing roki. (Rule id par special case v1 ke liye theek hai; generic chahiye toh rule mein `keyFields` column add karo.)
+- `.trim().toLowerCase()` -- `" Priya@Example.com"` aur `"priya@example.com"` ek hi bucket mein. Warna attacker case badal-badal ke limit bypass karega.
+- `.slice(0, MAX_USERNAME_LEN)` -- attacker 1 MB username bheje toh bhi key chhoti rahe.
+- `(ctx.username ?? '')` -- username bheja hi nahi? Tab bhi `ip:` bucket se limit -- khaali username se bypass nahi.
+- `` `rl:${ruleId}:${identityValue}` `` -- spec wala format: `rl:login:203.0.113.7:priya@example.com`. Prefix `rl:` + rule + identity.
+
+> IPv6 note: ek user ke paas poora `/64` block hota hai (crores addresses). Sirf full IPv6 par limit lagao toh wo har request naye address se bhej dega. Production mein IPv6 ko `/64` prefix tak cut karke key banate hain.
+
+### 2. `lua/token-bucket.lua` -- reference (explanation Part 3 mein)
+
+Poori script DESIGN ki canonical script hai; yahan sirf shape samjho -- **line-by-line Part 3 mein**.
+
+```lua
+-- KEYS[1] = bucket key
+-- ARGV[1] = capacity, ARGV[2] = refill tokens per second, ARGV[3] = cost
+local t = redis.call('TIME')                                   -- Redis ka clock, Node ka nahi
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')    -- purani state
+-- ... refill: tokens = min(capacity, tokens + elapsed * rate / 1000)
+-- ... tokens >= cost ? allow (tokens - cost) : reject + retry_after
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(capacity * 1000 / rate) + 1000)
+return { allowed, math.floor(tokens), retry_after }
+```
+
+Teen cheezein abhi yaad rakho:
+
+1. **Input:** 1 key + 3 args (capacity, refillPerSec, cost). **Output:** `[allowed (1/0), remaining, retryAfterMs]`.
+2. **`TIME`** -- time Redis se liya, Node server ka nahi. 20 Node servers ki clocks thodi alag hoti hain (clock skew); ek hi clock use karne se refill calculation consistent.
+3. Poori script Redis mein **atomic** chalti hai -- beech mein koi doosri command us key ko nahi chhu sakti. Isliye "read, calculate, write" mein race condition nahi.
+
+### 3. `stores/redis-token-bucket.store.ts` -- Redis + Lua
+
+```ts
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { Cluster, Redis, Result } from 'ioredis';
+import type { RateLimitDecision, RateLimitRule, TokenBucketStore } from '../types/rate-limit';
+
+const TOKEN_BUCKET_LUA = readFileSync(join(__dirname, '../lua/token-bucket.lua'), 'utf8');
+
+declare module 'ioredis' {
+  interface RedisCommander<Context> {
+    tokenBucket(
+      key: string, capacity: number, refillPerSec: number, cost: number,
+    ): Result<[number, number, number], Context>;
+  }
+}
+
+export class RedisTokenBucketStore implements TokenBucketStore {
+  constructor(private readonly redis: Redis | Cluster) {
+    redis.defineCommand('tokenBucket', { numberOfKeys: 1, lua: TOKEN_BUCKET_LUA });
+  }
+
+  async consume(key: string, rule: RateLimitRule, cost: number): Promise<RateLimitDecision> {
+    const [allowed, remaining, retryAfterMs] =
+      await this.redis.tokenBucket(key, rule.capacity, rule.refillPerSec, cost);
+
+    return {
+      allowed: allowed === 1,
+      limit: rule.capacity,
+      remaining,
+      retryAfterMs,
+      resetSec: Math.ceil((rule.capacity - remaining) / rule.refillPerSec),
+    };
+  }
+}
+```
+
+**Code Explanation:**
+
+- `readFileSync(join(__dirname, '../lua/token-bucket.lua'), 'utf8')` -- Lua script alag `.lua` file mein hai (syntax highlighting, alag test). **Startup par ek baar** padhte hain, sync read theek hai kyunki abhi koi request nahi aa rahi. (Build step mein `.lua` file ko `dist/` mein copy karna mat bhoolna -- `tsc` sirf `.ts` copy karta hai.)
+- `declare module 'ioredis' { interface RedisCommander ... }` -- TypeScript ko batana ki `redis.tokenBucket(...)` naam ki command exist karti hai aur `[number, number, number]` return karti hai. Iske bina `this.redis.tokenBucket` par type error aata. (Ye ioredis ka documented pattern hai.)
+- `Redis | Cluster` -- same store single Redis ke saath bhi chale aur **Redis Cluster** (3 primaries) ke saath bhi. ioredis dono par `defineCommand` support karta hai.
+- `redis.defineCommand('tokenBucket', { numberOfKeys: 1, lua })` -- ioredis ko script do. Pehli call par ioredis `EVALSHA <sha1>` bhejta hai; Redis bole `NOSCRIPT` (script cache mein nahi, jaise restart ke baad) toh ioredis khud `EVAL` se poori script bhej deta hai. Hum har request par poora script text network par nahi bhejte -- sirf 40 char ka SHA.
+- `numberOfKeys: 1` -- pehla argument key hai (`KEYS[1]`), baaki `ARGV`. Redis Cluster isi key se decide karta hai ki command kis primary par jaaye.
+- `await this.redis.tokenBucket(key, rule.capacity, rule.refillPerSec, cost)` -- **ek network round trip**. Poora token bucket logic Redis ke andar.
+- `allowed === 1` -- Lua boolean seedha return nahi karta (Redis `false` ko nil bana deta hai), isliye script 1/0 bhejti hai aur hum boolean banate hain.
+- `limit: rule.capacity` -- `RateLimit-Limit` header.
+- `resetSec: Math.ceil((capacity - remaining) / refillPerSec)` -- spec ka formula: jitne tokens kam hain, unko refill hone mein kitne second. Example: `api-free` mein 99 bache -> `ceil(1 / 1.6667) = 1`. Login mein 0 bache -> `ceil(5 / 0.0833) = 61` (exact 5/60 hota toh 60).
+- `try/catch` yahan kyun nahi? -- store ka kaam sirf Redis se baat karna hai. Redis fail hua toh error **upar service tak jaane do** -- fallback ka decision service ki policy hai, store ki nahi.
+
+### 4. `stores/memory-token-bucket.store.ts` -- local fallback
+
+```ts
+import type { RateLimitDecision, RateLimitRule, TokenBucketStore } from '../types/rate-limit';
+
+interface Bucket { tokens: number; ts: number }
+
+export class MemoryTokenBucketStore implements TokenBucketStore {
+  private readonly buckets = new Map<string, Bucket>();
+
+  constructor(
+    private readonly instanceCount: number,   // config se, e.g. 10
+    private readonly maxKeys = 100_000,
+  ) {}
+
+  async consume(key: string, rule: RateLimitRule, cost: number): Promise<RateLimitDecision> {
+    const capacity = Math.max(1, Math.floor(rule.capacity / this.instanceCount));
+    const rate = rule.refillPerSec / this.instanceCount;
+    const now = Date.now();
+
+    const prev = this.buckets.get(key) ?? { tokens: capacity, ts: now };
+    let tokens = Math.min(capacity, prev.tokens + (Math.max(0, now - prev.ts) * rate) / 1000);
+
+    let allowed = false;
+    let retryAfterMs = 0;
+    if (tokens >= cost) {
+      tokens -= cost;
+      allowed = true;
+    } else {
+      retryAfterMs = Math.ceil(((cost - tokens) * 1000) / rate);
+    }
+
+    this.buckets.delete(key);                  // delete + set = key Map ke end mein (LRU order)
+    this.buckets.set(key, { tokens, ts: now });
+    if (this.buckets.size > this.maxKeys) {
+      const oldest = this.buckets.keys().next().value;
+      if (oldest !== undefined) this.buckets.delete(oldest);
+    }
+
+    const remaining = Math.floor(tokens);
+    return {
+      allowed, limit: capacity, remaining, retryAfterMs,
+      resetSec: Math.ceil((capacity - remaining) / rate),
+    };
+  }
+}
+```
+
+**Code Explanation:**
+
+- `implements TokenBucketStore` -- Redis store jaisa hi interface. Service ke liye dono interchangeable.
+- `instanceCount` -- config (`INSTANCE_COUNT` env, ya autoscaler ka current count) se. **Kyun?** Redis down hai toh har Node instance apna alag counter rakhega. 10 instances aur har ek poore 100 allow kare = **1000/min**, 10x leak. Isliye har instance ko **hissa** do.
+- `Math.floor(rule.capacity / this.instanceCount)` -- `api-free`: 100/10 = **10 per instance**. `anon-ip`: 60/10 = 6.
+- `Math.max(1, ...)` -- `login`: 5/10 = 0.5 -> floor 0 -> bucket kabhi allow hi nahi karegi. Minimum 1 rakha. Trade-off: login fallback mein ~10/min (instances x 1) ho jaata hai -- 2x loose, lekin phir bhi limited aur sirf Redis outage ke time.
+- `rate = rule.refillPerSec / this.instanceCount` -- refill bhi divide. `api-free`: 1.6667/10 = ~0.167 tokens/s per instance.
+- `Date.now()` -- yahan Node ka clock theek hai, kyunki ye bucket **sirf isi process** ki hai. Clock skew ka sawaal hi nahi (Redis wale case mein kai servers ek key share karte the, isliye `TIME`).
+- `?? { tokens: capacity, ts: now }` -- naya client = full bucket (Lua jaisa hi behaviour).
+- `Math.min(capacity, prev.tokens + elapsed * rate / 1000)` -- **refill**: jitna time guzra, utne tokens wapas, lekin capacity se zyada nahi. Same formula jaisa Lua mein.
+- `Math.max(0, now - prev.ts)` -- system clock peeche chala jaaye (NTP adjust) toh negative elapsed se tokens kam na hon.
+- `retryAfterMs = Math.ceil((cost - tokens) * 1000 / rate)` -- kitne tokens kam hain / refill speed = kitna wait.
+- `this.buckets.delete(key); this.buckets.set(key, ...)` -- JS `Map` insertion order yaad rakhta hai. Delete + set = ye key "sabse recent" ban gayi. Isse Map khud ek simple **LRU** ban jaata hai.
+- `if (this.buckets.size > this.maxKeys)` -- **bounded memory**. Redis outage ke time attacker lakhon IPs se aaye toh Map infinite na badhe. `keys().next().value` = sabse purani (least recently used) key -> delete. Uski bucket "full" maan li jaayegi -- thoda over-admission, lekin process OOM se nahi marega.
+- `async` kyun jab andar koi `await` nahi? -- interface `Promise` maangta hai; Redis store ke saath same shape.
+- `limit: capacity` -- fallback mein headers **local** capacity dikhayenge (10, 100 nahi). Ye honest hai: abhi yahi limit lag rahi hai. Client ko thoda alag number dikhega sirf outage ke time.
+
+> Alternative bounded approach: `setInterval` se har minute un keys ko hatao jinka `ts` 60s se purana hai (unki bucket waise bhi full ho chuki). LRU cap + ye sweep dono saath bhi chal sakte hain.
+
+### 5. `services/rate-limiter.service.ts` -- policy: Redis, warna fallback
+
+```ts
+import type { RateLimitDecision, RateLimitRule, TokenBucketStore } from '../types/rate-limit';
+import { bucketKey } from '../utils/key-builder';
+import { rateLimitChecks, rateLimitCheckDuration, rateLimiterFallback } from '../infra/metrics';
+import type { Logger } from '../infra/logger';
+
+const WARN_EVERY_MS = 10_000;
+
+export class RateLimiterService {
+  private lastWarnAt = 0;
+
+  constructor(
+    private readonly primary: TokenBucketStore,    // RedisTokenBucketStore
+    private readonly fallback: TokenBucketStore,   // MemoryTokenBucketStore
+    private readonly logger: Logger,
+  ) {}
+
+  async check(rule: RateLimitRule, identityValue: string, cost = 1): Promise<RateLimitDecision> {
+    const key = bucketKey(rule.id, identityValue);
+    const endTimer = rateLimitCheckDuration.startTimer();
+    let decision: RateLimitDecision;
+
+    try {
+      decision = await this.primary.consume(key, rule, cost);
+    } catch (err) {
+      rateLimiterFallback.inc();
+      this.warnSampled(err, rule.id);
+      decision = await this.fallback.consume(key, rule, cost);
+    } finally {
+      endTimer();
+    }
+
+    rateLimitChecks.inc({ rule: rule.id, result: decision.allowed ? 'allowed' : 'rejected' });
+    return decision;
+  }
+
+  private warnSampled(err: unknown, ruleId: string): void {
+    const now = Date.now();
+    if (now - this.lastWarnAt < WARN_EVERY_MS) return;
+    this.lastWarnAt = now;
+    this.logger.warn({ err, ruleId }, 'Redis limiter failed, using local fallback');
+  }
+}
+```
+
+**Code Explanation:**
+
+- `constructor(primary, fallback, logger)` -- dono stores bahar se (dependency injection). Service ko `new Redis()` nahi pata. Test mein `primary` ek fake de do jo hamesha throw kare -> fallback path test.
+- `check(rule, identityValue, cost = 1)` -- spec ka signature. `cost = 1` default: normal request 1 token. Mehenga endpoint (jaise bulk export) `cost = 10` le sakta hai -- ek hi bucket mein "weighted" limit.
+- `bucketKey(rule.id, identityValue)` -- `rl:api-free:ak_live_9f2c`. Key banana ek hi jagah, taaki Redis aur memory store dono same key use karein.
+- `rateLimitCheckDuration.startTimer()` -- histogram timer. `rate_limit_check_duration_seconds` ka p99 dashboard par < 2 ms dikhna chahiye. Badha toh alert.
+- `try { decision = await this.primary.consume(...) }` -- normal path: Redis Lua.
+- `catch (err)` -- Redis down (`enableOfflineQueue: false` -> turant error), ya slow (`commandTimeout: 20` -> 20 ms baad error), ya cluster failover chal raha hai. Sab ek hi raasta: fallback.
+- `rateLimiterFallback.inc()` -- `rate_limiter_fallback_total` metric. Ye 0 se upar gaya = alert: "limiter local mode mein hai, limits approximate hain".
+- `this.warnSampled(err, rule.id)` -- **sampled log**. Redis down + 100K RPS = har request par log = 100K log lines/sec -> logging system (aur disk) bhi gir jaayega. Har 10 sec mein ek warn kaafi hai; poori ginti metric mein hai.
+- `decision = await this.fallback.consume(key, rule, cost)` -- local bucket se decision. Request ko **na error milti hai na latkaati hai**.
+- `finally { endTimer(); }` -- success ho ya fallback, duration record ho. (Agar fallback bhi throw kare toh error middleware tak jaata hai -- wahan `failMode` decide karega.)
+- `rateLimitChecks.inc({ rule, result })` -- `rate_limit_checks_total{rule="login",result="rejected"}`. Isse dikhega: kaunsa rule kitna reject kar raha hai. `rule` label mein sirf rule id (kuch sau values) -- **API key/IP label mein kabhi nahi** (10M labels = Prometheus mar jaayega; isko "high cardinality" kehte hain).
+- `if (now - this.lastWarnAt < WARN_EVERY_MS) return;` -- simple time-based sampling. Per-instance hai, toh 10 instances = max 1 log/sec total.
+
+### 6. `rules/rule.repository.ts` -- Postgres se rules (sirf SQL)
+
+```ts
+import type { Pool } from 'pg';
+import type { RateLimitRule } from '../types/rate-limit';
+
+export interface RateLimitOverride {
+  clientId: string;
+  ruleId: string;
+  capacity: number;
+  refillPerSec: number;
+}
+
+export class RuleRepository {
+  constructor(private readonly db: Pool) {}
+
+  async loadEnabledRules(): Promise<RateLimitRule[]> {
+    const { rows } = await this.db.query(
+      `SELECT id, identifier, route_pattern, plan, capacity, refill_per_sec, fail_mode, enabled
+         FROM rate_limit_rules
+        WHERE enabled = true`,
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      identifier: r.identifier,
+      routePattern: r.route_pattern,
+      plan: r.plan,
+      capacity: r.capacity,
+      refillPerSec: Number(r.refill_per_sec),
+      failMode: r.fail_mode,
+      enabled: r.enabled,
+    }));
+  }
+
+  async loadActiveOverrides(): Promise<RateLimitOverride[]> {
+    const { rows } = await this.db.query(
+      `SELECT client_id, rule_id, capacity, refill_per_sec
+         FROM rate_limit_overrides
+        WHERE expires_at IS NULL OR expires_at > now()`,
+    );
+    return rows.map((r) => ({
+      clientId: r.client_id,
+      ruleId: r.rule_id,
+      capacity: r.capacity,
+      refillPerSec: Number(r.refill_per_sec),
+    }));
+  }
+}
+```
+
+**Code Explanation:**
+
+- `WHERE enabled = true` -- disabled rules memory mein aate hi nahi. Admin ne rule band kiya -> 30s mein har instance par band.
+- Poori table load, koi `LIMIT`/filter nahi -- few hundred rows hain. Isliye Part 9 mein bola: extra index ki zarurat nahi.
+- `Number(r.refill_per_sec)` -- **important gotcha.** `pg` library `NUMERIC` ko **string** mein deta hai (`"1.6667"`), taaki precision na khoye. String ko Lua ya math mein bhejoge toh `"1.6667" / 10` JS mein chal jaayega lekin `"1" + 1 = "11"` jaise bugs aate hain. Yahin number bana do.
+- `routePattern: r.route_pattern` -- DB `snake_case` -> app `camelCase`. Mapping sirf repository mein.
+- `WHERE expires_at IS NULL OR expires_at > now()` -- expire ho chuke overrides load hi nahi hote. Koi cron job nahi chahiye -- 30s ke andar purani limit khud wapas.
+- `now()` DB ka time -- saare instances ek hi clock se decide karte hain ki override active hai ya nahi.
+
+### 7. `rules/rule-cache.ts` -- memory cache + 30s refresh + rule matching
+
+```ts
+import type { ClientContext, RateLimitRule, RuleResolver } from '../types/rate-limit';
+import type { RateLimitOverride, RuleRepository } from './rule.repository';
+import { identityFor } from '../utils/key-builder';
+import { ruleCacheAge } from '../infra/metrics';
+import type { Logger } from '../infra/logger';
+
+export class RulesNotLoadedError extends Error {}
+
+export class RuleCache implements RuleResolver {
+  private rules: RateLimitRule[] = [];
+  private overrides = new Map<string, RateLimitOverride>();
+  private loadedAt = 0;
+  private timer?: NodeJS.Timeout;
+
+  constructor(
+    private readonly repo: RuleRepository,
+    private readonly logger: Logger,
+    private readonly refreshMs = 30_000,
+  ) {}
+
+  async start(): Promise<void> {
+    await this.refresh();
+    this.timer = setInterval(() => void this.refresh(), this.refreshMs);
+    this.timer.unref();
+  }
+
+  stop(): void {
+    clearInterval(this.timer);
+  }
+
+  isLoaded(): boolean {
+    return this.loadedAt > 0;
+  }
+
+  async refresh(): Promise<void> {
+    try {
+      const [rules, overrides] = await Promise.all([
+        this.repo.loadEnabledRules(),
+        this.repo.loadActiveOverrides(),
+      ]);
+      this.rules = rules.sort(bySpecificity);
+      this.overrides = new Map(overrides.map((o) => [`${o.clientId}:${o.ruleId}`, o]));
+      this.loadedAt = Date.now();
+    } catch (err) {
+      this.logger.error({ err }, 'Rule refresh failed, keeping last good copy');
+    }
+    if (this.loadedAt > 0) ruleCacheAge.set((Date.now() - this.loadedAt) / 1000);
+  }
+
+  resolve(ctx: ClientContext): RateLimitRule | null {
+    if (this.loadedAt === 0) throw new RulesNotLoadedError('Rules not loaded yet');
+
+    const rule = this.rules.find((r) =>
+      routeMatches(r.routePattern, ctx.method, ctx.path) &&
+      (r.plan === null || r.plan === ctx.plan) &&
+      identityFor(r, ctx) !== null,
+    );
+    if (!rule) return null;
+
+    const clientId = ctx.apiKeyId ?? ctx.userId;
+    const o = clientId ? this.overrides.get(`${clientId}:${rule.id}`) : undefined;
+    return o ? { ...rule, capacity: o.capacity, refillPerSec: o.refillPerSec } : rule;
+  }
+}
+
+// 'POST /auth/login' = method + exact path, '/api/v1/*' = kisi bhi method ka prefix match
+function routeMatches(pattern: string, method: string, path: string): boolean {
+  const [m, p] = pattern.includes(' ') ? pattern.split(' ', 2) : [null, pattern];
+  if (m && m !== method) return false;
+  return p.endsWith('*') ? path.startsWith(p.slice(0, -1)) : path === p;
+}
+
+// Zyada specific rule pehle: method wala > lamba pattern > plan wala
+function bySpecificity(a: RateLimitRule, b: RateLimitRule): number {
+  const score = (r: RateLimitRule) =>
+    (r.routePattern.includes(' ') ? 10_000 : 0) + r.routePattern.length * 10 + (r.plan ? 1 : 0);
+  return score(b) - score(a);
+}
+```
+
+**Code Explanation -- loading:**
+
+- `private rules / overrides / loadedAt` -- ye poora "cache" hai: process memory mein ek array aur ek Map. KBs mein.
+- `async start()` -- server start par **pehli load await** hoti hai. `server.ts` iske baad hi `listen()` karta hai (ya readiness probe tab tak fail karta hai) -- taaki bina rules ke traffic na aaye.
+- `setInterval(() => void this.refresh(), this.refreshMs)` -- har 30s reload. `void` isliye ki promise ko jaan-boojhke ignore kar rahe hain (refresh andar hi apni errors pakadta hai, toh unhandled rejection nahi).
+- `this.timer.unref()` -- **ye chhoti line important hai.** Normally ek active `setInterval` Node process ko zinda rakhta hai. Graceful shutdown mein server band hua, connections band hue, lekin ye timer process ko exit nahi karne deta. `unref()` = "sirf is timer ki wajah se process ko zinda mat rakho." Tests bhi hang nahi hote.
+- `Promise.all([...])` -- rules aur overrides dono queries parallel.
+- `this.rules = rules.sort(bySpecificity)` -- **naya array poora banke ek hi assignment mein swap**. Node single-threaded hai, toh koi request "aadhe purane, aadhe naye" rules nahi dekhegi.
+- `new Map(... [`${clientId}:${ruleId}`, o])` -- override lookup O(1): `"ak_live_ent_77aa:api-pro"` -> override.
+- `catch (err) { logger.error(...) }` -- **Postgres down? Kuch mat badlo.** `this.rules` wahi purane (last good copy) rehte hain aur limiting chalti rehti hai. DB ka girna limiter ko nahi girata. Ye `throw` nahi karta, isliye interval chalta rehta hai aur DB wapas aate hi agla refresh successful.
+- `ruleCacheAge.set(...)` -- `rate_limit_rule_cache_age_seconds` metric. Normal: 0-30. Agar 300+ dikhe = DB se refresh 10 baar fail -- alert, lekin emergency nahi.
+
+**Code Explanation -- matching (`resolve`):**
+
+- `if (this.loadedAt === 0) throw new RulesNotLoadedError(...)` -- rules kabhi load hi nahi hue = **koi decision possible nahi**. Middleware isko pakad ke `failMode` ke hisaab se chalega.
+- `this.rules.find(...)` -- rules **specificity order** mein sorted hain, toh pehla match = sabse specific rule. Few hundred rules par linear scan ~microseconds. (Hazaaron rules hon toh route-prefix wala Map/trie bana lo.)
+- `routeMatches(...)` -- do shapes: `'POST /auth/login'` (method + exact path) aur `'/api/v1/*'` (prefix, koi bhi method).
+- `(r.plan === null || r.plan === ctx.plan)` -- `null` plan = sab ke liye. `api-free` sirf free plan wale key par, `api-pro` sirf pro par.
+- `identityFor(r, ctx) !== null` -- rule `apiKey` wala hai lekin request anonymous hai -> skip, agla rule (`anon-ip`). Isi se ek hi route `/api/v1/*` par API key wale aur anonymous dono sahi rule paate hain.
+- `const clientId = ctx.apiKeyId ?? ctx.userId;` -- override kiske liye dhundhein.
+- `{ ...rule, capacity: o.capacity, refillPerSec: o.refillPerSec }` -- rule ki **copy** mein override values. Original rule object nahi badalte (warna sab clients ko enterprise limit mil jaati!). Rule id wahi rehta hai, toh Redis key bhi wahi `rl:api-pro:ak_live_ent_77aa`.
+- `bySpecificity` -- `POST /auth/login` (method wala, score 10000+) > `/api/v1/*` (lamba) > `/*` (chhota). Tie mein plan wala pehle. Isse `POST /auth/login` par `login` rule jeetta hai, `anon-ip` nahi.
+
+> Rule change hone par Redis buckets ka kya? Capacity 100 se 50 ki -> Lua `min(capacity, tokens)` agle call par tokens 50 par cap kar dega. 100 se 200 ki -> bucket dheere-dheere 200 tak bharegi. Koi migration nahi chahiye -- token bucket ka ek aur fayda.
+
+### 8. `middleware/rate-limit.ts` -- HTTP layer
+
+```ts
+import type { Request, RequestHandler, Response } from 'express';
+import type { ClientContext, RateLimitDecision, RateLimitRule, RuleResolver } from '../types/rate-limit';
+import type { RateLimiterService } from '../services/rate-limiter.service';
+import { identityFor } from '../utils/key-builder';
+import { logger } from '../infra/logger';
+
+const FAIL_CLOSED_PREFIXES = ['/auth/'];   // rule hi pata na ho, tab bhi auth routes closed
+
+export function rateLimit(rules: RuleResolver, limiter: RateLimiterService): RequestHandler {
+  return async (req, res, next) => {
+    const ctx = buildContext(req, res);
+    let rule: RateLimitRule | null = null;
+    let decision: RateLimitDecision | null = null;
+
+    try {
+      rule = rules.resolve(ctx);
+      const identity = rule ? identityFor(rule, ctx) : null;
+      if (rule && identity) decision = await limiter.check(rule, identity);
+    } catch (err) {
+      const failMode = rule?.failMode
+        ?? (FAIL_CLOSED_PREFIXES.some((p) => ctx.path.startsWith(p)) ? 'closed' : 'open');
+      logger.error({ err, ruleId: rule?.id, failMode }, 'Rate limiter could not decide');
+      if (failMode === 'open') return next();
+      res.status(503).json({ error: 'RATE_LIMITER_UNAVAILABLE', message: 'Please retry shortly' });
+      return;
+    }
+
+    if (!decision) return next();              // is route par koi rule nahi
+
+    res.set({
+      'RateLimit-Limit': String(decision.limit),
+      'RateLimit-Remaining': String(decision.remaining),
+      'RateLimit-Reset': String(decision.resetSec),
+    });
+    if (decision.allowed) return next();
+
+    const retryAfterSec = Math.max(1, Math.ceil(decision.retryAfterMs / 1000));
+    res.set('Retry-After', String(retryAfterSec));
+    res.status(429).json({ error: 'RATE_LIMITED', message: 'Too many requests', retryAfterSec });
+  };
+}
+
+function buildContext(req: Request, res: Response): ClientContext {
+  const apiKey = res.locals.apiKey as { id: string; plan: ClientContext['plan'] } | undefined;
+  return {
+    method: req.method,
+    path: req.path,
+    ip: req.ip ?? 'unknown',
+    apiKeyId: apiKey?.id,
+    plan: apiKey?.plan ?? res.locals.plan,
+    userId: res.locals.userId,
+    username: typeof req.body?.username === 'string' ? req.body.username : undefined,
+  };
+}
+```
+
+**Code Explanation -- `rateLimit`:**
+
+- `rateLimit(rules, limiter)` -- **factory function** jo middleware return karta hai. Dependencies ek baar milti hain (app.ts mein), har request par nahi.
+- `const ctx = buildContext(req, res);` -- Express ki duniya se ek plain object banao. Iske aage ka code (`RuleCache`, `identityFor`) Express nahi jaanta.
+- `let rule / decision = null` -- `try` ke bahar declare, taaki `catch` mein pata ho ki rule mila tha ya nahi.
+- `rule = rules.resolve(ctx);` -- memory se rule. Rules kabhi load nahi hue toh yahan `RulesNotLoadedError` throw hota hai.
+- `if (rule && identity) decision = await limiter.check(rule, identity);` -- asli check. Redis fail ho toh service andar hi fallback kar leti hai -- yahan error **nahi** aata.
+- `catch (err)` -- yahan tab hi aate hain jab **koi decision possible nahi**: rules load nahi hue, ya limiter code mein unexpected bug (fallback bhi fail). Yahi `failMode` ka kaam hai.
+- `rule?.failMode ?? (...'/auth/'... ? 'closed' : 'open')` -- rule pata hai toh uska `failMode`. Rule hi pata nahi (rules load nahi hue) toh safe default: `/auth/` routes **closed**, baaki **open**. Kyun? Login jaise route par "bina limit ke chhod do" = brute force ka khula darwaza; baaki API par "sab ko block" = poori company down.
+- `if (failMode === 'open') return next();` -- **availability over strictness**: limiter ki galti ki wajah se customer ki valid request fail nahi honi chahiye.
+- `res.status(503)` -- closed: 503 (humari taraf ki problem, temporary), 429 nahi (client ki galti nahi hai).
+- `if (!decision) return next();` -- is route par koi rule nahi (jaise internal route) -> bina limit aage.
+- **`next()` try ke bahar kyun?** Agar `next()` try ke andar hota aur aage ka koi handler sync error throw karta, toh hamara `catch` usko "limiter error" samajh ke dobara `next()` call kar deta -- double response bug. Decision try mein, action bahar.
+- `res.set({ 'RateLimit-Limit': ..., ... })` -- **allowed par bhi** headers. Achhe clients `Remaining` dekh ke khud slow ho jaate hain -- 429 aane se pehle hi.
+- `String(...)` -- header values strings hoti hain.
+- `if (decision.allowed) return next();` -- allowed -> aage auth, route handler.
+- `Math.max(1, Math.ceil(decision.retryAfterMs / 1000))` -- ms ko seconds mein, **round up** (600 ms -> 1 s; 12000 ms -> 12 s). Minimum 1, taaki client ko kabhi `Retry-After: 0` na mile.
+- `res.status(429).json({...})` -- spec ka body format. `next()` call **nahi** kiya -> request yahin khatam. Controller, DB, bcrypt -- kuch nahi chala.
+
+**Code Explanation -- `buildContext`:**
+
+- `res.locals.apiKey` -- `identifyClient` middleware ne pehle set kiya: API key secret ka hash -> in-memory/Redis cache -> `{ id: 'ak_live_9f2c', plan: 'free' }`. `res.locals` Express ka per-request "bag" hai middlewares ke beech data pass karne ke liye.
+- `req.ip` -- **`trust proxy` setting par depend karta hai** (app.ts mein). Load balancer ke peeche bina `trust proxy` ke `req.ip` = LB ka IP -> **saare anonymous users ek hi bucket mein** -> 60/min poori duniya ke liye -> sabko 429. `trust proxy: true` blindly set kiya toh attacker khud `X-Forwarded-For: 1.2.3.4` bhej ke har request par naya IP bana lega -> limit bypass. Sahi: jitne proxies tumhare hain utne hops trust karo (`app.set('trust proxy', 1)`).
+- `req.ip ?? 'unknown'` -- Express 5 types mein `req.ip` undefined ho sakta hai (socket band). Sab unknown ek bucket mein -- rare edge case.
+- `plan: apiKey?.plan ?? res.locals.plan` -- API key ka plan, warna logged-in user ka plan.
+- `userId: res.locals.userId` -- `identifyClient` JWT ka **signature verify** karke (sirf CPU, koi DB nahi) userId daalta hai. Bina verify kiye decode kabhi mat karo -- attacker fake userId bana ke doosre user ka quota khatam kar dega.
+- `username: typeof req.body?.username === 'string' ? ... : undefined` -- sirf string accept. Attacker `{"username": {"$gt": ""}}` jaisa object bheje toh ignore.
+
+### 9. `app.ts` -- wiring + middleware order
+
+```ts
+import express from 'express';
+import Redis from 'ioredis';
+import { Pool } from 'pg';
+import { config } from './config';
+import { logger } from './infra/logger';
+import { RuleRepository } from './rules/rule.repository';
+import { RuleCache } from './rules/rule-cache';
+import { RedisTokenBucketStore } from './stores/redis-token-bucket.store';
+import { MemoryTokenBucketStore } from './stores/memory-token-bucket.store';
+import { RateLimiterService } from './services/rate-limiter.service';
+import { rateLimit } from './middleware/rate-limit';
+import { requestId } from './middleware/request-id';
+import { identifyClient } from './middleware/identify-client';
+import { authenticate } from './middleware/authenticate';
+import { errorHandler } from './middleware/error-handler';
+import { apiRoutes } from './routes';
+
+export async function buildApp() {
+  const redis = new Redis(config.redisUrl, {
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 1,
+    commandTimeout: 20,
+  });
+  // At scale (3 primaries + replicas):
+  // new Redis.Cluster(nodes, { enableOfflineQueue: false,
+  //   redisOptions: { maxRetriesPerRequest: 1, commandTimeout: 20 } })
+
+  const db = new Pool({ connectionString: config.databaseUrl, max: 10 });
+
+  const ruleCache = new RuleCache(new RuleRepository(db), logger);
+  await ruleCache.start();
+
+  const limiter = new RateLimiterService(
+    new RedisTokenBucketStore(redis),
+    new MemoryTokenBucketStore(config.instanceCount),
+    logger,
+  );
+
+  const app = express();
+  app.set('trust proxy', 1);
+  app.get('/health', (_req, res) => { res.json({ status: 'ok', rulesLoaded: ruleCache.isLoaded() }); });
+
+  app.use(requestId);
+  app.use(express.json({ limit: '10kb' }));
+  app.use(identifyClient);
+  app.use(rateLimit(ruleCache, limiter));
+  app.use(authenticate);
+  app.use(apiRoutes);
+  app.use(errorHandler);
+
+  return { app, redis, db, ruleCache };
+}
+```
+
+**Code Explanation -- connections:**
+
+- `enableOfflineQueue: false` -- Redis disconnected ho toh command queue mein mat rakho, **turant error**. Default mein ioredis commands queue kar leta hai -> har API request Redis ke wapas aane tak latki rehti -> poori API hang. Hum chahte hain: turant error -> fallback.
+- `maxRetriesPerRequest: 1` -- ek command ke liye baar baar retry nahi. Limiter ke paas retry ka time hi nahi hai.
+- `commandTimeout: 20` -- 20 ms mein jawab nahi toh error -> fallback. Normal jawab ~1 ms mein aata hai; 20 ms = kuch gadbad hai. URL shortener ke 50 ms se tight, kyunki ye **har** request par lagta hai aur budget 2 ms ka hai.
+- `new Redis.Cluster(...)` (comment) -- 100K RPS peak par 3 primaries. Cluster mein per-node options `redisOptions` ke andar jaate hain. Hamari script single-key hai, toh cluster mein bina kisi change ke chalti hai.
+- `new Pool({ ..., max: 10 })` -- Postgres sirf har 30s rules load karta hai (aur business routes). Limiter ke liye DB pool bada nahi chahiye -- hot path par DB hai hi nahi.
+- `await ruleCache.start()` -- **rules load hone ke baad hi** app bante hain. DB us waqt down ho toh `start()` crash nahi karta (refresh andar error pakadta hai), lekin `isLoaded()` false rehta hai aur `/health` batata hai -- readiness probe isko dekh ke traffic rok sakta hai.
+- `new RateLimiterService(redisStore, memoryStore, logger)` -- **composition root**: sirf yahan pata hai ki primary Redis hai aur fallback memory.
+- `config.instanceCount` -- fallback ke liye divide factor. Autoscaling ho toh ise orchestrator se update karo ya thoda conservative (max instances) rakho.
+
+**Code Explanation -- middleware order (sabse important interview point):**
+
+```
+request -> /health -> requestId -> express.json -> identifyClient -> rateLimit -> authenticate -> routes -> errorHandler
+```
+
+- `app.set('trust proxy', 1)` -- ek LB hop trust karo, taaki `req.ip` = asli client IP (upar samjhaya).
+- `app.get('/health', ...)` -- **limiter se pehle.** LB har kuch second health check karta hai; usko rate limit kiya toh LB instance ko "dead" samajh ke hata dega.
+- `requestId` -- sabse pehle, taaki 429 ke logs mein bhi request id ho.
+- `express.json({ limit: '10kb' })` -- login rule ko `username` chahiye, jo body mein hai. 10 KB limit ki wajah se parsing sasta hai; bada body limiter se pehle hi reject.
+- `identifyClient` -- **limiter se pehle, lekin sasta.** Limiter ko pata hona chahiye "kaun" (API key id + plan). Isme sirf hash + cache lookup + JWT signature verify -- koi heavy DB query nahi. Invalid key? Anonymous maan lo -> `anon-ip` rule lagega -> API key guessing bhi IP se limited.
+- `rateLimit(...)` -- **authenticate aur business logic se pehle.** Poora point: abusive traffic ko sabse sasta "no" do, mehenga kaam (DB se user load, permissions, bcrypt, business queries) shuru hone se **pehle**.
+- `authenticate` -- heavy auth: user/permissions load, scopes check, 401/403. Agar ye limiter se **pehle** hota toh attacker ki har request par DB hit hota -- limiter DB ko bacha hi nahi paata.
+- `apiRoutes` -- business logic.
+- `errorHandler` -- sabse last, taaki upar ki koi bhi error yahan aaye.
+
+**Agar order galat ho toh kya bigdega?**
+
+| Galti | Nateeja |
+|---|---|
+| `rateLimit` routes ke **baad** | Limiter kabhi chalta hi nahi (response already bhej diya) |
+| `rateLimit` heavy `authenticate` ke **baad** | Brute force / flood ki har request DB aur bcrypt tak jaati hai -- limiter bekaar |
+| `rateLimit` `identifyClient` se **pehle** | Sab requests IP se limit hongi, plan-wise limits (free/pro) kaam hi nahi karengi |
+| `/health` `rateLimit` ke **baad** | LB ke health checks 429 khaa sakte hain -> instances rotation se bahar |
+| `express.json` `rateLimit` ke **baad** | Login rule ko username nahi milega -> sirf IP par limit (NAT ke peeche sab users ek bucket) |
+| `trust proxy` nahi | Sab anonymous users = LB ka IP = ek bucket -> sabko 429 |
+
+### Poora code ek line mein
+
+```
+Request -> identifyClient (kaun?) -> RuleCache (kaunsa rule? memory) -> RateLimiterService
+        -> Redis Lua (1 atomic round trip) | Redis fail -> MemoryTokenBucketStore (capacity / N)
+        -> headers + next()  ya  429 + Retry-After        | koi decision nahi -> failMode (open / 503)
+```
+
+---
+
+## Remember
+
+> **Rate limiter ek gate guard hai: "kaun ho, kaunsa rule, ek Redis call, haan ya 429" -- sab kuch mehenga kaam shuru hone se pehle.** Rules Postgres mein (chhote, durable) lekin memory se padhe jaate hain; counters Redis mein (fast, atomic, TTL) kyunki har request ek write hai. Redis gire toh local bucket (capacity / instances), rules na hon tabhi `failMode`.
+
+## Quick Self-Test
+
+1. Rate-limit counters Postgres mein rakhne se kaunsi 3 cheezein toot jaayengi, jab ki rules ke liye Postgres bilkul theek hai?
+2. `rateLimit` middleware ko `authenticate` ke baad laga diya -- limiter technically kaam karega, phir bhi kya problem hai?
+3. `MemoryTokenBucketStore` capacity ko `instanceCount` se divide kyun karta hai, aur `login` rule (capacity 5) ke saath 10 instances par kya edge case aata hai?
+4. Redis key mein API key ka secret kyun nahi daala, aur login key mein username ko lowercase kyun kiya?
+5. `app.set('trust proxy', ...)` na lagao toh kya hoga? Aur `true` blindly laga do toh kya hoga?
+
+---
+
+**Next (Part 3):** Algorithms (fixed window aur uska boundary burst, sliding window log, sliding window counter, leaky bucket, token bucket -- aur token bucket Lua script line by line), Concurrency (race conditions, atomicity, Lua vs MULTI, Redis Cluster aur hash tags), Redis state deep dive (TTL, memory, eviction, hot keys). "next" bolo.
+
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') return '<div class="mermaid">' + code + '</div>';
+    return '<pre><code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</code></pre>';
+  };
+  renderer.table = function(header, body) {
+    return '<div class="table-wrap"><table><thead>' + header + '</thead><tbody>' + body + '</tbody></table></div>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

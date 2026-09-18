@@ -322,6 +322,20 @@
   .img-card img { display: block; width: 100%; height: auto; }
   .img-hint { font-size: 0.78rem; color: var(--muted); margin: 6px 0 14px; font-family: -apple-system, "Segoe UI", Arial, sans-serif; }
   .img-card .read-along { margin-top: 12px; }
+  /* System Design page */
+  .sd-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 14px;
+             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+  .sd-head label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .sd-head select { flex: 1; min-width: 0; max-width: 100%; padding: 10px 12px; font-size: 1rem; border-radius: 8px;
+                    border: 1px solid var(--border); background: var(--card-bg); color: var(--fg); }
+  .sd-pills { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 8px;
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+  .sd-pill { flex: 0 0 auto; max-width: 220px; text-align: left; background: var(--card-bg); color: var(--fg);
+             border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; cursor: pointer; font-size: 0.8rem; line-height: 1.3; }
+  .sd-pill span { display: block; color: var(--muted); font-size: 0.72rem; margin-top: 2px; white-space: normal; }
+  .sd-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .sd-pill.active span { color: rgba(255,255,255,0.85); }
+  .sd-loading { color: var(--muted); }
   .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-top: 18px; }
   .img-tile {
     background: var(--card-bg);
@@ -374,6 +388,7 @@
     <button id="btn-prep" title="Private interview prep (password protected)">&#128274; Interview Prep</button>
     <button id="btn-links" title="Useful learning links">&#128279; Links</button>
     <button id="btn-images" title="System design diagrams with notes">&#128444;&#65039; Images</button>
+    <button id="btn-sd" title="Full system design study material">&#127959;&#65039; System Design</button>
     <button id="theme-sepia">Sepia</button>
     <button id="theme-light">Light</button>
     <button id="theme-dark">Dark</button>
@@ -7054,6 +7069,9 @@ If this runs inside an API request or needs to survive restarts (e.g. notifying 
 
 Related: [[61-1000-requests-10x-faster]], [[54-notify-5000-users-10x-faster]], [[01-concurrency-vs-parallelism]]
 </script>
+<!--SD-MANIFEST-START-->
+<script type="application/json" id="sd-manifest">{"systems":[{"slug":"url-shortener","title":"URL Shortener","parts":[{"n":1,"file":"part-1-basics-to-hld.md","label":"Basics -> Requirements -> Estimation -> HLD"},{"n":2,"file":"part-2-flow-api-db-lld-code.md","label":"Request Flow -> API -> Database -> LLD -> Code"},{"n":3,"file":"part-3-algorithms-concurrency-caching.md","label":"Algorithms -> Concurrency -> Caching"},{"n":4,"file":"part-4-scaling-failures-consistency-security-observability.md","label":"Scaling -> Failures -> Consistency -> Security -> Observability"},{"n":5,"file":"part-5-tradeoffs-versions-followups-nodejs.md","label":"Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions"},{"n":6,"file":"part-6-implement-answers-whiteboard-cheatsheet.md","label":"Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet"}]},{"slug":"rate-limiter","title":"Rate Limiter","parts":[{"n":1,"file":"part-1-basics-to-hld.md","label":"Basics -> Requirements -> Estimation -> HLD"},{"n":2,"file":"part-2-flow-api-db-lld-code.md","label":"Request Flow -> API -> Database -> LLD -> Code"},{"n":3,"file":"part-3-algorithms-concurrency-redis.md","label":"Algorithms -> Concurrency -> Redis State"},{"n":4,"file":"part-4-scaling-failures-consistency-security-observability.md","label":"Scaling -> Failures -> Consistency -> Security -> Observability"},{"n":5,"file":"part-5-tradeoffs-versions-followups-nodejs.md","label":"Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions"},{"n":6,"file":"part-6-implement-answers-whiteboard-cheatsheet.md","label":"Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet"}]},{"slug":"payment-system","title":"Payment System","parts":[{"n":1,"file":"part-1-basics-to-hld.md","label":"Basics -> Requirements -> Estimation -> HLD"},{"n":2,"file":"part-2-flow-api-db-lld-code.md","label":"Request Flow -> API -> Database -> LLD -> Code"},{"n":3,"file":"part-3-algorithms-concurrency-idempotency-store.md","label":"Algorithms -> Concurrency -> Idempotency Store"},{"n":4,"file":"part-4-scaling-failures-consistency-security-observability.md","label":"Scaling -> Failures -> Consistency -> Security -> Observability"},{"n":5,"file":"part-5-tradeoffs-versions-followups-nodejs.md","label":"Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions"},{"n":6,"file":"part-6-implement-answers-whiteboard-cheatsheet.md","label":"Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet"}]},{"slug":"file-storage","title":"File Storage (S3-style)","parts":[{"n":1,"file":"part-1-basics-to-hld.md","label":"Basics -> Requirements -> Estimation -> HLD"},{"n":3,"file":"part-3-algorithms-concurrency-caching.md","label":"Algorithms -> Concurrency -> Caching + CDN"},{"n":4,"file":"part-4-scaling-failures-consistency-security-observability.md","label":"Scaling -> Failures -> Consistency -> Security -> Observability"},{"n":5,"file":"part-5-tradeoffs-versions-followups-nodejs.md","label":"Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions"}]},{"slug":"search-system","title":"Search System","parts":[{"n":1,"file":"part-1-basics-to-hld.md","label":"Basics -> Requirements -> Estimation -> HLD"},{"n":2,"file":"part-2-flow-api-db-lld-code.md","label":"Request Flow -> API -> Index + DB Design -> LLD -> Code"},{"n":3,"file":"part-3-inverted-index-ranking-autocomplete.md","label":"Inverted Index -> Ranking -> Autocomplete -> Concurrency -> Caching"},{"n":4,"file":"part-4-scaling-failures-consistency-security-observability.md","label":"Scaling -> Failures -> Consistency -> Security -> Observability"},{"n":5,"file":"part-5-tradeoffs-versions-followups-nodejs.md","label":"Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions"},{"n":6,"file":"part-6-implement-answers-whiteboard-cheatsheet.md","label":"Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet"}]},{"slug":"notification-paging","title":"Notification / Paging System","parts":[{"n":1,"file":"part-1-basics-to-hld.md","label":"Basics -> Requirements -> Estimation -> HLD"},{"n":2,"file":"part-2-flow-api-db-lld-code.md","label":"Request Flow -> API -> Database -> LLD -> Code"},{"n":3,"file":"part-3-dedup-timers-retries-concurrency.md","label":"Dedup -> Timers -> Retries -> Concurrency -> Redis State"},{"n":4,"file":"part-4-scaling-failures-consistency-security-observability.md","label":"Scaling -> Failures -> Consistency -> Security -> Observability"},{"n":5,"file":"part-5-tradeoffs-versions-followups-nodejs.md","label":"Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions"},{"n":6,"file":"part-6-implement-answers-whiteboard-cheatsheet.md","label":"Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet"}]}]}</script>
+<!--SD-MANIFEST-END-->
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
@@ -7184,6 +7202,34 @@ function buildSidebar(filterText) {
     tocContainer.prepend(group);
   }
 
+  // "System Design" group at the very top: one entry per system
+  const sdItems = SD.systems.filter((s) => !q || s.title.toLowerCase().includes(q) || 'system design'.includes(q));
+  if (sdItems.length) {
+    const isOpen = q.length > 0 || currentSD !== null || sdGroupOpen;
+    const group = document.createElement('div');
+    group.className = 'category-group';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'category-title' + (isOpen ? '' : ' collapsed');
+    titleEl.textContent = '\u{1F3D7}️ System Design (' + sdItems.length + ')';
+    const itemsEl = document.createElement('div');
+    itemsEl.className = 'category-items' + (isOpen ? '' : ' collapsed');
+    titleEl.addEventListener('click', () => {
+      const nowCollapsed = titleEl.classList.toggle('collapsed');
+      itemsEl.classList.toggle('collapsed', nowCollapsed);
+      sdGroupOpen = !nowCollapsed;
+    });
+    sdItems.forEach((s) => {
+      const btn = document.createElement('button');
+      btn.className = 'toc-item' + (currentSD && currentSD.slug === s.slug ? ' active' : '');
+      btn.innerHTML = escHtml(s.title) + ' <span class="toc-num">' + s.parts.length + (s.parts.length === 1 ? ' part' : ' parts') + '</span>';
+      btn.addEventListener('click', () => renderSystemDesign(s.slug, null));
+      itemsEl.appendChild(btn);
+    });
+    group.appendChild(titleEl);
+    group.appendChild(itemsEl);
+    tocContainer.prepend(group);
+  }
+
   if (!tocContainer.children.length) {
     const note = document.createElement('div');
     note.className = 'empty-note';
@@ -7193,7 +7239,7 @@ function buildSidebar(filterText) {
 }
 
 function renderHome() {
-  currentId = null; currentImage = null;
+  currentId = null; currentImage = null; currentSD = null;
   document.title = 'Learning Dashboard';
   progressEl.textContent = lessons.length + ' lessons';
   let html = '<h1>Your Learning Library</h1>' +
@@ -7274,7 +7320,7 @@ function buildSuggestions(lesson) {
 function openLesson(id) {
   const lesson = lessons.find(l => l.id === id);
   if (!lesson) return;
-  currentId = id; currentImage = null;
+  currentId = id; currentImage = null; currentSD = null;
   document.title = lesson.title + ' - Learning Dashboard';
   readerEl.innerHTML = marked.parse(linkifyCrossRefs(lesson.content), { renderer }) +
     buildSuggestions(lesson);
@@ -7316,7 +7362,7 @@ const LINKS = [
 ];
 
 function renderLinks() {
-  currentId = null; currentImage = null;
+  currentId = null; currentImage = null; currentSD = null;
   document.title = 'Links - Learning Dashboard';
   progressEl.textContent = LINKS.length + ' links';
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -7597,6 +7643,7 @@ const escHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;',
 function renderImages() {
   currentId = null;
   currentImage = null;
+  currentSD = null;
   document.title = 'Images - Learning Dashboard';
   progressEl.textContent = IMAGES.length + ' diagrams';
   readerEl.innerHTML = '<h1>&#128444;&#65039; Diagrams &amp; Cheat Sheets</h1>' +
@@ -7616,6 +7663,7 @@ function renderImage(i) {
   if (!img) return renderImages();
   currentId = null;
   currentImage = i;
+  currentSD = null;
   document.title = img.title + ' - Learning Dashboard';
   progressEl.textContent = 'Image ' + (i + 1) + ' of ' + IMAGES.length;
   const src = encodeURI(img.file);
@@ -7639,6 +7687,104 @@ readerEl.addEventListener('click', (e) => {
   e.preventDefault();
   el.dataset.img === 'all' ? renderImages() : renderImage(Number(el.dataset.img));
 });
+
+// ---- System Design tab -------------------------------------------------
+// The list of systems/parts comes from the sd-manifest block (written by
+// tools/build-systemdesign.mjs). Each part's text is fetched from
+// systemdesign/<system>/<part>.md only when opened, so index.html stays small.
+let SD = { systems: [] };
+try { SD = JSON.parse((document.getElementById('sd-manifest') || {}).textContent || '{"systems":[]}'); } catch (e) {}
+let currentSD = null;
+let sdGroupOpen = false;
+const sdCache = new Map();
+
+function sdFind(slug) { return SD.systems.find((s) => s.slug === slug) || null; }
+
+function sdLastRead() {
+  try { return JSON.parse(localStorage.getItem('dashboard.sd') || 'null'); } catch (e) { return null; }
+}
+
+async function renderSystemDesign(slug, n) {
+  if (!SD.systems.length) {
+    readerEl.innerHTML = '<h1>System Design</h1><p>No system designs found yet.</p>';
+    return;
+  }
+  const last = sdLastRead();
+  const sys = sdFind(slug) || sdFind(last && last.slug) || SD.systems[0];
+  const wanted = n != null ? n : (last && last.slug === sys.slug ? last.n : sys.parts[0].n);
+  const part = sys.parts.find((p) => p.n === wanted) || sys.parts[0];
+
+  currentId = null; currentImage = null; currentSD = null;
+  currentSD = { slug: sys.slug, n: part.n };
+  try { localStorage.setItem('dashboard.sd', JSON.stringify(currentSD)); } catch (e) {}
+  document.title = sys.title + ' - Part ' + part.n + ' - Learning Dashboard';
+  progressEl.textContent = 'System Design - ' + sys.title + ' - Part ' + part.n + ' (' + sys.parts.length + ' parts)';
+
+  const options = SD.systems.map((s) =>
+    '<option value="' + s.slug + '"' + (s.slug === sys.slug ? ' selected' : '') + '>' +
+    escHtml(s.title) + ' (' + s.parts.length + (s.parts.length === 1 ? ' part' : ' parts') + ')</option>').join('');
+  const pills = sys.parts.map((p) =>
+    '<button class="sd-pill' + (p.n === part.n ? ' active' : '') + '" data-sd="' + sys.slug + '" data-part="' + p.n + '">' +
+    'Part ' + p.n + '<span>' + escHtml(p.label) + '</span></button>').join('');
+  readerEl.innerHTML =
+    '<div class="sd-head"><label for="sd-select">System</label><select id="sd-select">' + options + '</select></div>' +
+    '<div class="sd-pills">' + pills + '</div>' +
+    '<div id="sd-body"><p class="sd-loading">Loading Part ' + part.n + '...</p></div>';
+  document.getElementById('sd-select').addEventListener('change', (e) => renderSystemDesign(e.target.value, null));
+  readerEl.querySelector('.sd-pill.active')?.scrollIntoView({ block: 'nearest', inline: 'center' });
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+
+  const base = 'systemdesign/' + sys.slug + '/';
+  const url = base + part.file;
+  let md = sdCache.get(url);
+  if (md == null) {
+    try {
+      const res = await fetch(encodeURI(url), { cache: 'no-cache' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      md = await res.text();
+      sdCache.set(url, md);
+    } catch (err) {
+      if (!currentSD || currentSD.slug !== sys.slug || currentSD.n !== part.n) return;
+      document.getElementById('sd-body').innerHTML =
+        '<p>Could not load this part (' + escHtml(String(err.message || err)) + ').</p>' +
+        (location.protocol === 'file:'
+          ? '<p>Browsers block loading these files when the dashboard is opened straight from your PC. Open the live site to read it, or open <a href="' + encodeURI(base + 'index.html') + '" target="_blank">this system\'s reader</a> directly.</p>'
+          : '<p>Check your connection and try again.</p>');
+      return;
+    }
+  }
+  // The user may have moved to another part while this one was loading
+  if (!currentSD || currentSD.slug !== sys.slug || currentSD.n !== part.n) return;
+
+  const idx = sys.parts.indexOf(part);
+  const prev = sys.parts[idx - 1], next = sys.parts[idx + 1];
+  const body = document.getElementById('sd-body');
+  body.innerHTML = marked.parse(md, { renderer }) +
+    '<div class="suggest-nav">' +
+      (prev ? '<button data-sd="' + sys.slug + '" data-part="' + prev.n + '">&larr; Part ' + prev.n + ': ' + escHtml(prev.label) + '</button>' : '<span></span>') +
+      (next ? '<button class="next" data-sd="' + sys.slug + '" data-part="' + next.n + '">Part ' + next.n + ': ' + escHtml(next.label) + ' &rarr;</button>' : '<span></span>') +
+    '</div>';
+  // Relative links/images inside a part point at files in that system's folder
+  body.querySelectorAll('a[href]').forEach((a) => {
+    const h = a.getAttribute('href');
+    if (h && !/^([a-z]+:|#|\/)/i.test(h)) { a.setAttribute('href', base + h); a.target = '_blank'; }
+  });
+  body.querySelectorAll('img[src]').forEach((im) => {
+    const s = im.getAttribute('src');
+    if (s && !/^([a-z]+:|\/)/i.test(s)) im.setAttribute('src', base + s);
+  });
+  mermaid.run({ querySelector: '#sd-body .mermaid' });
+}
+
+readerEl.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-sd]');
+  if (!el) return;
+  e.preventDefault();
+  renderSystemDesign(el.dataset.sd, Number(el.dataset.part));
+});
+document.getElementById('btn-sd').addEventListener('click', () => renderSystemDesign(null, null));
 
 document.getElementById('btn-images').addEventListener('click', renderImages);
 document.getElementById('btn-links').addEventListener('click', renderLinks);

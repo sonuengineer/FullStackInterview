@@ -1,0 +1,1256 @@
+# URL Shortener -- HLD + LLD (Part 4: Scaling -> Failures -> Consistency -> Security -> Observability)
+
+> Is file mein prompt ke **Parts 16-20** hain: scaling (1x se 1000x), failure scenarios, consistency, security, aur observability (logs, metrics, tracing).
+> Pichle parts ka recap: Part 1 mein numbers nikale (**~116 writes/s avg, ~11.6K reads/s avg, ~35K peak, ~10 TB in 5 saal, hot cache ~10 GB**), Part 2 mein stateless Node.js + Postgres (primary + replica) + Redis ka code likha, aur Part 3 mein counter blocks + Base62, unique index, aur 3-layer caching (local LRU -> Redis -> DB) banaya. Ab dekhenge ye design **traffic badhne par, cheezein tootne par, aur attack hone par** kaise behave karta hai.
+
+---
+
+## PART 16 -- Scaling: 1x -> 10x -> 100x -> 1000x
+
+### Pehle ek rule
+
+Scaling ka matlab "sab kuch pehle din laga do" **nahi** hai. Har level par sirf ye poochho:
+
+1. **Sabse pehle kya tootega?** (bottleneck)
+2. **Usko todne ka sabse sasta tareeka kya hai?**
+3. **Kya abhi zarurat NAHI hai?** (ye bolna utna hi important hai)
+
+**Bottleneck ka simple matlab:** system ka woh hissa jo sabse pehle full ho jaata hai -- jaise highway par ek hi toll booth. Baaki highway kitna bhi chauda karo, traffic wahin atkega.
+
+### Numbers har level par (Part 1 ke numbers x multiplier)
+
+| Level | Writes/s (avg / peak) | Reads/s (avg / peak) | Storage/day | 5 saal storage | Hot cache |
+|---|---|---|---|---|---|
+| **1x** | ~116 / ~300 | ~11.6K / ~35K | 5 GB | ~10 TB | ~10 GB |
+| **10x** | ~1.2K / ~3K | ~116K / ~350K | 50 GB | ~90 TB | ~100 GB |
+| **100x** | ~11.6K / ~30K | ~1.16M / ~3.5M | 500 GB | ~900 TB | ~1 TB |
+| **1000x** | ~116K / ~300K | ~11.6M / ~35M | 5 TB | ~9 PB | ~10 TB |
+
+> Hot cache ko linearly badhaya hai -- real life mein hot set itni tezi se nahi badhta, lekin interview mein safe (upper bound) estimate achha hai.
+
+Ab har level ko dekhte hain.
+
+### 1x -- Jo humne Parts 1-3 mein banaya
+
+```
+Client -> DNS -> LB (TLS) -> 8-12 Node.js instances -> Redis (1 primary + 1 replica)
+                                                    -> Postgres primary (writes)
+                                                    -> 1 read replica (cache misses)
+```
+
+- **Node.js:** ~35K peak / ~3-5K per instance = **~8-12 instances**. Stateless hain, toh LB kisi ko bhi request de sakta hai.
+- **Redis:** 35K ops/s -- ek Redis node ~1 lakh ops/s kar leta hai. Hot data 10 GB -- ek node mein fit. **Redis Cluster abhi nahi.**
+- **DB reads:** hit ratio 95% maano toh misses = 5% x 35K = **~1,750 queries/s** peak -- ek replica aaram se.
+- **DB writes:** ~300/s peak -- ek primary ke liye kuch nahi.
+- **ID generation:** 300 writes/s / 1000 per block = **0.3 sequence calls/sec**. Koi bottleneck nahi.
+- **Queue:** sirf agar analytics chahiye.
+- **CDN:** nahi (bandwidth 5-17 MB/s, aur 302 + analytics hai).
+- **Sharding:** nahi.
+
+> Interview line: "1x par mera design simple hai -- stateless Node.js LB ke peeche, ek Redis node replica ke saath, aur Postgres primary plus ek read replica. Is scale par sharding, Redis Cluster ya CDN ki zarurat nahi hai."
+
+### 10x -- Pehli dikkatein
+
+Ab 350K peak reads/s aur 3K peak writes/s.
+
+| Area | Kya tootega? | Change | Kyun ye change, kuch aur kyun nahi |
+|---|---|---|---|
+| Node.js | 350K / ~4K = **~90 instances** | Auto-scaling group (CPU ya RPS par scale) | Stateless hain, toh bas instances badhao. Code change zero |
+| DB connections | 90 instances x pool 20 = **1,760 connections**. Postgres itne connections par memory kha jaata hai | **PgBouncer** (connection pooler) beech mein | Har Postgres connection ek alag process hai (~5-10 MB). PgBouncer hazaaron app connections ko ~100 real connections par multiplex karta hai |
+| Redis | 350K ops/s aur ~100 GB hot data -- ek node ki CPU aur memory dono tight | **Redis Cluster** (3-6 shards, har shard ka replica) | Memory aur CPU dono ko baantna hai. Read replicas sirf CPU baant-te, memory nahi |
+| Viral keys | Ek key ek hi Redis shard par | Part 3 wala **local LRU** ab aur zaruri | Viral link local cache se serve, Redis shard bachta hai |
+| DB reads | 5% misses = ~17.5K/s | **3-5 read replicas** | Simple index lookups hain; replicas add karna sasta aur easy |
+| DB writes | 3K/s peak | **Kuch nahi** -- ek primary handle kar leta hai | Sharding abhi premature hai |
+| Storage | ~90 TB in 5 saal | **Table partitioning** (created_at se monthly) + purane/expired data ka archival. Sharding ka **plan** banao | Partition se vacuum, index rebuild, archival easy. Ek table 90 TB bahut painful hai |
+
+**Partitioning vs Sharding -- farak samjho:**
+
+- **Partitioning ka simple matlab:** ek hi DB server ke andar badi table ko chhote tukdon mein baantna (jaise ek almaari ke alag drawers). Server ek hi hai.
+- **Sharding ka simple matlab:** data ko **alag alag DB servers** par baantna (alag almaariyan, alag kamron mein). Har server sirf apne hisse ka data rakhta hai.
+
+> Interview line: "10x par Node.js horizontally scale hoga, DB ke saamne PgBouncer lagega kyunki connections ki ginti problem banegi, Redis ko Cluster mein shift karunga kyunki hot data ~100 GB ho jaayega, aur replicas badhaunga. Writes abhi bhi ek primary sambhal lega, isliye sharding nahi -- sirf plan."
+
+### 100x -- Ab database asli bottleneck
+
+Ab 3.5M peak reads/s, 30K peak writes/s, ~900 TB data.
+
+**1. DB writes aur storage -> Sharding**
+
+30K writes/s aur ~900 TB ek primary par nahi chalega. Ab data ko shards mein baanto.
+
+**Shard key kya ho?** `short_code` -- kyunki 99% queries `WHERE short_code = ?` hain. Har redirect **exactly ek shard** par jaata hai.
+
+```
+shard = hash(short_code) % N          (ya consistent hashing / lookup table)
+
+short_code "aB92xK1"  -> hash -> shard 3
+short_code "priya-deal" -> hash -> shard 7
+```
+
+- **Hash kyun, range kyun nahi?** Counter se codes sequential hain (`1000001, 1000002...`). Range sharding mein saare naye writes **last shard** par jaayenge = hot shard. Hash se writes barabar bikharte hain.
+- **`% N` ka problem:** N=8 se 9 kiya toh almost saari keys ki jagah badal jaati hai. Isliye **consistent hashing** ya **virtual shards** (jaise 1024 logical shards, 8 physical servers par mapped) use karte hain -- naya server aaye toh sirf kuch logical shards move hote hain.
+- **Kya toota?** "User ke saare links" (`WHERE user_id = ?`) ab **saare shards** par jaana padega (scatter-gather). Fix: ek alag `user_links` table jo `user_id` se sharded ho (data duplicate, lekin query fast).
+
+**Alternative:** khud sharding manage karne ki jagah **DynamoDB / Cassandra** par shift karo -- partition key `short_code`, sharding aur replication built-in. Trade-off: flexible SQL queries gaye, aur (DynamoDB mein) vendor lock-in. Part 2 mein humne repository layer isi din ke liye alag rakhi thi -- sirf `url.repository.ts` badlega.
+
+**2. ID generation**
+
+30K writes/s / 1000 = 30 sequence calls/s -- ek sequence abhi bhi chal jaayega, lekin woh ek DB par tika hai. Options: har shard/region ka **alag ID range** (region prefix), ya **block size 10,000** kar do, ya Snowflake-style IDs (Part 3). Unique index har shard mein hai, lekin global uniqueness ab ID design se aati hai -- isliye custom alias ka insert bhi usi shard par jaayega jahan `hash(alias)` le jaaye (toh alias ki uniqueness bhi ek hi shard ka unique index guarantee karta hai).
+
+**3. Reads -> Multi-region + edge**
+
+3.5M reads/s ek region se serve karna possible hai, lekin ab users globally hain aur latency matter karti hai.
+
+- **Multi-region read:** 2-3 regions mein Node.js + Redis + DB replicas. **GeoDNS / latency-based routing** user ko nazdeeki region bhejta hai.
+- **CDN / edge:** ab soch sakte ho. Agar 302 + analytics chahiye, toh edge par redirect **cache mat karo**, lekin edge function (CloudFront Functions / Cloudflare Workers) apni KV store se redirect de sakta hai aur click event async bhej sakta hai. Agar business 301 accept kare, toh CDN bahut sasta aur fast.
+
+**4. Analytics** -- 3.5M click events/s. Ab queue **Kafka** jaisa partitioned log hona chahiye, events **batch** mein (Part 3: Redis INCR / worker batch).
+
+```mermaid
+flowchart TD
+    U[Users worldwide] --> GD[GeoDNS]
+    GD --> R1[Region A: LB + Node.js]
+    GD --> R2[Region B: LB + Node.js]
+    R1 --> C1[(Redis Cluster A)]
+    R2 --> C2[(Redis Cluster B)]
+    R1 --> S[(Sharded DB: shard by hash of short_code)]
+    R2 --> RR[(Regional read replicas)]
+    S -. replication .-> RR
+    R1 -. click events .-> K[[Kafka]]
+    R2 -. click events .-> K
+    K --> W[Analytics workers]
+```
+
+> Interview line: "100x par pehla asli bottleneck database hoga -- writes aur storage dono. Main short_code ke hash se shard karunga kyunki har redirect ek hi key par lookup hai. Range sharding nahi, kyunki sequential codes ek hi shard ko hot kar denge. Reads ke liye multi-region deployment aur regional replicas, aur analytics ke liye Kafka."
+
+### 1000x -- Kya bottleneck banega?
+
+Honestly, 1000x of 100M users duniya ki population se zyada hai -- interviewer ye **stress test** ke liye poochta hai: "tumhare design ka breaking point kahan hai?" Toh ye bolo:
+
+| Bottleneck | Kyun | Kya karunga |
+|---|---|---|
+| **Code space** | 10B URLs/day. 62^7 = 3.52 trillion **~1 saal mein khatam** | **8 characters** (62^8 = ~218 trillion, ~60 saal). Purane 7-char codes chalte rahenge |
+| **Storage (~9 PB)** | Har cheez store karna mehenga | TTL/expiry default karo (e.g. anonymous links 1 saal), cold data sasti storage (S3 + index) par, hot data key-value store mein |
+| **Writes (300K/s)** | Ek central sequence ya ek region ka primary nahi sambhalega | Har region apne IDs banaye (region bits wala Snowflake-style ID), writes local region mein, async cross-region replication |
+| **Cross-region consistency** | Region A mein bana link region B mein turant chahiye | Write-through cache + "not found locally -> home region se poocho" fallback (Part 18 ka idea, global level par) |
+| **Cost** | 35M req/s par har ms aur har byte ka bill | Edge par zyada se zyada serve karo, logs sample karo (Part 20), compute right-size |
+| **Operational complexity** | Hazaaron nodes, har din kuch na kuch tootega | **Cell-based architecture** -- system ko independent "cells" mein baanto, ek cell fail ho toh sirf uske users affected |
+
+**Cell-based architecture ka simple matlab:** poore system ki kai independent copies (cells), har cell users/keys ke ek hisse ko serve karti hai. Ek cell mein bug ya outage = sirf kuch % users par asar, poori duniya par nahi.
+
+> Interview line: "1000x par sabse pehle 7-character code space ek saal mein khatam hoga, toh 8 characters par jaunga. Storage petabytes mein hoga, toh expiry aur tiered storage chahiye. Writes ek central counter se nahi honge -- region-aware IDs. Aur itne bade system ko cells mein baantunga taaki blast radius chhota rahe."
+
+### Har scaling tool -- kab lagana hai, kab nahi
+
+| Tool | Kya karta hai | Hamare system mein kab | Kab NAHI |
+|---|---|---|---|
+| **Horizontal scaling** | Zyada machines add karo (vertical = badi machine) | 1x se hi (8-12 instances) | Chhote MVP mein 1-2 instance kaafi |
+| **Stateless Node.js** | Server memory mein user/session state nahi | Hamesha -- scaling ki pehli shart | -- |
+| **Load balancing** | Traffic instances mein baanto + health checks | 1x se | Single-server hobby project |
+| **Redis** | Hot reads memory se | 1x se (35K peak reads) | ~100 reads/s par Postgres ka buffer cache kaafi |
+| **Redis Cluster** | Cache ko multiple nodes par baanto | 10x (~100 GB hot) | 1x (10 GB ek node mein fit) |
+| **DB read replicas** | Read load baanto | 1x (1 replica), 10x (3-5) | Jab cache hit ratio 99% ho aur misses bahut kam |
+| **PgBouncer** | Connections multiplex | 10x (~90 instances) | 1x (12 x 20 = 240 connections, `max_connections` set karke chal jaata hai) |
+| **Partitioning** | Ek DB mein table ke tukde | 10x (storage) | 1x ke pehle 1-2 saal |
+| **Sharding** | Data alag servers par | 100x (writes + storage) | Jab tak ek primary writes sambhal le -- sharding ka operational cost bahut hai |
+| **Queue** | Async kaam (click events) | Jab analytics requirement ho | Core create/redirect mein koi async kaam nahi |
+| **CDN / edge** | User ke paas serve | Global latency ya 301 ho | 1x -- bandwidth problem nahi, aur 302 analytics ke saath conflict |
+| **Multi-region** | Regional outage aur latency | 100x ya strict availability/latency SLA | Jab ek region ka multi-AZ kaafi ho |
+
+### Horizontal scaling ki ek hidden shart: stateless -- lekin humare paas state hai!
+
+Humne Part 3 mein Node.js ki memory mein **local LRU cache** aur **IdGenerator block** rakha. Kya ye stateless ke khilaf hai?
+
+**Nahi**, kyunki dono **disposable** hain:
+
+- Local LRU: instance mar gaya toh bas cache khaali -- data Redis/DB mein hai.
+- ID block: instance mar gaya toh 1000 IDs waste -- koi correctness issue nahi.
+
+**Rule:** instance ki memory mein wahi rakho jo kho jaaye toh kuch na toote. User session, uploaded file, "pending work" -- ye memory mein nahi.
+
+---
+
+## PART 17 -- Failure Scenarios (interviewer style)
+
+Format har jagah: **Problem -> Impact -> Solution.** Pehle ek golden rule:
+
+> **Redirect path sabse zaruri hai.** Koi bhi optional cheez (analytics, cache, scanning) fail ho toh redirect nahi girna chahiye. Create path thoda degrade ho sakta hai.
+
+### Failure map
+
+```
+                    Redirect (99% traffic)          Create (1% traffic)
+Redis down          Works (slower, DB par load)     Works
+Replica down        Works (primary fallback)        Works
+Primary down        Works (cache + replica)         FAILS until failover (503)
+Node instance dies  Works (LB removes it)           Works
+Queue down          Works (clicks lost/buffered)    Works
+Safe Browsing down  Works                           Works (degraded scan)
+```
+
+### 1. "What if the database goes down?"
+
+**Pehle poochho: primary ya replica?**
+
+**Primary down:**
+
+- **Problem:** Postgres primary crash / AZ outage.
+- **Impact:** **Creates fail** (writes sirf primary par). Redirects **chalte rehte hain** -- 95% Redis/local cache se, baaki replica se. ID block ka refill bhi fail hoga.
+- **Solution:**
+  - **Automatic failover:** managed DB (RDS/Aurora Multi-AZ) ya Patroni standby ko primary bana deta hai -- usually **~30 sec se 2 min**.
+  - App ko DB ka **DNS endpoint** do, IP nahi -- failover ke baad DNS naye primary ko point karta hai. pg Pool ke broken connections error denge; naye connections naye primary par.
+  - Create API us time **503 + `Retry-After`** de, 500 nahi -- client ko pata chale ki retry kare.
+  - **Synchronous standby** (ya Aurora jaisa shared storage) rakho taaki failover mein committed data lose na ho (**RPO ~0**).
+
+**RPO / RTO ka simple matlab:** **RPO** = kitna data lose ho sakta hai (last kitne seconds ka). **RTO** = wapas chalu hone mein kitna time.
+
+**Replica down:**
+
+- **Impact:** cache misses fail ho sakte hain -> kuch redirects 500.
+- **Solution:** multiple replicas LB/DNS ke peeche; saare replicas gaye toh **primary par fallback** (lekin primary ko overload se bachane ke liye rate limit ke saath).
+
+> Interview line: "Primary down hone par create fail hoga jab tak failover na ho -- usually ek-do minute -- aur main 503 with Retry-After dunga. Redirect chalta rahega kyunki woh cache aur replicas se aata hai. Durability ke liye synchronous standby rakhunga taaki committed link kabhi lose na ho."
+
+### 2. "What if Redis goes down?"
+
+- **Problem:** Redis crash / network partition.
+- **Impact:** har request cache miss -> **~20x load DB par** (95% hit ratio ka ulta). Latency 2 ms se ~10 ms. DB undersized hai toh **cascading failure**.
+- **Solution (Part 3 mein already):**
+  - `enableOfflineQueue: false`, `commandTimeout: 50`, `.catch(() => null)` -> fail fast, DB se serve.
+  - Local LRU hot keys ko bachata hai.
+  - Redis **primary + replica with automatic failover** (Sentinel / ElastiCache Multi-AZ).
+  - Circuit breaker -- baar baar fail ho toh kuch sec Redis ko call hi mat karo.
+  - Replicas itne hon ki Redis-less mode mein kam se kam kuch minute survive karein; baaki ke liye **load shedding** (low-priority traffic jaise create API ko 503).
+
+> Interview line: "Redis ko main cache ki tarah treat karunga, source of truth nahi. Redis down hone par request DB se serve hogi, latency badhegi aur DB load ~20x ho sakta hai, isliye Redis HA mein chalega aur DB side par replicas plus load shedding ka plan hoga."
+
+### 3. "What if a Node.js server crashes?"
+
+- **Problem:** uncaught exception, OOM (memory leak), ya machine hi chali gayi.
+- **Impact:** us instance par chal rahi **in-flight requests fail** (client ko 502). Baaki instances par koi asar nahi. Uska ID block waste (theek hai).
+- **Solution:**
+  - LB **health check** (`/health`) fail -> 5-10 sec mein instance traffic se bahar.
+  - Orchestrator (Kubernetes / ECS / PM2) process restart kare.
+  - Min **N+1 / N+2 instances** -- ek gaya toh baaki peak sambhal lein. Instances **multiple AZs** mein.
+  - Redirect (GET) idempotent hai -- browser/LB retry kar le toh koi nuksaan nahi.
+  - **Deploys** ke time crash jaisa hi hota hai (instance band hota hai) -- isliye **graceful shutdown** zaruri. Code neeche.
+
+### Graceful shutdown -- `server.ts`
+
+**Graceful shutdown ka simple matlab:** process band karne se pehle -- nayi requests lena band karo, chal rahi requests poori karo, phir DB/Redis connections saaf band karo. Jaise dukaan band karte waqt shutter aadha girao, andar wale customers ko nipta do, phir taala lagao.
+
+```ts
+// server.ts
+import { buildApp } from './app';
+import { config } from './config';
+import { logger } from './infra/logger';
+
+const { app, db, redis } = buildApp();
+const server = app.listen(config.port, () => logger.info({ port: config.port }, 'server started'));
+
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
+let shuttingDown = false;
+
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  app.locals.draining = true;
+  logger.info({ signal }, 'shutdown started');
+
+  const forceExit = setTimeout(() => {
+    logger.error('graceful shutdown timed out, forcing exit');
+    process.exit(1);
+  }, 25_000);
+  forceExit.unref();
+
+  await new Promise((r) => setTimeout(r, 5_000));
+
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeIdleConnections();
+  });
+
+  await Promise.allSettled([db.end(), redis.quit()]);
+  logger.info('shutdown complete');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+process.on('unhandledRejection', (err) => {
+  logger.fatal({ err }, 'unhandled rejection');
+  void shutdown('unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaught exception');
+  process.exit(1);
+});
+```
+
+Aur `app.ts` ka health check draining ko respect kare:
+
+```ts
+app.get('/health', (_req, res) => {
+  if (app.locals.draining) return res.status(503).json({ status: 'draining' });
+  res.json({ status: 'ok' });
+});
+```
+
+**Code Explanation:**
+
+- `const { app, db, redis } = buildApp();` -- Part 2 ka `buildApp` isi liye `db` aur `redis` return karta tha -- shutdown par inhe band karna hai.
+- `server.keepAliveTimeout = 65_000` -- Node ka default keep-alive 5 sec hai. LB (jaise AWS ALB) idle connection 60 sec tak rakhta hai. Node pehle connection band kare aur LB usi par request bhej de = **random 502**. Isliye Node ka timeout LB se **zyada** rakho.
+- `server.headersTimeout = 66_000` -- keepAliveTimeout se thoda zyada, warna Node ke purane versions mein wahi 502 race.
+- `let shuttingDown = false` + `if (shuttingDown) return` -- SIGTERM do baar aaye (ya SIGTERM + error) toh shutdown do baar na chale.
+- `app.locals.draining = true` -- ab `/health` **503** dega. LB samajh jaayega "is instance ko nayi traffic mat bhejo".
+- `setTimeout(... process.exit(1) ..., 25_000)` -- **safety net.** Koi request latak gayi toh shutdown hamesha ke liye na atke. Kubernetes default 30 sec baad SIGKILL karta hai -- hum usse pehle khud nikal jaate hain.
+- `forceExit.unref()` -- ye timer akela process ko zinda na rakhe. Sab kaam jaldi ho gaya toh process timer ka wait nahi karega.
+- `await new Promise((r) => setTimeout(r, 5_000))` -- **5 sec ruko.** LB ko health check fail dekhne aur instance ko rotation se nikaalne mein kuch sec lagte hain. Us beech aane wali requests ko abhi bhi serve karna hai. Ye line na ho toh deploy ke time kuch requests 502 paati hain.
+- `server.close(() => resolve())` -- **nayi connections lena band.** Callback tab chalta hai jab saari existing connections khatam ho jaayein, yaani in-flight requests poori ho gayi.
+- `server.closeIdleConnections()` -- keep-alive par khuli lekin **idle** connections turant band karo, warna `close()` unka wait karta rehta. (Node 18.2+.)
+- `Promise.allSettled([db.end(), redis.quit()])` -- ab koi request nahi chal rahi, toh pg pool ke saare connections aur Redis connection **cleanly** band. `allSettled` isliye ki ek fail ho toh bhi doosra band ho. Postgres ki taraf "connection reset" errors aur leaked connections nahi bante.
+- `process.exit(0)` -- sab saaf, exit code 0 = normal shutdown.
+- `process.on('SIGTERM', ...)` -- Kubernetes/ECS/PM2 deploy ya scale-in par **SIGTERM** bhejte hain. `SIGINT` = local Ctrl+C.
+- `unhandledRejection` -> log + graceful shutdown -- koi promise bina `.catch` reject hua = unknown state. Log karo aur saaf band ho jao; orchestrator naya process chalayega.
+- `uncaughtException` -> seedha `exit(1)` -- synchronous exception ke baad process ki memory state bharose layak nahi. Graceful ki koshish mein aur gadbad ho sakti hai, isliye log karke turant exit.
+- `/health` mein `draining` check -- ye readiness signal hai. Instance zinda hai, lekin traffic nahi chahiye.
+
+### 4. "What if the queue goes down?" (sirf agar analytics hai)
+
+- **Problem:** Kafka/SQS unreachable.
+- **Impact:** click events publish nahi ho rahe. **Redirect par asar nahi hona chahiye.**
+- **Solution:**
+  - Publish **fire-and-forget** with timeout -- redirect kabhi queue ka wait nahi karta.
+  - Chhota **bounded in-memory buffer** (e.g. max 10K events per instance); bhar gaya toh **drop + metric** (`click_events_dropped_total`). Unbounded buffer = memory leak = Node crash = redirect bhi gaya.
+  - Kafka producer ke apne retries + buffer hote hain; managed queue multi-AZ hoti hai.
+  - Business se poochho: analytics mein thoda loss chalega? Usually **haan** -- 0.1% clicks gum hona redirect down hone se bahut behtar hai.
+
+### 5. "What if there is a network timeout?"
+
+- **Problem:** DB/Redis/third-party slow ho gaya, response nahi aa raha.
+- **Impact:** bina timeout ke request latki rehti hai -> pg pool ke 20 connections busy -> baaki requests pool ka wait -> event loop free hai lekin sab slow -> LB timeout -> **poora instance "down" jaisa.**
+- **Solution -- har network call par timeout:**
+
+```ts
+const db = new Pool({
+  connectionString: config.databaseUrl,
+  max: 20,
+  connectionTimeoutMillis: 1_000,
+  idleTimeoutMillis: 30_000,
+  statement_timeout: 2_000,
+});
+```
+
+**Code Explanation:**
+
+- `connectionTimeoutMillis: 1_000` -- pool se connection 1 sec mein nahi mila (sab busy) toh error do, hamesha ke liye queue mein mat baitho. Fail fast.
+- `idleTimeoutMillis: 30_000` -- 30 sec se idle connection band karo, resources waste na hon.
+- `statement_timeout: 2_000` -- Postgres khud 2 sec se lambi query cancel kar dega. Hamari redirect query ~2 ms ki hai -- 2 sec ka matlab kuch bahut galat hai.
+- Redis ke liye Part 2 mein already `commandTimeout: 50`.
+
+**Retry ka rule:** retry sirf **idempotent** operations ka, **exponential backoff + jitter** ke saath, aur limited (1-2 baar). Redirect read retry safe hai. Create (INSERT) ka blind retry duplicate link bana sakta hai -- agla point.
+
+**Exponential backoff + jitter ka simple matlab:** retry ke beech wait har baar double karo (100ms, 200ms, 400ms) aur thoda random add karo -- taaki hazaar clients ek hi millisecond par dobara hamla na karein.
+
+### 6. "What if the same create request comes twice?" (duplicate request)
+
+- **Problem:** mobile app ne POST bheja, network timeout hua (lekin server par link ban chuka tha), app ne retry kiya.
+- **Impact:** user ke paas **2 alag short links** same URL ke liye. URL shortener mein ye **low harm** hai (ek extra row), lekin "my links" page par duplicate dikhega, aur paid quota do baar kata.
+- **Solution: `Idempotency-Key` header.**
+
+**Idempotency ka simple matlab:** agar same request accidentally 2 baar aaye, toh business operation 2 baar nahi hona chahiye -- doosri baar pehle wala result hi wapas mile.
+
+Client har "logical" create ke liye ek UUID banata hai aur retries mein **wahi** bhejta hai:
+
+```
+POST /api/v1/urls
+Idempotency-Key: 5f1c8a2e-8a1d-4a51-9d0a-6f3d2b7e9c10
+```
+
+```ts
+// middleware/idempotency.ts
+import type { Request, Response, NextFunction } from 'express';
+import type Redis from 'ioredis';
+
+const TTL_SEC = 24 * 60 * 60;
+
+export const idempotency = (redis: Redis) =>
+  async (req: Request, res: Response, next: NextFunction) => {
+    const idemKey = req.get('Idempotency-Key');
+    if (!idemKey) return next();
+
+    const key = `idem:${res.locals.userId ?? req.ip}:${idemKey}`;
+    const claimed = await redis.set(key, 'PENDING', 'EX', TTL_SEC, 'NX').catch(() => 'SKIP');
+    if (claimed === 'SKIP') return next();
+
+    if (claimed !== 'OK') {
+      const stored = await redis.get(key).catch(() => null);
+      if (stored === null) return next();
+      if (stored === 'PENDING') {
+        return res.status(409).json({ error: 'REQUEST_IN_PROGRESS' });
+      }
+      return res.status(201).json(JSON.parse(stored!));
+    }
+
+    const originalJson = res.json.bind(res);
+    res.json = (body: unknown) => {
+      if (res.statusCode === 201) {
+        redis.set(key, JSON.stringify(body), 'EX', TTL_SEC).catch(() => {});
+      } else {
+        redis.del(key).catch(() => {});
+      }
+      return originalJson(body);
+    };
+    next();
+  };
+```
+
+**Code Explanation:**
+
+- `req.get('Idempotency-Key')` -- header nahi hai toh normal flow. Ye optional feature hai; purane clients tootenge nahi.
+- ``key = `idem:${userId ?? ip}:${idemKey}` `` -- key ko user se **scope** karo. Warna User A ki key guess karke User B uska response padh sakta hai.
+- `redis.set(key, 'PENDING', 'EX', TTL_SEC, 'NX')` -- **NX** = sirf tab set karo jab key na ho. Ye atomic "claim" hai: do same requests ek saath aayein toh sirf ek ko `'OK'` milega (Part 3 ka distributed lock wala hi idea).
+- `.catch(() => 'SKIP')` -- Redis down hai toh idempotency skip karke normal create karo (**fail open**). Worst case = ek duplicate link. URL shortener ke liye ye trade-off theek hai.
+- `claimed !== 'OK'` -- key pehle se hai = ye retry hai.
+- `stored === null` -- beech mein key expire ho gayi ya Redis ne jawab nahi diya -> normal flow (fail open).
+- `stored === 'PENDING'` -- pehli request abhi chal hi rahi hai -> 409, client thoda ruk ke retry kare. Dono ko parallel chalne nahi diya.
+- `return res.status(201).json(JSON.parse(stored!))` -- pehli request poori ho chuki thi -> **wahi response** wapas. Naya link nahi bana.
+- `res.json = (body) => {...}` -- controller jab response bhejega, hum usko pakad ke Redis mein save karte hain. Controller ko idempotency ka pata bhi nahi.
+- `if (res.statusCode === 201)` -- sirf success save karo. Validation error ya 500 hua toh key `del` -- client dobara try kare toh fresh attempt ho.
+- `TTL_SEC = 24h` -- retries usually minutes mein hote hain; 24 ghante baad key saaf.
+
+**Trade-off:** ye Redis-based hai, toh Redis gaya = guarantee gayi. **Payment system** mein ye nahi chalega -- wahan idempotency key **database mein** unique constraint ke saath, business write ke **same transaction** mein store hoti hai. (Wahi hum Payment System wale design mein karenge.) URL shortener mein duplicate link ka nuksaan chhota hai, isliye simple version kaafi.
+
+### 7. "What if the same message is processed twice?" (duplicate message)
+
+- **Problem:** analytics worker ne 500 events process kiye, DB mein counts update kiye, lekin Kafka ko offset commit karne se **pehle** crash ho gaya. Restart par wahi 500 events **dobara** aayenge.
+- **Impact:** clicks **double count**.
+- **Kyun hota hai?** Kafka/SQS usually **at-least-once** delivery dete hain.
+
+**At-least-once ka simple matlab:** message kam se kam ek baar zaroor milega, lekin kabhi kabhi ek se zyada baar bhi. "Exactly once" network par practically bahut mushkil/mehenga hai.
+
+- **Solution: idempotent consumer** -- har event ka unique `eventId` (redirect ke time `randomUUID()`), aur worker "ye event pehle process hua?" check + count update **ek hi transaction** mein kare:
+
+```ts
+async function processBatch(events: ClickEvent[]): Promise<void> {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query<{ event_id: string; short_code: string }>(
+      `INSERT INTO processed_events (event_id, short_code)
+       SELECT * FROM unnest($1::uuid[], $2::text[])
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING event_id, short_code`,
+      [events.map((e) => e.eventId), events.map((e) => e.shortCode)],
+    );
+
+    const counts = new Map<string, number>();
+    for (const r of rows) counts.set(r.short_code, (counts.get(r.short_code) ?? 0) + 1);
+
+    for (const [shortCode, n] of counts) {
+      await client.query(
+        `INSERT INTO daily_clicks (short_code, day, clicks) VALUES ($1, current_date, $2)
+         ON CONFLICT (short_code, day) DO UPDATE SET clicks = daily_clicks.clicks + EXCLUDED.clicks`,
+        [shortCode, n],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+**Code Explanation:**
+
+- `db.connect()` -- pool se ek dedicated connection, kyunki transaction ek hi connection par chalni chahiye.
+- `BEGIN` -- ab se jo bhi hoga, ya sab commit hoga ya kuch nahi.
+- `INSERT INTO processed_events ... ON CONFLICT (event_id) DO NOTHING` -- `event_id` primary key hai. Jo event pehle aa chuka hai woh insert nahi hoga.
+- `unnest($1::uuid[], $2::text[])` -- 500 events **ek query** mein insert (500 alag queries nahi).
+- `RETURNING event_id, short_code` -- sirf **naye** (pehli baar dikhe) events wapas aate hain. Duplicates yahin filter ho gaye.
+- `counts` Map -- naye events ko short_code ke hisaab se gino: `aB92xK -> 37`.
+- `INSERT ... ON CONFLICT (short_code, day) DO UPDATE SET clicks = clicks + EXCLUDED.clicks` -- **upsert**: row nahi hai toh banao, hai toh atomic add (Part 3 wala atomic update). Har code ke liye 1 query, har click ke liye nahi.
+- `COMMIT` -- dedup record aur count **saath** save hote hain. Crash COMMIT se pehle hua = kuch save nahi hua = retry par sahi count. Crash COMMIT ke baad (offset commit se pehle) hua = retry par saare events "duplicate" nikalenge = count nahi badhega. **Dono case sahi.**
+- `ROLLBACK` + `throw` -- error par aadha kaam undo, aur upar wala loop offset commit **nahi** karega.
+- `client.release()` -- connection pool mein wapas. Bhoole toh pool leak -> kuch der mein saari queries atak jaayengi.
+- Offset/ack isi function ke **baad** commit hota hai -- pehle process, phir ack.
+
+**Trade-off:** `processed_events` table roz badhegi (1B rows/day at 1x!). Isliye usko **daily partition** karo aur 2-3 din purane partitions drop karo (duplicates usually minutes/hours mein hi aate hain). Agar business kahe "clicks approximate chalenge" (+/- 0.01%), toh dedup chhod do -- sasta aur simple. **Requirement se decide karo.**
+
+### 8. "What if the worker crashes?"
+
+- **Problem:** analytics worker process OOM / crash.
+- **Impact:** events queue mein jama hote rehte hain (**consumer lag** badhta hai). Koi data loss nahi -- queue durable hai. Dashboards purane numbers dikhayenge.
+- **Solution:**
+  - Orchestrator restart kare; **consumer group** mein multiple workers -- ek gaya toh Kafka uske partitions baaki workers ko de deta hai (rebalance).
+  - **Ack/commit offset sirf processing ke baad** (upar wala pattern) -> crash = redo, loss nahi.
+  - **Poison message** (jo har baar crash karaye): N retries ke baad **DLQ (dead letter queue)** mein daalo, warna worker infinite crash loop mein.
+  - Alert: consumer lag > threshold (Part 20).
+
+**DLQ ka simple matlab:** ek alag queue jahan "bimaar" messages bhej dete hain jo baar baar fail ho rahe hain, taaki baaki messages atke nahi. Baad mein insaan dekh ke fix/replay karta hai.
+
+### 9. "What if a third-party API is down?" (Google Safe Browsing / Web Risk)
+
+Create par hum check karte hain ki long URL malware/phishing toh nahi (PART 19 mein detail).
+
+- **Problem:** Safe Browsing API slow / down / quota khatam.
+- **Impact:** agar create uska wait kare -> **create latency 2-30 sec** ya create hi fail. Hamari availability ab Google ki availability ke barabar ho gayi.
+- **Solution:** timeout + fallback + baad mein dobara check.
+
+```ts
+// services/url-safety.ts
+type Verdict = 'safe' | 'unsafe' | 'unknown';
+
+export async function checkUrlSafety(url: string): Promise<Verdict> {
+  try {
+    const res = await fetch(`${config.safeBrowsingUrl}?key=${config.safeBrowsingKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client: { clientId: 'sho-rt', clientVersion: '1.0' },
+        threatInfo: {
+          threatTypes: ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE'],
+          platformTypes: ['ANY_PLATFORM'],
+          threatEntryTypes: ['URL'],
+          threatEntries: [{ url }],
+        },
+      }),
+      signal: AbortSignal.timeout(300),
+    });
+    if (!res.ok) return 'unknown';
+    const data = (await res.json()) as { matches?: unknown[] };
+    return data.matches?.length ? 'unsafe' : 'safe';
+  } catch {
+    return 'unknown';
+  }
+}
+```
+
+Service mein:
+
+```ts
+const verdict = await checkUrlSafety(input.longUrl);
+if (verdict === 'unsafe') throw new AppError(400, 'URL_BLOCKED', 'This URL is flagged as unsafe');
+const scanStatus = verdict === 'safe' ? 'clean' : 'pending';
+// insert ke saath scan_status save; 'pending' wale links ko background worker dobara scan karega
+```
+
+**Code Explanation:**
+
+- `type Verdict = 'safe' | 'unsafe' | 'unknown'` -- teen answers, do nahi. **"Pata nahi"** ek alag state hai -- usko "safe" maan lena ya "unsafe" maan lena dono galat ho sakte hain.
+- `fetch(...)` -- Node 18+ ka built-in fetch; koi extra library nahi.
+- `config.safeBrowsingKey` -- API key config/secret manager se, code mein hardcode nahi (PART 19).
+- `threatTypes: [...]` -- malware, phishing (`SOCIAL_ENGINEERING`), unwanted software -- teeno check.
+- `signal: AbortSignal.timeout(300)` -- **300 ms mein jawab nahi toh chhod do.** Ye sabse important line hai: third-party ki slowness hamari slowness na bane.
+- `if (!res.ok) return 'unknown'` -- 429 (quota) / 5xx -> unknown, crash nahi.
+- `data.matches?.length ? 'unsafe' : 'safe'` -- API khaali object `{}` deti hai jab URL clean hai, aur `matches` array jab threat mila.
+- `catch { return 'unknown' }` -- timeout ya network error bhi unknown.
+- `verdict === 'unsafe'` -> **400**, link banega hi nahi.
+- `scanStatus = 'pending'` -- **fail open with follow-up**: link bana do, lekin background worker (retry ke saath) dobara scan karega; unsafe nikla toh `is_active = false` + cache `DEL`.
+
+**Fail open vs fail closed:**
+
+| Choice | Matlab | Kab |
+|---|---|---|
+| **Fail open** | Check nahi ho paaya toh allow karo (baad mein re-scan) | Logged-in, trusted users; availability zyada important |
+| **Fail closed** | Check nahi ho paaya toh reject karo (503) | Anonymous users (spam/phishing ka zyada risk), ya abuse wave chal rahi ho |
+
+Ek realistic mix: **logged-in = fail open, anonymous = fail closed.** Aur baar baar fail ho raha ho toh **circuit breaker** (e.g. `opossum` library) -- kuch sec tak call hi mat karo, seedha `unknown`.
+
+> Note: Safe Browsing Lookup API ki terms commercial use restrict karti hain -- commercial product ke liye Google ka **Web Risk API** (paid) hai. Interview mein naam se zyada **pattern** (timeout, fallback, re-scan) matter karta hai.
+
+> Interview line: "Third-party call ko main hamesha timeout ke saath wrap karunga -- 300 ms. Wo down ho toh main 'unknown' state rakhta hoon: trusted users ke liye link bana ke background mein re-scan, anonymous ke liye reject. Circuit breaker lagaunga taaki Google ki problem hamari latency na bane."
+
+### Failure summary
+
+| Failure | Redirect | Create | Main fix |
+|---|---|---|---|
+| DB primary | OK | 503 till failover | Multi-AZ failover, sync standby, Retry-After |
+| DB replica | OK | OK | Multiple replicas, primary fallback |
+| Redis | Slow | OK | Fail fast, local LRU, HA, circuit breaker |
+| Node crash | OK (in-flight fail) | OK | Health checks, N+2, graceful shutdown |
+| Queue | OK | OK | Fire-and-forget, bounded buffer, drop metric |
+| Timeout | -- | -- | Timeout on every call, limited retries with backoff |
+| Duplicate request | -- | Same response | Idempotency-Key |
+| Duplicate message | -- | -- | Idempotent consumer (eventId + transaction) |
+| Worker crash | OK | OK | Ack after process, consumer group, DLQ |
+| Third-party down | OK | Degraded | Timeout, unknown state, re-scan, breaker |
+
+---
+
+## PART 18 -- Consistency
+
+### Teen words, simple Hinglish mein
+
+**Strong consistency ka simple matlab:** write successful hote hi **har** reader ko, **har** jagah se, naya data hi dikhega. Jaise bank ka ek hi register -- entry likhi, turant sab ko dikhti hai.
+
+**Eventual consistency ka simple matlab:** write ke baad kuch time tak kuch readers ko purana data dikh sakta hai, lekin agar naye writes band hon toh **thodi der mein sab same** ho jaayenge. Jaise WhatsApp group mein message -- kisi ko 1 sec baad dikha, kisi ko 5 sec baad, lekin sabko dikhega.
+
+**Read-after-write consistency ka simple matlab:** **jisne** likha, usko apna likha hua turant dikhna chahiye. Baaki duniya ko thodi der baad dikhe toh chalega. Jaise Instagram par apni post daali -- tumhe turant dikhni chahiye, follower ko 2 sec baad dikhe toh koi baat nahi.
+
+```
+Time ->       t0 write        t1              t2              t3
+Strong:       new             new             new             new       (sab ko, hamesha)
+Eventual:     new(primary)    old(replica)    old(cache)      new       (thodi der baad sab new)
+Read-after-   writer: new     writer: new     others: maybe old  ->  eventually new
+write:
+```
+
+**Kyun sab kuch strong nahi rakh dete?** Strong consistency ka matlab usually **ek hi jagah** (primary) se padhna ya har write par saare copies ko sync karna. Isse **latency badhti hai aur availability ghat-ti hai** (replica/cache ka fayda gaya). Isliye jahan zarurat hai wahan strong, baaki jagah eventual. (Ye CAP / PACELC trade-off ka practical roop hai -- network partition ho toh consistency ya availability mein se ek chunna padta hai, aur normal time mein bhi consistency vs latency.)
+
+### Is system mein kahan kya chahiye?
+
+| Operation | Consistency | Kyun | Kaise |
+|---|---|---|---|
+| Short code / alias **uniqueness** | **Strong** | Do URLs ka same code = kisi ko galat website. Ye kabhi nahi hona chahiye | Sirf **primary** par INSERT + **UNIQUE index** (Part 3). Replica se "alias available?" check karke decide **kabhi** mat karo |
+| ID generation | **Strong** | Duplicate ID = duplicate code | `nextval()` primary par, atomic |
+| Redirect right after create | **Read-after-write** (creator + early clickers) | User ne link banaya, turant WhatsApp par bheja, dost ne click kiya -> 404 = "tumhara product toota hua hai" | Neeche dekho |
+| Redirect generally | **Eventual** OK | Mapping kabhi badalti hi nahi (immutable), toh stale ka sawaal sirf delete/edit par | Cache + replicas |
+| Delete / disable propagation | **Eventual, bounded** | 5 sec tak purana redirect chal jaaye -- usually OK. Phishing ke liye jaldi chahiye | DB update -> Redis DEL -> local LRU 5s |
+| Click counts / analytics | **Eventual** | Dashboard 1-2 min late ho, kisi ko farak nahi | Queue + batch worker |
+| "My links" list | Read-after-write (for owner) | Banaya aur list mein nahi dikha = confusing | Create ke baad list ki query **primary** se, ya response se client-side list mein jodo |
+
+### Problem: create ke turant baad click -> 404
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant N as Node.js
+    participant P as Postgres Primary
+    participant R as Read Replica
+    participant C as Redis
+    U->>N: POST /api/v1/urls
+    N->>P: INSERT aB92xK
+    P-->>N: OK
+    N-->>U: 201 sho.rt/aB92xK
+    Note over P,R: replication lag ~100 ms (load par 1-5 sec)
+    U->>N: GET /aB92xK (50 ms baad)
+    N->>C: GET url:aB92xK
+    C-->>N: nil
+    N->>R: SELECT ... aB92xK
+    R-->>N: 0 rows (abhi tak pahuncha hi nahi)
+    N->>C: SET url:aB92xK __404__ EX 60
+    N-->>U: 404 Not Found
+```
+
+**Replication lag ka simple matlab:** primary par write hua, lekin replica tak copy pahunchne mein kuch ms/sec lagte hain. Us beech replica purana data deta hai.
+
+Aur dekho sabse bura hissa: Part 3 ka **negative cache** us 404 ko **60 sec ke liye Redis mein save** kar deta hai. Ab replica catch up bhi kar le, toh bhi 60 sec tak **sabko** 404! Ek chhota lag, bada bug.
+
+### Fixes (simple se strong)
+
+**Fix 1 -- Write-through on create (sabse effective)**
+
+Part 3 mein create ke baad `DEL url:<code>` kiya tha. Ab usko **`SET`** mein badal do:
+
+```ts
+await this.repo.insert({...});
+this.cache
+  .set(`url:${shortCode}`, input.longUrl, 'EX', withJitter(Math.min(3600, ttlFor(input.expiresAt))))
+  .catch(() => {});
+local.delete(`url:${shortCode}`);
+```
+
+**Code Explanation:**
+
+- `this.repo.insert(...)` -- pehle DB (primary) mein likho. DB fail = cache mein kuch nahi, koi jhooth nahi.
+- `this.cache.set(url:<code>, longUrl, ...)` -- **write-through**: naya link turant Redis mein. Pehla click replica tak jaayega hi nahi. Purana `__404__` (agar tha) bhi overwrite ho gaya.
+- `Math.min(3600, ttlFor(input.expiresAt))` -- sirf **1 ghante** ka TTL. Part 3 mein humne kaha tha write-through memory waste karta hai; 1 ghanta rakhne se: 10M/day / 24 = ~4.2 lakh keys/ghanta x 500 B = **~200 MB**. Sasta. Ek ghante baad link popular hai toh normal cache-aside usko wapas le aayega. (`ttlFor` = expiry ke hisaab se seconds, Part 3 wala logic.)
+- `.catch(() => {})` -- Redis down hai toh create fail mat karo; Fix 2 backup hai.
+- `local.delete(...)` -- is instance ka purana local 404 hatao.
+
+**Fix 2 -- Replica "not found" bole toh primary se confirm karo (safety net)**
+
+```ts
+// repositories/url.repository.ts
+constructor(private readonly primary: Pool, private readonly replica: Pool) {}
+
+async findByShortCode(shortCode: string): Promise<UrlRecord | null> {
+  const fromReplica = await this.queryByCode(this.replica, shortCode);
+  if (fromReplica) return fromReplica;
+  return this.queryByCode(this.primary, shortCode);
+}
+```
+
+**Code Explanation:**
+
+- `constructor(primary, replica)` -- ab repository ke paas do pools: writes ke liye primary, reads ke liye replica. (`queryByCode` = Part 2 wali SELECT, bas pool parameter se.)
+- `fromReplica` mila -> return. 99%+ cache misses yahin khatam, primary ko chhua bhi nahi. Mapping immutable hai, toh replica ka "found" hamesha sahi hai.
+- Replica ne "nahi mila" bola -> **primary se confirm**. Ho sakta hai link abhi abhi bana ho. Sirf iske baad `__404__` negative cache hoga.
+- **Trade-off:** har **asli 404** (bots ke random codes) ab 2 queries, ek primary par. Isse bachane ke liye: Part 2 ka code pattern filter, Part 3 ka 60s negative cache, aur `GET` par per-IP rate limit (PART 19). Agar phir bhi zyada ho, toh sirf "recent" codes ke liye primary fallback karo (counter-based code decode karke ID dekho -- Part 3 ka `decodeBase62` -- agar ID pichle kuch minute ke blocks mein hai tabhi primary).
+
+**Fix 3 -- Sticky reads for the writer (normal apps mein common, yahan kam useful)**
+
+Writer ko cookie do "agle 10 sec primary se padho". **Yahan kyun kam kaam ka?** Link par click **doosre log** karte hain (SMS/WhatsApp receivers), writer nahi. Unke paas cookie hi nahi. Isliye URL shortener mein Fix 1 + Fix 2 behtar hain.
+
+> Interview line: "Uniqueness strong honi chahiye, isliye short code sirf primary par unique index ke saath insert hota hai. Redirect ke liye eventual consistency chalti hai kyunki mapping immutable hai -- lekin create ke turant baad click par replica lag se 404 aa sakta hai, aur negative cache usko 60 sec chipka dega. Isliye create par write-through cache karunga 1 ghante TTL ke saath, aur replica miss par primary se confirm karke hi 404 dunga. Analytics fully eventual hai."
+
+### Delete propagation -- timeline
+
+User ne `aB92xK` delete kiya (Part 3 ka `deleteUrl`):
+
+```
+t = 0 ms     DB (primary): is_active = false            <- source of truth updated
+t = 2 ms     Redis: DEL url:aB92xK                      <- shared cache saaf
+t = 0-5 s    Doosre Node instances ka local LRU (5s TTL) purana URL de sakta hai
+t = ~100 ms  Replica par bhi update pahunch gaya
+t > 5 s      Sab jagah 404 (replica filter is_active = true)
+
+Worst case: Redis DEL fail hua (Redis down) -> 24 ghante tak (Redis TTL) purana redirect!
+```
+
+**Isliye:**
+
+- Normal delete ke liye **"max ~5 sec stale"** acceptable hai -- ye **bounded eventual consistency** hai.
+- Redis DEL fail ho toh **retry** chahiye -- delete event ek queue/outbox mein daalo aur worker DEL retry kare jab tak success na ho. Ye phishing links ke liye zaruri hai.
+- Browser side: hum `Cache-Control: private, max-age=0` bhejte hain (Part 2), toh browser cache mein purana redirect nahi chipakta. **301 use karte toh delete kabhi browser tak propagate hi nahi hota** -- 301 vs 302 ka ek aur consistency angle.
+- Replica lag + local cache race (Part 3 ka "delayed double delete") -- 1-2 sec baad ek aur DEL.
+
+**Outbox ka simple matlab:** DB mein ek "pending kaam" table jisme business write ke saath hi (same transaction) ek row likh do -- "is code ka cache DEL karna hai". Worker woh rows padh ke kaam karta hai aur done mark karta hai. DB commit hua = kaam kabhi bhoola nahi jaayega.
+
+### Multi-region mein (100x+)
+
+- Writes ek **home region** mein (ya region-aware IDs ke saath local writes). Doosre regions ko async replication se data milta hai -> wahan **eventual**.
+- Region B mein naye link ka pehla click -> local miss -> **home region se fetch** (Fix 2 ka global version) -> local cache mein daalo.
+- Uniqueness: auto-generated codes region-aware IDs se unique; **custom alias** ke liye ek global authority chahiye (alias ka hash -> ek owner region/shard), warna do regions ek saath same alias de denge.
+
+---
+
+## PART 19 -- Security
+
+URL shortener ki ek special baat: **ye by design ek "open redirect" hai** -- koi bhi apna URL daale aur hamara trusted domain usko aage bhej de. Isliye attackers isko phishing chhupane ke liye use karte hain, aur agar hamara domain phishing mein use hua toh Gmail/Chrome **poore `sho.rt` domain ko block** kar sakte hain -- sab users ke links toot jaayenge. **Security yahan business survival hai.**
+
+### Threat -> defence map
+
+| Threat | Example | Defence |
+|---|---|---|
+| Spam / bulk abuse | Bot 1 lakh links/hour banaye | Rate limiting, auth, CAPTCHA for anonymous |
+| Phishing / malware | Fake bank login page ka short link | URL scanning, blocklist, report abuse, re-scan |
+| Enumeration | Script `aB92xK, aB92xL...` try kare | Random 8-char codes for private links, GET rate limit |
+| Injection | `longUrl = "'; DROP TABLE urls; --"` | Parameterized queries, zod validation |
+| Account takeover / IDOR | User A, User B ka link delete kare | AuthN + ownership check (AuthZ) |
+| Secret leak | DB password GitHub par | Secret manager, never in git |
+| Eavesdropping | Public WiFi par token chori | HTTPS everywhere, HSTS |
+
+### 1. Authentication -- "tum kaun ho?"
+
+- **Redirect (`GET /:code`):** koi auth nahi -- public hai, har koi click karega.
+- **Create (`POST /api/v1/urls`):** anonymous allowed (strict limits) **ya** logged-in.
+  - **Web users:** login -> **JWT** (short expiry, e.g. 15 min) + refresh token httpOnly cookie mein. Ya session cookie -- dono valid.
+  - **B2B / developers:** **API keys** (`X-API-Key` header).
+
+**API keys -- DB mein plain text kabhi nahi, hash karke:**
+
+```ts
+// middleware/api-key-auth.ts
+import { createHash } from 'node:crypto';
+import type { Request, Response, NextFunction } from 'express';
+
+export const apiKeyAuth = (keys: ApiKeyRepository) =>
+  async (req: Request, res: Response, next: NextFunction) => {
+    const raw = req.get('X-API-Key');
+    if (!raw) return next();
+
+    const hash = createHash('sha256').update(raw).digest('hex');
+    const key = await keys.findActiveByHash(hash);
+    if (!key) return res.status(401).json({ error: 'UNAUTHORIZED' });
+
+    res.locals.userId = key.userId;
+    res.locals.plan = key.plan;
+    next();
+  };
+```
+
+**Code Explanation:**
+
+- `req.get('X-API-Key')` -- header se key. Nahi hai toh anonymous (aage rate limiter strict limit lagayega).
+- `createHash('sha256').update(raw).digest('hex')` -- aane wali key ka hash banao. DB mein sirf **hash** stored hai. DB leak ho jaaye toh bhi attacker ke paas asli keys nahi.
+- **bcrypt kyun nahi?** Passwords chhote aur guessable hote hain, isliye unke liye **slow** hash (bcrypt/argon2) chahiye. API key 32+ random bytes ki hai -- guess karna impossible, toh fast SHA-256 kaafi hai, aur hash se seedha **index lookup** ho jaata hai (bcrypt mein har row compare karna padta).
+- `keys.findActiveByHash(hash)` -- `WHERE key_hash = $1 AND revoked_at IS NULL` -- revoke ki hui keys kaam nahi karengi.
+- `401` -- key bheji lekin galat. Anonymous mein fallback **mat** karo, warna galat key wale ko pata nahi chalega ki kuch gadbad hai.
+- `res.locals.userId / plan` -- aage controller aur rate limiter isko use karenge (plan ke hisaab se quota).
+- Key user ko **sirf ek baar** dikhao (create ke time), jaise GitHub tokens. Prefix rakho (`shrt_live_...`) taaki leak hone par GitHub secret scanning pakad sake.
+
+### 2. Authorization -- "tum ye kar sakte ho?"
+
+Authenticated hona kaafi nahi. User 42 ne `DELETE /api/v1/urls/aB92xK` bheja -- **kya `aB92xK` user 42 ka hai?**
+
+```sql
+UPDATE urls SET is_active = false
+ WHERE short_code = $1 AND user_id = $2;     -- ownership WHERE mein hi
+```
+
+- Ownership check **query ke andar** -- "pehle SELECT karke owner check, phir UPDATE" ka race aur bhoolne ka risk dono khatam (Part 3 ka `deleteUrl`).
+- 0 rows update hui -> **404**, 403 nahi. 403 bolega "link exist karta hai, bas tumhara nahi" -- ye bhi info leak hai.
+- **IDOR ka simple matlab:** Insecure Direct Object Reference -- URL mein ID badal ke doosre ka data access kar lena. Har owner-only endpoint par `user_id` condition isi se bachati hai.
+- Admin actions (abuse block) ke liye alag **role** check (`role = 'admin'`), alag internal endpoint.
+
+### 3. Input validation (Part 2 ka recap + kuch aur)
+
+Part 2 mein zod se: http/https only, max 2048, own domain blocked, alias regex, reserved words, 10 KB body limit. Aur jodo:
+
+- **Credentials in URL block karo:** `https://paypal.com@evil.com/login` -- user ko `paypal.com` dikhta hai, jaata `evil.com` par. `new URL(u).username` ya `password` non-empty ho toh reject.
+- **Doosre shorteners ke links** (`bit.ly/...`) -- chain redirect se phishing chhupti hai. Block ya unka final destination resolve karke scan karo.
+- **Hostname normalize** karo (lowercase, punycode `xn--`) taaki blocklist bypass na ho (`PAYPAL.com`, lookalike Unicode domains).
+- **SSRF** -- agar kabhi server khud long URL fetch kare (link preview, title nikalna), toh `localhost`, `169.254.169.254` (cloud metadata), private IPs block karo. **SSRF ka simple matlab:** attacker hamare server se hamare hi internal network par request karwa le. Core redirect mein hum URL fetch nahi karte, toh ye sirf preview feature ke saath aata hai.
+
+### 4. SQL injection
+
+Part 2 mein saari queries **parameterized** (`$1, $2`) hain -- values SQL text mein kabhi concatenate nahi hoti. Rule simple hai:
+
+```ts
+// GALAT -- kabhi nahi
+db.query(`SELECT * FROM urls WHERE short_code = '${code}'`);
+// SAHI
+db.query('SELECT * FROM urls WHERE short_code = $1', [code]);
+```
+
+- Pehli line mein `code = "x' OR '1'='1"` poori table leak kar dega.
+- Doosri mein value alag bheji jaati hai -- DB usko sirf data samjhta hai, SQL command nahi. ORM/query builder (Prisma, Knex) bhi andar yahi karte hain -- lekin unke **raw query** functions mein string concat mat karo.
+- Extra layer: app ka DB user sirf `SELECT/INSERT/UPDATE` permissions ke saath (**least privilege**) -- `DROP` ka right hi nahi.
+
+### 5. Rate limiting
+
+Part 2 mein `createUrlLimiter` use kiya tha, dikhaya nahi. Ye raha -- Redis based, taaki **saare instances ek hi counter** dekhein (in-memory limiter mein 12 instances = 12x limit).
+
+**Fixed window ka simple matlab:** time ko buckets mein kaato (e.g. har ghanta). Har bucket mein ek counter. Counter limit se upar = block. Agla bucket = counter fresh.
+
+```ts
+// middleware/rate-limit.ts
+import type { Request, Response, NextFunction } from 'express';
+import type Redis from 'ioredis';
+import { logger } from '../infra/logger';
+
+interface LimitOptions {
+  redis: Redis;
+  name: string;
+  limit: number;
+  windowSec: number;
+  keyFor: (req: Request, res: Response) => string;
+}
+
+export function rateLimit({ redis, name, limit, windowSec, keyFor }: LimitOptions) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const window = Math.floor(Date.now() / 1000 / windowSec);
+    const key = `rl:${name}:${keyFor(req, res)}:${window}`;
+
+    let count: number;
+    try {
+      const results = await redis.multi().incr(key).expire(key, windowSec + 5).exec();
+      count = Number(results?.[0]?.[1] ?? 0);
+    } catch (err) {
+      logger.warn({ err, name }, 'rate limiter unavailable, allowing request');
+      return next();
+    }
+
+    const resetSec = (window + 1) * windowSec - Math.floor(Date.now() / 1000);
+    res.set('RateLimit-Limit', String(limit));
+    res.set('RateLimit-Remaining', String(Math.max(0, limit - count)));
+
+    if (count > limit) {
+      res.set('Retry-After', String(resetSec));
+      return res.status(429).json({ error: 'RATE_LIMITED', retryAfterSec: resetSec });
+    }
+    next();
+  };
+}
+```
+
+Wiring (`app.ts` / routes):
+
+```ts
+app.set('trust proxy', 1);
+
+export const createUrlLimiter = rateLimit({
+  redis,
+  name: 'create',
+  limit: 10,
+  windowSec: 3600,
+  keyFor: (req, res) => (res.locals.userId ? `u:${res.locals.userId}` : `ip:${req.ip}`),
+});
+```
+
+**Code Explanation:**
+
+- `interface LimitOptions` -- ek hi factory se alag limiters: create ke liye, redirect ke 404s ke liye, login ke liye.
+- `Math.floor(Date.now() / 1000 / windowSec)` -- current window ka number. windowSec = 3600 matlab har ghante ka alag number (e.g. 491,832). Naya ghanta = naya number = naya counter, reset karne ki zarurat hi nahi.
+- ``key = `rl:create:ip:1.2.3.4:491832` `` -- `rl:` prefix (Part 2 mein bola tha), limiter ka naam, kaun (user ya IP), kaunsi window.
+- `redis.multi().incr(key).expire(key, windowSec + 5).exec()` -- **MULTI** = dono commands ek saath, beech mein koi doosra command nahi. `INCR` atomic hai -- 12 instances ek saath badhayein toh bhi count sahi (Part 3 ka atomic operation). Key nahi thi toh INCR usko 0 se 1 bana deta hai.
+- `expire(key, windowSec + 5)` -- window khatam hone ke baad key khud delete, Redis memory saaf. +5 sec buffer clock ke chhote farak ke liye.
+- `results?.[0]?.[1]` -- ioredis `exec()` har command ka `[error, result]` deta hai; pehla command INCR tha, uska result = count.
+- `catch -> next()` -- Redis down hai toh request **allow** karo (**fail open**). Rate limiter ke girne se create API down nahi honi chahiye. Trade-off: us time spam ho sakta hai. Anonymous traffic ke liye **fail closed** bhi valid choice hai -- requirement par depend.
+- `RateLimit-Limit / RateLimit-Remaining` headers -- achhe clients khud slow ho jaate hain.
+- `count > limit` -> **429** + `Retry-After` -- client ko exact pata kab dobara try kare.
+- `app.set('trust proxy', 1)` -- **bahut important.** LB ke peeche `req.ip` hamesha **LB ka IP** hota -- sab users ek hi IP, ek hi counter! Ye setting Express ko `X-Forwarded-For` ka pehla trusted hop use karne deti hai. `1` = sirf ek proxy (hamara LB) par bharosa -- `true` mat do, warna attacker fake `X-Forwarded-For` header se apna IP badal lega.
+- `keyFor: userId ?? ip` -- logged-in user ka limit user par (IP change karke bypass nahi), anonymous ka IP par.
+
+**Fixed window ki kamzori:** 10:59:59 par 10 requests + 11:00:00 par 10 = **2 sec mein 20** (limit ka double). Create API ke liye usually chalta hai. Strict chahiye toh **sliding window** ya **token bucket** -- ye poora "Rate Limiter" system design mein detail mein karenge.
+
+**Kahan kahan limit:**
+
+| Endpoint | Key | Example limit | Kyun |
+|---|---|---|---|
+| `POST /api/v1/urls` anonymous | IP | 10/hour | Spam |
+| `POST /api/v1/urls` logged-in | userId + plan | 1000/day (free), zyada paid | Quota + abuse |
+| `GET /:code` | IP | e.g. 300/min, aur **404s** par alag strict limit (50/min) | Enumeration + bots |
+| Login | IP + email | 5/15 min | Password guessing |
+
+> Global DDoS (lakhon IPs) app-level limiter se nahi rukta -- uske liye **WAF / CDN** (Cloudflare, AWS Shield) edge par.
+
+### 6. HTTPS / HSTS
+
+- **TLS load balancer par terminate** (Part 2) -- certificates ACM / Let's Encrypt se, auto-renew.
+- Port 80 par aayi har request -> **301 to HTTPS** (ye redirect ka 301 hai, short link ka nahi).
+- **HSTS ka simple matlab:** server browser ko bolta hai "agle 1 saal tak is domain par **sirf HTTPS** use karna, HTTP try bhi mat karna." Isse public WiFi par koi pehli HTTP request pakad ke downgrade nahi kar sakta.
+- LB -> Node traffic private network (VPC) mein plain HTTP usually theek hai; compliance (PCI/HIPAA) ho toh wahan bhi TLS.
+- Redirect targets: `http://` long URLs bhi allowed hain (Part 2) -- user ko HTTP site par bhejna hamari choice nahi, lekin chaaho toh interstitial warning dikha sakte ho.
+
+### 7. API security headers + CORS
+
+```ts
+import helmet from 'helmet';
+import cors from 'cors';
+
+app.use(helmet({ hsts: { maxAge: 31_536_000, includeSubDomains: true } }));
+app.use('/api', cors({ origin: ['https://app.sho.rt'], methods: ['GET', 'POST', 'DELETE'] }));
+```
+
+**Code Explanation:**
+
+- `helmet(...)` -- ek line mein security headers: `Strict-Transport-Security` (HSTS), `X-Content-Type-Options: nosniff`, `X-Frame-Options`, aur Express ka `X-Powered-By` hata deta hai (attacker ko framework mat batao).
+- `maxAge: 31_536_000` -- 365 din seconds mein. `includeSubDomains` -- `api.sho.rt` jaise subdomains par bhi.
+- `app.use('/api', cors(...))` -- **CORS sirf API par**, redirect route par nahi. Redirect browser navigation hai, CORS ki zarurat hi nahi.
+- `origin: ['https://app.sho.rt']` -- sirf hamara frontend browser se API call kar sake. `origin: '*'` cookies ke saath dangerous hai. (B2B clients server-to-server call karte hain -- CORS unpar lagu hi nahi hota, woh API key use karte hain.)
+- **CORS ka simple matlab:** browser ka rule jo decide karta hai ki `evil.com` ka JavaScript `api.sho.rt` ko call karke response padh sakta hai ya nahi. Ye **browser** enforce karta hai -- curl/Postman par koi asar nahi, isliye ye authentication ka substitute nahi hai.
+
+### 8. Secrets
+
+- DB password, Redis password, Safe Browsing key, JWT signing key -- **kabhi code ya git mein nahi.**
+- Local: `.env` file, `.gitignore` mein. Production: **AWS Secrets Manager / SSM Parameter Store / Vault / Kubernetes secrets** -> container start par env vars.
+- `config/index.ts` (Part 2) mein zod se validate: secret missing = app **start hi na ho** (galat config ke saath half-working app se better).
+- **Rotation:** DB passwords aur keys periodically badlo; JWT ke liye `kid` (key id) rakho taaki purana aur naya key kuch time saath chal sakein.
+- Logs mein secrets/tokens **redact** karo (pino ka `redact` option -- PART 20).
+- Git mein galti se push ho gaya? History se hatana kaafi nahi -- **turant rotate** karo, maan lo leak ho chuka hai.
+
+### 9. Encryption
+
+| Kahan | Kya | Kaise |
+|---|---|---|
+| **In transit** (network par) | Client <-> LB, app <-> DB, app <-> Redis | TLS. Postgres `sslmode=require`, Redis/ElastiCache in-transit encryption |
+| **At rest** (disk par) | DB storage, backups, Redis snapshots, logs | Managed services mein KMS encryption ek checkbox hai -- on rakho |
+| **Application level** | User passwords | **bcrypt / argon2** (hash, encrypt nahi -- wapas nikalna hi nahi chahiye) |
+| | API keys | SHA-256 hash (upar) |
+| | Long URLs | Usually plain. Agar private links mein sensitive tokens hain (`?token=...`), toh column encryption consider karo -- lekin phir DB-side search/scan mushkil |
+
+**Encryption vs hashing:** encryption ulta ho sakta hai (key se decrypt). Hashing one-way hai. Password ko kabhi encrypt nahi, **hash** karte hain.
+
+### 10. Abuse prevention (sabse important, is system ke liye)
+
+```
+Create request
+   |
+   v
+[Rate limit] -> [Validation] -> [Domain blocklist] -> [Safe Browsing / Web Risk] -> save (scan_status)
+                                                                                      |
+                                    background re-scan (daily / on report) <----------+
+                                                   |
+                                        unsafe -> is_active = false + cache DEL + user flag
+```
+
+- **Scan on create** -- PART 17 wala `checkUrlSafety`, timeout ke saath.
+- **Re-scan later** -- link banate waqt clean tha, baad mein destination site hack ho gayi ya attacker ne content badal diya. Isliye popular + naye links ka **periodic re-scan**.
+- **Own blocklist** -- known bad domains, jo abuse reports se aaye. Redis Set ya DB table, create par check.
+- **Report abuse flow** -- `POST /api/v1/reports { shortCode, reason }` -> moderation queue -> admin `is_active = false` -> **Redis DEL + outbox retry** (PART 18). Urgent phishing ke liye yahi "block" path fastest hona chahiye.
+- **Anonymous restrictions** -- chhote limits, CAPTCHA, custom alias nahi, **default expiry** (e.g. 30 din) -- anonymous links lambe time tak zinda nahi.
+- **Interstitial / preview page** -- suspicious (scan pending) links par "You are leaving sho.rt to evil.example -- continue?" page. User ko destination dikhta hai.
+- **Preview feature** -- `sho.rt/aB92xK+` jaisa URL destination dikhaye bina redirect ke (bit.ly jaisa).
+- **Account-level signals** -- ek naya account 1 ghante mein 500 links, sab alag domains -> auto-suspend + review.
+- **Enumeration** -- sequential codes public links ke liye OK; private links ke liye random 8-char codes (Part 3) + 404 rate limit.
+
+> Interview line: "Security mein sabse bada risk abuse hai, kyunki shortener basically ek open redirect hai. Main create par rate limiting, validation, blocklist aur Safe Browsing check karunga timeout ke saath, links ko background mein re-scan karunga, aur report-abuse se is_active false karke cache turant invalidate karunga. Baaki standard: parameterized SQL, HTTPS with HSTS, API keys hashed, secrets secret manager mein, aur owner-only endpoints par authorization query ke andar hi."
+
+---
+
+## PART 20 -- Observability
+
+**Observability ka simple matlab:** system ke bahar se dekh ke samajh paana ki andar kya ho raha hai -- **bina naya code deploy kiye.** 3 pillars:
+
+| Pillar | Sawaal jo answer karta hai | Example |
+|---|---|---|
+| **Metrics** | "Kuch gadbad hai kya? Kitni?" | p99 latency 20 ms se 400 ms ho gayi |
+| **Logs** | "Kya hua exactly?" | `request_id=abc err="connection timeout" route=/:shortCode` |
+| **Traces** | "Kahan time gaya?" | 400 ms mein se 380 ms Postgres replica query mein |
+
+Flow: **alert (metric) -> dashboard (metric) -> trace (kahan) -> log (kyun).**
+
+### 1. Logs -- structured, request id ke saath
+
+```ts
+// infra/logger.ts
+import pino from 'pino';
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  redact: ['req.headers.authorization', 'req.headers["x-api-key"]', 'req.headers.cookie'],
+});
+```
+
+```ts
+// app.ts
+import pinoHttp from 'pino-http';
+import { randomUUID } from 'node:crypto';
+
+app.use(pinoHttp({
+  logger,
+  genReqId: (req, res) => {
+    const id = (req.headers['x-request-id'] as string) ?? randomUUID();
+    res.setHeader('X-Request-Id', id);
+    return id;
+  },
+  autoLogging: { ignore: (req) => req.url === '/health' },
+  customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
+}));
+```
+
+**Code Explanation:**
+
+- `pino(...)` -- **structured logging**: har log ek JSON line (`{"level":30,"msg":"...","shortCode":"aB92xK"}`). Kyun? Log system (CloudWatch, Loki, ELK) mein `shortCode = "aB92xK"` se filter kar sakte ho. Plain text (`"resolved aB92xK"`) par sirf grep.
+- Pino kyun? Node ke fastest loggers mein se -- 35K req/s par logger khud bottleneck nahi hona chahiye.
+- `level: process.env.LOG_LEVEL ?? 'info'` -- production mein info, debugging ke time bina code change `debug`.
+- `redact: [...authorization, x-api-key, cookie]` -- tokens aur API keys logs mein `[Redacted]` dikhenge. Logs ko bahut log padhte hain -- secrets wahan leak nahi hone chahiye.
+- `pinoHttp({ logger, ... })` -- har request ka ek log automatically: method, url, status, response time.
+- `genReqId` -- **request id**: LB/client ne `X-Request-Id` bheja toh wahi, warna naya UUID. Is request ki har log line mein yahi id. User complaint kare "mera link nahi chala", support response header se id le aur **ek search mein poori kahani** mil jaaye.
+- `res.setHeader('X-Request-Id', id)` -- response mein bhi wapas, taaki client/support ke paas ho.
+- `autoLogging.ignore('/health')` -- LB har 5 sec har instance ko ping karta hai; woh logs noise hain.
+- `customLogLevel` -- 5xx = `error`, 4xx = `warn`, baaki `info`. Alerts sirf error level par.
+
+**Production reality -- log volume:** har redirect log kiya toh ~11.6K req/s x ~300 bytes = **~300 GB/day** logs. Mehenga! Isliye:
+
+- Redirect ke success logs **sample** karo (e.g. 1%) ya band, **errors 100%**.
+- Metrics se counts lo (sasta), logs sirf details ke liye.
+- Logs mein PII soch samajh ke: IP address, full long URL (usme tokens ho sakte hain) -- retention policy rakho.
+
+### 2. Metrics -- kya measure karein
+
+**RED method** (har service ke liye): **R**ate (RPS), **E**rrors (error rate), **D**uration (latency).
+**USE method** (har resource ke liye): **U**tilization, **S**aturation, **E**rrors -- CPU, memory, DB pool, Redis.
+
+**Percentile (p50/p95/p99) ka simple matlab:** p99 = 100 mein se 99 requests isse jaldi khatam hui. **Average se kyun nahi?** 99 requests 2 ms + 1 request 2000 ms = average ~22 ms "sab theek" lagta hai, lekin har 100 mein ek user 2 sec wait kar raha hai. Us 1% par tail latency chhupi hoti hai.
+
+| Metric | Example name | Kyun dekhna hai |
+|---|---|---|
+| RPS | `http_requests_total` (rate) | Traffic pattern, viral spike, scale decision |
+| Latency p50/p95/p99 | `http_request_duration_seconds` (histogram) | Redirect ka SLO |
+| Error rate (5xx) | `http_requests_total{status_code=~"5.."}` | **Hamari** galti -- page karo |
+| 4xx rate | `...{status_code=~"4.."}` | 404 spike = bot enumeration; 429 spike = abuse ya limit galat |
+| CPU | `process_cpu_seconds_total` | Scale out trigger |
+| Memory | `nodejs_heap_size_used_bytes`, `process_resident_memory_bytes` | Memory leak (lagatar badhna) |
+| Event loop lag | `nodejs_eventloop_lag_p99_seconds` | Node-specific: koi sync kaam event loop block kar raha hai |
+| DB latency | `db_query_duration_seconds{op, pool}` | Replica slow? Query plan badla? |
+| DB pool waiting | `pg_pool_waiting_clients` | > 0 lagatar = pool chhota ya DB slow |
+| Replica lag | `pg_replication_lag_seconds` (postgres_exporter se) | Read-after-write risk (PART 18) |
+| Redis hit ratio | `url_cache_lookups_total{layer, result}` | Hit ratio gira = DB par load badhega |
+| Redis latency / errors | `redis_command_errors_total` | Circuit breaker khula? |
+| Queue lag | `kafka_consumergroup_lag` (exporter se) | Worker peeche -- analytics stale |
+| Dropped events | `click_events_dropped_total` | Queue down / buffer full |
+| Business | `urls_created_total`, `urls_blocked_total{reason}` | Create achanak zero = kuch toota hai, chahe errors na dikhein |
+
+### Code -- prom-client
+
+```ts
+// infra/metrics.ts
+import client from 'prom-client';
+import type { Pool } from 'pg';
+import type { Request, Response, NextFunction } from 'express';
+
+client.collectDefaultMetrics();
+
+const httpDuration = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request latency',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+});
+
+export const cacheLookups = new client.Counter({
+  name: 'url_cache_lookups_total',
+  help: 'Cache lookups by layer and result',
+  labelNames: ['layer', 'result'],
+});
+
+export function registerPoolMetrics(pools: Record<string, Pool>) {
+  new client.Gauge({
+    name: 'pg_pool_waiting_clients',
+    help: 'Requests waiting for a pg connection',
+    labelNames: ['pool'],
+    collect() {
+      for (const [name, pool] of Object.entries(pools)) this.set({ pool: name }, pool.waitingCount);
+    },
+  });
+}
+
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction) {
+  const end = httpDuration.startTimer();
+  res.on('finish', () => {
+    end({ method: req.method, route: req.route?.path ?? 'unmatched', status_code: String(res.statusCode) });
+  });
+  next();
+}
+
+export async function metricsHandler(_req: Request, res: Response) {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+}
+```
+
+Use:
+
+```ts
+// app.ts
+app.use(metricsMiddleware);
+registerPoolMetrics({ primary: primaryPool, replica: replicaPool });
+// /metrics alag internal port par expose karo, public nahi
+
+// url.service.ts -- resolve() ke andar
+cacheLookups.inc({ layer: 'local', result: hot ? 'hit' : 'miss' });
+cacheLookups.inc({ layer: 'redis', result: cached ? 'hit' : 'miss' });
+```
+
+**Code Explanation:**
+
+- `client.collectDefaultMetrics()` -- ek line mein CPU, memory, heap, GC, **event loop lag**, open handles. Ye Node process ki basic health hai.
+- `new client.Histogram({...})` -- **histogram** latency ko buckets mein ginta hai (2 ms se kam kitne, 5 ms se kam kitne...). Isi se Prometheus p50/p95/p99 nikalta hai. Average wala counter ye nahi de sakta.
+- `buckets: [0.002, ... 2.5]` -- seconds mein. Hamara redirect ~2-15 ms hai, isliye chhote buckets zyada. Galat buckets = galat percentiles.
+- `labelNames: ['method', 'route', 'status_code']` -- in dimensions se slice kar sakte ho: "sirf redirect ka p99", "sirf 5xx".
+- `cacheLookups` Counter with `layer` + `result` -- local aur Redis ka hit ratio **alag alag**. Local ka ratio viral traffic batata hai, Redis ka overall cache health.
+- `new client.Gauge({ labelNames: ['pool'], collect() {...} })` -- **gauge** = upar neeche jaane wala number. `collect()` tab chalta hai jab Prometheus scrape karta hai -- har request par update karne ki zarurat nahi. `pool.waitingCount` = kitni queries connection ke intezaar mein. `pool` label se primary aur replica ek hi metric mein alag dikhte hain (sirf 2 values -- low cardinality, safe).
+- `httpDuration.startTimer()` -- start time note; `end({...})` duration record karta hai labels ke saath.
+- `res.on('finish', ...)` -- response poora bhej diya tab measure -- asli latency.
+- `route: req.route?.path ?? 'unmatched'` -- **sabse important line.** Label mein **route pattern** (`/:shortCode`) daalo, actual path (`/aB92xK`) **kabhi nahi**. Actual path daala toh har short code ek naya time series -- billions series = Prometheus mar jaayega. Ise **cardinality explosion** kehte hain.
+- `metricsHandler` -- Prometheus har 15 sec `/metrics` scrape karta hai; text format mein saare metrics. **Public mat karo** -- internal port / network policy.
+- `cacheLookups.inc({ layer: 'local', ... })` -- service mein har lookup par count. PromQL se hit ratio nikalega.
+
+**Useful queries (PromQL):**
+
+```
+# Redirect p99 latency (last 5 min)
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{route="/:shortCode"}[5m])))
+
+# 5xx error rate
+sum(rate(http_request_duration_seconds_count{status_code=~"5.."}[5m]))
+  / sum(rate(http_request_duration_seconds_count[5m]))
+
+# Redis hit ratio
+sum(rate(url_cache_lookups_total{layer="redis",result="hit"}[5m]))
+  / sum(rate(url_cache_lookups_total{layer="redis"}[5m]))
+```
+
+- `rate(...[5m])` -- counter ko "per second, last 5 min average" mein badlo.
+- `histogram_quantile(0.99, ...)` -- buckets se p99 calculate.
+- Histogram ka `_count` series free mein milta hai -- alag request counter ki zarurat nahi.
+
+### 3. Alerts -- kab kisko jagaana hai
+
+**SLO ka simple matlab:** Service Level Objective -- ek measurable promise, jaise "99.9% redirects 100 ms ke andar, aur 99.99% successful." Alerts isi promise ke tootne par.
+
+| Alert | Condition (example) | Severity | Kyun |
+|---|---|---|---|
+| Redirect errors | 5xx rate > 1% for 5 min | **Page** (raat ko jagao) | Links toot rahe hain |
+| Redirect latency | p99 > 100 ms for 10 min | Page | SLO toot raha |
+| Create errors | 5xx > 5% for 5 min | Page (business hours) / high | Create kam critical |
+| Cache hit ratio | Redis hit < 85% for 15 min | Warn | DB par load badhne wala |
+| Redis down | errors > 0 continuously for 2 min | Page | 20x DB load, cascading risk |
+| DB pool saturation | waiting clients > 0 for 5 min | Warn | Pool / DB slow |
+| Replica lag | > 5 sec for 5 min | Warn | Stale reads, 404 risk |
+| Event loop lag | p99 > 100 ms for 5 min | Warn | Sync code / CPU overload |
+| Memory | RSS lagatar badh raha (1 ghante mein +30%) | Warn | Leak -> OOM crash |
+| CPU | > 75% for 15 min | Warn / autoscale | Capacity |
+| Queue lag | > 5 min purane events | Warn | Analytics stale / worker down |
+| 404 spike | 404 rate 5x normal | Info / security | Enumeration attack |
+| Creates zero | `urls_created_total` rate = 0 for 10 min (daytime) | High | Silent failure |
+
+**Rule:** page sirf tab jab **user ko dard ho raha ho** aur insaan ko kuch karna pade. Har warn par raat ko jagaaoge toh team alerts ignore karna seekh jaayegi (**alert fatigue**).
+
+### 4. Tracing -- OpenTelemetry
+
+**Distributed tracing ka simple matlab:** ek request ka poora safar -- LB -> Node -> Redis -> Postgres -> Kafka -> worker -- ek timeline (trace) mein, har step ek "span" with duration. "Slow kyun hai?" ka jawab seedha dikhta hai.
+
+```
+trace_id = 4bf92f...   GET /aB92xK   total 412 ms
+  |-- express middleware         1 ms
+  |-- redis GET url:aB92xK       50 ms  (timeout -> miss)
+  |-- pg SELECT (replica)        355 ms  <- yahan problem
+  |-- redis SET                  1 ms
+```
+
+```ts
+// tracing.ts -- sabse pehle load hona chahiye
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { ParentBasedSampler, TraceIdRatioBasedSampler } from '@opentelemetry/sdk-trace-base';
+
+const sdk = new NodeSDK({
+  serviceName: 'url-shortener',
+  traceExporter: new OTLPTraceExporter(),
+  sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(0.01) }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+```
+
+Start: `node --import ./dist/tracing.js ./dist/server.js`
+
+**Code Explanation:**
+
+- `NodeSDK` -- OpenTelemetry ka Node setup. **OpenTelemetry (OTel)** = vendor-neutral standard -- aaj Jaeger, kal Datadog/Honeycomb/Grafana Tempo, code same.
+- `getNodeAutoInstrumentations()` -- **auto-instrumentation**: `http`, `express`, `pg`, `ioredis` jaisi libraries ko patch karke har call ka span khud banata hai. Hume har function mein manual code nahi likhna.
+- `OTLPTraceExporter()` -- spans ek **OTel Collector** ko bhejo (default `localhost:4318`); collector aage backend ko. App vendor se decoupled.
+- `TraceIdRatioBasedSampler(0.01)` -- sirf **1%** requests trace. 35K req/s par 100% trace = storage aur CPU bomb. 1% = ~350 traces/s -- patterns dekhne ke liye kaafi.
+- `ParentBasedSampler` -- upstream (e.g. LB/API gateway) ne decide kar diya "ye trace karo" toh hum bhi follow karein -- trace beech mein tootta nahi.
+- `--import ./dist/tracing.js` -- tracing **baaki sab imports se pehle** load hona chahiye, warna `pg`/`express` already load ho chuke honge aur patch nahi honge.
+- Errors aur slow requests hamesha chahiye? Collector mein **tail sampling** -- request khatam hone ke baad decide karo "error tha ya slow tha -> rakho".
+- **Queue ke across:** trace context (`traceparent`) Kafka message headers mein daalo -- worker ka processing bhi usi trace mein judega.
+- **Logs <-> traces:** pino log mein `trace_id` daalo (OTel pino instrumentation khud karta hai) -- dashboard par slow trace dekha, ek click mein us request ke logs.
+
+### Dashboard -- ek screen par kya ho
+
+```
++-----------------------------+-----------------------------+
+| Redirect RPS (by status)    | Redirect p50 / p95 / p99    |
++-----------------------------+-----------------------------+
+| 5xx % (redirect, create)    | Cache hit ratio (local/Redis)|
++-----------------------------+-----------------------------+
+| DB latency + pool waiting   | Replica lag                 |
++-----------------------------+-----------------------------+
+| Node CPU / memory / ev-loop | Queue lag + dropped events  |
++-----------------------------+-----------------------------+
+| URLs created / blocked      | 404 + 429 rate (abuse)      |
++-----------------------------+-----------------------------+
+```
+
+> Interview line: "Main teen cheezein rakhunga: structured logs pino ke saath har request par request id, Prometheus metrics RED method se -- RPS, error rate, p99 latency -- plus Node-specific event loop lag, DB pool waiting, replica lag aur Redis hit ratio, aur OpenTelemetry tracing 1% sampling ke saath. Metric labels mein route pattern use karunga, actual short code nahi, warna cardinality explode ho jaayegi. Alerts SLO par honge -- redirect 5xx aur p99 latency par page, hit ratio aur queue lag par warning."
+
+---
+
+## Remember
+
+> **Scale tab karo jab bottleneck dikhe, har network call ko timeout aur fallback do, uniqueness ko strong aur baaki ko eventual rakho, abuse ko pehle din se roko, aur jo measure nahi kar sakte usko fix bhi nahi kar sakte.**
+
+## Quick Self-Test
+
+1. 10x traffic par sabse pehle PgBouncer kyun chahiye, jab DB writes abhi bhi sirf ~3K/s hain? Number ke saath batao.
+2. `short_code` par range sharding ki jagah hash sharding kyun? Counter-based codes ke saath range sharding mein kya tootega?
+3. Create ke 50 ms baad click par 404 aaya, aur agle 60 sec tak sabko 404 aata raha. Kaunse do mechanisms mil ke ye bug banate hain, aur tumhara fix kya hai?
+4. Graceful shutdown mein `server.close()` se pehle 5 sec ka wait kyun hai? Aur `keepAliveTimeout` LB ke idle timeout se zyada kyun rakhte hain?
+5. Prometheus histogram mein `route` label ki jagah actual path (`/aB92xK`) daal diya toh kya hoga?
+
+---
+
+**Next (Part 5):** Trade-offs (Postgres vs MongoDB, Redis vs DB, SQL vs NoSQL, UUID vs Snowflake, cache vs no cache, sync vs async...), MVP -> Scalable -> Highly Scalable (3 versions), 15+ interviewer follow-up questions, "What if..." requirement change questions, aur Node.js specific questions. "next" bolo.

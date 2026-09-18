@@ -1,0 +1,1027 @@
+# Payment System -- HLD + LLD (Part 5: Trade-offs -> 3 Versions -> Follow-ups -> Node.js Questions)
+
+> Is file mein prompt ke **Parts 21-25** hain: payment system ke har major decision ka trade-off, MVP -> Scalable -> Highly Scalable versions, 20 interviewer follow-up questions, requirement change ("What if...") questions, aur Node.js specific questions -- sab isi ShopKart Payment Service se jude hue.
+> Part 4 recap: humne dekha ki scale par asli bottleneck PSP hai (DB nahi), DB / PSP / Kafka / Node instance fail hone par kya hota hai (PSP timeout = `PROCESSING` + 202, kabhi `FAILED` nahi; DB down = fail closed), consistency kahan strong chahiye (payment + ledger + idempotency key ek hi commit mein) aur kya monitor karna hai (`payments_stuck_processing`, `outbox_oldest_unpublished_age_seconds`, `ledger_imbalance_total` jo hamesha 0). Ab un sab decisions ko **"kyun ye, kyun woh nahi"** ki language mein bolna seekhenge.
+
+Ek baar hamara system yaad kar lo, kyunki har answer isi par tika hai:
+
+```
+Client (PSP SDK tokenizes card -> pm_token)
+  -> LB / API Gateway (TLS, rate limit on POST /v1/payments)
+  -> N stateless Node.js (Express 5) Payment Service instances
+       -> PostgreSQL primary + sync standby: payments, refunds, idempotency_keys,
+          ledger_entries, webhook_events, outbox
+       -> PSP API (timeout 10 s, retries WITH PSP idempotency key = our payment id)
+  PSP -> POST /webhooks/psp (HMAC verify, dedupe on (psp, psp_event_id))
+  Outbox relay -> Kafka `payments.events` -> Order, Notification (idempotent consumers)
+  Recovery worker (every 1 min)  |  Reconciliation job (daily)
+```
+
+Numbers jo baar baar aayenge: **5M payments/day, ~58 TPS avg, ~1,000 TPS peak (planned), ~10 row writes per payment -> ~10K row writes/sec peak, ~5K reads/s peak, ~10 GB/day storage, ~25.5 TB for 7 years, idempotency keys ~5 GB live (24 h), ~174 webhooks/s avg, PSP latency 300 ms - 3 s.**
+
+---
+
+## PART 21 -- Trade-offs: har decision ka "kyun ye, kyun woh nahi"
+
+### Pehle rule samjho
+
+Payment interview mein sabse common galti: "Kafka use karenge, Redis mein idempotency rakhenge, fast ho jaayega" -- bina ye bataye ki **galat hone ki keemat kya hai**. Rate Limiter mein galti ki keemat thi "kisi ko 2 extra requests mil gayi". Yahan galti ki keemat hai **"customer ka paisa do baar kata"** ya **"paisa kata aur order confirm nahi hua"**. Isliye yahan har trade-off ka tarazu ulta jhukta hai:
+
+```
+Requirement  ->  Options  ->  Har option ki keemat  ->  Kya ye keemat PAISE ke saath chalegi?
+```
+
+Hamari requirements yaad rakho: **no double charge, no lost payment, ledger always balanced, strong consistency for payment + ledger + key, 7-year audit, 99.95% availability lekin doubt ho toh fail closed, p99 create ~2-3 s OK (PSP dominated).**
+
+### 1. Idempotency store: Postgres vs Redis vs Both
+
+| | Postgres (hamara) | Redis only | Both (Redis fast-path + Postgres truth) |
+|---|---|---|---|
+| **Pros** | Key claim + payment row + ledger + outbox **ek hi transaction** mein commit; durable (WAL + sync standby); `ON CONFLICT DO NOTHING` + PK = atomic claim; ek hi system operate karna | Sub-ms `SET NX PX`; DB par load kam; TTL se auto cleanup | Replays (`COMPLETED` keys) Redis se fast; DB par thoda kam read load |
+| **Cons** | Har request par ek extra INSERT (~1 KB); 24 h cleanup job chahiye; DB par thoda aur write load | **Payment row aur key alag systems mein** -> Redis mein key `COMPLETED`, Postgres commit fail (ya ulta) = inconsistent; Redis failover (async replication) par key kho sakti hai -> retry = **double charge**; eviction policy galat ho toh key gayab | Do jagah state -> sync ka bug; cache stale ho sakta hai; complexity double, fayda chhota (~5 GB keys ek Postgres table ke liye kuch nahi) |
+| **Kab use karunga** | Jab key ka matlab "paisa move hua ya nahi" hai -- payments, refunds, transfers | Low-stakes dedupe: "notification do baar na jaaye", form double submit, jahan kabhi-kabhi duplicate chal jaaye | Jab DB genuinely replay reads se dab raha ho (hamare scale par nahi) |
+
+**Decision:** "Postgres, same database as payments. Idempotency key ka pura point ye hai ki 'key COMPLETED' aur 'payment SUCCEEDED + ledger' ek saath sach hon ya ek saath jhooth. Ye guarantee sirf ek transaction de sakta hai. Yahan Redis ki zarurat nahi -- Redis sirf gateway par rate limiting ke liye hai."
+
+> Rate Limiter se contrast: wahan counters Redis mein the kyunki woh **ephemeral** the (kho gaye toh bas limit reset). Idempotency key ephemeral nahi hai -- kho gayi toh paisa do baar kat sakta hai.
+
+### 2. Sync API (wait for PSP) vs Async API (202 + webhook/poll)
+
+| | Sync: request PSP result tak rukti hai | Async: turant 202, result baad mein | Hybrid (hamara) |
+|---|---|---|---|
+| **Pros** | Client code simple: ek call, final answer; card payments mein 80-90%+ cases 1-3 s mein final | API latency chhoti aur predictable (~50-100 ms); PSP slow ho toh bhi hamare sockets/connections free; queue se PSP rate limit ke andar smooth | Normal case mein final answer (201), PSP slow/timeout par 202 `PROCESSING` -- dono duniya |
+| **Cons** | PSP 3 s le toh hamari request 3 s; PSP hang = client hang (timeout zaruri); in-flight requests jama | Client ko polling / push handle karna padta hai; UX mein "processing" screen; ek aur queue + worker | Client ko **dono** paths handle karne padte hain (201 aur 202) |
+| **Kab use karunga** | Internal/admin tools, simple MVP | Latency SLA bahut tight (What if #5), bulk payouts, UPI collect jahan user ko app mein approve karna hi hai | Customer checkout -- hamara default |
+
+**Decision:** "Hybrid. 10 s PSP timeout ke andar result aaya toh 201 with final status, warna 202 `PROCESSING` aur webhook/recovery worker final karega. Kabhi bhi timeout ko `FAILED` nahi bolte -- 'pata nahi' aur 'fail hua' alag cheezein hain."
+
+### 3. PostgreSQL vs MongoDB vs DynamoDB (payments data)
+
+| | PostgreSQL (hamara) | MongoDB | DynamoDB |
+|---|---|---|---|
+| **Pros** | Multi-row ACID transaction (payment + ledger + key + outbox ek commit); partial unique index (`ux_payments_one_active_per_order`); `CHECK` constraints (`refunded_minor <= amount_minor`); SQL for finance/reconciliation; mature ops, PITR | Flexible schema (PSP payloads JSON); multi-document transactions 4.0+ se hain; horizontal sharding built-in | Serverless-ish, massive scale, predictable single-digit ms; `ConditionExpression` se conditional writes; `TransactWriteItems` (max 100 items) |
+| **Cons** | Single primary ki write limit (hamare 10K rows/s par comfortable, 100x par nahi); sharding khud karna padta hai | Transactions ke saath performance cost aur limits; partial unique index jaise business constraints kam natural; finance team ko SQL chahiye | Ad-hoc queries (reconciliation, "is mahine ke saare refunds") ke liye GSI ya export; constraints app mein; item size 400 KB; cost model samajhna padta hai |
+| **Kab use karunga** | Default for money: correctness constraints DB mein chahiye, scale ek primary mein fit | Product catalog, PSP raw payload archive, jahan schema bahut badalta hai | Bahut high scale, AWS-native team, access patterns pehle se fixed (key-value by payment id) |
+
+**Decision:** "Postgres, kyunki hamara scale (~10K row writes/s peak) ek well-tuned primary mein fit hai aur mujhe constraints DB level par chahiye -- app ka bug bhi double active payment nahi bana sakta. Mongo/Dynamo galat nahi hain; Dynamo mein bhi conditional writes se ye design ban jaata hai, bas zyada logic app mein aata hai."
+
+### 4. SQL vs NoSQL for the Ledger (aur "ledger databases")
+
+| | SQL table `ledger_entries` (hamara) | NoSQL (document per transaction) | Specialized ledger DB (e.g. TigerBeetle) |
+|---|---|---|---|
+| **Pros** | Ledger entries payment ke saath **same commit** mein; `SUM` by account/time aasaan; DB grants se UPDATE/DELETE band (append-only) | Ek transaction = ek document (debit + credit saath) -> atomic by design | Double-entry built-in (debit = credit enforce), bahut high throughput ke liye design, balance checks engine mein |
+| **Cons** | Hot account (`sales_revenue`) ka running balance ek row mein rakho toh contention -- isliye hum balance **store nahi** karte, SUM karte hain | Cross-document balance queries mushkil; accounting team ke tools SQL expect karte hain | Naya system, team ko seekhna; payment DB se alag commit -> distributed consistency problem wapas; ecosystem chhota |
+| **Kab use karunga** | Merchant-side payment service, millions/day | Rarely for ledger | Bahut badi scale ke core ledgers (wallets, brokers) -- evaluate karunga, default nahi |
+
+**Decision:** "SQL, same Postgres. Ledger ka sabse bada kaam **audit aur trust** hai, speed nahi. Huge scale par TigerBeetle jaise purpose-built ledger DBs ek option hain, lekin maine production mein compare nahi kiya -- main honestly bolunga ki tab benchmark karke decide karunga."
+
+### 5. Kafka vs RabbitMQ vs SQS (payment events)
+
+| | Kafka (hamara) | RabbitMQ | SQS (+ SNS for fan-out) |
+|---|---|---|---|
+| **Pros** | Retained log -> naya consumer (fraud, analytics) purane events replay kar sakta hai; key = payment id -> ek payment ke events order mein; bahut high throughput; multiple consumer groups | Simple routing (exchanges), per-message ack, DLQ easy; chhoti teams ke liye operate karna aasaan | Fully managed, zero ops; DLQ built-in; FIFO queues with dedupe (5 min window) |
+| **Cons** | Operate karna heavy (ya managed MSK/Confluent -- paisa); consumer lag, rebalancing samajhna padta hai | Messages consume ke baad gone (replay nahi, streams feature ko chhod ke); ordering per queue, scaling par tricky | FIFO throughput limits (high-throughput mode ke saath badhte hain), AWS lock-in; fan-out ke liye SNS + multiple queues; retention max 14 din |
+| **Kab use karunga** | Multiple consumers + replay + audit stream chahiye | Task queues (send receipt email), chhota scale | AWS pe ho, events kam, ops team chhoti |
+
+**Decision:** "Kafka, kyunki ShopKart ke paas already Kafka hai aur `payment.succeeded` ko Order, Notification, aur kal fraud/analytics sab consume karenge. Agar ye naya startup hota toh SQS + SNS bhi bilkul theek. Broker koi bhi ho -- at-least-once hi milega, isliye consumers `processed_events(event_id)` se dedupe karte hain."
+
+### 6. Outbox vs CDC (Debezium) vs Direct publish
+
+| | Direct publish (commit ke baad `producer.send`) | Outbox + relay worker (hamara) | CDC (Debezium reads WAL) |
+|---|---|---|---|
+| **Pros** | Sabse simple, lowest latency | Event aur payment update **same transaction** -> dono ya koi nahi; relay simple (poll `WHERE published_at IS NULL`) | App ko publish ka pata bhi nahi; WAL se har change, polling load nahi; lag bahut kam |
+| **Cons** | **Dual write problem:** DB commit hua, process crash, event gaya hi nahi -> Order service ko kabhi pata nahi chala ki payment ho gaya. Ulta: event gaya, DB rollback -> jhootha event | Polling load; relay ek aur process; at-least-once (publish hua, `published_at` update se pehle crash -> dobara publish) | Kafka Connect + Debezium operate karna; replication slot WAL ko hold karta hai (slot atka = disk full risk); schema changes pipeline tod sakte hain |
+| **Kab use karunga** | Kabhi nahi for money events. Logs/metrics jaise best-effort events ke liye theek | Default: 1,000 TPS par polling bilkul chalti hai | V3: bahut high event volume, ya jab platform team already CDC chala rahi ho (outbox table + Debezium outbox router bhi common combo hai) |
+
+**Decision:** "Outbox. 'Payment succeeded but Order never heard' ek real incident type hai, aur outbox usko design se khatam karta hai. CDC V3 mein -- tab bhi outbox table rakhunga, bas relay ki jagah Debezium usko padhega."
+
+### 7. Webhooks vs Polling the PSP
+
+| | Webhooks (PSP pushes) | Polling (hum `getPaymentByIdempotencyKey` poochte hain) |
+|---|---|---|
+| **Pros** | Near real-time; PSP ki taraf se kaam; 3DS/UPI jaise async outcomes ke liye natural | Hum control mein; webhook miss/late ho toh bhi truth mil jaata hai; debugging simple |
+| **Cons** | Late, duplicate, out-of-order, kabhi-kabhi aate hi nahi (PSP bug, hamara endpoint down, firewall); signature verification + dedupe zaruri | Har poll PSP ki rate limit khata hai; latency = poll interval; 5M payments sabko poll karna bekaar |
+| **Kab use karunga** | Primary signal | Safety net: sirf stuck payments (`PROCESSING`/`REQUIRES_ACTION` > few min) ke liye recovery worker |
+
+**Decision:** "Dono. Webhook primary, recovery worker har 1 min stuck payments ke liye PSP se poochta hai, aur daily reconciliation last safety net. Teen independent paths -- koi ek fail ho toh baaki pakad lete hain."
+
+### 8. Fail-closed vs Fail-open (Rate Limiter ka ulta)
+
+| | Fail-open (doubt mein aage badho) | Fail-closed (doubt mein ruko, "try again") |
+|---|---|---|
+| **Rate Limiter mein** | Hamara choice -- limiter down toh API chalti rahe, 2 extra requests se kuch nahi bigadta | Sirf `login` jaisi security rules |
+| **Payments mein** | Idempotency check nahi ho paaya phir bhi charge kar do = **double charge ka risk**; ledger write fail phir bhi success bol do = books galat | Hamara choice: DB down -> 503, nothing charged, client same key se retry kare |
+| **Keemat** | Customer trust + chargebacks + regulatory issue | Kuch minute ke liye sales ruk sakti hain -- revenue loss, lekin recover ho sakta hai |
+
+**Decision:** "Payments mein fail closed. Ek missed sale recover ho jaati hai (customer 2 min baad dobara try karta hai), double charge ka refund + support ticket + trust loss bahut mehenga hai. Lekin 'fail closed' ka matlab 'sab band' nahi -- GET status aur webhook ingestion chalte rehne chahiye, aur PSP down par 503 `PSP_UNAVAILABLE` saaf bolta hai ki kuch charge nahi hua."
+
+### 9. Synchronous vs Asynchronous DB replication (RPO vs latency)
+
+| | Async replication | Sync replication (hamara, quorum) |
+|---|---|---|
+| **Pros** | Commit latency unaffected; standby down ho toh primary par koi asar nahi | Commit tabhi ack jab standby ne bhi WAL likh liya -> primary mara toh **RPO ~0** |
+| **Cons** | Primary crash par last kuch ms/seconds ke commits standby par nahi -> "PSP ne charge kiya, humne record kiya, record gayab" | Har commit par +1 network round trip (same region, cross-AZ ~1-3 ms); akela sync standby down = primary ke writes **ruk jaate hain** |
+| **Kab use karunga** | Read replicas, analytics, cross-region DR copy | Payment primary ka HA standby |
+
+**Decision:** "Primary + 2 standbys, `synchronous_standby_names = 'ANY 1 (s1, s2)'` -- koi bhi ek ack kare toh commit. Ek standby gira toh bhi writes chalte hain. Cross-region DR copy async (70+ ms har commit par nahi de sakte). Hamare ~3 transactions per payment par 2 ms extra kuch nahi, PSP 2 s le raha hai."
+
+### 10. UUID vs ULID vs Snowflake (payment ids)
+
+> URL Shortener Part 3 mein humne short codes ke liye counter + Base62 liya tha aur Snowflake ko "overkill" bola tha. Yahan requirement alag hai: id **guessable nahi** honi chahiye (payment id URL mein hai), aur **sortable** ho toh index aur debugging achhe.
+
+| | UUID v4 | ULID (hamara: `pay_01J8...`) | Snowflake (64-bit) |
+|---|---|---|---|
+| **Pros** | Random (122 bits), zero coordination, har language mein | 48-bit ms timestamp + 80-bit random -> time-sortable, B-tree index mein inserts end par (page splits kam), app-generated, no coordination; 26 chars | 8 bytes, sortable, compact |
+| **Cons** | Random order -> index mein random inserts, bade tables par cache misses; sort se time pata nahi | Timestamp leak (payment kab bana) -- usually OK; same ms mein ordering sirf monotonic generator se | Machine/worker id assign karna padta hai; clock backward jaaye toh duplicates ka risk; sequential-ish -> guessable (authz zaruri) |
+| **Kab use karunga** | Idempotency keys (client-generated, bas unique chahiye) | Payments, refunds, events (`evt_<ULID>`) | Bahut high write volume, numeric ids chahiye (Twitter-scale) |
+
+**Decision:** "Payment id ULID with prefix (`pay_`, `re_`, `evt_`) -- prefix se log mein turant pata chalta hai ye kya hai (Stripe style). UUID v7 bhi same fayda deta hai (time-ordered UUID) -- dono chalenge. Idempotency key client UUID v4 bhejta hai. Aur yaad rakho: id guessable ho ya na ho, `GET /v1/payments/:id` par **owner check** hamesha."
+
+### 11. Optimistic conditional UPDATE vs `SELECT ... FOR UPDATE`
+
+| | Conditional update (hamara) | `SELECT ... FOR UPDATE` then update |
+|---|---|---|
+| **Pros** | Ek statement: `UPDATE ... WHERE id=$1 AND status = ANY($4)` -> atomic check-and-set; koi lock PSP call ke across hold nahi; `rowCount 0` = kisi aur (webhook) ne already move kar diya | Complex logic (multiple rows padh ke decide) ke liye natural; transaction ke andar consistent view |
+| **Cons** | Logic WHERE clause mein fit hona chahiye; lose karne wala re-read kare | Lock tab tak jab tak transaction open -> agar koi PSP call transaction ke andar kare toh 2-3 s ka row lock + pool connection; deadlocks ka risk |
+| **Kab use karunga** | State transitions, refund amount reserve (`refunded_minor + $2 <= amount_minor`) | Short transactions jahan multiple rows ka decision chahiye -- e.g. wallet debit (What if #11) |
+
+**Decision:** "Conditional update. Payment state machine ka har transition ek compare-and-swap hai. `FOR UPDATE` galat nahi hai, lekin uska lock kabhi network call ke across mat pakdo."
+
+### 12. Client-generated vs Server-generated idempotency keys
+
+| | Client-generated (hamara) | Server-generated / natural key |
+|---|---|---|
+| **Pros** | Sirf client jaanta hai ki "ye retry hai ya naya intent" -- network timeout ke baad bhi same key bhejta hai; industry standard (Stripe, IETF draft `Idempotency-Key` header) | Client ko kuch nahi karna; legacy clients ke saath kaam |
+| **Cons** | Client bug: har retry par naya key -> dedupe fail (isliye second net: one-active-payment-per-order index); key reuse with different body -> 422 | Server key kaise banaye? Body hash se -> "user ne jaan-boojh ke same amount 2 baar bheja" aur "retry" mein farq nahi; `order_id` se -> sirf "one payment per order" jahan valid wahi |
+| **Kab use karunga** | Public/mobile API | Natural uniqueness available ho (order id, `sub_<id>:<period>` for subscriptions, `auto-refund:<payment_id>`) |
+
+**Decision:** "Client key primary, natural-key unique index secondary. Do independent layers."
+
+### 13. Store full response vs only status for replay
+
+| | Full response (hamara: `response_code` + `response_body` JSONB) | Sirf `payment_id` + status, response dobara banao |
+|---|---|---|
+| **Pros** | Replay **byte-for-byte same** -- client ko pehli baar jaisa hi jawab; decline (`201 FAILED, card_declined`) bhi replay | Kam storage |
+| **Cons** | ~1 KB per key x 5M = ~5 GB live (24 h) | Payment ab `REFUNDED` hai toh retry par "REFUNDED" dikhega, jabki original response "SUCCEEDED" tha -- client confuse; errors (422, 400) ka replay mushkil |
+| **Kab use karunga** | Payments/refunds jahan response semantics important | Bahut bade responses, ya jahan "latest state" hi chahiye (tab client ko GET use karna chahiye) |
+
+**Decision:** "Full response store. 5 GB ek Postgres ke liye chhota hai. Idempotency ka promise hai 'same request -> same response', 'same request -> current state' nahi."
+
+### 14. Baaki pairs ek table mein
+
+| Pair | Payments par decision |
+|---|---|
+| **REST vs gRPC (internal)** | Client-facing REST (mobile/web, PSP webhooks sab HTTP JSON). Internal: Order -> Payment ka sync call rare hai (events se baat hoti hai); REST theek. gRPC tab jab internal high-volume calls + strict contracts (protobuf) + polyglot services hon. |
+| **Single PSP vs Multi-PSP** | Single PSP: simple, ek integration, better pricing volume se. Multi-PSP: PSP outage mein failover, method-wise best success rate, fee negotiation -- lekin har PSP ka alag webhook format, alag reconciliation file, aur **card token ek PSP ka doosre par kaam nahi karta** (network tokens / vault chahiye). V1-V2 single, V3 multi. |
+| **Cache vs no cache** | Payment state cache nahi karte -- `GET` primary se (read-after-write). ~5K reads/s peak ek primary + indexed PK lookup ke liye chhota hai. Cache karo toh "SUCCEEDED ho gaya, UI abhi bhi PROCESSING dikha raha" bugs. |
+| **Polling vs WebSocket (client ko result)** | Mobile app 202 ke baad `GET` poll karta hai (1-2 s backoff, max ~30 s) ya push notification. WebSocket sirf checkout screen ke liye -- zyada tar teams polling se shuru karti hain. |
+
+### Summary: saare decisions ek table mein
+
+| Decision | Humne kya chuna | Kab badlenge |
+|---|---|---|
+| Idempotency store | Postgres, same DB, same tx | Kabhi Redis-only nahi |
+| API style | Hybrid: 201 final ya 202 `PROCESSING` | Latency SLA < 500 ms -> full async |
+| DB | Postgres primary + 2 sync-quorum standbys | 10x+ writes -> shard/cells |
+| Ledger | Append-only SQL table, same DB | Huge scale -> separate ledger service/DB |
+| Events | Outbox -> relay -> Kafka | High volume -> Debezium CDC on outbox |
+| PSP truth | Webhooks + recovery polling + daily recon | -- |
+| Failure mode | Fail closed | -- (kabhi nahi for money) |
+| IDs | `pay_<ULID>`, client UUID v4 keys | -- |
+| Concurrency | Conditional updates, no locks across PSP | Wallet balances -> short `FOR UPDATE` |
+| PSP | Single (Razorpay) behind `PspClient` interface | Outages / success rate -> multi-PSP router |
+
+> Interview line: "Rate limiter mein main availability choose karta tha, payment mein correctness. Har decision ka test ek hi hai: agar ye component beech mein crash ho jaaye, toh kya paisa do baar katega ya kho jaayega? Jis option mein jawab 'nahi' hai, woh chahe thoda slow ya boring ho, wahi lunga."
+
+---
+
+## PART 22 -- Minimum -> Scalable -> Highly Scalable (3 versions)
+
+Interviewer 3 versions isliye maangta hai taaki dekhe ki tum **Day 1 par multi-PSP router + Kafka + multi-region** nahi bana doge, lekin **idempotency Day 1 se** hogi -- kyunki correctness scale ka feature nahi hai.
+
+### Version 1 -- Simple MVP (ek Node app, ek Postgres, ek PSP)
+
+```
+Client (PSP SDK -> pm_token)
+  |
+  v
+Node.js (1-2 instances, Express)
+  |-- POST /v1/payments  (Idempotency-Key required, idempotency_keys table)
+  |-- POST /webhooks/psp (HMAC verify, webhook_events dedupe)
+  |-- synchronous PSP charge (timeout + same PSP idempotency key)
+  v
+PostgreSQL (single, managed, daily backups + PITR)
+  payments, idempotency_keys, ledger_entries, webhook_events
+```
+
+- **Kitna traffic?** ~50K payments/day (~0.6 TPS avg, sale mein shayad 20-50 TPS peak). Ek Node process 50 TPS x 2 s = ~100 in-flight PSP calls aaram se sambhal leta hai. Honestly ye **bahut saare startups ke liye kaafi hai**.
+- **Components aur "humne ye abhi kyun add kiya?":**
+  - **`idempotency_keys` table** -- ye MVP mein bhi hai, kyunki mobile retry aur double-click Day 1 se hote hain. Scale ka issue nahi, correctness ka hai.
+  - **PSP idempotency key = payment id** -- PSP call retry par bhi ek hi charge. Free hai, skip karne ka koi reason nahi.
+  - **Webhook endpoint** -- 3DS / UPI ka result webhook se hi aata hai. Signature verify + dedupe table.
+  - **Ledger table** -- chhota sa, lekin Day 1 se. Baad mein 1 saal ke purane payments ka ledger banana (backfill) bahut dard deta hai.
+  - **Unique index one-active-payment-per-order** -- ek line ka SQL, double-click with two keys se bachata hai.
+- **Kya jaan-boojh ke NAHI hai:** Kafka (Order service ko sync HTTP callback ya woh hamari DB table poll kare), outbox relay, separate workers (ek `setInterval` cron hi recovery kar leta hai), circuit breaker, multi-PSP, read replicas.
+
+**Next version par kab jaayenge? (signals)**
+
+| Metric / signal | Threshold (rough) | Matlab |
+|---|---|---|
+| Downtime ki keemat | Ek deploy/restart = checkout band; single DB maintenance = sales band | HA: multiple instances + standby DB |
+| Order service ko payment result miss | "Payment hua, order PENDING reh gaya" tickets | Outbox + reliable events |
+| Stuck `PROCESSING` | Manual SQL se fix karna pad raha hai | Recovery worker |
+| Finance | "PSP settlement aur hamare numbers match nahi" | Daily reconciliation job |
+| Peak TPS | ~100+ TPS sale mein, PSP timeouts badh rahe | Circuit breaker, timeouts tune, instances |
+
+### Version 2 -- Scalable (hamara current design)
+
+```mermaid
+flowchart TD
+    C[Mobile / Web + PSP SDK] --> GW[LB / API Gateway: TLS + rate limit]
+    GW --> N1[Payment Service Node.js]
+    GW --> N2[Payment Service Node.js]
+    GW --> N3[Payment Service x N]
+    N1 --> PG[(Postgres primary)]
+    PG -. sync quorum .-> S1[(Standby 1)]
+    PG -. sync quorum .-> S2[(Standby 2)]
+    N1 -- timeout, retry, circuit breaker --> PSP[PSP API]
+    PSP -- webhook --> GW
+    OR[Outbox relay] --> PG
+    OR --> K[[Kafka payments.events]]
+    K --> ORD[Order Service]
+    K --> NOT[Notification Service]
+    RW[Recovery worker, every 1 min] --> PG
+    RW --> PSP
+    REC[Reconciliation job, daily] --> PG
+    REC --> SF[PSP settlement file]
+```
+
+- **Kitna traffic?** 5M payments/day, ~58 TPS avg, **~1,000 TPS peak**, ~10K row writes/s peak (ek tuned primary mein fit), ~5K reads/s peak, ~10 GB/day, ~174 webhooks/s avg. In-flight at peak: 1,000 TPS x 2 s = **~2,000 concurrent PSP calls** across instances (e.g. 8-10 instances -> ~200-250 each; exact count load test se).
+- **Har naya component -- "humne ye abhi kyun add kiya?"**
+  - **N stateless instances behind LB** -- HA aur rolling deploys. Stateless isliye possible ki saara state (keys, locks via `locked_until`) Postgres mein hai.
+  - **Sync-quorum standbys** -- primary mara toh RPO ~0 ke saath failover (~30-60 s typical managed setups mein). Us beech POST 503 (fail closed).
+  - **Outbox + relay + Kafka** -- dual write problem khatam; Order + Notification + future consumers.
+  - **Recovery worker** -- crash ke baad `IN_PROGRESS` keys (lock expired) aur `PROCESSING` payments ko `recovery_point` se aage badhata hai. Iske bina "paisa kata, status PROCESSING forever".
+  - **Reconciliation job** -- PSP settlement file vs ledger. Finance ka trust isi se aata hai.
+  - **Circuit breaker on PSP** -- PSP 50% errors de raha hai toh har request 10 s timeout tak latke nahi; turant 503 `PSP_UNAVAILABLE` (nothing charged, safe to retry).
+  - **Gateway rate limit on POST /v1/payments** -- Rate Limiter system reuse; card testing attacks ke khilaaf pehli line.
+  - **Monthly partitions** for `payments` and `ledger_entries` -- 25.5 TB / 7 years; purane partitions sasti storage par.
+- **Kya abhi bhi NAHI hai:** Redis for idempotency, sharding, multi-PSP, multi-region active-active, CDN, Elasticsearch.
+
+**Next version par kab jaayenge? (signals)**
+
+| Metric | Threshold (rough) | Matlab |
+|---|---|---|
+| Primary write load | Sustained > 60-70% of tested capacity (e.g. 30K+ row writes/s), WAL/replication lag badh raha | Shard / cells |
+| PSP availability | PSP outage ne 2+ baar sale kharab ki; `psp_errors_total` spikes | Multi-PSP routing |
+| Payment success rate | Kisi method/bank par doosre PSP ka success rate clearly better | Smart routing |
+| New geography | EU/other country launch with data residency rules | Multi-region, per-region data |
+| Ledger usage | Wallets, payouts, marketplace splits -- ledger ab sirf "record" nahi, balance ka source | Separate ledger service |
+| Outbox lag | `outbox_oldest_unpublished_age_seconds` regularly > 30-60 s at peak | CDC |
+
+### Version 3 -- Highly Scalable (10x-100x, multi-PSP, multi-region)
+
+```mermaid
+flowchart TD
+    U[Clients: India, EU] --> G[GeoDNS: route by customer home region]
+    G --> RA[Region India]
+    G --> RB[Region EU]
+    RA --> CR[Cell router: hash customer_id]
+    CR --> C1[Cell 1: Node + Postgres shard]
+    CR --> C2[Cell 2: Node + Postgres shard]
+    C1 --> RT[PSP router: health + success rate + cost]
+    RT --> P1[PSP A]
+    RT --> P2[PSP B]
+    C1 -- CDC Debezium --> K[[Kafka]]
+    K --> LS[Ledger Service + ledger DB]
+    K --> ORD[Order, Notification, Fraud, Analytics]
+    RB --> CR2[EU cells, EU data stays in EU]
+```
+
+- **Kitna traffic?** 10x = 50M/day, ~10K TPS peak, ~100K row writes/s; 100x = ~100K TPS peak, ~1M row writes/s -- ek primary se bahut bahar.
+- **Har naya component -- "humne ye abhi kyun add kiya?"**
+  - **Cells sharded by `customer_id`** -- idempotency key scope `(customer_id, key)` hai, toh ek customer ka key + payment + ledger rows ek hi shard mein -> **single-shard transaction**, koi distributed transaction nahi. Cell = poora stack (Node + DB) ka ek chhota copy; ek cell gira toh sirf uske customers affect (blast radius chhota).
+  - **PSP router** -- har payment ke liye PSP choose: health (circuit state), method-wise success rate, fees. Failover **sirf naye payments** ke liye: jo payment PSP A par `PROCESSING` hai usko PSP B par retry karna = double charge risk.
+  - **Separate Ledger Service** -- payment service ab sirf "event emit" karta hai; ledger service double-entry, balances, payouts, fees sambhalta hai. Trade-off: payment + ledger ab **ek commit mein nahi** -> ledger events ke through eventually consistent, aur reconciliation ab internal bhi (payments vs ledger).
+  - **CDC (Debezium on outbox)** -- relay polling ki jagah WAL se, high volume par lag kam.
+  - **Multi-region with data residency** -- customer ka data uske home region mein (e.g. Indian payment data India mein -- RBI ka 2018 data localization direction ek example hai; legal team se confirm). Ek customer ek region = conflicts nahi.
+- **Keemat:** cross-cell queries (finance reports) ke liye data warehouse chahiye; hot global accounts (`sales_revenue`) ko per-cell sub-accounts mein baantna padta hai; multi-PSP = N reconciliations, N webhook formats; ops team bahut badi. **Isliye sirf tab jab signals bolein.**
+
+### Teeno versions side by side
+
+| | V1 MVP | V2 Scalable | V3 Highly Scalable |
+|---|---|---|---|
+| Traffic | ~50K/day, tens of TPS | 5M/day, ~1,000 TPS peak | 50M-500M/day, 10K-100K TPS peak |
+| App | 1-2 Node instances | N stateless Node + workers | Cells, each with Node + workers |
+| DB | Single Postgres + PITR | Primary + 2 sync-quorum standbys, monthly partitions | Postgres shard per cell (by `customer_id`) |
+| Idempotency | `idempotency_keys` table | Same + recovery points + recovery worker | Same, per cell |
+| Events | HTTP callback / polling | Outbox -> Kafka | Outbox + CDC -> Kafka |
+| PSP | One, sync | One, timeouts + retries + circuit breaker | Multi-PSP router |
+| Ledger | Table in same DB | Table in same DB | Separate ledger service |
+| Regions | 1 | 1 (multi-AZ) | Multi-region by home region |
+| Recon | Manual / spreadsheet | Daily job + review queue | Per-PSP, per-cell, automated |
+
+> Interview line: "Idempotency, ledger aur webhook dedupe Version 1 mein bhi hain -- ye correctness hai, scale nahi. Scale ke saath main HA, outbox, recovery add karta hoon, aur bahut baad mein sharding aur multi-PSP -- jab metrics bolein, CV ke liye nahi."
+
+---
+
+## PART 23 -- Interview Follow-up Questions (20)
+
+> Tip: har answer mein 3 cheezein -- **seedha answer, reason, trade-off**. Numbers hamare design ke.
+
+### Correctness core
+
+**1. Interviewer:** "Double charge kabhi nahi hoga, kaise guarantee karoge?"
+
+**My Answer:** "Teen independent layers, taaki ek ka bug doosra pakde:
+1. **Our idempotency key** -- `(customer_id, key)` PK, `INSERT ... ON CONFLICT DO NOTHING`. Same key ka retry -> replay ya 409, naya payment nahi.
+2. **One active payment per order** -- partial unique index `ux_payments_one_active_per_order`. Client ne bug se do alag keys bheji (double-click) toh bhi doosra INSERT fail -> 409 `ORDER_ALREADY_PAID`.
+3. **PSP idempotency key = our payment id** -- hamara PSP call retry hua (timeout ke baad) toh PSP khud dedupe karta hai, ek hi charge.
+Aur inke upar **reconciliation**: agar teeno ke bawajood kuch hua, daily job PSP settlement mein do charges dekh ke alert karega. 'Guarantee' main tabhi bolta hoon jab detect + fix bhi ho."
+
+**2. Interviewer:** "Exactly-once hai ya at-least-once?"
+
+**My Answer:** "Network par **exactly-once delivery** possible nahi -- sender ko pata hi nahi chalta ki message pahuncha ya ack kho gaya, toh usko retry karna hi padega. Hum **at-least-once delivery + idempotent processing = exactly-once effect** karte hain. Har jagah yahi pattern: client -> API (idempotency key), API -> PSP (PSP idempotency key), PSP -> us (webhook dedupe on `psp_event_id`), us -> Kafka -> consumers (`event_id` dedupe in `processed_events`). Duplicate aayega, effect ek hi baar."
+
+**3. Interviewer:** "Client ne key bheji hi nahi toh?"
+
+**My Answer:** "`400 IDEMPOTENCY_KEY_REQUIRED`. Payments par main optional nahi rakhta -- Stripe mein optional hai, lekin woh general-purpose API hai; hamara client hamara hi app hai, toh enforce kar sakte hain. Agar koi legacy client hai jo key nahi bhej sakta, toh bhi hum safe hain kyunki layer 2 (one-active-payment-per-order) double charge rokta hai -- bas client ko replay ki jagah 409 milega. Server-side key banana (body hash) main avoid karta hoon: 'retry' aur 'jaan-boojh ke dobara' mein farq nahi kar sakta."
+
+**4. Interviewer:** "Keys kitne time rakhoge? 24 hours kyun?"
+
+**My Answer:** "Key ka kaam retries ko dedupe karna hai. Client retries seconds-minutes mein hote hain; mobile app offline tha toh few hours. 24 h mein practically saare retries cover. ~5 GB live, cleanup job `DELETE ... WHERE created_at < now() - interval '24 hours'` (batches mein, `ix_idem_created` index se). Zyada rakhne ka nuksaan: storage aur cleanup cost. Kam rakhne ka risk: 25 hour baad aaya retry naya payment ban sakta hai -- lekin tab bhi order-level index rokega. Ek catch: `IN_PROGRESS` keys ko cleanup mat karo jab tak unka payment final na ho -- recovery unhi par depend karti hai."
+
+**5. Interviewer:** "PSP call timeout ho gayi. Ab?"
+
+**My Answer:** "Timeout ka matlab 'pata nahi', 'fail' nahi -- PSP ne shayad charge kar diya ho. Toh: payment `PROCESSING` hi rehta hai, key `IN_PROGRESS` with `recovery_point = 'PSP_CALLED'`, lock release (`locked_until = now()`), client ko **202 `PROCESSING`**. Phir teen raaste: client ka retry (same key) resume karta hai, webhook aata hai, ya recovery worker `psp.getPaymentByIdempotencyKey(paymentId)` se poochta hai. Agar PSP bolta hai 'aisa koi payment nahi' toh same PSP key se `charge` dobara safe hai. **Galat** jawab: timeout par `FAILED` mark karna -> customer dobara pay karega -> double charge."
+
+**6. Interviewer:** "Partial refund ke baad doosra refund aaya. Over-refund kaise rokoge?"
+
+**My Answer:** "Refund amount **PSP call se pehle** reserve karta hoon, conditional update se: `UPDATE payments SET refunded_minor = refunded_minor + $2 WHERE id = $1 AND status IN ('SUCCEEDED','PARTIALLY_REFUNDED') AND refunded_minor + $2 <= amount_minor RETURNING *`. `rowCount 0` -> 422 `REFUND_EXCEEDS_AMOUNT`. Do concurrent refunds (10,000 aur 45,000 on 49,900) -- Postgres row lock se ek pehle, doosra re-evaluate hoke fail. Phir `refunds` row `PENDING`, PSP `refund` with idempotency key = refund id. PSP ne definitively fail kiya toh reservation wapas (`refunded_minor - $2`), unknown toh `PENDING` rehne do, recovery sambhalegi. Success par ledger reversal entries, status `PARTIALLY_REFUNDED` ya `REFUNDED`. DB ka `CHECK (refunded_minor <= amount_minor)` last guard."
+
+**7. Interviewer:** "Currency conversion kaise handle karoge?"
+
+**My Answer:** "Pehla rule: **money = integer minor units + currency**, kabhi float nahi. Aur minor unit ka exponent currency par depend karta hai -- INR/USD 2 decimals, JPY 0, KWD/BHD 3 (ISO 4217). Toh `Money` ke saath exponent table chahiye. Conversion: customer jis currency mein pay karta hai (presentment) aur hume jismein settle hota hai (settlement) dono store karo, plus **FX rate snapshot** (rate, source, timestamp, rate id) -- baad mein 'kitna rate laga tha' ka audit. Rounding ek jagah, ek rule (banker's ya half-up, finance decide kare). Ledger mein har currency ka apna balance -- INR debit aur USD credit ko 'balance' nahi maan sakte; FX ke liye alag `fx_clearing` accounts. Usually FX PSP hi karta hai (DCC / multi-currency) aur hum rate record karte hain."
+
+### Testing aur trust
+
+**8. Interviewer:** "Ye sab test kaise karoge? PSP ko production mein toh fail nahi kara sakte."
+
+**My Answer:** "Teen layer:
+1. **Fake PSP** (`PspClient` interface ka in-memory implementation) jo script kar sake: succeed, decline, timeout-but-charged, timeout-not-charged, duplicate webhook, out-of-order webhook. Har case ka test: 'exactly ek charge, ledger balanced, key COMPLETED'. (Part 25 Q11.)
+2. **Fault injection / chaos:** har phase ke beech process kill karo (Tx 1 ke baad, PSP call ke baad, Tx 2 se pehle) -> recovery worker chala ke assert: final state sahi, ek charge. Staging mein PSP sandbox + network delay (toxiproxy jaisa tool).
+3. **Property-based tests on ledger** (fast-check jaisi library): random sequence of payments, partial refunds, webhooks, retries -> invariant: har `transaction_id` par sum(DEBIT) = sum(CREDIT), `refunded_minor <= amount_minor`, PSP charges count = SUCCEEDED payments count.
+Plus PSP sandbox ke saath contract tests, taaki fake aur asli PSP drift na karein."
+
+**9. Interviewer:** "Finance team tumhare numbers par bharosa kyun kare?"
+
+**My Answer:** "Teen cheezon se. (1) **Immutable double-entry ledger** -- entries append-only, DB grants se UPDATE/DELETE band, galti ka fix reversing entry. Har rupee ka trail. (2) **Invariant monitoring** -- `ledger_imbalance_total` hamesha 0; ek bhi non-zero = page. (3) **Daily reconciliation** -- PSP settlement file ki har line ko hamare ledger se match: missing on our side, missing on PSP side, amount mismatch, fee mismatch -> `reconciliation_mismatches_total` + review queue. Jab tak mismatches resolve nahi hote, us din ke numbers 'provisional'. Finance ko hamari DB par nahi, **do independent sources ke match** par bharosa hai."
+
+### Data aur compliance
+
+**10. Interviewer:** "GDPR bolta hai data delete karo, audit bolta hai 7 saal rakho. Dono kaise?"
+
+**My Answer:** "Conflict jitna lagta hai utna nahi -- GDPR khud legal obligation ke liye retention allow karta hai (lekin exact rules legal team confirm kare, aur India mein DPDP Act + RBI/tax rules alag hain). Design: **PII ko financial record se alag karo.** Ledger aur payments mein sirf ids (`customer_id`), amounts, timestamps -- naam, email, phone nahi. Card data hamare paas hai hi nahi (PSP token). Delete request par customer profile ki PII delete/pseudonymize, financial records 7 saal tak `customer_id` ke saath rehte hain jo ab kisi insaan se link nahi hota. Ek aur technique: **crypto-shredding** -- per-customer encryption key, delete = key delete."
+
+**11. Interviewer:** "Multi-region kaise karoge?"
+
+**My Answer:** "Payments ke liye default **active-passive**: ek primary region jahan saare writes, doosre region mein async DR copy. Active-active isliye mushkil hai ki idempotency key aur 'one active payment per order' ko **global uniqueness** chahiye -- do regions mein same key par do claims ho gaye toh double charge. Agar sach mein multi-region writes chahiye toh **home region per customer**: har customer ka data aur writes sirf uske region mein, GeoDNS / routing se. Ye data residency ke saath bhi fit hai. Cross-region consensus DBs (Spanner / CockroachDB) option hain, lekin har commit par cross-region latency -- PSP ke 2 s ke saamne shayad chal jaaye, lekin cost aur complexity badi."
+
+**12. Interviewer:** "Disaster recovery -- RPO/RTO kya hai? Money ke liye RPO ~0 kyun?"
+
+**My Answer:** "Primary region ke andar: sync-quorum standby -> **RPO ~0**, RTO ~1-2 min (failover + connections reconnect). Plus WAL archiving -> **PITR** (e.g. 'kisi ne galti se table corrupt kiya, 10:42 par wapas le jao'). Region down: async DR region -> RPO seconds, RTO 15-30 min (runbook, rehearsed). RPO 0 kyun matter karta hai: agar last 5 sec ke commits kho gaye, toh un payments ka PSP par charge ho chuka hai lekin hamare paas record nahi -> customer ka paisa kata, order nahi bana. Recover ho sakta hai -- PSP se list mangwa ke (recovery worker + reconciliation) rebuild -- lekin woh manual, slow aur dara dene wala hai. Isliye DR drill mein ye bhi check: 'PSP se hamara state rebuild ho sakta hai'."
+
+### Scale, cost, performance
+
+**13. Interviewer:** "Traffic 10x ho gaya -- 10K TPS peak. Pehle kya tootega?"
+
+**My Answer:** "Pehle **PSP** -- uski rate limits (per merchant account) aur uska apna capacity. Humein PSP ke saath limits pehle se negotiate karni hongi, ya multi-PSP. Phir hamara DB: ~100K row writes/s ek primary ke liye stretch hai -- pehle vertical + tuning (batching outbox publish, fewer indexes, fillfactor), phir cells by `customer_id`. Node instances stateless, bas zyada (in-flight 20K). Kafka partitions badhao. Idempotency table 50 GB/day -- partition by day aur `DROP PARTITION` se cleanup, `DELETE` nahi."
+
+**14. Interviewer:** "Is system ka cost kahan hai?"
+
+**My Answer:** "Surprising answer: **infra nahi, PSP fees**. Example assumption: avg order Rs 1,000, PSP fee ~2% -> Rs 20 per payment x 5M/day = ~Rs 10 crore/day fees. Hamara Postgres + Node + Kafka shayad kuch lakh per month. Toh cost optimization ka asli lever: PSP fee negotiation (volume), method routing (UPI sasta, cards mehenge -- India mein UPI P2M par abhi zero MDR hai jaisi policies change hoti rehti hain), failed payment retries kam karna (har decline + retry customer drop-off hai). Infra side par: 7-year storage ko purane partitions cold storage mein, idempotency keys 24 h. Lekin sync standby hata ke paise bachana galat bachat -- RPO 0 ki keemat chhoti hai."
+
+**15. Interviewer:** "p99 latency kaise control karoge?"
+
+**My Answer:** "Hamara apna hissa chhota hai: 3 short transactions (~5 ms each) + hashing. p99 ka 90%+ PSP hai (300 ms - 3 s). Toh: (1) `psp_request_duration_seconds{op}` alag se measure -- 'hum slow hain ya PSP'. (2) PSP timeout 10 s -- p99 ko bound karta hai, uske baad 202. (3) Keep-alive HTTPS agent -- har call par TLS handshake (~100+ ms) nahi. (4) Circuit breaker -- PSP bimaar ho toh sab requests 10 s wait na karein. (5) Kabhi bhi PSP call DB transaction ke andar nahi -- warna pool exhaust hoke sab slow. (6) 3DS / UPI mein latency user ki hai (OTP daalna), usko API latency mein mat gino."
+
+### Security
+
+**16. Interviewer:** "Card testing attack ho raha hai -- bot hazaaron stolen cards try kar raha hai. Kya karoge?"
+
+**My Answer:** "Card testing mein attacker chhote amounts par cards validate karta hai -- hamein PSP fees aur declines ka nuksaan, aur PSP account risk mein. Layers: (1) Gateway rate limits on `POST /v1/payments` -- per customer, per IP, per device, aur **per card fingerprint** (PSP token se milta hai). (2) Velocity rules: ek account se 10 min mein 5+ declines -> block + CAPTCHA/step-up. (3) Payment sirf **existing order** ke liye (amount server side se) -- random amount try nahi kar sakte; guest checkout par extra checks. (4) PSP ke fraud tools (Radar-type) on. (5) Metric: `payments_total{status="FAILED"}` ratio + `failure_code = card_declined` spike alert. Ye wahi Rate Limiter hai -- bas key card fingerprint aur account hai."
+
+**17. Interviewer:** "Webhook endpoint public hai. Koi fake `payment.succeeded` bhej de toh?"
+
+**My Answer:** "Har webhook ka `X-PSP-Signature` = HMAC-SHA256 of **raw body** with shared secret; `crypto.timingSafeEqual` se compare. Invalid -> 401, kuch apply nahi. Replay attack ke liye timestamp tolerance (e.g. 5 min, agar PSP signed timestamp bhejta hai) + `(psp, psp_event_id)` dedupe. Extra paranoia: webhook ko sirf 'ping' maano -- amount/status PSP API se fetch karke confirm karo (What if #10). Secret rotation ke liye do secrets ek saath valid rakho kuch time."
+
+### Consistency
+
+**18. Interviewer:** "Order service ke saath consistency kaise? Payment succeed hua, lekin order us beech cancel ho gaya?"
+
+**My Answer:** "Ye distributed transaction hai -- 2PC nahi karte (PSP 2PC mein participate nahi karta). **Saga with events**: Payment service `payment.succeeded` publish karta hai (outbox). Order service consume karta hai (dedupe on `event_id`). Normal: order `PAID`. Agar order already `CANCELLED` hai (user ne cancel kiya, ya inventory expire): Order service **compensating action** -- `POST /v1/payments/:id/refunds` full amount, `Idempotency-Key: auto-refund:<payment_id>` (natural key, taaki event 2 baar aaye toh refund ek hi baar). Customer ko notification 'payment refunded'. Better: order checkout ke waqt inventory hold with expiry payment timeout se lamba, taaki ye case rare ho. Consistency eventual hai, lekin **convergent** -- har path kisi final sahi state par pahunchta hai."
+
+**19. Interviewer:** "Webhook aur API response mein race -- dono ek saath payment update karein toh?"
+
+**My Answer:** "Dono conditional update karte hain: `UPDATE payments SET status='SUCCEEDED' ... WHERE id=$1 AND status = ANY('{PROCESSING,REQUIRES_ACTION}')`. Postgres row lock se ek jeetega, doosre ka `rowCount 0`. Haarne wala re-read karta hai, dekhta hai `SUCCEEDED` -- 'idempotent apply success', error nahi. Ledger entries aur outbox event sirf jeetne wale ke transaction mein likhe jaate hain, toh do baar nahi. Terminal states peeche nahi jaate -- late `payment.failed` webhook `SUCCEEDED` ko nahi badal sakta."
+
+**20. Interviewer:** "Redis kahan use karoge is system mein?"
+
+**My Answer:** "Payment path mein nahi. Idempotency aur payment state Postgres mein, ek transaction mein -- Redis wahan second source of truth banega aur consistency todega. Redis sirf gateway par rate limiting (card testing) ke liye, aur maybe circuit breaker state share karne ke liye (lekin per-instance breaker bhi theek hai). Ye bolna interview mein strong signal hai -- har tool har jagah nahi lagta."
+
+---
+
+## PART 24 -- Requirement Change ("What if...") Questions
+
+> Format: **Current Design -> New Problem -> Change -> Trade-off.**
+
+### 1. What if traffic becomes 100x?
+
+- **Current Design:** 5M/day, ~1,000 TPS peak, ek Postgres primary (~10K row writes/s), ek PSP.
+- **New Problem:** 500M/day, ~5,800 TPS avg, **~100K TPS peak**, ~1M row writes/s, ~1 TB/day storage, 200K in-flight PSP calls. Koi ek PSP account itna nahi leta; ek primary bhi nahi.
+- **Change:**
+  - Cells sharded by `customer_id` (key + payment + ledger same shard, single-shard transactions).
+  - Multi-PSP routing + multiple merchant accounts per PSP.
+  - Outbox via CDC; Kafka partitions 10x.
+  - Separate ledger service; hot accounts per cell (`sales_revenue:cell7`), rollup for finance.
+  - Idempotency keys daily partitions, `DROP PARTITION` cleanup.
+- **Trade-off:** cross-cell reporting warehouse se; resharding (cell split) ek project hai; bahut zyada ops. Honest: 100x par hum basically ek chhota PSP ban rahe hain -- tab "build vs buy" dobara socho.
+
+### 2. What if we remove the idempotency table?
+
+- **Current Design:** 3 layers (key, order-level index, PSP key).
+- **New Problem:** kya tootega, exactly?
+  - Timeout ke baad retry -> naya payment id -> PSP key bhi naya. **Order-level index** abhi bhi doosre active payment ko rokega (409 `ORDER_ALREADY_PAID`) -- toh order payments par double charge **mostly** bacha.
+  - Lekin client ko original response replay nahi hoga -- 409 milega, usko GET karna padega. UX kharab.
+  - **Refunds toot jaate hain:** refund ka koi natural unique key nahi. "Refund 10,000" ka retry = doosra 10,000 refund. Over-refund `CHECK` sirf total ko cap karta hai, duplicate ko nahi.
+  - Pehla attempt `FAILED` (decline) tha aur client retry karta hai -> naya attempt allowed (sahi), lekin agar pehla actually `PROCESSING` tha aur crash hua -- no recovery point, no resume.
+- **Change:** agar table hatani hi hai toh har operation ko natural key do: refund = `(payment_id, client_refund_ref)` unique.
+- **Trade-off:** Lesson: order-level index ek safety net hai, idempotency ka replacement nahi. Interview mein ye analysis dikhata hai ki tum har layer ka exact kaam jaante ho.
+
+### 3. What if the database is down?
+
+- **Current Design:** sab state Postgres mein.
+- **New Problem:** naye payments claim nahi ho sakte, webhooks store nahi ho sakte.
+- **Change:**
+  - `POST /v1/payments` -> **503 before calling PSP** (fail closed). Kuch charge nahi hua, client same key se retry kare.
+  - Webhooks -> 500, PSP retries karta hai (usually hours/days tak exponential backoff) -- hum kuch nahi khote.
+  - In-flight payments jinka PSP call ho chuka aur Tx 2 fail hua: key `IN_PROGRESS` / payment `PROCESSING` -- DB wapas aane par recovery worker PSP se poochh ke complete karega.
+  - Sync standby promote (~30-60 s). Readiness probe DB check kare taaki LB bekaar instances ko traffic na de.
+- **Trade-off:** outage ke dauraan sales band. "Queue mein daal do baad mein charge karenge" tempting hai -- lekin customer ne checkout chhod diya, 20 min baad charge hua toh surprise + dispute. Money par fail closed.
+
+### 4. What if we need multi-region active-active?
+
+- **Current Design:** single region, multi-AZ.
+- **New Problem:** do regions ek hi customer ke writes lein toh idempotency key claim aur order-level uniqueness **global** honi chahiye. Async replication = do regions dono "row nahi hai" dekhein -> dono charge kar dein. Ledger dono jagah likha -> reconcile kaun karega?
+- **Change:** options:
+  - **Home region per customer** (recommended): writes sirf home region mein; doosra region reads/DR. Region fail hua toh us region ke customers manual/automated failover ke baad (RPO seconds) doosre region mein.
+  - **Globally consistent DB** (Spanner, CockroachDB): har commit par cross-region consensus (~50-150 ms). PSP ke saamne chhota, lekin cost aur ops heavy.
+- **Trade-off:** "true" active-active for money = latency ya correctness mein se ek chhodo. Interview mein main bolunga: "payments ko active-active mat karo jab tak business sach mein maange; home-region sharding 90% fayda deta hai."
+
+### 5. What if API latency must be < 500 ms?
+
+- **Current Design:** sync-ish, p99 ~2-3 s (PSP).
+- **New Problem:** PSP khud 300 ms - 3 s leta hai. PSP ke saath sync wait karke 500 ms possible nahi.
+- **Change:** **fully async API**: Tx 1 (claim + payment `CREATED`) -> **202 `{ id, status: 'PROCESSING' }`** ~50-100 ms mein. PSP call background worker karta hai (job queue ya outbox-driven `charge` command). Result webhook / push / GET poll se. Idempotency same rehti hai.
+- **Trade-off:** client complexity (poll/push); ek aur queue + worker; UX mein "processing" state. Aur pehle clarify: "500 ms hamari API ka ya user ko final result ka?" -- 3DS/UPI mein user khud OTP/app approve karta hai, woh kabhi 500 ms nahi hoga.
+
+### 6. What if one customer creates 10M payments?
+
+- **Current Design:** gateway rate limit on POST, order-level uniqueness.
+- **New Problem:** 10M/day = **~116 payments/sec** ek customer se -- koi insaan nahi karta. Ye bot/card testing/integration bug hai. PSP fees + declines + PSP account ban ka risk; idempotency table bhi 10 GB extra.
+- **Change:**
+  - Per-customer + per-card-fingerprint + per-IP limits (Rate Limiter) -- e.g. 10 payment attempts / 10 min per customer.
+  - Velocity/fraud rules: declines ratio > X -> block account, step-up auth.
+  - Business check: payment sirf valid unpaid order ke liye -- 10M orders bhi banne chahiye, toh order creation par bhi limits.
+  - Agar ye legit B2B customer hai (bulk payouts?) -> alag API (batch), alag limits, contract.
+- **Trade-off:** strict limits legit power users (reseller) ko rok sakti hain -- allowlist + manual review.
+
+### 7. What if requests are duplicated?
+
+- **Current Design:** yahi toh hamara main case hai.
+- **New Problem:** duplicates kahan-kahan se: double-click, mobile retry, LB retry, PSP call retry, webhook duplicates, Kafka redelivery.
+- **Change (already in design), har hop par dedupe:**
+
+| Hop | Duplicate kyun | Dedupe |
+|---|---|---|
+| Client -> API | double-click, retry | `Idempotency-Key` + order-level index |
+| API -> PSP | timeout retry | PSP idempotency key = payment id |
+| PSP -> webhook | PSP retries until 200 | `webhook_events` PK `(psp, psp_event_id)` |
+| Relay -> Kafka | crash before `published_at` | consumers `processed_events(event_id)` |
+| Recovery worker vs client retry | dono same key resume karein | `locked_until` takeover (only one wins) |
+
+- **Trade-off:** har dedupe ek table/write hai -- storage aur latency. Lekin payments mein ye non-negotiable hai.
+
+### 8. What if two servers try to take over the same stuck key?
+
+- **Current Design:** takeover `UPDATE idempotency_keys SET locked_until = now() + interval '60 seconds' WHERE customer_id=$1 AND key=$2 AND locked_until < now() RETURNING *`.
+- **New Problem:** Server A ka client retry aur recovery worker B dono ek saath expired key dekhte hain.
+- **Change:** kuch naya nahi -- ye UPDATE atomic hai. Dono UPDATE chalaate hain; Postgres pehle wale ko row lock deta hai, doosra wait karta hai. Pehla commit hua (`locked_until` ab future mein) -> READ COMMITTED mein doosra WHERE **naye row version par dobara check** karta hai -> `locked_until < now()` false -> 0 rows -> 409 `IDEMPOTENCY_IN_PROGRESS` (client) ya skip (worker). Aur agar dono kisi tarah PSP tak pahunch bhi gaye, PSP key = payment id -> ek charge.
+- **Trade-off:** lock 60 s ka lease hai. Agar A zinda tha lekin GC pause / slow PSP se 60 s se zyada atka, toh B takeover karega aur A bhi chalta rahega -- dono ka PSP call same key se (safe), dono ka Tx 2 conditional update (ek jeetega). Isliye lease + idempotent steps dono chahiye; akela lease kaafi nahi (fencing ka simple version).
+
+### 9. What if the business demands literally "exactly-once payment"?
+
+- **Current Design:** at-least-once + idempotency.
+- **New Problem:** PM kehta hai "exactly once guarantee chahiye, retries hi hata do".
+- **Change:** honestly samjhao: network par exactly-once **delivery** impossible hai (Two Generals problem -- ack kho sakta hai, sender ko kabhi certain pata nahi). Retries hatao toh "at-most-once" -- timeout par payment lost ya customer khud dobara pay karega (double charge ka zyada risk). Jo hum de sakte hain aur dete hain: **exactly-once effect** = at-least-once delivery + idempotency keys + dedupe at every hop + **reconciliation** jo bache hue edge cases pakde + refund jo galti ho toh fix kare.
+- **Trade-off:** 'exactly-once' marketing word hai; engineering word hai 'effectively once with detection and correction'. Interviewer yahi sunna chahta hai.
+
+### 10. What if the PSP changes webhook format or sends events out of order?
+
+- **Current Design:** `webhook_events` raw payload store, state machine forward-only.
+- **New Problem:** v2 format mein field names badal gaye; `payment.failed` (attempt 1) `payment.succeeded` (attempt 2) ke **baad** aaya.
+- **Change:**
+  - **Anti-corruption layer / adapter:** `razorpay.client.ts` mein PSP payload -> hamara internal `PspChargeResult`. Version header dekh ke parser choose. Raw payload hamesha store, taaki naya parser purane events dobara process kar sake.
+  - Unknown event type -> store + 200 + alert (500 do toh PSP hamesha retry karega).
+  - **Out of order:** terminal states peeche nahi jaate (`SUCCEEDED` par late `failed` ignore). Aur stronger: **webhook ko sirf trigger maano** -- aane par PSP API se current state fetch karo (`getPaymentByIdempotencyKey`) aur woh apply karo. Order ki problem hi khatam.
+- **Trade-off:** har webhook par ek PSP API call (rate limit + latency) -- 174/s avg manageable; PSP limits check karo.
+
+### 11. What if we add wallets (stored balance)?
+
+- **Current Design:** hum paisa hold nahi karte; PSP karta hai. Ledger = record.
+- **New Problem:** ab ShopKart customer ka balance rakhta hai. Ledger ab **balance ka source of truth** hai -- galti = customer ka asli paisa galat. Regulatory: India mein stored value = PPI license (RBI) -- legal question pehle. Concurrency: do purchases ek saath, balance 500, dono 400 ke -> overdraft.
+- **Change:**
+  - Account table with `balance_minor` + ledger entries **same transaction** mein; debit: `UPDATE wallet_accounts SET balance_minor = balance_minor - $2 WHERE id = $1 AND balance_minor >= $2` (ya short `SELECT ... FOR UPDATE`) -- `CHECK (balance_minor >= 0)`.
+  - Invariant: balance = sum(credits) - sum(debits) per account -- nightly verify.
+  - Idempotency same pattern; top-up via PSP, spend internal.
+  - Hot wallets (merchant accounts) -> sub-accounts.
+- **Trade-off:** row-level contention per wallet (theek hai, ek user sequential hai; merchant wallets problem). Specialized ledger DBs yahan relevant hone lagte hain.
+
+### 12. What if we add subscriptions / recurring billing?
+
+- **Current Design:** one-shot, user-initiated payments.
+- **New Problem:** server khud har mahine charge karega -- koi client key nahi; scheduler 2 baar chala toh double charge; card expire/decline.
+- **Change:**
+  - `subscriptions`, `invoices` tables; invoice per period with **natural unique key** `(subscription_id, period_start)` -> scheduler do baar chale toh bhi ek invoice.
+  - Payment idempotency key = `inv_<id>` -- same flow.
+  - Mandates: card e-mandate / UPI AutoPay (India mein pre-debit notification aur limits jaise RBI rules -- PSP handle karta hai, confirm karo).
+  - Dunning: decline par retry schedule (1, 3, 5 din), phir cancel; har retry naya attempt, same invoice.
+  - Proration, plan change, timezone (period boundary kiska midnight?) -- sab edge cases.
+- **Trade-off:** billing engine khud ek bada system hai -- Stripe Billing / PSP subscriptions "buy" karna aksar sahi.
+
+### 13. What if the PSP is down for 1 hour during a sale? (apna)
+
+- **Current Design:** single PSP, circuit breaker -> 503 `PSP_UNAVAILABLE`.
+- **New Problem:** 1 hour x ~1,000 TPS peak = lakhon lost checkouts.
+- **Change:** short term: breaker open -> turant 503 with clear message (nothing charged); order hold rakho; status page. Medium term: **secondary PSP** for new payments (router). Card token PSP-specific hai -> network tokenization / PSP-agnostic vault, ya fallback sirf UPI/netbanking par jahan token issue nahi. `PROCESSING` payments PSP A par hi resolve honge -- unko B par mat bhejo.
+- **Trade-off:** do integrations, do reconciliations; secondary PSP ki pricing kharab ho sakti hai (kam volume).
+
+### 14. What if finance finds a Rs 1,200 mismatch? (apna)
+
+- **Current Design:** daily reconciliation.
+- **New Problem:** settlement file mein ek payment hai jo hamare ledger mein nahi.
+- **Change:** review queue item -> payment id / PSP id se trace: webhook aaya tha? (`webhook_events`), payment `PROCESSING` mein atka? recovery worker logs? Fix = PSP truth se status apply + ledger entry (naya, reversing ya missing entry -- purani edit kabhi nahi). Root cause fix (bug) + alert threshold.
+- **Trade-off:** reconciliation 1 din late pakadti hai -- isliye intraday recon (hourly, PSP API se) V3 mein.
+
+---
+
+## PART 25 -- Node.js Specific Interview Questions
+
+### Q1. "Node.js single-threaded hai, toh 1,000 TPS payments kaise handle karega jab har PSP call 2 second leti hai?"
+
+**My Answer:** "Node ka JS single-threaded hai, **I/O nahi**. PSP call ek HTTPS socket hai -- `await psp.charge()` par function pause hota hai aur event loop doosri requests chalata hai. 2 second 'wait' hai, CPU kaam nahi. Little's law: in-flight = rate x time = 1,000 x 2 s = **~2,000 concurrent calls**. Har ek bas ek socket + chhota closure hai (KBs). 8-10 instances par ~200-250 each -- Node ke liye aaram. Hamara CPU kaam per payment chhota hai (JSON, SHA-256, 3 short DB transactions). Asli khatra CPU nahi, **resources jo wait ke dauraan pakde rehte hain** -- sabse bada: DB connection."
+
+```ts
+// WRONG: PSP call transaction ke andar -> pool connection 2-3 s tak pakda
+await withTransaction(async (client) => {
+  await paymentRepo.markProcessing(client, paymentId);
+  const result = await psp.charge(input);           // 2 s wait WITH a DB connection + row lock
+  await paymentRepo.applyResult(client, paymentId, result);
+});
+
+// RIGHT: short tx -> PSP call outside -> short tx
+await withTransaction((c) => paymentRepo.markProcessing(c, paymentId));   // ~5 ms
+const result = await psp.charge(input);                                    // no connection held
+await withTransaction((c) => paymentService.applyResult(c, paymentId, result));
+```
+
+**Code Explanation:**
+
+- WRONG version: 1,000 TPS x 2 s = 2,000 connections chahiye -- Postgres ke typical `max_connections` (hundreds) aur pool (e.g. 20 per instance) se bahut zyada. Pool khatam -> **saari** requests (GET bhi) queue mein -> poora service slow, jabki CPU idle hai. Plus row lock 2 s tak -> webhook ka update bhi atka.
+- RIGHT version: har transaction ~5 ms. 1,000 TPS x 3 tx x 5 ms = **~15 connections busy** on average. Pool 20 per instance kaafi.
+- Isiliye spec mein phases hain: Tx 1 -> PSP (outside any tx) -> Tx 2. Crash beech mein ho toh `recovery_point` batata hai kahan se resume karna hai.
+- Doosra wait resource: outbound sockets to PSP -- keep-alive agent with a bounded pool (Q2), warna har call par naya TLS handshake.
+
+### Q2. "PSP call ka timeout kaise lagaoge? `AbortController` kya karta hai?"
+
+**My Answer:** "Timeout ke bina ek hung PSP connection request ko minutes tak pakde rakh sakta hai. Node 18+ ka built-in `fetch` `AbortSignal` leta hai. `AbortSignal.timeout(ms)` ek signal deta hai jo ms baad khud abort ho jaata hai."
+
+```ts
+export class RazorpayClient implements PspClient {
+  constructor(private readonly baseUrl: string, private readonly apiKey: string) {}
+
+  async charge(input: PspChargeInput): Promise<PspChargeResult> {
+    try {
+      const res = await fetch(`${this.baseUrl}/v1/payments`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${this.apiKey}`,
+          'idempotency-key': input.idempotencyKey,           // = our payment id
+        },
+        body: JSON.stringify({ amount: input.amountMinor, currency: input.currency, token: input.paymentMethodToken }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.status >= 500 || res.status === 429) throw new RetryableError(`psp ${res.status}`);
+      return mapChargeResponse(res.status, await res.json());
+    } catch (err) {
+      if (err instanceof RetryableError) throw err;
+      if (isTimeoutOrNetwork(err)) return { outcome: 'unknown' };
+      throw err;
+    }
+  }
+  // getPaymentByIdempotencyKey, refund ...
+}
+```
+
+**Code Explanation:**
+
+- `'idempotency-key': input.idempotencyKey` -- har attempt par **same** key (payment id). Timeout ke baad retry bhi PSP par ek hi charge.
+- `AbortSignal.timeout(10_000)` -- spec ka 10 s. Abort hone par `fetch` reject hota hai (`TimeoutError` / `AbortError` name ke saath) -- socket band.
+- 5xx / 429 -> `RetryableError` -> retry helper (Q3) retry karega. 4xx (validation, decline) retry nahi -- decline ek valid answer hai.
+- Timeout/network error -> `{ outcome: 'unknown' }`. **Kabhi `failed` nahi** -- request PSP tak pahunchi ya nahi, pata nahi. Service isko `PROCESSING` + 202 banata hai.
+- Shutdown ke saath combine karna ho: `AbortSignal.any([AbortSignal.timeout(10_000), shutdownController.signal])` (Node 20.3+).
+- Keep-alive: Node ka `fetch` (undici) connections reuse karta hai; high volume par ek custom `undici.Agent({ connections: 256, keepAliveTimeout: 30_000 })` dispatcher se per-origin sockets bound karo.
+
+### Q3. "Retries with backoff -- kab retry, kab nahi? Code dikhao."
+
+**My Answer:** "Retry sirf tab jab (1) error transient hai (network, 5xx, 429) aur (2) operation idempotent hai -- PSP ke liye ye idempotency key se guaranteed hai. Exponential backoff + full jitter, max attempts limited."
+
+```ts
+export class RetryableError extends Error {}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function withRetry<T>(
+  fn: (attempt: number) => Promise<T>,
+  { maxAttempts = 3, baseMs = 200, capMs = 2_000 } = {},
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      if (!(err instanceof RetryableError) || attempt >= maxAttempts) throw err;
+      const backoff = Math.min(capMs, baseMs * 2 ** (attempt - 1));
+      await sleep(Math.random() * backoff);                 // full jitter
+    }
+  }
+}
+
+// usage: same idempotency key on every attempt
+const result = await withRetry(() => psp.charge({ ...input, idempotencyKey: paymentId }));
+```
+
+**Code Explanation:**
+
+- `RetryableError` -- sirf ye retry hota hai. Decline, 400, auth error seedha throw.
+- Backoff ceiling: attempt 1 ke baad up to 200 ms, attempt 2 ke baad up to 400 ms (800, 1600 agar zyada attempts) -- `capMs` 2 s par rukta hai.
+- `Math.random() * backoff` -- **full jitter**: sale mein 1,000 requests ek saath fail hui toh sab ek saath retry na karein (thundering herd PSP par).
+- `maxAttempts = 3` -- total time budget yaad rakho: 3 x 10 s timeout = 30 s worst case, jo client ke timeout se zyada ho sakta hai. Isliye practically timeout (`unknown`) par in-request retry nahi -- 202 do aur recovery worker ko retry karne do; in-request retry sirf fast failures (connection refused, 503) par.
+- `idempotencyKey: paymentId` har attempt par same -- ye line retry ko **safe** banati hai. Iske bina retry = double charge.
+- Circuit breaker isse bahar wrap hota hai: breaker open -> call hi nahi, turant `PSP_UNAVAILABLE`.
+
+### Q4. "`crypto` module mein se kya use karoge? Request fingerprint kaise banaoge?"
+
+**My Answer:** "Teen cheezein: `randomUUID` (client/tests ke liye idempotency keys, request ids), `createHash('sha256')` (request fingerprint), `createHmac` + `timingSafeEqual` (webhooks, Q5). Fingerprint mein trick hai **canonical JSON** -- `{a:1,b:2}` aur `{b:2,a:1}` same request hai, hash bhi same aana chahiye."
+
+```ts
+import { createHash, randomUUID } from 'node:crypto';
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    return `{${Object.keys(obj).sort()
+      .filter((k) => obj[k] !== undefined)
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function requestHash(method: string, path: string, body: unknown): string {
+  return createHash('sha256').update(`${method}\n${path}\n${canonicalJson(body)}`).digest('hex');
+}
+
+const idempotencyKey = randomUUID();   // client side: ONCE per logical payment, reused on retries
+```
+
+**Code Explanation:**
+
+- `canonicalJson` -- object keys sort karke serialize; arrays ka order same rakha (array order meaningful hai). `undefined` values skip (JSON.stringify bhi skip karta hai).
+- `requestHash` -- spec: SHA-256 of `method + path + canonical JSON body`. `\n` separator taaki `POST` + `/v1/paymentsX` jaise ambiguous concatenation na bane.
+- Same key + different hash -> **422 `IDEMPOTENCY_KEY_REUSED`** (client bug: key reuse for a different order).
+- `randomUUID()` -- CSPRNG se UUID v4. Client ise **ek baar** banata hai ("pay for order X, attempt 1") aur har retry par wahi bhejta hai. Har retry par naya UUID = idempotency khatam.
+- SHA-256 cheap hai (microseconds for ~100 byte body) -- worker thread ki zarurat nahi.
+
+### Q5. "Webhook signature verify karo. `timingSafeEqual` ka pitfall kya hai? Raw body kyun?"
+
+**My Answer:** "HMAC **exact bytes** par bana hai jo PSP ne bheje. Agar `express.json()` ne parse karke dobara stringify kiya toh spacing/key order badal sakta hai -> signature kabhi match nahi. Isliye webhook route par sirf `express.raw()`, baaki app par `express.json()`."
+
+```ts
+import express from 'express';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+app.post('/webhooks/psp', express.raw({ type: 'application/json', limit: '256kb' }), webhookController.handle);
+app.use(express.json({ limit: '32kb' }));                   // rest of the app, AFTER the webhook route
+
+export function verifySignature(rawBody: Buffer, header: string | undefined, secret: string): boolean {
+  if (!header || !/^[0-9a-f]{64}$/i.test(header)) return false;
+  const expected = createHmac('sha256', secret).update(rawBody).digest();   // 32-byte Buffer
+  const received = Buffer.from(header, 'hex');
+  if (received.length !== expected.length) return false;                  // timingSafeEqual throws on length mismatch
+  return timingSafeEqual(received, expected);
+}
+```
+
+**Code Explanation:**
+
+- `express.raw(...)` sirf is route par -> `req.body` ek `Buffer` hai, exact bytes. Webhook route ko global `express.json()` se **pehle** register kiya, warna json parser body kha lega.
+- Regex check -- header missing / galat format par `Buffer.from` ajeeb buffer banata (hex parse invalid chars par ruk jaata hai).
+- `createHmac(...).digest()` -- Buffer (32 bytes), hex string nahi. Buffers compare karo.
+- **Pitfall:** `timingSafeEqual` alag length ke buffers par **`RangeError` throw** karta hai -- try/catch ke bina ye 500 ban jaata aur PSP retry karta rehta. Isliye pehle length check. (Length leak koi secret nahi -- HMAC length sabko pata hai.)
+- `===` string compare kyun nahi: pehle mismatched character par ruk jaata hai -> timing se attacker byte-by-byte guess kar sakta hai (theory mein; network noise mein mushkil, lekin constant-time compare free hai).
+- Verify ke baad: `JSON.parse(rawBody.toString('utf8'))`, `webhook_events` mein `ON CONFLICT DO NOTHING` insert, transition apply, fast 200.
+
+### Q6. "Money JS mein kaise represent karoge? `number`, `BigInt`, ya string? pg BIGINT kya return karta hai?"
+
+**My Answer:** "Floats kabhi nahi: `0.1 + 0.2 = 0.30000000000000004`. Integer paise use karo. `number` integers exactly `Number.MAX_SAFE_INTEGER` = 9,007,199,254,740,991 tak represent karta hai -- paise mein ~90 lakh crore rupees. Ek payment ke liye kaafi, isliye spec `number` + `Number.isSafeInteger` check. Lekin **pg driver BIGINT ko string return karta hai** (default), kyunki woh 64-bit hai aur JS number 53-bit safe."
+
+```ts
+import pg from 'pg';
+
+// Option A: parse BIGINT (OID 20) globally, but refuse unsafe values loudly
+pg.types.setTypeParser(20, (text: string) => {
+  const n = Number(text);
+  if (!Number.isSafeInteger(n)) throw new Error(`BIGINT ${text} exceeds safe integer range`);
+  return n;
+});
+
+export function toMoney(amountMinor: unknown, currency: string): Money {
+  if (typeof amountMinor !== 'number' || !Number.isSafeInteger(amountMinor) || amountMinor <= 0) {
+    throw new ValidationError('amountMinor must be a positive safe integer');
+  }
+  return { amountMinor, currency };
+}
+
+// Aggregates (sum over 7 years) -> BigInt, and serialize as string
+const { rows } = await pool.query(`SELECT sum(amount_minor)::text AS total FROM ledger_entries WHERE account = $1`, ['sales_revenue']);
+const total = BigInt(rows[0].total ?? '0');
+res.json({ totalMinor: total.toString() });                 // JSON.stringify(BigInt) throws TypeError
+```
+
+**Code Explanation:**
+
+- `setTypeParser(20, ...)` -- OID 20 = `int8`/BIGINT. Default string ki jagah number, **lekin** unsafe value par throw -- chupchap precision loss (last digits galat) money mein sabse khatarnak bug hai.
+- `toMoney` -- API boundary par validation: integer, safe, positive. `49900` sahi, `499.00` reject.
+- Aggregates: `sum(bigint)` Postgres mein `numeric` return karta hai (pg default string). 7 saal ka total: 5M x Rs 1,000 avg x 365 x 7 = ~1.28e15 paise -- safe limit ke kaafi kareeb! Isliye sums `BigInt` mein aur API mein **string** (`"1277500000000000"`).
+- `JSON.stringify` BigInt par `TypeError` deta hai -- explicitly `.toString()` karo.
+- Arithmetic: `BigInt` aur `number` mix nahi hote (`1n + 1` TypeError) -- ek layer mein ek type.
+- Percentage/fee calculation (2% of 49,900 = 998) -- integer math + explicit rounding rule, `Math.round(49900 * 0.02)` jaisa float step ek jagah, tested.
+
+### Q7. "pg Pool aur transactions -- `withTransaction` helper kaisa hoga? Galti kahan hoti hai?"
+
+**My Answer:** "Sabse common bug: `pool.query('BEGIN')`, phir `pool.query('INSERT...')` -- pool har query **alag connection** par bhej sakta hai, toh BEGIN ek connection par, INSERT doosre par -- transaction hai hi nahi. Rule: ek transaction = ek checked-out client, aur `release()` hamesha `finally` mein."
+
+```ts
+import pg from 'pg';
+
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,                                  // per instance; 10 instances = 200 connections total
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 2_000,           // pool exhausted -> fail fast, don't hang
+  statement_timeout: 5_000,
+});
+
+export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});        // connection may already be broken
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+**Code Explanation:**
+
+- `max: 20` -- pool size. Total connections = instances x max x (API + workers ke pools). 10 x 20 = 200 -- Postgres `max_connections` se kam rakho, ya beech mein PgBouncer (transaction pooling). Bada pool = zyada fast nahi; DB ke CPU cores ke hisaab se active queries limited.
+- `connectionTimeoutMillis: 2_000` -- pool khatam hai toh 2 s mein error -> 503, request hamesha ke liye latki nahi.
+- `statement_timeout` -- galat query DB ko pakde na rahe.
+- `pool.connect()` -> ek dedicated client; BEGIN/queries/COMMIT sab isi par.
+- `catch` -> ROLLBACK; uska apna error ignore (connection toot gaya ho toh), original error throw.
+- `finally { client.release() }` -- release bhool gaye toh har request ek connection leak karegi; 20 requests baad pool khatam, service "hang". Ye production mein bahut hota hai.
+- `fn` ke andar **koi PSP/HTTP call nahi** (Q1). Code review rule.
+
+### Q8. "Outbox relay aur recovery worker ka graceful shutdown kaise karoge?"
+
+**My Answer:** "Deploy par SIGTERM aata hai. Worker ko beech mein maara toh: batch publish ho gaya lekin `published_at` update nahi hua -> duplicates (consumers dedupe kar lenge, lekin kam hi achha). Sahi: naya batch mat uthao, current batch khatam karo, commit, phir exit."
+
+```ts
+let stopping = false;
+let current: Promise<void> = Promise.resolve();
+
+async function relayLoop() {
+  while (!stopping) {
+    current = publishBatch().catch((err) => logger.error({ err }, 'outbox batch failed'));
+    await current;
+    if (!stopping) await sleep(200);
+  }
+}
+
+async function publishBatch(): Promise<void> {
+  await withTransaction(async (c) => {
+    const { rows } = await c.query(
+      `SELECT id, event_id, aggregate_id, event_type, payload FROM outbox
+       WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`);
+    if (rows.length === 0) return;
+    await producer.send({
+      topic: 'payments.events',
+      messages: rows.map((r) => ({ key: r.aggregate_id, value: JSON.stringify({ eventId: r.event_id, type: r.event_type, data: r.payload }) })),
+    });
+    await c.query(`UPDATE outbox SET published_at = now() WHERE id = ANY($1::bigint[])`, [rows.map((r) => r.id)]);
+  });
+}
+
+process.once('SIGTERM', async () => {
+  stopping = true;
+  await current;                            // finish the in-flight batch
+  await producer.disconnect();
+  await pool.end();
+  process.exit(0);
+});
+
+void relayLoop();
+```
+
+**Code Explanation:**
+
+- `stopping` flag -- loop naya batch nahi uthata; `current` in-flight batch ka promise.
+- `FOR UPDATE SKIP LOCKED` -- multiple relay instances ek hi rows par na ladein; har instance alag batch leta hai. (Yahan Kafka send transaction ke andar hai -- chhota batch aur Kafka fast hai, toh acceptable; lekin ye wahi "network call inside tx" hai jo Q1 mein mana kiya tha -- bound it: 100 rows, Kafka timeout chhota.) Ordering note: multiple relays + SKIP LOCKED se ek payment ke events ka order toot sakta hai; strict ordering chahiye toh ek relay (leader) ya partition by aggregate.
+- `key: r.aggregate_id` -- key = payment id -> same partition -> ek payment ke events order mein.
+- Crash after `send`, before `UPDATE` commit -> agli baar dobara publish -> **at-least-once**. Consumers `event_id` se dedupe.
+- `.catch(...)` batch ke andar -- ek failure loop ko nahi maarta (Q10).
+- SIGTERM: flag -> in-flight batch await -> producer disconnect -> pool end -> exit. Kubernetes `terminationGracePeriodSeconds` (default 30 s) se kam mein khatam hona chahiye.
+- Recovery worker same pattern: current payment ka resume khatam karo; beech mein chhoda toh bhi safe, kyunki key ka lease expire hoke koi aur resume karega.
+
+### Q9. "kafkajs producer ko payments ke liye kaise configure karoge?"
+
+**My Answer:** "`acks: -1` (all in-sync replicas ne likha tabhi success) aur idempotent producer -- taaki producer ke internal retry se Kafka mein duplicate na bane."
+
+```ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payment-service', brokers: process.env.KAFKA_BROKERS!.split(',') });
+
+export const producer = kafka.producer({
+  idempotent: true,                // broker dedupes producer retries (producer id + sequence number)
+  maxInFlightRequests: 1,          // keep per-partition order with retries
+});
+
+await producer.connect();
+await producer.send({ topic: 'payments.events', acks: -1, messages: [/* ... */] });
+```
+
+**Code Explanation:**
+
+- `idempotent: true` -- kafkajs docs mein ise experimental bola gaya hai; ye `acks = -1` require karta hai. Broker har producer ko id deta hai aur har message ka sequence number track karta hai -> network retry par duplicate write reject.
+- **Limit samjho:** ye sirf *usi producer session ke retries* dedupe karta hai. Relay crash hoke restart hua aur same outbox rows dobara bheje -> ye naye messages hain Kafka ke liye. Isliye end-to-end dedupe consumer ke `processed_events(event_id)` se hi hota hai.
+- `acks: -1` -- leader + saare in-sync replicas. Topic par `min.insync.replicas=2` (replication factor 3) ke saath, broker mara toh bhi event nahi khota. `acks: 1` = leader crash par event loss.
+- `maxInFlightRequests: 1` -- retries ke saath order safe (throughput thoda kam, hamare ~few hundred events/s ke liye kuch nahi).
+- Honest note: kafkajs ka maintenance slow hua hai; naye projects `@confluentinc/kafka-javascript` (librdkafka based) bhi dekhte hain. Concepts same.
+
+### Q10. "Background workers mein unhandled promise rejection ka kya? Worker chupchap mar gaya toh?"
+
+**My Answer:** "Node 15+ mein unhandled rejection default par **process crash** karta hai. Worker ke liye do cheezein: (1) har iteration apne errors khud pakde, taaki ek bura payment poora worker na maare; (2) jo sach mein unexpected hai, woh crash kare aur orchestrator restart kare -- aur **metric/alert** ho, kyunki worker ka chupchap band hona sabse bura hai (stuck payments badhte rahenge)."
+
+```ts
+async function recoveryTick() {
+  const stuck = await paymentRepo.findStuck({ olderThanSec: 60, limit: 50 });
+  for (const p of stuck) {
+    try {
+      await paymentService.resume(p.id);                    // asks PSP, applies result idempotently
+    } catch (err) {
+      logger.error({ err, paymentId: p.id }, 'recovery failed for payment');
+      metrics.recoveryErrors.inc();
+    }
+  }
+}
+
+setInterval(() => { recoveryTick().catch((err) => logger.error({ err }, 'recovery tick failed')); }, 60_000);
+
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ reason }, 'unhandled rejection -- exiting');
+  process.exit(1);                                           // let Kubernetes restart a clean process
+});
+```
+
+**Code Explanation:**
+
+- Per-payment try/catch -- ek payment ka PSP error (ya bug) baaki 49 ko nahi rokta.
+- `recoveryTick().catch(...)` -- `setInterval` callback ka promise koi await nahi karta; `.catch` ke bina DB error = unhandled rejection = crash.
+- Overlap: tick 60 s se lamba chala toh do ticks overlap -- safe hai (key lease + conditional updates), lekin `inFlight` flag se skip karna saaf hai.
+- `unhandledRejection` -> log + exit(1). "Log karke chalte raho" galat hai -- process ab unknown state mein hai. Restart + alert better.
+- Health: worker `lastSuccessfulTickAt` expose kare; `payments_stuck_processing` gauge badh raha aur tick purana -> page.
+
+### Q11. "Is sab ko test kaise karoge -- fake PSP aur fake timers?"
+
+**My Answer:** "`PspClient` interface hai, toh test mein ek `FakePspClient` inject karo jo script ki hui outcomes de aur **charges count kare** -- asli assertion 'kitne charges hue' hai."
+
+```ts
+import { describe, it, expect, vi } from 'vitest';
+
+class FakePspClient implements PspClient {
+  charges = new Map<string, PspChargeResult>();              // PSP-side idempotency: key -> result
+  nextCallTimesOut = false;
+
+  async charge(input: PspChargeInput): Promise<PspChargeResult> {
+    const existing = this.charges.get(input.idempotencyKey);
+    if (existing) return existing;                            // real PSP dedupes on key
+    const result: PspChargeResult = { outcome: 'succeeded', pspPaymentId: `psp_${this.charges.size + 1}` };
+    this.charges.set(input.idempotencyKey, result);           // charged even if we "time out"
+    if (this.nextCallTimesOut) { this.nextCallTimesOut = false; return { outcome: 'unknown' }; }
+    return result;
+  }
+  async getPaymentByIdempotencyKey(key: string) { return this.charges.get(key) ?? { outcome: 'failed' as const }; }
+  async refund() { return { outcome: 'succeeded' as const, pspRefundId: 're_psp_1' }; }
+}
+
+it('timeout then client retry with same key -> exactly one charge', async () => {
+  const psp = new FakePspClient();
+  const svc = buildPaymentService({ psp });                   // real service + test Postgres
+  psp.nextCallTimesOut = true;
+
+  const first = await svc.createPayment({ customerId: 'cus_1', key: 'k-1', orderId: 'ord_123', paymentMethodToken: 'pm_abc' });
+  expect(first.code).toBe(202);                               // PROCESSING, not FAILED
+
+  const retry = await svc.createPayment({ customerId: 'cus_1', key: 'k-1', orderId: 'ord_123', paymentMethodToken: 'pm_abc' });
+  expect(retry.body.status).toBe('SUCCEEDED');
+  expect(psp.charges.size).toBe(1);
+  expect(await ledgerImbalance()).toBe(0);
+});
+
+it('retry helper backs off without real waiting', async () => {
+  vi.useFakeTimers();
+  const fn = vi.fn().mockRejectedValueOnce(new RetryableError('503')).mockResolvedValue('ok');
+  const p = withRetry(fn);
+  await vi.runAllTimersAsync();                               // jump through the backoff sleep
+  await expect(p).resolves.toBe('ok');
+  expect(fn).toHaveBeenCalledTimes(2);
+  vi.useRealTimers();
+});
+```
+
+**Code Explanation:**
+
+- `FakePspClient.charges` -- PSP ki idempotency simulate: same key par wahi result, naya charge nahi. Isse hamara "PSP key = payment id" design test hota hai.
+- `nextCallTimesOut` -- sabse khatarnak case: **PSP ne charge kiya lekin humein `unknown` mila**. Test assert karta hai 202 (FAILED nahi), aur retry par `SUCCEEDED` with `charges.size === 1`.
+- `ledgerImbalance()` -- helper jo per `transaction_id` debit - credit ka sum check kare -> 0. Har test ke end mein invariant.
+- `buildPaymentService` real Postgres (Docker / testcontainers) ke saath -- `ON CONFLICT`, partial unique index, conditional updates mock karke test nahi hote.
+- Fake timers: `withRetry` ka `sleep(Math.random() * 200)` asli wait nahi karega; `runAllTimersAsync` timers aur beech ke promises dono chala deta hai.
+- Aage: har phase ke beech "crash" inject karo (service ko `recovery_point` ke baad throw karwao), phir recovery worker chalao -> same assertions. Ye Follow-up #8 ka chaos layer hai.
+
+### Q12. "Worker threads ya cluster module chahiye?"
+
+**My Answer:** "Worker threads nahi -- hamara kaam I/O-bound hai (PSP, Postgres, Kafka); CPU kaam (SHA-256, HMAC, JSON) microseconds ka. Cluster module ki jagah containers: har pod ek process, Kubernetes N pods. Dhyaan: har process ka apna pg pool -- 4 workers x 10 pods x 20 = 800 connections; isliye process count badhao toh pool size ghatao ya PgBouncer. Worker threads tab sochunga jab reconciliation job mein bada CSV (lakhon lines) parse karna ho -- tab bhi pehle **streams** (`fs.createReadStream` + line parser, backpressure ke saath), phir zarurat ho toh worker."
+
+### Node.js answers ka summary
+
+| Topic | Hamare payment service mein ek line |
+|---|---|
+| Event loop | 2,000 in-flight PSP calls = sockets, CPU nahi; khatra = resources held while waiting |
+| Transactions | Never await PSP inside `withTransaction`; ~15 busy connections at peak |
+| Timeouts | `AbortSignal.timeout(10_000)`; timeout = `unknown` = 202, kabhi `failed` nahi |
+| Retries | Only transient errors, full jitter, **same PSP idempotency key** |
+| crypto | `randomUUID` once per intent; SHA-256 over canonical JSON; HMAC over raw bytes |
+| `timingSafeEqual` | Length check first (warna RangeError); compare Buffers |
+| Raw body | `express.raw` only on `/webhooks/psp`, registered before `express.json` |
+| Money | Integer paise, `Number.isSafeInteger`; pg BIGINT = string by default; sums in BigInt, sent as string |
+| pg Pool | One client per tx, `release()` in `finally`, `connectionTimeoutMillis` |
+| Shutdown | Stop taking batches, finish current, commit, disconnect, exit |
+| kafkajs | `idempotent: true`, `acks: -1`; consumer dedupe still required |
+| Unhandled rejections | Per-item try/catch; truly unexpected -> exit + restart + alert |
+| Testing | `FakePspClient` counting charges; fake timers for backoff; real Postgres |
+
+---
+
+## Remember
+
+> **Payments mein har decision ka test ek hi hai: "beech mein crash ho jaaye toh kya paisa do baar katega ya kho jaayega?" Isliye idempotency Postgres mein same transaction mein, PSP call transaction ke bahar same key ke saath, timeout = `PROCESSING` (kabhi `FAILED` nahi), doubt mein fail closed -- aur exactly-once delivery nahi, exactly-once effect.**
+
+## Quick Self-Test
+
+1. Idempotency keys Redis mein rakhne ka ek concrete failure scenario batao jisme customer double charge hota hai. Rate Limiter mein Redis kyun theek tha?
+2. Idempotency table hata do -- order payments par kya bacha rehta hai (kaunsa layer), aur refunds kyun toot jaate hain?
+3. PSP call `withTransaction` ke andar kyun nahi? 1,000 TPS x 2 s par connections ka math karo -- andar vs bahar.
+4. Timeout ke baad teen raaste kaunse hain jo payment ko final state tak le jaate hain? Timeout par `FAILED` mark karna double charge kaise karwata hai?
+5. Product "exactly-once payment" maange -- tum kya explain karoge, aur har hop par (client, PSP, webhook, Kafka) kaunsa dedupe kaam karta hai?
+
+---
+
+**Next (Part 6):** Implement it (TypeScript), 30-second answer, 5-minute answer, whiteboard drawing order, final cheat sheet. "next" bolo.

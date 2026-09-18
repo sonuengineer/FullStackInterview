@@ -1,0 +1,702 @@
+# Rate Limiter -- HLD + LLD (Part 4: Scaling -> Failures -> Consistency -> Security -> Observability)
+
+> Is file mein prompt ke **Parts 16-20** hain: scaling (1x se 1000x), failure scenarios, consistency, security, aur observability.
+> Pichle parts ka recap: Part 1 mein numbers nikale (**~23K RPS average, ~100K RPS peak, har request = 1 Redis round trip, ~1.5 GB bucket memory, Redis Cluster with 3 primaries**). Part 2 mein `rateLimit()` middleware + `RateLimiterService` + Redis Lua token bucket + `RuleCache` (Postgres, 30s refresh) ka code likha. Part 3 mein algorithms compare kiye aur token bucket Lua script line by line samjha. Ab dekhenge ye limiter **traffic badhne par, cheezein tootne par, aur attack hone par** kaise behave karta hai.
+
+**Ek baat pehle se yaad rakho:** rate limiter ka kaam hai baaki system ko bachana. Agar limiter khud hi API ko gira de, toh woh bodyguard hai jo maalik ko hi ghar mein ghusne nahi de raha. Isliye is part ka har decision ek sawaal se nikalta hai: **"limiter fail ho toh API chalti rahe?"**
+
+---
+
+## PART 16 -- Scaling: 1x -> 10x -> 100x -> 1000x
+
+### Pehle ek rule
+
+Har level par sirf teen sawaal:
+
+1. **Sabse pehle kya tootega?** (bottleneck)
+2. **Usko todne ka sabse sasta tareeka kya hai?**
+3. **Kya abhi zarurat NAHI hai?**
+
+**Yaad rakho (Part 1 ka key insight):** rate limiter **read-heavy nahi** hai. Har check ek read + write hai (tokens ghatao, timestamp update karo). Isliye URL shortener ki tarah "cache laga do" wala trick yahan kaam nahi karta. Yahan bottleneck **memory nahi, throughput** hai -- Redis ek second mein kitne Lua scripts chala sakta hai.
+
+### Levels define karte hain
+
+Spec ka ~100K RPS peak ek bade SaaS ka number hai. Scaling ki kahani samajhne ke liye hum ek chhote startup se shuru karte hain:
+
+| Level | Peak RPS | Active identities/day | Bucket memory (~150 B/key) | Node instances (~2K RPS each) | Redis |
+|---|---|---|---|---|---|
+| **1x** (startup) | ~1K | ~100K | ~15 MB | 1-2 | 1 node (ya kuch nahi) |
+| **10x** | ~10K | ~1M | ~150 MB | ~5-8 | 1 primary + 1 replica |
+| **100x** (hamara spec) | ~100K | ~10M | ~1.5 GB | ~50 | Cluster: 3 primaries + 3 replicas |
+| **1000x** | ~1M | ~100M | ~15 GB | ~500 | Cluster: ~20-30 primaries + local batching |
+
+> "~2K RPS per instance" ek assumption hai -- asli number business logic par depend karta hai, limiter par nahi. Limiter ka apna cost sirf ek Redis round trip hai.
+
+### 1x -- ~1K RPS, chhota startup
+
+```
+Client -> LB -> 1-2 Node.js instances -> Redis (1 node)
+                                      -> Postgres (rules + app data)
+```
+
+- **Honest baat:** agar **sirf ek** Node instance hai, toh `MemoryTokenBucketStore` (process memory mein token bucket) bhi bilkul theek hai. Redis ki zarurat hi nahi. Restart par counters reset honge -- kisi ko fark nahi padega.
+- Jaise hi **2+ instances** aaye, in-memory limiter galat ho jaata hai: LB round-robin karta hai, toh har instance apna alag bucket rakhta hai. 100/min ka limit asal mein **100 x instances** ban jaata hai. Tab shared Redis chahiye.
+- Redis: 1K checks/s ek Redis node ke liye kuch bhi nahi (budget ~50K/s). Memory ~15 MB.
+- **Kya NAHI chahiye:** Redis Cluster, separate rate-limit service, edge limiting (basic nginx `limit_req` optional), local batching.
+
+> Interview line: "1x par ek hi instance ho toh in-memory token bucket kaafi hai. Do ya zyada instances hote hi limit instances se multiply ho jaata hai, isliye shared Redis mein Lua token bucket lagata hoon. Is scale par Redis Cluster ya alag rate-limit service overengineering hai."
+
+### 10x -- ~10K RPS
+
+| Area | Kya tootega? | Change | Kyun |
+|---|---|---|---|
+| Redis throughput | 10K / 50K = **20%** of one primary | **Kuch nahi** -- ek primary kaafi | Throughput abhi budget ke andar |
+| Redis availability | Ek node gaya = har check fail | **1 primary + 1 replica** with automatic failover (Sentinel / ElastiCache Multi-AZ) | Ab limiter production critical hai |
+| Latency | Har request par ek extra round trip | Redis ko **same AZ / same VPC** mein rakho, `commandTimeout: 20` | Budget < 2 ms p99 hai; cross-AZ hop bhi ~1 ms kha jaata hai |
+| Redis failure | Redis down = kya karein? | `MemoryTokenBucketStore` **fallback** (PART 17) | Availability over strictness |
+| IP floods | Bots ek IP se hazaaron req/s | Edge par **coarse per-IP limit** (nginx `limit_req`, ALB + WAF rate rule) | Jo traffic Node tak pahunche hi nahi, woh sabse sasta hai |
+
+- **Kya NAHI chahiye:** Redis Cluster (memory 150 MB, throughput 20%), sharding, standalone service.
+
+> Interview line: "10x par throughput abhi bhi ek Redis primary sambhal leta hai, isliye cluster nahi. Lekin ab Redis ko replica ke saath automatic failover par chalaunga, local fallback add karunga, aur edge par coarse per-IP limit lagaunga taaki floods Node tak na pahunchein."
+
+### 100x -- ~100K RPS (hamara spec)
+
+Ye woh design hai jo Parts 1-3 mein bana.
+
+```mermaid
+flowchart LR
+    C[Clients] --> E[Edge / LB + WAF: coarse IP limits]
+    E --> N1[Node 1: rateLimit middleware]
+    E --> N2[Node 2 ... Node ~50]
+    N1 --> RC[(Redis Cluster: 3 primaries + 3 replicas)]
+    N2 --> RC
+    N1 -. every 30s .-> PG[(Postgres: rate_limit_rules)]
+    N2 -. every 30s .-> PG
+```
+
+**1. Redis throughput -> Redis Cluster (3 primaries)**
+
+100K / 50K budget = 2 primaries ka minimum, **3 primaries** (~33K each) headroom ke saath. Har key `rl:<ruleId>:<identifierValue>` hash hoke ek slot par jaati hai (16,384 slots), slots primaries mein bante hain. Hamara Lua script **single key** touch karta hai, isliye hash tags `{...}` ki zarurat nahi.
+
+**Redis Cluster ka simple matlab:** data ko kai Redis primaries mein baanto; har key ka ek "ghar" (slot) fixed hai. Client (ioredis `new Redis.Cluster([...])`) khud jaanta hai kaunsi key kaunse node par hai.
+
+**Read replicas kyun kaam nahi aate?** Har check ek **write** hai. Replica par write nahi hota. Replicas sirf failover ke liye hain, throughput ke liye nahi.
+
+**2. Connections**
+
+ioredis har Node instance se har Redis node par ek connection rakhta hai aur usi par saari commands **multiplex** karta hai. 50 instances x 6 nodes = **~300 connections** -- Redis ke liye kuch nahi (default `maxclients` 10,000).
+
+**3. Pipelining**
+
+`enableAutoPipelining: true` (ioredis option) -- ek event-loop tick mein aaye saare commands ek hi network write mein chale jaate hain. 100K RPS par ye Redis ka CPU (syscalls) kaafi bachata hai. Code change zero.
+
+**4. Hot key**
+
+Ek badi enterprise API key 5K RPS bheje toh uska bucket ek hi primary par hai. 5K us primary ke 33K budget mein fit hai -- abhi problem nahi. 1000x par ye problem banega.
+
+**5. Kya NAHI chahiye:** queue (limiter synchronous answer deta hai), CDN (limiter ka koi cacheable response nahi), DB replicas (rules sirf kuch sau rows, 30s mein ek query), sharding Postgres ki.
+
+> Interview line: "100K RPS par har request ek Lua script hai aur Redis read replicas writes nahi le sakte, toh main Redis Cluster mein 3 primaries rakhta hoon, har ek ~33K ops/s par, aur har primary ka replica failover ke liye. Script single-key hai toh hash tags nahi chahiye. ioredis auto-pipelining se syscall overhead kam hota hai."
+
+### 1000x -- ~1M RPS: kya bottleneck banega?
+
+| Bottleneck | Kyun | Kya karunga |
+|---|---|---|
+| **Redis ops/s** | 1M / 50K = **20 primaries minimum**, headroom ke saath ~30 | Cluster badhao, **aur** Redis calls hi kam karo (local batching, neeche) |
+| **Hot keys** | Ek huge customer ka bucket ek hi shard par; shard CPU 100% | **Local token batching** us key ke liye; ya limit ko N sub-keys mein split (`rl:api-pro:ak_x:0..7`, har ek limit/8) |
+| **Connections** | 500 instances x ~30 nodes = **~15K connections** | Default `maxclients` 10K se upar; ya standalone rate-limit service jo connections consolidate kare |
+| **Latency / regions** | Users globally; ek region ke Redis tak cross-region hop ~70-150 ms | **Per-region limits** (PART 18) |
+| **Floods** | Bade DDoS 1M RPS ko bhi bauna bana dete hain | Edge / CDN / WAF zaruri, app limiter nahi bacha sakta (PART 17) |
+| **Polyglot services** | Go, Java, Python services bhi limit chahti hain; har language mein Lua logic copy? | **Standalone rate-limit service** (Envoy global rate limit service / hamara `POST /v1/ratelimit/check`) -- Version 3 |
+
+**Local token batching -- sabse important 1000x trick**
+
+Idea: har request par Redis mat jao. Redis se **ek saath N tokens** le lo (hamara Lua script `cost` leta hai -- `cost = 10`), phir woh 10 tokens instance ki memory mein kharch karo. Tokens khatam -> phir Redis se 10.
+
+```
+Without batching:  10 requests -> 10 Redis calls
+With batch = 10:   10 requests -> 1 Redis call (cost=10) + 9 local decisions
+```
+
+- **Fayda:** Redis calls ~10x kam. 1M RPS ~100K Redis ops ban sakta hai (sirf un keys par jahan batching on hai).
+- **Nuksaan (accuracy):** instance A ke paas 8 bache tokens pade hain, instance B ko "limit khatam" mil raha hai -- client ko thoda **jaldi** 429 mil sakta hai. Aur instance crash hua toh uske liye tokens waste.
+- **Kahan use karo:** sirf high-limit keys (`api-pro` 1000/min, enterprise). `api-free` (100/min) ya `login` (5/min) par **kabhi nahi** -- 5 attempts mein 10 ka batch ka koi matlab nahi.
+
+**Standalone service kab?** Jab bahut saari services (alag languages) ek hi limits share karein, ya Redis connections 15K+ ho jaayein. Tab limiter ek gRPC service ban jaata hai (Envoy RLS jaisa) jo Redis se baat karta hai; baaki services sirf "allowed?" poochti hain. Trade-off: **ek extra network hop** (~0.5-1 ms) aur ek aur service jise HA rakhna hai. Isliye v1/v2 mein library + shared Redis hi sahi hai.
+
+> Interview line: "1000x par Redis ops/s hi bottleneck hai -- 20 se zyada primaries lagenge, hot keys ek shard ko jalayenge aur connections 15K cross karenge. Main high-limit keys ke liye local token batching karunga -- Redis se 10 tokens ek saath lo aur memory mein kharch karo -- thodi accuracy ke badle ~10x kam Redis calls. Multi-region mein per-region limits, aur polyglot services ke liye standalone rate-limit service."
+
+### Har scaling tool -- kab lagana hai, kab nahi
+
+| Tool | Hamare system mein kab | Kab NAHI |
+|---|---|---|
+| **In-memory limiter** | Sirf 1 instance; aur fallback ke roop mein hamesha | 2+ instances par primary store ke roop mein |
+| **Shared Redis** | 2+ instances se | Single-instance app |
+| **Redis replica + failover** | 10x se | Hobby project |
+| **Redis Cluster** | 100x (throughput > ~50K ops/s) | Jab ek primary budget ke andar ho |
+| **Auto-pipelining** | 100x (sasta, ek flag) | -- (on karne mein koi nuksaan nahi) |
+| **Edge / WAF IP limits** | 10x se, ya pehle attack ke baad | -- |
+| **Local token batching** | 1000x, sirf high-limit keys | Chhote limits (login, free) |
+| **Standalone service** | Polyglot / 1000x | Ek Node codebase |
+| **Queue / CDN / DB replicas** | Kabhi nahi (limiter ke liye) | Hamesha -- synchronous, uncacheable, rules tiny |
+
+---
+
+## PART 17 -- Failure Scenarios (interviewer style)
+
+Format: **Problem -> Impact -> Solution.** Golden rule (spec ki failure policy):
+
+> **Redis error/timeout -> local `MemoryTokenBucketStore` fallback, capacity aur refill ko instances ki ginti se divide karke.** `failMode` (`open`/`closed`) sirf tab kaam aata hai jab **koi bhi decision possible na ho** (rules kabhi load hi nahi hue, ya limiter mein unexpected bug). Normal API traffic: **availability over strictness.**
+
+### Failure map
+
+```
+Failure                     API chalti hai?   Limits kaise?
+Redis primary down (30s)    Haan              Local fallback (approx)
+Redis slow                  Haan              Timeout 20 ms -> fallback
+Poora Redis Cluster down    Haan              Local fallback (approx)
+Node instance crash         Haan              Kuch nahi khoya (stateless)
+Rules DB down               Haan              RuleCache ki last good copy
+Bad rule deploy             Haan (lekin 429s) Validation + shadow + rollback
+Bada DDoS                   Nahi (bina edge)  Edge/CDN/WAF chahiye
+```
+
+### 1. "What if the Redis primary goes down?"
+
+- **Problem:** Cluster ke ek primary ka crash / AZ issue.
+- **Impact:** us primary ke slots wali keys (~1/3 keys) par checks fail, jab tak replica promote na ho -- usually **~10-30 sec** ka failover window. Async replication ki wajah se naye primary ke paas last kuch milliseconds ke token updates nahi honge -> kuch clients ko thode extra tokens. Chalega.
+- **Solution:** us window mein `RateLimiterService` Redis error pakad ke **local fallback** use karta hai. Neeche code.
+
+```ts
+// src/services/rate-limiter.service.ts (fallback path)
+async check(rule: RateLimitRule, identityValue: string, cost = 1): Promise<RateLimitDecision> {
+  const key = buildKey(rule.id, identityValue);
+  const endTimer = checkDuration.startTimer();
+  try {
+    const decision = await this.redisStore.consume(key, rule, cost);
+    checksTotal.inc({ rule: rule.id, result: decision.allowed ? 'allowed' : 'rejected' });
+    return decision;
+  } catch (err) {
+    fallbackTotal.inc();
+    if (Math.random() < 0.01) {
+      this.logger.warn({ err, ruleId: rule.id }, 'redis limiter failed, using local fallback');
+    }
+    const n = Math.max(1, this.instanceCount());
+    const localRule: RateLimitRule = {
+      ...rule,
+      capacity: Math.max(1, Math.floor(rule.capacity / n)),
+      refillPerSec: rule.refillPerSec / n,
+    };
+    const decision = this.memoryStore.consume(key, localRule, cost);
+    checksTotal.inc({ rule: rule.id, result: decision.allowed ? 'allowed' : 'rejected' });
+    return decision;
+  } finally {
+    endTimer();
+  }
+}
+```
+
+**Code Explanation:**
+
+- `buildKey(rule.id, identityValue)` -- `src/utils/key-builder.ts` se `rl:api-free:ak_live_9f2c` jaisi key. Fallback mein bhi **same key** use hoti hai, bas store alag.
+- `checkDuration.startTimer()` -- `rate_limit_check_duration_seconds` histogram; `finally` mein `endTimer()` taaki success aur fallback dono ka time naapa jaaye.
+- `await this.redisStore.consume(...)` -- normal path: Lua token bucket, `commandTimeout: 20` ke saath. Timeout bhi error hai, toh woh bhi `catch` mein aata hai.
+- `fallbackTotal.inc()` -- `rate_limiter_fallback_total`. Healthy system mein ye **zero** rehna chahiye; badha matlab Redis mein problem (alert PART 20 mein).
+- `Math.random() < 0.01` -- sirf 1% errors log. Redis down par 100K errors/s log karoge toh logging system bhi gir jaayega.
+- `this.instanceCount()` -- kitne Node instances chal rahe hain (config / autoscaling group se). Approx number bhi chalega.
+- `capacity: Math.max(1, Math.floor(rule.capacity / n))` -- 50 instances par `api-pro` 1000 -> **20 per instance**, `api-free` 100 -> **2**. `Math.max(1, ...)` zaruri hai: `login` 5 / 50 = 0.1 -> floor se 0 -> **sab login block** ho jaate. Isliye kam se kam 1.
+- `refillPerSec: rule.refillPerSec / n` -- `api-pro` 16.67/s -> ~0.33/s per instance. Idea: LB traffic ko barabar baantta hai, toh har instance global limit ka 1/n hissa enforce kare -> total approx global limit.
+- `this.memoryStore.consume(...)` -- same token bucket algorithm, process memory mein. Synchronous, koi network nahi.
+- **Accuracy ka sach:** LB bilkul barabar nahi baantta, toh fallback mein limit kabhi thoda zyada kabhi kam hoga. `login` par ek attacker 50 instances par round-robin ho toh burst mein ~50 attempts le sakta hai (har instance 1). Chhote failover window ke liye accept, aur edge ka per-IP limit backup hai.
+- **Zaruri detail:** `MemoryTokenBucketStore` **bounded** ho (LRU, jaise max 100K keys). Warna Redis down + random-IP flood = har IP ka naya bucket memory mein = Node OOM crash.
+
+> Interview line: "Redis primary down hone par failover ke 10-30 sec mein main local in-memory token bucket par fall back karta hoon, capacity aur refill ko instance count se divide karke, taaki total roughly global limit ke paas rahe. Ye approximate hai, lekin API chalti rehti hai aur limits poori tarah gaayab nahi hote. `rate_limiter_fallback_total` metric ise track karta hai."
+
+### 2. "What if Redis is slow (not down)?"
+
+- **Problem:** Redis CPU 100% (hot key, `KEYS *` jaisi galat command, bgsave fork), latency 1 ms se 50 ms.
+- **Impact:** **slow down se bura hai.** Down ho toh error turant aata hai; slow ho toh har request intezaar karti hai. Budget < 2 ms p99 hai -- 50 ms wait = poori API slow.
+- **Solution:**
+  - `commandTimeout: 20` -- 20 ms ke baad give up -> fallback. Worst case 20 ms, 50 ms+ nahi.
+  - `enableOfflineQueue: false` -- disconnected ho toh commands queue mein jama nahi hongi, turant error.
+  - `maxRetriesPerRequest: 1` -- ek retry max; limiter ke liye retry loop latency hi badhata hai.
+  - **Circuit breaker:** agar last 5 sec mein >50% checks timeout hue, toh agle ~5 sec Redis ko call hi mat karo, seedha fallback. Warna har request 20 ms ka timeout bharti rahegi.
+
+**Circuit breaker ka simple matlab:** ghar ka MCB -- baar baar short circuit ho toh switch khud off, taaki poora ghar na jale. Thodi der baad ek request se "test" karo (half-open), theek ho toh wapas on.
+
+### 3. "What if the whole Redis Cluster is down?"
+
+- **Problem:** saare nodes gaye (bad config push, network ACL galti, ya provider outage).
+- **Impact:** har check fallback par. Limits approximate, lekin **API up**.
+- **Solution:** wahi local fallback -- spec ki policy ka poora fayda yahi hai. `login` (`failMode: 'closed'`) bhi local fallback use karta hai kyunki fallback abhi bhi limit kar raha hai; `failMode` sirf "koi decision hi possible nahi" wale case ke liye hai. Circuit breaker Redis ko recovery ke waqt ek saath 100K RPS se hit hone se bachata hai. Alert: fallback > 0 for 1 min -> page.
+
+### 4. "What if a Node.js instance crashes?"
+
+- **Problem:** OOM / uncaught exception / machine gayi.
+- **Impact:** us instance ki in-flight requests fail (502). **Rate limit state kuch nahi khoya** -- counters Redis mein hain, Node stateless hai. Sirf uski local fallback buckets gayi (woh approximate thi hi).
+- **Solution:** LB health check, auto-restart, graceful shutdown (URL shortener Part 4 jaisa). Limiter ke liye kuch special nahi -- ye statelessness ka inaam hai.
+
+### 5. "What if the rules database (Postgres) is down?"
+
+- **Problem:** Postgres down / network issue.
+- **Impact:** hot path par **zero** -- hot path DB touch hi nahi karta. `RuleCache` ka 30s refresh fail hoga.
+- **Solution:**
+  - `RuleCache` **last good copy** rakhta hai aur refresh fail hone par usi se chalta hai. `rate_limit_rule_cache_age_seconds` badhta jaayega -> alert > 120 sec.
+  - **Startup par DB down (rules kabhi load nahi hue):** yahan koi decision possible nahi. Best fix: **readiness probe fail** karo jab tak rules load na hon -- LB naye instance ko traffic hi nahi dega, purane instances chalte rahenge. Agar phir bhi request aa jaaye, route ke default `failMode` se decide: normal API `open`, login `closed` (503).
+
+### 6. "What if someone deploys a bad rule?"
+
+- **Problem:** admin ne galti se `api-pro` ka capacity 1000 ki jagah 1 kar diya, ya `route_pattern` `/*` laga diya.
+- **Impact:** 30 sec ke andar saare instances naya rule le lete hain -> **har paying customer ko 429.** Ye limiter ka sabse realistic outage hai -- Redis nahi, insaan.
+- **Solution (layers):**
+  - **DB CHECK constraints:** `capacity > 0`, `refill_per_sec > 0` -- "limit 0 = sab block" DB level par hi impossible.
+  - **Admin API validation:** naya capacity purane ke 10% se kam ho, ya route pattern bahut broad ho -> reject ya second admin ka approval.
+  - **Shadow / dry-run mode:** naya rule pehle sirf **count** kare, block nahi. Middleware decision nikalta hai, metric mein `result="rejected"` badhata hai, lekin request aage jaane deta hai. Ek din data dekho: "kitne customers is rule se 429 khaate?" Phir enforce karo. (Iske liye rule mein ek `mode: 'enforce' | 'shadow'` field chahiye.)
+  - **Rollback:** har change audit table mein (purana + naya value, kisne, kab). Rollback = purana row wapas + emergency refresh (PART 18 ka pub/sub).
+  - Alert: kisi plan ka 429 rate achanak 5x -> page (PART 20).
+
+### 7. "What if there is a network partition?"
+
+- **Problem:** kuch Node instances Redis tak nahi pahunch paa rahe, baaki pahunch rahe hain.
+- **Impact:** partitioned instances local fallback par (1/n limit), baaki Redis par. Ek client ke requests dono taraf gaye toh total thoda **zyada** admit ho sakta hai (roughly Redis wala hissa + fallback wala hissa). Redis Cluster ke andar partition ho toh minority side ka primary `cluster-node-timeout` ke baad writes band karta hai aur majority side replica promote karti hai.
+- **Solution:** accept karo -- ye bounded over-admission hai, API down nahi. Metric per instance dikhayega kaunse instances fallback mein hain.
+
+### 8. "What about clock skew?"
+
+- **Problem:** 50 Node servers ki ghadiyaan thodi alag hain. Agar har Node apna `Date.now()` bhejta, toh ek fast clock wala server bucket ko "future" mein refill kar deta.
+- **Solution:** Lua script **Redis ka `TIME`** use karta hai -- ek key ke liye ek hi ghadi. `math.max(0, now - ts)` negative elapsed ko 0 bana deta hai (jaise failover ke baad naye primary ki ghadi thodi peeche ho). Naye primary ki ghadi aage ho toh thoda early refill -- chhoti over-admission, accept.
+
+### 9. "What about duplicate / retried requests?"
+
+- **Problem:** client ka request timeout hua, usne retry kiya. Kya retry ka token lagna chahiye?
+- **Answer:** **haan, ye intended hai.** Limiter "kitna kaam backend ne kiya" gin raha hai, business operation nahi. Retry bhi backend ka kaam hai. Retry loop wale buggy scripts se bachna hi to limiter ka kaam hai.
+- Duplicate **business effect** (do baar payment) rokna idempotency keys ka kaam hai -- limiter ka nahi (next system: Payment / Idempotent API).
+- **Client ko kya karna chahiye:** 429 par `Retry-After` padho, utna ruko, **plus jitter**.
+
+### 10. "What about a thundering herd of retries?"
+
+- **Problem:** 10:00:00 par 5,000 clients ko 429 mila, sabko `Retry-After: 12`. Sab **ek saath** 10:00:12 par retry karte hain.
+- **Impact:** har 12 sec par ek spike -> phir 429 -> phir spike. Traffic lehron mein aata hai.
+- **Solution:** client SDK mein jitter:
+
+```ts
+// our official client SDK -- 429 handling
+async function withRateLimitRetry<T>(call: () => Promise<Response>, maxRetries = 3): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await call();
+    if (res.status !== 429 || attempt >= maxRetries) return res;
+    const retryAfterSec = Number(res.headers.get('Retry-After') ?? '1');
+    const jitterMs = Math.random() * 1000 * Math.min(2 ** attempt, 8);
+    await new Promise((r) => setTimeout(r, retryAfterSec * 1000 + jitterMs));
+  }
+}
+```
+
+**Code Explanation:**
+
+- `res.status !== 429 || attempt >= maxRetries` -- sirf 429 par retry, aur max 3 baar. Infinite retry loop hi to asli problem thi.
+- `res.headers.get('Retry-After')` -- server bata raha hai kitna rukna hai (Lua ka `retry_after` ms se seconds). Guess mat karo.
+- `Math.random() * 1000 * Math.min(2 ** attempt, 8)` -- **jitter**: har client alag random delay jodta hai (pehli baar 0-1 sec, phir 0-2, 0-4, max 0-8 sec). 5,000 clients ek second par nahi, kai seconds mein bikhar jaate hain.
+- `retryAfterSec * 1000 + jitterMs` -- `Retry-After` se **pehle kabhi retry nahi**, sirf baad mein.
+- Server side bhi chhota random (0-1 sec) `Retry-After` mein jod sakta hai -- un clients ke liye jo hamara SDK use nahi karte.
+
+### 11. "What if a DDoS is bigger than our servers?"
+
+- **Problem:** botnet 2M RPS, lakhon IPs se.
+- **Impact:** in-app limiter **nahi bacha sakta.** 429 dene ke liye bhi request ko LB, TLS handshake, Node parse aur ek Redis call tak aana padta hai. Redis khud target ban jaata hai (har naya IP = naya key). Limiter ki cost > attack ki cost.
+- **Solution:** layers mein defence:
+  - **Edge / CDN / WAF** (Cloudflare, AWS Shield + WAF): volumetric attack network edge par hi absorb.
+  - **Gateway par local per-IP limit** (nginx `limit_req`, Envoy local rate limit) -- har gateway apni memory mein, bina Redis. Coarse, lekin sasta.
+  - **App limiter** sirf business limits ke liye (per API key, per plan, login).
+  - Redis `maxmemory` + eviction policy + evictions ka alert -- evicted bucket = limit reset, isliye headroom rakho.
+
+> Interview line: "In-app rate limiter business quota aur abuse ke liye hai, DDoS ke liye nahi. Volumetric attack ko edge par WAF/CDN rokta hai, gateway par Redis-free per-IP limit, aur app mein per-key limits. Jo request Node tak aa gayi uska cost pehle hi lag chuka hai."
+
+### Failure summary
+
+| Failure | Detect kaise | Fallback |
+|---|---|---|
+| Redis down / slow | `rate_limiter_fallback_total` > 0, Redis latency | Local bucket (1/n), circuit breaker |
+| Rules DB down | `rate_limit_rule_cache_age_seconds` > 120 | Last good RuleCache |
+| Rules never loaded | Readiness probe fail | `failMode`: open / closed (503) |
+| Bad rule | 429 rate spike per plan | CHECK + validation + shadow + rollback |
+| Herd retries | Periodic 429 spikes | Jitter in SDK + `Retry-After` |
+| DDoS | Edge metrics, RPS spike | Edge / WAF, not the app |
+
+---
+
+## PART 18 -- Consistency
+
+### Teen words, simple Hinglish mein
+
+- **Strong consistency:** jaise hi ek jagah value badli, **har** padhne wala turant nayi value dekhega. Jaise ek hi bank passbook -- sab usi ko dekhte hain.
+- **Eventual consistency:** abhi kuch log purani value dekh sakte hain, lekin thodi der mein sab same ho jaayenge. Jaise WhatsApp group mein message sabke phone par thoda aage peeche pahunchna.
+- **Read-after-write consistency:** **jisne likha**, woh turant apna likha hua dekhe. Baaki thoda late dekhein toh chalega. Jaise tumne profile photo badli -- tumhe turant dikhni chahiye, dost ko 5 sec baad bhi chalega.
+
+### Is system mein kahan kya?
+
+| Cheez | Kya chahiye | Kyun |
+|---|---|---|
+| **Ek key ka token count (ek Redis primary)** | Strong (atomic per key) | Lua script atomic hai -- Redis single-threaded hai, script beech mein koi aur command nahi ghusti. Do instances ek saath same key check karein toh bhi race condition nahi |
+| **Global accuracy (poore system mein)** | **Strict NAHI** -- approximate | Spec: "small over-admission OK". 1000/min par 1010 nikal gaye toh kuch nahi tootega |
+| **Failover / fallback / partition** | Over-admission accept | Availability > strictness (PART 17) |
+| **Multi-region limits** | Eventual | Cross-region strong check = har request par 70-150 ms |
+| **Rules (RuleCache)** | Eventual (30s) | Rules kabhi kabhi badalte hain; emergency ke liye push (neeche) |
+| **Admin ne rule save kiya, API response** | Read-after-write | Admin `PUT` ke baad `GET` Postgres primary se padhe, cache se nahi |
+
+**Race condition ka example (Lua ke bina):** instance A ne `HMGET` kiya -> 1 token. Instance B ne bhi `HMGET` kiya -> 1 token. Dono ne allow kiya, dono ne 0 likha. 1 token par 2 requests gaye. Lua script read + decide + write ko ek atomic step bana deta hai -- isliye Part 3 mein Lua choose kiya.
+
+**Replica se kyun nahi padhte?** Har check write hai, toh sab primary par. Isliye replica lag ka stale read wala problem (URL shortener ka 404 bug) yahan hai hi nahi -- sirf failover ke waqt kuch ms ki updates khoti hain.
+
+### Multi-region (1000x) -- teen options
+
+Maano India, US, EU -- teen regions, aur `api-pro` 1000/min **global** chahiye.
+
+| Option | Kaise | Accuracy | Latency | Kab |
+|---|---|---|---|---|
+| **A. Ek global Redis** | Sab regions ek region ke Redis ko call karein | Exact | 70-150 ms cross-region -- < 2 ms budget toot gaya | Kabhi nahi (hot path par) |
+| **B. Per-region limits** | Har region ka apna Redis, limit baant do (jaise 1000 -> traffic share ke hisaab se 600/250/150) | Region ke andar exact; client ek region mein jyada bheje toh jaldi 429 | Local ~1 ms | **Default choice** -- simple |
+| **C. Local + async sync** | Har region local count kare, har ~1 sec apna usage doosre regions ko bheje; har region "global used" ka estimate rakhe | Approx; sync lag mein over-admission | Local ~1 ms | Jab customer sach mein multiple regions se traffic bhejte hain |
+
+**Option C ka over-admission kitna?** Sync har 1 sec. Worst case: doosre 2 regions 1 sec tak blind hain -> extra ~2 x 16.67 = **~33 requests** (pro ka refill 16.67/s). 1000/min ke saamne ~3%. Accept.
+
+> Most customers ek hi region se aate hain (unka server ek jagah hai), isliye Option B mein bhi real life mein complaints kam hoti hain.
+
+### Rule changes -- 30s eventual, aur emergency
+
+**Normal case:** admin ne `api-free` 100 -> 200 kiya. Har instance apne 30s refresh par naya rule leta hai. 30 sec tak kuch instances 100, kuch 200 enforce karenge. Theek hai.
+
+**Problem case:** ek customer abuse kar raha hai, admin usko **abhi** block (override capacity 1) karna chahta hai. 30 sec bahut hai. Ya bad rule ka **rollback** -- har second = hazaaron galat 429.
+
+**Fix: push invalidation + poll as safety net.**
+
+```ts
+// src/rules/rule-cache.ts (addition)
+const sub = redis.duplicate();
+await sub.subscribe('rl:rules:changed');
+sub.on('message', () => {
+  void this.refresh().catch((err) => logger.warn({ err }, 'rule refresh after push failed'));
+});
+// admin service, after a successful UPDATE:
+await redis.publish('rl:rules:changed', ruleId);
+```
+
+**Code Explanation:**
+
+- `redis.duplicate()` -- subscribe karne wala connection normal commands nahi chala sakta, isliye alag connection.
+- `sub.subscribe('rl:rules:changed')` -- har Node instance is channel ko sunta hai.
+- `sub.on('message', ...)` -- message aaya toh turant `refresh()` -- Postgres se rules dobara. Seconds nahi, milliseconds mein naya rule.
+- `.catch(...)` -- refresh fail hua toh purani copy chalti rahe; crash nahi.
+- `redis.publish(...)` -- admin API DB commit ke **baad** publish kare, pehle nahi -- warna instances purana data padh lenge.
+- **30s poll kyun rakhein?** Redis pub/sub fire-and-forget hai: jo instance us waqt disconnected tha, usko message kabhi nahi milega. Poll guarantee deta hai ki max 30 sec mein sab same. (Alternative: Postgres `LISTEN/NOTIFY`.)
+
+> Interview line: "Ek key ke andar consistency strong hai kyunki Lua script atomic hai. Lekin poore system mein strict global accuracy ki zarurat nahi -- failover, fallback aur multi-region mein thoda over-admission accept karta hoon. Multi-region mein default per-region limits. Rules 30s mein eventually consistent hain, aur emergency block ke liye pub/sub push invalidation, poll ko safety net rakhte hue."
+
+---
+
+## PART 19 -- Security
+
+Rate limiter khud ek security tool hai -- lekin attacker **limiter ko hi** bewakoof bana sakta hai. Soch: "main apni identity kaise badlun taaki har request naya bucket paaye?"
+
+### Threat -> defence map
+
+| Threat | Defence |
+|---|---|
+| Fake IP via `X-Forwarded-For` | `trust proxy` = exact hop count |
+| IPv6 se lakhon addresses | Per `/64` limit |
+| API key secret leak via keys/logs | Key **id** use karo, secret kabhi nahi |
+| Naye API keys bana ke limit reset | Limit per **account**, per key nahi |
+| Botnet (many IPs) | Per-account + global limits, CAPTCHA, WAF |
+| Login brute force / credential stuffing | IP+username, username, IP -- teen layers |
+| Headers se info leak | `RateLimit-Remaining` sirf jahan zarurat |
+| Rules tamper | Admin authz + audit |
+| Redis access | AUTH/ACL, TLS, private network |
+| Expensive endpoint abuse | `cost` based limits |
+
+### 1. Identity spoofing -- `X-Forwarded-For`
+
+**Problem:** anonymous limit (`anon-ip`) IP par hai. Node ko IP kahan se milta hai? LB ke peeche `req.socket.remoteAddress` hamesha LB ka IP hai, isliye `X-Forwarded-For` header padhna padta hai. Lekin ye header **client bhi bhej sakta hai**: `X-Forwarded-For: 1.2.3.4`. Agar hum sabse pehla (left-most) IP maan lein, toh attacker har request par random IP bhej ke **har baar naya bucket** le lega.
+
+```ts
+// src/app.ts
+app.set('trust proxy', 1); // exactly one trusted hop: our load balancer
+```
+
+```ts
+// src/utils/key-builder.ts
+import ipaddr from 'ipaddr.js';
+
+export function ipIdentity(rawIp: string): string {
+  const addr = ipaddr.process(rawIp);          // '::ffff:1.2.3.4' -> IPv4 '1.2.3.4'
+  if (addr.kind() === 'ipv4') return addr.toString();
+  const parts = (addr as ipaddr.IPv6).parts.slice(0, 4);
+  return parts.map((p) => p.toString(16)).join(':') + '::/64';
+}
+```
+
+**Code Explanation:**
+
+- `app.set('trust proxy', 1)` -- Express ko bolo: "sirf **ek** hop (hamara LB) par bharosa karo." Express `X-Forwarded-For` ko right se padhta hai aur **LB ne jo IP likha** wahi `req.ip` banta hai. Client ki bheji fake entries left side mein reh jaati hain, ignore.
+- `trust proxy` = `true` **kabhi mat karo** -- iska matlab "sab par bharosa", yaani left-most (attacker controlled) IP. CDN + LB do hops hain toh `2` likho -- exact number.
+- `ipaddr.process(rawIp)` -- IPv4-mapped IPv6 (`::ffff:1.2.3.4`) ko normal IPv4 bana deta hai, taaki ek hi user ke do alag keys na banein.
+- `parts.slice(0, 4)` -- IPv6 address 8 parts (16-bit each) ka hota hai. Pehle 4 parts = **/64 prefix**. Ek ghar / ek VM ko ISP poora /64 deta hai = 2^64 addresses. Per-address limit lagaya toh attacker har request naye address se bhejega. Isliye limit **per /64**.
+- Result `rl:anon-ip:2001:db8:ab:1::/64` jaisi key banti hai.
+
+### 2. API key ka secret key names mein nahi
+
+- Redis key `rl:api-free:ak_live_9f2c` mein **key id** (public prefix / DB id) hai, **secret nahi**. Redis `MONITOR`, `SCAN`, slowlog, ya backup mein secret dikhna = leak.
+- Logs mein bhi sirf key id ya uska hash. Raw `Authorization` header kabhi log nahi (pino `redact: ['req.headers.authorization']`).
+- **Login key** `rl:login:203.0.113.7:priya@example.com` mein email hai (PII). Chaaho toh username ka hash (`sha256(lowercase(email))` ke pehle 16 chars) use karo -- limit same kaam karega, Redis mein email nahi dikhega.
+
+### 3. Key rotation abuse
+
+**Problem:** free plan user ek account mein 20 API keys bana leta hai. Har key ka alag bucket = 20 x 100/min.
+
+**Fix:** plan limit **account (customer) id** par lagao, key id par nahi. Middleware cheap lookup se key -> account nikalta hai (ye lookup already cached hai), identity value = account id. Saath mein keys per account ka cap (jaise free = 2 keys).
+
+### 4. Distributed attackers (many IPs)
+
+**Problem:** scraper 10,000 residential IPs se, har IP sirf 10 req/min. Per-IP limit (60/min) kabhi trigger nahi hoga.
+
+**Fix (layers):**
+- Scraping zyadatar logged-in / API key se hoti hai -> **per-account** limit IP se independent.
+- **Global per-endpoint limit** (jaise public search 5K/min total) -- backend bachta hai, bhale bots kaise bhi bikhre hon.
+- **CAPTCHA / challenge** jab signals suspicious hon (naya device, datacenter IP ranges).
+- **WAF bot management** -- fingerprints, known bad IP lists. Ye kaam hamare Node code se behtar edge kar sakta hai.
+
+### 5. Login brute force + credential stuffing
+
+**Brute force** = ek username par bahut passwords. **Credential stuffing** = leaked (email, password) pairs ki list, har username par sirf 1-2 try, hazaaron IPs se.
+
+| Rule | Key | Kya rokta hai |
+|---|---|---|
+| `login` (spec) | IP + username, 5/min | Ek attacker ka ek account par brute force |
+| Per username | username, jaise 20/hour | Ek account par **many IPs** se brute force |
+| `anon-ip` | IP, 60/min | Ek IP se bahut saare usernames |
+| Global login failure rate | endpoint-wide | Credential stuffing ki "lehar" -- alert + CAPTCHA sabke liye |
+
+- **Per-username limit ka side effect:** attacker jaan-bujh ke galat password bhej ke **asli user ko lock** kar sakta hai (account lockout DoS). Isliye hard block ki jagah **CAPTCHA / step-up verification**, aur sirf **failed** attempts gino.
+- Credential stuffing ke against asli defence: breached password check, 2FA, device fingerprint. Rate limiter sirf speed kam karta hai.
+- `login` ka `failMode: 'closed'` -- agar koi decision hi possible nahi, toh login par brute force khula chhodne se better 503 hai.
+
+### 6. Headers se enumeration -- `RateLimit-Remaining` dikhayein?
+
+| Endpoint | Headers dikhao? | Kyun |
+|---|---|---|
+| Public API (`api-free`, `api-pro`) | **Haan** | Achhe clients isse khud slow hote hain -- 429 kam, support tickets kam |
+| Login | **Nahi** (ya sirf `Retry-After` 429 par) | "Remaining: 3" attacker ko exactly batata hai kitne try bache aur kab reset |
+| Anonymous endpoints | Minimal | Attacker ko hamara exact rule map na mile |
+
+Ek aur leak: **invalid API key** par limit kaise lagega? Agar invalid key par limiter chale hi nahi, toh attacker unlimited keys guess kar sakta hai. Fix: invalid key wali requests ko **IP** limit (`anon-ip`) se limit karo -- key validity check ke pehle.
+
+### 7. Admin API authorization
+
+- `PUT /admin/v1/rate-limit-rules/:id` se koi bhi limit hata sakta hai -- yaani poora protection off. Isliye:
+  - Sirf internal network / VPN + SSO; **admin role** check (authentication ke baad authorization).
+  - Input validation (PART 17 #6) + DB CHECK constraints.
+  - **Audit log** har change ka: kaun, kab, purana value, naya value.
+  - Enterprise override (`rate_limit_overrides`) mein `expires_at` -- temporary badhaaye limits khud khatam hon.
+
+### 8. Redis security
+
+- **Private network** only -- Redis ka public endpoint kabhi nahi (internet par khule Redis roz hack hote hain).
+- **TLS** in transit (ElastiCache in-transit encryption), **AUTH / ACL** user.
+- ACL se limiter ko sirf wahi commands do jo chahiye, aur sirf `rl:*` keys:
+
+```
+ACL SETUSER limiter on >${REDIS_PASSWORD} ~rl:* &rl:* +evalsha +eval +script|load +hmget +hset +pexpire +time +publish +subscribe +ping +cluster|slots
+```
+
+- `~rl:*` -- sirf `rl:` wali keys. `&rl:*` -- sirf `rl:` wale pub/sub channels.
+- Lua ke andar ki commands (`HMGET`, `HSET`, `PEXPIRE`, `TIME`) bhi ACL se check hoti hain, isliye unhe bhi allow karna padta hai.
+- `FLUSHALL`, `CONFIG`, `KEYS` allowed nahi -- app bug ya leaked password se bhi poora data nahi udd sakta.
+- Password secret manager / env se, code mein kabhi nahi.
+
+### 9. Denial of wallet -- cost-based limits
+
+**Problem:** 100 req/min limit hai. Lekin `GET /api/v1/users/:id` 2 ms ka hai aur `POST /api/v1/reports/export` 30 sec CPU + ek paid third-party call. Attacker 100 exports/min se tumhara cloud bill uda dega -- **denial of wallet**.
+
+**Fix:** Lua script already `cost` leta hai. Expensive endpoint zyada tokens kharche:
+
+```ts
+// report export route -- one export costs 20 tokens from the same bucket
+const decision = await rateLimiter.check(rule, accountId, 20);
+```
+
+- `api-free` ke 100 tokens mein ab sirf 5 exports/min. Saste endpoints 1 token.
+- Paise wale kaam ke liye **daily / monthly quota** bhi alag rakho (jaise 50 exports/day) -- per-minute limit monthly bill ko cap nahi karta.
+
+> Interview line: "Limiter ki security ka matlab hai identity ko spoof-proof banana: `trust proxy` exact hop count, IPv6 par /64, plan limits account par taaki naye keys se reset na ho. Login par IP+username, username aur global failure rate -- teen layers, aur hard lockout ki jagah CAPTCHA. Keys mein secret nahi, sirf key id. Redis private network, TLS aur ACL ke saath, admin API role-based aur audited, aur expensive endpoints par cost-based tokens."
+
+---
+
+## PART 20 -- Observability
+
+Limiter ke baare mein teen log sawaal poochte hain:
+- **On-call engineer:** "Limiter khud healthy hai? API ko slow toh nahi kar raha?"
+- **Product / business:** "Kitne customers 429 kha rahe hain? Free plan ka limit sahi hai?"
+- **Customer support:** "Customer X bol raha hai use 429 kyun aa raha hai?"
+
+Observability in teeno ka jawab de.
+
+### 1. Logs -- sampled, safe
+
+Har allowed request log nahi hoga (100K RPS). Rejections ~1% = **~20M/day** (~1K/s peak) -- ye bhi sab log karna mehenga. Isliye **sampled** rejection logs + metrics mein exact count.
+
+```json
+{"level":"info","msg":"rate_limited","ruleId":"api-free","route":"GET /api/v1/orders",
+ "identityType":"apiKey","identityHash":"a91f03c2","plan":"free","remaining":0,
+ "retryAfterMs":12000,"source":"redis","requestId":"req_7f3a","traceId":"4bf92f..."}
+```
+
+- `ruleId`, `route` (pattern, actual path nahi), `plan` -- "kaunsa rule kaat raha hai".
+- `identityHash` -- key id / IP ka hash. **Raw API key secret kabhi nahi.** Support ko customer ka exact key id chahiye toh woh account id se dhoondh sakte hain.
+- `source: "redis" | "fallback"` -- decision kahan se aaya.
+- Sampling: 1% random + **har identity ka pehla rejection per minute** (taaki chhote customer ka ek bhi 429 miss na ho).
+- Fallback warnings bhi sampled (PART 17 code).
+
+### 2. Metrics -- kya measure karein
+
+| Metric | Type | Kya batata hai |
+|---|---|---|
+| `rate_limit_checks_total{rule, result="allowed/rejected"}` | Counter | RPS per rule, 429 rate per rule/plan |
+| `rate_limit_check_duration_seconds` | Histogram | Limiter ki latency (budget < 2 ms p99) |
+| `rate_limiter_fallback_total` | Counter | Redis fail hua, local fallback use hua |
+| `rate_limit_rule_cache_age_seconds` | Gauge | Rules kitne purane (DB / refresh health) |
+| Redis latency / ops/s / CPU / memory / evictions | Exporter (redis_exporter / CloudWatch) | Shard hot? Memory full? Evictions = limits reset |
+| Node event loop lag, CPU, memory | `collectDefaultMetrics()` | Local fallback se memory badh rahi? |
+
+**Top offenders kahan?** Metric label mein identity **kabhi nahi** -- 10M identities = 10M time series = Prometheus dead (**cardinality explosion**). Top offenders sampled logs se nikalo (log query: "top 20 identityHash by count, last 1h"), ya Redis sorted set mein sirf **rejections** par `ZINCRBY` (1% traffic, sasta).
+
+### Code -- prom-client
+
+```ts
+// src/infra/metrics.ts
+import client from 'prom-client';
+
+client.collectDefaultMetrics();
+
+export const checksTotal = new client.Counter({
+  name: 'rate_limit_checks_total',
+  help: 'Rate limit checks by rule and result',
+  labelNames: ['rule', 'result'],
+});
+
+export const checkDuration = new client.Histogram({
+  name: 'rate_limit_check_duration_seconds',
+  help: 'Time spent deciding allow/reject',
+  buckets: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05],
+});
+
+export const fallbackTotal = new client.Counter({
+  name: 'rate_limiter_fallback_total',
+  help: 'Checks served by the local memory fallback',
+});
+
+export function registerRuleCacheAge(getLastRefreshMs: () => number) {
+  new client.Gauge({
+    name: 'rate_limit_rule_cache_age_seconds',
+    help: 'Seconds since RuleCache last refreshed successfully',
+    collect() {
+      this.set((Date.now() - getLastRefreshMs()) / 1000);
+    },
+  });
+}
+```
+
+**Code Explanation:**
+
+- `client.collectDefaultMetrics()` -- CPU, memory, heap, GC, **event loop lag** ek line mein.
+- `checksTotal` with `labelNames: ['rule', 'result']` -- `rule` sirf kuch sau values (rule ids), `result` sirf 2. Low cardinality, safe. Isi se 429 rate per rule nikalta hai. Plan chahiye toh rule id already plan batata hai (`api-free`, `api-pro`).
+- `checkDuration` ke `buckets` -- 0.5 ms se 50 ms. Hamara normal check ~0.5-1 ms hai aur timeout 20 ms, isliye buckets isi range mein ghane. Default buckets (5 ms se shuru) hamare < 2 ms budget ko naap hi nahi paate.
+- `fallbackTotal` -- bina labels. Healthy system mein flat zero line.
+- `registerRuleCacheAge(getLastRefreshMs)` -- `RuleCache` apna last successful refresh time deta hai. `collect()` Prometheus scrape ke waqt chalta hai, toh har request par kuch update nahi karna. Normal value 0-30 sec; 120+ = refresh atka hai.
+- Metrics `/metrics` internal port par expose, public nahi.
+
+**PromQL:**
+
+```
+# 429 rate per rule (fraction rejected)
+sum by (rule) (rate(rate_limit_checks_total{result="rejected"}[5m]))
+  / sum by (rule) (rate(rate_limit_checks_total[5m]))
+
+# limiter p99 latency
+histogram_quantile(0.99, sum by (le) (rate(rate_limit_check_duration_seconds_bucket[5m])))
+
+# fallback happening right now
+increase(rate_limiter_fallback_total[1m]) > 0
+```
+
+### 3. Tracing
+
+OpenTelemetry auto-instrumentation (URL shortener Part 4 jaisa setup) ioredis ka span khud banata hai. Upar se ek manual span `rate_limit.check` lagao taaki trace mein limiter alag dikhe:
+
+```
+trace_id = 4bf92f...   GET /api/v1/orders   total 48 ms
+  |-- rate_limit.check (rule=api-free, source=redis, allowed=true)   0.8 ms
+  |     |-- redis EVALSHA                                             0.6 ms
+  |-- auth + business logic                                          45 ms
+  |-- pg SELECT orders                                               ...
+```
+
+- Span attributes: `rule`, `source` (`redis`/`fallback`), `allowed`. Identity ka hash bhi chalega, raw key nahi.
+- Jab koi bole "API slow hai", trace turant bata deta hai limiter 0.8 ms hai ya 20 ms (timeout).
+
+### 4. Alerts
+
+| Alert | Condition (example) | Severity | Kyun |
+|---|---|---|---|
+| Fallback active | `increase(rate_limiter_fallback_total[1m]) > 0` for 1 min | **Page** | Redis gaya; limits approximate |
+| Limiter slow | check p99 > 5 ms for 5 min | Page | Poori API ki latency badh rahi |
+| 429 spike per plan | ek rule/plan ka rejected fraction normal se 5x, 10 min | Page | Bad rule deploy ya bada customer bug |
+| Rule cache stale | `rate_limit_rule_cache_age_seconds` > 120 | Warn | DB down / refresh atka |
+| Redis CPU | > 70% for 10 min (kisi bhi shard) | Warn | Hot key / capacity |
+| Redis evictions | > 0 | Warn | Memory full; buckets reset ho rahe |
+| Redis memory | > 75% of maxmemory | Warn | Capacity plan |
+| 429 zero | rejected = 0 for 1 hour (daytime) | Info | Limiter shayad chal hi nahi raha (bypass bug) |
+
+**Rule:** page sirf tab jab customer ko dard ho ya protection chala gaya ho. Baaki warn -- warna alert fatigue.
+
+### 5. Dashboards + customer support: "Mujhe 429 kyun aa raha hai?"
+
+Ye limiter ka sabse common support ticket hai. Support engineer ek internal page par account id daale aur dekhe:
+
+```
++-------------------------------+--------------------------------+
+| Account: acme (plan: free)    | Applied rule: api-free          |
+| Override: none                | 100 req/min, burst 100          |
++-------------------------------+--------------------------------+
+| 429s last 24h (graph)         | Requests/min vs limit (graph)  |
++-------------------------------+--------------------------------+
+| Top routes rejected           | Retry pattern: 400 req in 2 s  |
+| GET /api/v1/orders (92%)      | after each 429 -> no backoff    |
++-------------------------------+--------------------------------+
+```
+
+- **Kaunsa rule + override** laga -- RuleCache / DB se.
+- **Rejections ka time graph** -- sampled logs se (identityHash filter).
+- **Pattern** -- aksar jawab hota hai "aapka script 429 ke baad bina ruke retry karta hai" -> fix: `Retry-After` + jitter (PART 17 #10), ya pro plan.
+- Ye dashboard support ko engineer ke bina jawab dene deta hai -- aur sales ko "is customer ko upgrade chahiye" ka signal.
+
+**Ops dashboard:** checks/s per rule, 429 fraction per plan, limiter p50/p99, fallback count, rule cache age, Redis per-shard CPU/latency/memory/evictions.
+
+> Interview line: "Main limiter ko teen angle se observe karunga: health -- check latency p99, fallback count, rule cache age, Redis per-shard CPU aur evictions; business -- 429 rate per rule aur plan; aur support -- sampled rejection logs rule, route aur identity hash ke saath, raw key kabhi nahi. Identity ko metric label nahi banaunga kyunki cardinality explode hogi; top offenders logs se. Alerts: fallback active, p99 > 5 ms, aur kisi plan ka 429 spike -- jo aksar bad rule deploy ka pehla signal hota hai."
+
+---
+
+## Remember
+
+> **Rate limiter ka bottleneck throughput hai, memory nahi; Redis fail ho toh local fallback se API chalao, per-key atomic raho lekin global accuracy approximate chalegi; identity ko spoof-proof banao; aur fallback count, check latency, 429 rate per plan -- teen numbers hamesha dekho.**
+
+## Quick Self-Test
+
+1. 10x (~10K RPS) par Redis Cluster kyun nahi chahiye, aur 100x par 3 primaries kyun? Redis read replicas throughput kyun nahi badhate is system mein?
+2. 50 instances par Redis down hua. Fallback mein `api-pro` aur `login` ka per-instance capacity kya hoga, aur `Math.max(1, ...)` na hota toh `login` ka kya hota?
+3. Local token batching (batch = 10) `api-pro` par theek hai lekin `login` par kyun nahi? Iski accuracy ki keemat kya hai?
+4. `app.set('trust proxy', true)` likhne se anonymous limit kaise toot jaata hai? IPv6 par per-address limit kyun bekaar hai?
+5. Admin ne galti se `api-pro` capacity 1 kar di. Kaunsa alert sabse pehle bajega, aur kaunse teen mechanisms ise pehle hi rok sakte the ya jaldi rollback kar sakte the?
+
+---
+
+**Next (Part 5):** Trade-offs, MVP -> Scalable -> Highly Scalable, Follow-up questions, What-ifs, Node.js questions. "next" bolo.

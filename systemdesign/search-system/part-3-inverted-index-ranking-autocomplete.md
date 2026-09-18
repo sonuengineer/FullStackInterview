@@ -1,0 +1,2345 @@
+# Search System -- HLD + LLD (Part 3: Inverted Index -> Ranking -> Autocomplete -> Concurrency -> Caching)
+
+> Is file mein prompt ke **Parts 13-15** hain: search ke saare important algorithms **zero se** (inverted index by hand, BM25 ki poori calculation, Levenshtein DP table, edge n-gram), phir **indexing pipeline ki concurrency aur ordering**, phir **caching ki saari layers** (browser se lekar OS page cache tak).
+> **Part 1-2 recap (3 lines):** (1) Humne decide kiya ki `ILIKE '%...%'` 50M products par marta hai -- speed bhi aur relevance bhi -- isliye **Elasticsearch** index `products_v3` (alias `products`, 6 primary x 1 replica, 6 data nodes, 3 master nodes), Postgres **source of truth** rahega aur ES **derived**. (2) Write path: Catalog Service ek hi transaction mein `products` + `product_outbox` likhta hai -> outbox poller -> Kafka `product-changes` (12 partitions, key = `productId`) -> `product-indexer` consumer group -> ES **bulk API** (500 docs / 5 MB / 1 s). Dual-write banned. (3) Read path: Node Search API -> Redis `q:<sha1(...)>` cache -> QueryBuilder jo canonical `bool` query banata hai (`must` = `multi_match` on `title^3, brand^2, description`; `filter` = brand/price/inStock) + `function_score` + 3 aggregations + `track_total_hits: 10000`.
+> **Ab is part mein:** woh saara "magic" khol ke dekhenge -- inverted index andar se kaisa dikhta hai, score ka number kahan se aata hai, typo kaise handle hota hai, autocomplete kaise 4,000 QPS jhel leta hai, indexer mein out-of-order updates kaise data corrupt karte hain, aur cache kis-kis jagah baithi hai.
+> **Part 4 mein:** scaling (shards, replicas, hot nodes, sale-day 20x traffic), failure scenarios (ES yellow/red, node loss, indexer lag, split brain), consistency, security aur observability.
+
+---
+
+## PART 13 -- Important Algorithms (zero se)
+
+Search system mein **saat** algorithms hain jo actually kaam karte hain. Har ek ko hum ek hi chhote dataset par chalayenge, haath se, taaki koi cheez "black box" na rahe.
+
+> **Running dataset (5 products).** Yahi 5 products poore PART 13 mein use honge.
+>
+> | docId | title (raw, jaisa seller ne dala) |
+> |---|---|
+> | P1 | `Red Cotton Shirt for Men` |
+> | P2 | `Blue Cotton Shirt Slim Fit Cotton Blend` |
+> | P3 | `Cotton Bedsheets for Double Bed` |
+> | P4 | `Mens Running Shoes` |
+> | P5 | `Formal Shirt &amp; Tie Combo` |
+
+---
+
+### 13.1 -- Inverted Index zero se
+
+#### Pehle: "index" ka matlab search mein kya hai?
+
+Database ka B-tree index ek **sorted list of values -> row pointer** hota hai. Usse aap `WHERE brand = 'Apple'` ya `WHERE price BETWEEN 500 AND 2000` kar sakte ho, kyunki value **poori** match ya **range** match hoti hai.
+
+Text alag hai. `title = 'Red Cotton Shirt for Men'` ek value hai, lekin user `cotton shirt` search karta hai -- woh value ka **hissa** hai, aur **beech mein** hai. B-tree isme bilkul bekaar hai (leading wildcard).
+
+**Inverted index ka idea ek line mein:** documents ko ulta kar do. Normal (forward) index kehta hai "document P2 mein kaun se shabd hain?". **Inverted** index kehta hai **"shabd `cotton` kaun kaun se documents mein hai?"**.
+
+Real-life analogy: kisi motti book ke **peeche wala index** ("Caching ...... pages 45, 89, 210"). Aap poori kitaab nahi padhte, index mein shabd dhoondhte ho aur seedha page numbers utha lete ho. Bas yahan "page numbers" = `docId` list, aur ye list **sorted** hoti hai -- isse do lists ko merge karna sasta ho jaata hai.
+
+#### Step 1 -- Analyzer pipeline
+
+Raw text ko seedha index nahi kar sakte. `Cotton`, `cotton`, `COTTON` teen alag strings hain; `bedsheets` aur `bedsheet` alag; `&amp;` HTML ka kachra hai. Isliye har text field **analyzer** se guzarta hai.
+
+```
+raw text
+   |
+   v
+[1] CHAR FILTER     -- characters ke level par safai (HTML strip, & -> and)
+   |
+   v
+[2] TOKENIZER       -- string ko tokens (shabd) mein todo
+   |
+   v
+[3] LOWERCASE       -- token filter: sab chhote akshar
+   |
+   v
+[4] STOP WORDS      -- token filter: the, for, is, and... hatao
+   |
+   v
+[5] STEMMER         -- token filter: shabd ko uske root par lao
+   |
+   v
+TERMS  (yahi index mein jaate hain)
+```
+
+Hamare spec ka analyzer (`product_index`) exactly ye hai:
+
+```json
+"product_index": { "tokenizer": "standard", "filter": ["lowercase", "en_stop", "en_stemmer"] }
+```
+
+**Note (honest):** hamare mapping mein **char filter configure nahi** kiya gaya (default = koi nahi). Lekin pipeline ka pehla step yahi hota hai aur P5 dikhayega ki iski zarurat kyun pad sakti hai -- isliye main usko bhi chala raha hoon.
+
+**Terms:**
+
+- **Token** = tokenizer ke baad nikla ek tukda (abhi kachcha hai).
+- **Term** = saare filters ke baad ka final string, jo actually index mein store hota hai. Search bhi **terms** par hota hai, raw text par nahi. **Yaad rakho: jo cheez index mein term nahi hai, use kabhi koi query nahi dhoondh paayegi.**
+
+#### Step 2 -- Pipeline har stage par, table mein
+
+Pehle **P1 ko dheere-dheere**, taaki har stage saaf dikhe:
+
+| Stage | P1 ka output |
+|---|---|
+| [1] char filter | `Red Cotton Shirt for Men` (koi change nahi) |
+| [2] standard tokenizer | `Red` `Cotton` `Shirt` `for` `Men` |
+| [3] lowercase | `red` `cotton` `shirt` `for` `men` |
+| [4] en_stop | `red` `cotton` `shirt` `men` (`for` gaya) |
+| [5] en_stemmer | `red` `cotton` `shirt` `men` |
+
+Ab baaki chaar, ek hi table mein (interesting stages bold hain):
+
+| doc | [2] tokenizer | [3] lowercase | [4] en_stop | [5] en_stemmer (final terms) |
+|---|---|---|---|---|
+| P2 | `Blue Cotton Shirt Slim Fit Cotton Blend` | `blue cotton shirt slim fit cotton blend` | (koi stop word nahi) | `blue cotton shirt slim fit cotton blend` |
+| P3 | `Cotton Bedsheets for Double Bed` | `cotton bedsheets for double bed` | `for` gaya | `cotton` **`bedsheet`** **`doubl`** `bed` |
+| P4 | `Mens Running Shoes` | `mens running shoes` | -- | **`men`** **`run`** **`shoe`** |
+| P5 | `Formal Shirt Tie Combo` (char filter ne `&amp;` -> `&` kiya, phir tokenizer ne `&` chhoda) | `formal shirt tie combo` | -- | `formal shirt tie combo` |
+
+**Teen cheezein jo yahan turant seekhne layak hain:**
+
+1. **Stem asli shabd nahi hota.** `doubl` koi English word nahi hai. Koi baat nahi -- **query bhi usi stemmer se guzregi**, toh `Double` bhi `doubl` banega aur match ho jaayega. Stemmer ka kaam dictionary banana nahi, **dono taraf ek jaisa mapping** dena hai.
+2. **Stemmer algorithmic hai, dictionary nahi.** `Mens -> men` ho gaya, par `Men -> men` hi raha (`men` ka stem `man` nahi banta). Matlab **irregular plurals** (`men/man`, `mice/mouse`, `feet/foot`) stemmer se solve nahi honge -- unke liye **synonyms** chahiye (13.6).
+3. **Char filter ke bina** `&amp;` se `amp` naam ka ek jhoota term ban sakta tha, jo har HTML-wale title mein hota aur uska `df` bahut zyada ho jaata.
+
+#### Step 3 -- Postings list haath se banao
+
+Ab in terms ko ulta karke likhte hain. Har term ke saamne uski **postings list**: `[docId, tf, positions]`.
+
+- **tf (term frequency)** = us document mein ye term kitni baar aaya.
+- **positions** = kis-kis token position par aaya (0 se). Positions **phrase query** ke liye chahiye ("cotton shirt" exactly bagal-bagal ho).
+
+**Important:** stop word hatane par position **skip hoti hai, shift nahi hoti**. P1 mein `for` position 3 par tha, isliye `men` position **4** par hai, 3 par nahi. Agar shift hoti, toh `"shirt for men"` phrase query galti se `"shirt men"` par bhi match kar jaati.
+
+| term | postings `[docId, tf, positions]` | df |
+|---|---|---|
+| `bed` | `[P3, 1, [4]]` | 1 |
+| `bedsheet` | `[P3, 1, [1]]` | 1 |
+| `blend` | `[P2, 1, [6]]` | 1 |
+| `blue` | `[P2, 1, [0]]` | 1 |
+| `combo` | `[P5, 1, [3]]` | 1 |
+| **`cotton`** | `[P1, 1, [1]]` `[P2, 2, [1,5]]` `[P3, 1, [0]]` | **3** |
+| `doubl` | `[P3, 1, [3]]` | 1 |
+| `fit` | `[P2, 1, [4]]` | 1 |
+| `formal` | `[P5, 1, [0]]` | 1 |
+| `men` | `[P1, 1, [4]]` `[P4, 1, [0]]` | 2 |
+| `red` | `[P1, 1, [0]]` | 1 |
+| `run` | `[P4, 1, [1]]` | 1 |
+| **`shirt`** | `[P1, 1, [2]]` `[P2, 1, [2]]` `[P5, 1, [1]]` | **3** |
+| `shoe` | `[P4, 1, [2]]` | 1 |
+| `slim` | `[P2, 1, [3]]` | 1 |
+| `tie` | `[P5, 1, [2]]` | 1 |
+
+Do cheezein structure ke baare mein:
+
+- **Term dictionary alphabetically sorted hai.** Isliye term dhoondhna binary search / FST traversal hai, poori list scan nahi. Lucene isko **FST (Finite State Transducer)** mein rakhta hai -- shared prefixes ek hi baar store hote hain (`bed`, `bedsheet` ka `bed` hissa share).
+- **Har postings list docId ke order mein sorted hai.** Ye poore search engine ki buniyaad hai -- agli step mein dekhoge kyun.
+
+#### Step 4 -- Query "cotton shirt" chalao
+
+Query bhi **search analyzer** se guzregi (`product_search` = lowercase -> syn_graph -> en_stop -> en_stemmer). Abhi synonyms ignore karo (13.6 mein aayenge):
+
+```
+"cotton shirt"  ->  tokens: [cotton, shirt]  ->  terms: [cotton, shirt]
+```
+
+`multi_match` with `type: best_fields` default **OR** operator use karta hai, par samajhne ke liye pehle **AND** (dono terms chahiye) wala case dekho -- yahi intersection algorithm hai:
+
+```
+cotton -> [P1, P2, P3]
+shirt  -> [P1, P2, P5]
+```
+
+**Intersection walk (dono lists ek saath):**
+
+```
+ptrA -> cotton list       ptrB -> shirt list
+step  A      B      compare            action
+1     P1     P1     barabar            MATCH P1; dono aage
+2     P2     P2     barabar            MATCH P2; dono aage
+3     P3     P5     P3 < P5            A ko aage (P3 kabhi match nahi hoga)
+4     --     P5     A list khatam      STOP
+
+Result: {P1, P2}
+```
+
+Total postings entries chhue: **6**. Documents padhe: **0**. Ye poora kaam sirf integer comparisons hai.
+
+**Ab scale par socho.** Real index mein `cotton` ki list mein 1.2M docIds hain aur `shirt` ki mein 400K. Ek-ek karke chalein toh 1.6M steps. Isliye Lucene do trick lagata hai:
+
+**(a) Chhoti list ko drive karo.** `shirt` (400K) ko lead karao; har `shirt` docId ke liye `cotton` list mein `advance(target)` maaro. Ab upper bound 400K steps hai, 1.6M nahi.
+
+**(b) Skip list.** Postings list ek flat array nahi hai -- woh blocks (128 docIds) mein hoti hai aur upar ek **skip list** hoti hai jo batati hai "block 40 ka pehla docId 8,214,553 hai". `advance(9000000)` karne par pointer seedha sahi block par kood jaata hai, beech ke blocks decompress hi nahi hote.
+
+```
+shirt list (driver):   [ 12, 8214553, 8900041, ... ]
+                          |      |        |
+cotton skip levels:    L2 |------+--------+------------------|   (har 128^2 postings)
+                       L1 |--+---+---+----+---+---+---+---+--|   (har 128 postings)
+                       L0 [ actual docIds, delta-encoded ]
+
+advance(8214553):  L2 se sahi region -> L1 se sahi block -> us block ko decompress -> linear scan
+```
+
+Practically: 400K driver steps mein se zyadatar steps ek **skip** hote hain, aur asal mein decompress kiye gaye blocks kuch hazaar hi hote hain.
+
+**(c) Aur bada trick -- WAND / block-max.** Hume top 24 chahiye, saare 400K nahi. Lucene har block ka **maximum possible score** pehle se jaanta hai. Agar ek block ka max score abhi tak ke 24th best score se kam hai, toh **poora block skip** -- usko padha hi nahi jaata. Isliye `size: 24` wali query `size: 10000` se **bahut** sasti hai, aur isliye `track_total_hits: 10000` rakhna helpful hai (exact total maangoge toh ye sara skipping band ho jaata hai, kyunki har matching doc ginna padega).
+
+#### Step 5 -- Storage intuition (50M products)
+
+| Cheez | Hisaab | Size |
+|---|---|---|
+| Documents | spec | 50,000,000 |
+| Unique terms per doc (title + description, stop/stem ke baad) | ~100 | -- |
+| Total postings entries | 50M x 100 | **5,000,000,000** |
+| Bytes per posting (delta-encoded docId + tf + ~1.2 positions, PFOR compressed) | ~3 B | -- |
+| **Postings size** | 5e9 x 3 B | **~15 GB** |
+| Unique terms in dictionary (English + brands + model numbers + typos) | ~3,000,000 | -- |
+| Dictionary size (FST, shared prefixes) | 3M x ~30 B | **< 100 MB** |
+
+Ye **chaunkane wala result** hai: jis cheez ne poora search possible banaya (postings + dictionary) woh sirf ~15 GB hai, jabki spec ka total index **~130 GB** hai. Baaki ~115 GB kya hai?
+
+- **`_source`** -- poora original JSON, taaki result mein title/price/image wapas de sakein. Sabse bada hissa.
+- **doc values** -- sorting, aggregations (facets) aur `function_score` ke liye column-oriented copy of `brand`, `price`, `rating`, `popularityScore` etc.
+- **norms** -- har doc ke har text field ki length (BM25 ke liye), 1 byte per field per doc.
+
+**Iska seedha production matlab (PART 15 mein phir aayega):** jo hissa har query mein chahiye woh **chhota** hai (dictionary + postings + doc values), aur jo hissa **bada** hai (`_source`) woh sirf final 24 documents ke liye padha jaata hai. Isiliye 43 GB/node index 30 GB page cache mein "fit" ho jaata hai -- poora nahi, lekin **jo zaruri hai woh** fit ho jaata hai.
+
+#### Step 6 -- Postgres `ILIKE '%cotton shirt%'` ko yahi kaam karna pade toh?
+
+```sql
+SELECT * FROM products WHERE title ILIKE '%cotton shirt%' LIMIT 20;
+```
+
+Postgres ke paas koi inverted index nahi hai (jab tak aap `tsvector` + GIN na banao). Uske paas sirf ek raasta hai: **sequential scan**.
+
+| | Postgres `ILIKE '%...%'` | Inverted index |
+|---|---|---|
+| Kitne rows/entries chhune padte hain | **saare 50,000,000 rows** | 2 dictionary lookups + ~400K postings (skips ke saath bahut kam) |
+| Har item par kaam | `title` string par substring search (`O(L)` characters) | integer compare |
+| Complexity | **O(N x L)** -- N = 50M rows, L = title length | ~O(matching docs), aur top-k ke saath usse bhi kam |
+| I/O | poora heap padho (rows + TOAST pointers) | sirf zaruri postings blocks |
+| Result ka order | koi nahi -- jo pehle mila woh pehle | **score ke hisaab se sorted** |
+| Typo `iphon` | 0 results | fuzzy se mil jaata hai |
+| `Mobiles` vs `mobile` | 0 results (agar exact substring nahi) | stemmer se dono `mobil` |
+
+Bas ye teen cheezein alag likho aur poori kahani samajh aa jaayegi:
+
+1. **`%x%` ka leading wildcard B-tree ko bekaar kar deta hai.** B-tree prefix se sorted hai; jab aap "beech mein kahin" maangte ho toh sorted order ka koi fayda nahi -- har row dekhni hi padegi.
+2. **`LIKE` boolean hai.** Uske paas "kaun zyada relevant hai" ka **koi concept hi nahi**. Isliye `ORDER BY` mein aapko manually kuch likhna padega (`created_at`?) jo relevance nahi hai.
+3. **Isliye search engine do alag problems solve karta hai:** inverted index = **speed**, BM25 = **relevance**. Dono ek doosre ke bina adhoore hain.
+
+> **Honest note (spec ka rule):** agar catalog **100K** products ka hai, toh Elasticsearch mat lagao. Postgres `to_tsvector('english', title) @@ plainto_tsquery('cotton shirt')` + **GIN index** aapko wahi inverted index de deta hai (haan, GIN asal mein ek inverted index hi hai!) aur `ts_rank` thoda-bahut relevance bhi. ES tab lagao jab docs > ~5-10M ho, facet counts chahiye, ya relevance tuning/typo/synonyms chahiye.
+
+---
+
+### 13.2 -- Scoring: pehle TF-IDF, phir BM25
+
+Ab intersection se {P1, P2} mil gaye. **Kaun upar aayega?** Yahi ranking hai.
+
+#### Galat approach #1 -- "matches gino"
+
+Sabse pehla idea: jitne zyada query terms match huye, utna upar.
+
+```
+P1: cotton(1) + shirt(1) = 2
+P2: cotton(2) + shirt(1) = 3     -> P2 jeeta
+```
+
+Chalo ab ek asli catalog wala case dekho:
+
+| doc | title | description |
+|---|---|---|
+| A | `Cotton Shirt` | (khali) |
+| C | `Premium Shirt` | 500 words jisme "cotton" 8 baar aur "shirt" 5 baar aaya |
+
+"Count the matches" kehta hai: A = 2, C = 13 -> **C jeeta**. Lekin user ne "cotton shirt" search kiya aur A **exactly** wahi cheez hai.
+
+**Do alag bugs hain yahan:**
+
+1. **Lambe documents jeet jaate hain.** Jitna zyada likhoge, utne zyada matches -- bina zyada relevant hue. (Aur ye SEO/keyword-stuffing ka darwaza khol deta hai: seller description mein "cotton cotton cotton" likh dega.)
+2. **Common shabd dominate karte hain.** Agar query "the north face jacket" hai aur `the` bhi term hota, toh `the` 45M documents mein hai -- uska match bataata hi kuch nahi. Par count-based scoring usko `north` ke barabar weight deta hai.
+
+Toh hume do "knobs" chahiye: **shabd kitna rare hai** aur **document kitna lamba hai**.
+
+#### Fix #1 -- IDF: rare shabd zyada keemti hai
+
+**Term: IDF (Inverse Document Frequency).** Ek line mein: *"agar ye shabd bahut saare documents mein hai, toh iska match kuch nahi bataata; agar bahut kam documents mein hai, toh iska match bahut kuch bataata hai."*
+
+Lucene ka BM25 IDF formula:
+
+```
+idf(t) = ln( 1 + (N - df + 0.5) / (df + 0.5) )
+
+N  = index mein total documents        (hamare paas 50,000,000)
+df = document frequency = kitne documents mein ye term hai
+```
+
+`+0.5` sirf "smoothing" hai (df = 0 par divide-by-zero se bachne ke liye). Asli kaam **ratio** karta hai.
+
+**Asli calculation (N = 50,000,000):**
+
+| term | df | hisaab | idf |
+|---|---|---|---|
+| `the` (agar stop word na hota) | 45,000,000 | `ln(1 + 5,000,000.5 / 45,000,000.5)` = `ln(1.1111)` | **0.10536** |
+| `cotton` | 1,200,000 | `ln(1 + 48,800,000.5 / 1,200,000.5)` = `ln(41.6667)` | **3.72970** |
+| `shirt` | 400,000 | `ln(1 + 49,600,000.5 / 400,000.5)` = `ln(125.0)` | **4.82831** |
+| `airpods` | 12,000 | `ln(1 + 49,988,000.5 / 12,000.5)` = `ln(4166.5)` | **8.33483** |
+
+**`airpods` ka ek match `the` ke ek match se 8.33 / 0.105 = ~79 guna zyada keemti hai.**
+
+Yahi woh number hai jo interview mein bolna chahiye. Aur yahi wajah hai ki stop words hatana "optional optimization" hai, **correctness requirement nahi** -- IDF khud hi `the` ko lagbhag zero weight de deta hai. Stop words hum sirf **index size** aur **postings list length** ke liye hataate hain (45M-entry postings list rakhna waste hai).
+
+> **Rare-term intuition:** query `airpods case` mein ranking practically `airpods` hi decide karta hai, `case` nahi. Yahi "best_fields" ke behaviour ko samajhne ki key hai.
+
+#### Fix #2 -- TF saturation: 10th match 1st match jitna keemti nahi
+
+Agar doc mein `cotton` 1 baar se 2 baar ho gaya, toh woh **zyada** relevant hai -- theek hai. Lekin 9 baar se 10 baar hone par? Practically kuch nahi badla.
+
+Isliye BM25 `tf` ko seedha use nahi karta, usko **saturate** karta hai:
+
+```
+tfNorm = tf / (tf + k1)          <- simplified (abhi length ignore kar rahe hain)
+```
+
+`k1` **saturation ki speed** control karta hai. `k1 = 1.2` (Lucene default, aur hamara choice):
+
+| tf | `tf / (tf + 1.2)` | pichle se gain |
+|---|---|---|
+| 1 | 0.4545 | -- |
+| 2 | 0.6250 | **+0.1705** |
+| 3 | 0.7143 | +0.0893 |
+| 4 | 0.7692 | +0.0549 |
+| 5 | 0.8065 | +0.0373 |
+| 9 | 0.8824 | +0.0129 |
+| 10 | 0.8929 | **+0.0105** |
+| 20 | 0.9434 | -- |
+| 100 | 0.9881 | -- |
+
+**1 se 2 jaane ka fayda, 9 se 10 jaane ke fayde se 16.2 guna zyada hai.** Aur chahe `tf` 100 ho ya 1000, score kabhi **1.0** se upar nahi jaata. Keyword stuffing ki upper limit lag gayi.
+
+**`k1 = 1.2` kyun?**
+- `k1 = 0` -> `tfNorm` hamesha 0 (formula tootta hai); `k1` chhota (0.3) -> turant saturate, matlab "term hai ya nahi" bas yahi matter karta hai (boolean jaisa).
+- `k1` bada (3.0) -> dheere saturate, matlab repetition ko zyada importance -- long-form text (news articles, research papers) ke liye theek.
+- **Product titles chhote hain (5-15 tokens).** Wahan `cotton` 4 baar aana relevance ka signal kam, spam ka signal zyada hai. Isliye **jaldi saturate karna sahi hai** -> `k1 = 1.2`. Ye Lucene ka default hai aur 99% cases mein isko chhedna nahi chahiye.
+
+#### Fix #3 -- Length normalization: chhote field mein match zyada strong hai
+
+Do documents dono mein `cotton` 1 baar hai:
+
+- A ka title: `Cotton Shirt` (2 terms). Title ka **50%** hissa query hai.
+- B ka title: `Premium Quality Pure Cotton Casual Regular Fit Full Sleeve Solid Formal Shirt for Men Blue` (14 terms). Title ka **7%**.
+
+A clearly zyada relevant hai. Isliye BM25 `k1` ko field length se **scale** karta hai:
+
+```
+B_factor = k1 * ( 1 - b + b * (dl / avgdl) )
+
+dl     = is document ke is field mein kitne terms hain
+avgdl  = poore index mein is field ka average term count
+b      = length normalization kitni strong ho (0 se 1)
+```
+
+`b` ko samjho:
+
+| `b` | Matlab | Kab |
+|---|---|---|
+| `0` | Length bilkul ignore. Lamba document penalize nahi hota. | Jab saare docs ek hi length ke hon |
+| `0.75` | **Balanced** -- lamba document penalize hota hai, par pura nahi | **Default, aur hamara choice** |
+| `1` | Full normalization -- score poori tarah `dl/avgdl` par divide | Jab length purely noise ho |
+
+**`b = 0.75` kyun?** Kyunki product titles mein length **dono** cheezein batati hai: thoda lamba title = zyada details (genuinely useful), bahut lamba title = keyword stuffing. `b = 1` genuine detailed titles ko bhi maar deta; `b = 0` stuffing ko inaam deta. 0.75 beech ka honest choice hai aur decades ki IR research ka default hai.
+
+#### Poora BM25 formula
+
+```
+                    tf(t,d)
+score(q,d) = SUM  idf(t) x --------------------------------------
+             t in q         tf(t,d) + k1 x ( 1 - b + b x dl/avgdl )
+```
+
+**Har symbol:**
+
+| Symbol | Naam | Kahan se aata hai | Hamare paas |
+|---|---|---|---|
+| `t` | query ka ek term | analyzed query | `cotton`, `shirt` |
+| `d` | ek candidate document | postings intersection | P1, P2 |
+| `idf(t)` | inverse document frequency | **shard** ke `N` aur `df` se | table upar |
+| `tf(t,d)` | term frequency | postings list se | 1, 2, ... |
+| `k1` | tf saturation | setting | **1.2** |
+| `b` | length normalization strength | setting | **0.75** |
+| `dl` | document (field) length in terms | `norms` se (1 byte/doc) | 2, 8, 14 |
+| `avgdl` | average field length | shard stats | **9** (title field) |
+
+#### Poori worked calculation -- 1 query, 3 documents
+
+**Setup (spec ke numbers):**
+
+```
+N       = 50,000,000
+query   = "cotton shirt"
+df(cotton) = 1,200,000   -> idf = 3.72970
+df(shirt)  =   400,000   -> idf = 4.82831
+avgdl (title) = 9
+k1 = 1.2,  b = 0.75
+```
+
+**Documents:**
+
+| doc | title | analyzed terms | `dl` | `tf(cotton)` | `tf(shirt)` |
+|---|---|---|---|---|---|
+| A | `Cotton Shirt` | `cotton shirt` | 2 | 1 | 1 |
+| B | `Premium Quality Pure Cotton Casual Regular Fit Full Sleeve Solid Formal Shirt for Men Blue` | 14 terms | 14 | 1 | 1 |
+| C | `Cotton Cotton Cotton Shirt Shirt Keyword Stuffed Cotton` | 8 terms | 8 | 4 | 2 |
+
+**Step 1 -- har doc ka `B_factor` nikalo:**
+
+```
+A:  B = 1.2 x (1 - 0.75 + 0.75 x 2/9)  = 1.2 x (0.25 + 0.166667) = 1.2 x 0.416667 = 0.50000
+B:  B = 1.2 x (1 - 0.75 + 0.75 x 14/9) = 1.2 x (0.25 + 1.166667) = 1.2 x 1.416667 = 1.70000
+C:  B = 1.2 x (1 - 0.75 + 0.75 x 8/9)  = 1.2 x (0.25 + 0.666667) = 1.2 x 0.916667 = 1.10000
+```
+
+**Step 2 -- har term ka contribution:**
+
+| doc | term | `tf` | `tf / (tf + B)` | `x idf` | contribution |
+|---|---|---|---|---|---|
+| A | cotton | 1 | `1/(1+0.5)` = 0.66667 | x 3.72970 | **2.48647** |
+| A | shirt | 1 | `1/(1+0.5)` = 0.66667 | x 4.82831 | **3.21888** |
+| B | cotton | 1 | `1/(1+1.7)` = 0.37037 | x 3.72970 | **1.38137** |
+| B | shirt | 1 | `1/(1+1.7)` = 0.37037 | x 4.82831 | **1.78826** |
+| C | cotton | 4 | `4/(4+1.1)` = 0.78431 | x 3.72970 | **2.92526** |
+| C | shirt | 2 | `2/(2+1.1)` = 0.64516 | x 4.82831 | **3.11504** |
+
+**Step 3 -- total:**
+
+| doc | BM25 score | rank |
+|---|---|---|
+| **C** | 2.92526 + 3.11504 = **6.04030** | 1 |
+| **A** | 2.48647 + 3.21888 = **5.70534** | 2 |
+| **B** | 1.38137 + 1.78826 = **3.16963** | 3 |
+
+**Ab isko padho, kyunki yahan asli seekh hai:**
+
+- **A vs B: 5.705 vs 3.170 = 1.80x.** Bilkul same terms, same tf -- sirf title length ka farak. Length normalization ne kaam kiya. [OK]
+- **C (keyword-stuffed) abhi bhi upar hai (6.040 vs 5.705).** Honest answer: **BM25 akela stuffing ko poora nahi rok paata.** Par dekho usne kitna rok liya:
+  - **Naive "count x idf"** hota toh: A = `3.7297 + 4.8283` = **8.558**, C = `4x3.7297 + 2x4.8283` = **24.575**. C, A se **2.87 guna** upar.
+  - **BM25 ke saath:** C / A = **1.059**. 2.87x ka gap 1.06x reh gaya -- lagbhag tie.
+  - Aur baaki 6% gap ko **business signals** khatam karenge (13.4) -- C ki popularity 10 hai, A ki 20,000.
+
+> **Yahi asli lesson hai:** BM25 ka kaam "perfect ranking" dena nahi hai. Uska kaam **text relevance ko ek sane, bounded, comparable number** mein badalna hai, taaki uske upar business logic laga sako. Agar aapka text score hi bekaar hai, toh uske upar ka koi boost nahi bachaayega.
+
+#### ES asal mein karta kya hai (per-shard scoring)
+
+Ye chhoti si baat interview mein bahut achhi lagti hai:
+
+```
+Search API  -->  Coordinating node
+                      |
+       +--------+-----+-----+--------+--------+--------+
+       v        v           v        v        v        v
+    shard0   shard1      shard2   shard3   shard4   shard5     (6 primary shards)
+       |        |           |        |        |        |
+   har shard APNE docs par BM25 chalata hai, APNE N aur df ke saath
+   har shard apne top 24 (docId + score) bhejta hai
+                      |
+                      v
+        Coordinating node: 6 x 24 = 144 results ko score se sort
+        -> top 24 chuno -> phir un 24 ka `_source` fetch karo (fetch phase)
+```
+
+Ye **query_then_fetch** hai (default): pehle sirf ids + scores, phir sirf jeetne wale 24 documents ka poora JSON. Isliye `_source` bada hona theek hai -- woh sirf 24 docs ke liye padha jaata hai.
+
+**"Distributed IDF" ki subtlety:** dhyan do ki har shard `N` aur `df` **apne local** documents se nikalta hai. Matlab `airpods` ka idf shard0 par 8.34 aur shard3 par 8.29 ho sakta hai. Theoretically scores across shards perfectly comparable nahi hain.
+
+**Practically ye matter karta hai?**
+
+| Situation | Matter karta hai? |
+|---|---|
+| 6 shards, documents randomly distributed (default routing = hash of `_id`) | **Nahi.** Har shard ~8.3M docs, term distribution statistically identical. |
+| 2-3 shards, ya custom routing (e.g. `routing = sellerId`) | **Haan** -- ek shard mein Apple ke saare products chale gaye toh `apple` ka local df wahan bahut zyada, kahin bahut kam. |
+| Test index with 5 documents | **Haan, bahut** -- yahi wajah hai ki chhote test index par scores "ajeeb" lagte hain. |
+
+ES ne iske liye `search_type=dfs_query_then_fetch` diya hai: ek extra round-trip jismein pehle saare shards se global `df` collect hote hain, phir usse scoring hoti hai. **Hum ise production mein use nahi kar rahe** -- extra round trip = extra latency, aur hamare 6 well-balanced shards par fayda ~0 hai. Use karo sirf **debugging/tests** mein jab aap "score itna alag kyun hai" samajhna chahte ho.
+
+> **Interview line:** "BM25 ek shard-local calculation hai. Har shard apne `N` aur `df` se IDF nikalta hai aur apne top-k coordinating node ko bhejta hai. Well-balanced shards par ye difference statistical noise hai; agar aap custom routing use karte ho ya bahut kam documents hain, tab `dfs_query_then_fetch` ya kam shards consider karna."
+
+---
+
+### 13.3 -- Query context vs Filter context
+
+Hamari canonical query mein `bool` ke andar do alag jagah hain -- aur ye farak samajhna **sabse zyada latency bachata hai**:
+
+```json
+"bool": {
+  "must":   [ { "multi_match": { ... } } ],        <- QUERY context   (score karta hai)
+  "filter": [ { "term": { "brand": "Apple" } },    <- FILTER context  (sirf haan/na)
+              { "range": { "price": { "gte": 500, "lte": 2000 } } },
+              { "term": { "inStock": true } } ]
+}
+```
+
+| | Query context (`must`, `should`) | Filter context (`filter`, `must_not`) |
+|---|---|---|
+| Sawaal | "ye doc **kitna** match karta hai?" | "ye doc match karta hai -- **haan ya na**?" |
+| Output | ek float score | ek bit (0/1) |
+| Scoring ka kaam | **haan** -- BM25 chalta hai | **nahi** -- bilkul skip |
+| Cacheable | **nahi** (score query-specific hai) | **haan** -- **bitset** cache hoti hai |
+| ES mein kaunsa cache | koi nahi | **node query cache** |
+
+**Bitset kya hai?** Ek segment mein 8.3M documents hain. `brand = Apple` ka jawab ek **8.3M bits ka array** hai -- har doc ke liye 1 bit. 8.3M bits = ~1 MB (aur agar matches kam hain toh ES **roaring bitmap** use karta hai, jo aur bhi chhota).
+
+Ab do filters ko combine karna = **bitwise AND**. CPU ek instruction mein 64 bits AND karta hai. 8.3M bits = ~130,000 AND operations = **microseconds**. Aur ye bitset **agli query mein dobara ban-ne ki zarurat hi nahi** -- cached hai.
+
+#### Hamare filters kahan jaate hain
+
+| Filter | Kahan | Kyun |
+|---|---|---|
+| `q` (user ka text) | **`must`** (`multi_match`) | Yahi to relevance decide karta hai. Score chahiye. |
+| `brand=Apple` | **`filter`** | User ne explicitly bola. "Kitna Apple hai" ka koi matlab nahi -- ya hai ya nahi. |
+| `priceMin/priceMax` | **`filter`** | Same -- range ke andar hai ya nahi. |
+| `inStockOnly` | **`filter`** | Boolean. |
+| `categoryPath` | **`filter`** | User ne category chuni hai. |
+| `minRating >= 4` | **`filter`** | Range. (Rating ko **ranking** mein bhi chahiye? Woh `function_score` ka kaam hai, filter ka nahi.) |
+| `inStock` ka **boost** | `function_score` ki `functions` mein | Ye score badalta hai -- filter nahi, boost hai. Dhyan do: `inStock` **dono** jagah hai aur dono ka kaam alag hai. |
+
+> **Rule (yaad rakho):** **"Jo cheez score mein contribute nahi karti, usko hamesha `filter` mein daalo."** Agar aap khud ko `must` mein ek `term` query likhte hue pakdo, toh 95% chance hai ki aapko `filter` chahiye tha.
+
+#### `brand` ko `must` se `filter` mein le jaane par kya badalta hai?
+
+Maan lo query "cotton shirt" ke 1.2M docs match kar rahe hain aur user ne `brand = Allen Solly` bhi lagaya.
+
+**Agar `brand` `must` mein hota:**
+
+1. ES ko `brand` term query ka **score** nikalna padta -- har matching doc ke liye idf x tfNorm. `brand` ek `keyword` field hai, har doc mein tf = 1, toh ye score **poori tarah bekaar** hai (har doc ko same number milega) -- par compute phir bhi hota hai.
+2. Ye clause **cache nahi** hoti. Har request par scratch se.
+3. Score combination (`must` ke clauses ka sum) ka extra kaam.
+
+**Agar `brand` `filter` mein hai:**
+
+1. Pehli baar: bitset banti hai (ek postings list walk) aur **node query cache** mein chali jaati hai.
+2. Har agli baar: bitset cache se, cost ~0.1 ms.
+3. Aur sabse bada fayda -- **scorer ko kam documents dene padte hain**. Agar Allen Solly ke sirf 15,000 products hain, toh BM25 1.2M docs par nahi, ~15,000 par chalega.
+
+**Measured intuition (apne cluster par khud naapo, ye estimate hai):**
+
+| Setup | ES `took` (p95) |
+|---|---|
+| `brand` as `must` (scored, uncached) | ~90-100 ms |
+| `brand` as `filter`, **pehli** request (bitset ban rahi hai) | ~75 ms |
+| `brand` as `filter`, cached bitset | **~55-65 ms** |
+
+Yaani ek `must` ko `filter` mein move karne se ~30-35% latency gayi -- **bina result badle**. Ye search tuning ka sabse sasta win hai.
+
+> **Ek gotcha:** `filter` mein daalne se result **bilkul same** aata hai sirf tab jab woh clause score mein genuinely contribute nahi kar raha tha. Agar aap `should` ka koi clause galti se `filter` mein daal doge, toh woh **mandatory** ban jaayega (`filter` = AND) aur results kam ho jaayenge. `should` -> `filter` move **karne se pehle soch lo**.
+
+---
+
+### 13.4 -- Business ranking: `function_score`
+
+BM25 ne text ka kaam kar diya. Lekin marketplace mein text hi sab kuch nahi hai:
+
+- Ek product jo **out of stock** hai, woh top par aakar user ka time waste karta hai.
+- Ek product jiske **30 din mein 20,000 orders** aaye hain woh clearly better hai us product se jiske 10.
+- Ek **naya launch** thoda upar aana chahiye.
+
+Ye "business signals" hain. Inko relevance ke saath kaise milayein? Spec ka jawab:
+
+```json
+"function_score": {
+  "query": { "bool": { "must": [...], "filter": [...] } },
+  "functions": [
+    { "field_value_factor": { "field": "popularityScore", "modifier": "log1p", "missing": 0 }, "weight": 0.3 },
+    { "filter": { "term": { "inStock": true } }, "weight": 1.2 }
+  ],
+  "score_mode": "sum",
+  "boost_mode": "multiply"
+}
+```
+
+**Field by field:**
+
+| Field | Kya karta hai |
+|---|---|
+| `query` | Andar wali asli query. Iska output = **BM25 score**. |
+| `functions` | Ek list of "score modifiers". Har ek apna number nikalta hai. |
+| `field_value_factor.field` | Kis doc field se number uthana hai -- `popularityScore` (float, nightly job se aata hai). **Ye doc values se padha jaata hai, `_source` se nahi** -- isliye fast. |
+| `field_value_factor.modifier` | Raw value par kaunsa math lagana -- `log1p` = `log10(1 + value)`. |
+| `field_value_factor.missing` | Field hi na ho toh kya maano -- `0`. (Naye products jinke liye job abhi nahi chali.) |
+| `weight` (pehla function) | `0.3` -- popularity ka final asar kitna. |
+| `filter` + `weight` (doosra function) | Agar doc `inStock: true` hai toh ye function `1.2` deta hai; agar nahi, toh ye function **apply hi nahi hota** (0 contribute karta hai). |
+| `score_mode: "sum"` | Saare functions ke outputs ko **jodo** -> ek "multiplier" banao. |
+| `boost_mode: "multiply"` | Us multiplier ko **BM25 score se guna** karo -> final `_score`. |
+
+#### `log1p` kyun? Raw popularity kyun nahi?
+
+Ye sabse important design decision hai. Numbers dekho:
+
+| `popularityScore` (30-day orders) | raw x 0.3 | `log10(1+p)` | x 0.3 |
+|---|---|---|---|
+| 0 | 0 | 0.0000 | 0.0000 |
+| 10 | 3 | 1.0414 | 0.3124 |
+| 500 | 150 | 2.6998 | 0.8100 |
+| 20,000 | **6,000** | 4.3011 | 1.2903 |
+| 1,000,000 | **300,000** | 6.0000 | 1.8000 |
+
+**Raw popularity ke saath:** BM25 score 3 se 8 ke beech hota hai. Multiplier 6,000 aur 300,000 ho jaata hai. Ab `5.7 x 6000` vs `3.1 x 300000` -- **text score ka koi matlab hi nahi bacha**. Aapka "search" chupchaap **"sort by popularity"** ban gaya. User "cotton shirt" likhega aur usko site ka sabse popular product milega, jo shayad ek phone case ho.
+
+**`log1p` ke saath:** 1,000,000 vs 20,000 ka raw ratio **50x** hai, log ke baad sirf **1.40x**. Popularity ab ek **tie-breaker** hai, dictator nahi.
+
+> **Rule:** koi bhi unbounded business signal (orders, views, revenue, follower count) **kabhi raw form mein** score mein mat daalo. Log lo, ya bucket karo (0-10, 10-100, ...), ya percentile rank mein badlo.
+
+#### `boost_mode`: multiply vs sum vs replace
+
+Upar wale BM25 worked example ko aage badhate hain. Teen documents, unke business signals ke saath:
+
+| doc | BM25 | `popularityScore` | `inStock` | functions sum = `0.3 x log10(1+pop) + (inStock ? 1.2 : 0)` |
+|---|---|---|---|---|
+| A (`Cotton Shirt`) | 5.70534 | 20,000 | true | `1.2903 + 1.2` = **2.4903** |
+| B (lamba title) | 3.16963 | 1,000,000 | true | `1.8000 + 1.2` = **3.0000** |
+| C (stuffed) | 6.04030 | 10 | **false** | `0.3124 + 0` = **0.3124** |
+
+Ab teeno `boost_mode` ka result:
+
+| `boost_mode` | formula | A | B | C | Final order |
+|---|---|---|---|---|---|
+| **`multiply`** | `bm25 x fn` | **14.208** | 9.509 | 1.887 | **A > B > C** [OK] |
+| `sum` | `bm25 + fn` | 8.196 | 6.170 | **6.353** | A > **C** > B [X] |
+| `replace` | `fn` (BM25 phenk do) | 2.490 | **3.000** | 0.312 | **B** > A > C [X] |
+
+**Padho ki kya hua:**
+
+- **`multiply` (hamara choice):** A jeeta. Text mein best tha, stock mein tha, achhi popularity. C (jiska BM25 sabse zyada tha) **7th se seedha last** -- kyunki out of stock hai aur nobody buys it. Yahi hum chahte the.
+- **`sum` ne C ko wapas upar la diya.** Kyun? Kyunki `sum` mein dono scales **compete** karte hain, aur BM25 ka scale **query ke saath badalta hai**. Query `airpods` (idf 8.3) ka BM25 ~9 hoga, query `cotton` (idf 3.7) ka ~3. Ek hi fixed additive boost (`+1.2`) pehli query mein 13% hai aur doosri mein 40%. **Aapka boost predictably behave hi nahi karega.** `multiply` **scale-invariant** hai -- 20% boost hamesha 20% boost hai.
+- **`replace` ne search ko tod diya.** B jeeta sirf isliye ki woh sabse popular hai. Ye technically "search" nahi raha.
+
+> **Rule (yaad rakho):** **"Relevance ko multiply karo, replace mat karo."** Business signal relevance ka **multiplier** hai, uska **substitute** nahi.
+
+#### Ek asli gotcha: multiplier zero ho sakta hai
+
+Spec ki query mein ek real edge case hai jo production mein aapko milega:
+
+```
+Doc: out of stock (inStock = false) AND popularityScore = 0 (naya product, job abhi nahi chali)
+functions sum = 0.3 x log10(1+0) + 0 = 0 + 0 = 0
+boost_mode multiply -> final score = bm25 x 0 = 0
+```
+
+Aur **saare** aise documents ka score exactly `0` ho jaata hai -- yaani unke beech ka order BM25 se nahi, hamare tie-breaker `{ "productId": "asc" }` se decide hoga. Matlab **random**.
+
+**Fix (production mein main ye karta hoon):** ek teesra always-on function add kar do jiska kaam sirf floor set karna hai:
+
+```json
+"functions": [
+  { "weight": 1 },
+  { "field_value_factor": { "field": "popularityScore", "modifier": "log1p", "missing": 0 }, "weight": 0.3 },
+  { "filter": { "term": { "inStock": true } }, "weight": 1.2 }
+],
+"score_mode": "sum",
+"boost_mode": "multiply",
+"max_boost": 5
+```
+
+Ab multiplier ka **minimum 1.0** hai (yaani "koi boost nahi", score = pure BM25) aur `max_boost: 5` upar se bhi cap laga deta hai taaki ek viral product baaki sab ko na daba de.
+
+#### Aage ka step: Learning to Rank (LTR) -- v1 mein NAHI
+
+Ye saare `0.3`, `1.2`, `^3`, `^2` numbers **kisi ne haath se tune kiye hain**. Ek aadmi baitha, queries dekhi, numbers badle, aankh se judge kiya "ab better lag raha hai". Ye **scale nahi karta** -- 20 signals ke baad koi insaan nahi bata sakta ki kaunsa weight sahi hai.
+
+**Learning to Rank ka idea:** weights guess mat karo, unhe **data se seekho**. Ek ML model (usually **LambdaMART**, ek gradient-boosted tree) ko sikhao ki "in features wale document ko is query par kaunsi position milni chahiye".
+
+Uske liye **kya data chahiye** (aur yahi is section ka asli point hai):
+
+| Chahiye | Kahan se | Hamare paas hai? |
+|---|---|---|
+| **Click logs** -- kis query par kaunsa product, kaunsi position par dikha aur click hua | Kafka `search-queries` topic -> S3/warehouse | **Haan** -- spec mein `query, results count, clicked position` log ho raha hai |
+| **Impressions** -- kya-kya dikha tha par click **nahi** hua | Wahi log (poora result set, ya top 24) | Add karna padega |
+| **Conversions** -- click ke baad add-to-cart / order hua? | Order service se join | Add karna padega |
+| **Position bias correction** -- position 1 par click isliye hua ki woh relevant tha, ya isliye ki woh position 1 par tha? | Interleaving / randomization experiments | **Nahi** -- ye sabse mushkil hissa hai |
+| **Features at query time** -- BM25 per field, popularity, price, rating, category match | ES LTR plugin feature store | Plugin chahiye |
+
+**Hum v1 mein LTR nahi kar rahe** kyunki: (a) hamare paas abhi enough clean click data nahi, (b) position bias ke bina model seekhta hai "jo upar tha woh achha tha" -- yaani apne hi purane ranking ko copy karta hai, (c) ek aur moving part production mein. Pehle **query logs collect karo** (jo hum kar hi rahe hain), phir 6 mahine baad LTR.
+
+> **Interview line:** "v1 mein hand-tuned `function_score` -- text relevance ka multiplier, kabhi replacement nahi. Weights ko `log1p` se compress karta hoon taaki popularity relevance ko na daba de. Jab click logs mature ho jaayein, tab LambdaMART-based LTR se top 100 ko re-rank karunga -- lekin uske liye impressions aur position-bias correction pehle chahiye, warna model apne hi purane ranking ko copy kar lega."
+
+---
+
+### 13.5 -- Typo tolerance: Levenshtein edit distance
+
+Spec ka baseline: **zero-result rate ~12%** hai aur uska bada hissa typos hain. `iphon`, `samsng`, `bluetuth`, `addidas` -- ye sab abhi 0 results dete hain.
+
+#### Pehle: edit distance kya hai?
+
+**Term: Levenshtein edit distance.** Do strings ke beech minimum kitne **single-character operations** (insert, delete, substitute) chahiye taaki ek doosri ban jaaye.
+
+```
+iphon  -> iphone     1 insert  ('e')                       distance 1
+samsng -> samsung    1 insert  ('u')                       distance 1
+iphonr -> iphone     1 substitute ('r' -> 'e')             distance 1
+ifone  -> iphone     1 substitute + 1 insert               distance 2
+```
+
+#### DP table haath se: `iphon` -> `iphone`
+
+Dynamic programming: ek grid banao jahan `d[i][j]` = "`a` ke pehle `i` characters ko `b` ke pehle `j` characters mein badalne ki cost".
+
+**Rules:**
+```
+d[0][j] = j                        (khali string se j characters -- j inserts)
+d[i][0] = i                        (i characters se khali -- i deletes)
+
+d[i][j] = min(
+    d[i-1][j]   + 1,               DELETE a[i-1]
+    d[i][j-1]   + 1,               INSERT b[j-1]
+    d[i-1][j-1] + cost             SUBSTITUTE  (cost = 0 agar a[i-1] == b[j-1], warna 1)
+)
+```
+
+**Table (`a = iphon`, rows; `b = iphone`, columns):**
+
+```
+        ""   i    p    h    o    n    e
+  ""     0    1    2    3    4    5    6
+  i      1    0    1    2    3    4    5
+  p      2    1    0    1    2    3    4
+  h      3    2    1    0    1    2    3
+  o      4    3    2    1    0    1    2
+  n      5    4    3    2    1    0    1
+```
+
+**Answer = `d[5][6]` = bottom-right = 1.** [OK]
+
+Dhyan do **diagonal ka zero-track**: jab tak characters match ho rahe hain (`i=i`, `p=p`, `h=h`, `o=o`, `n=n`), diagonal par 0 chalta rehta hai. Aakhir mein ek extra character (`e`) bacha -> +1. Yahi visual hai "ek insert".
+
+**Complexity:** `O(m x n)` -- yahan 5 x 6 = 30 cells. Chhota lagta hai. **Ab yahi 3 million terms ke liye karo -- 90 million cell computations per query term.** Ye production mein impossible hai, aur isliye ES ye **nahi** karta (neeche dekho).
+
+#### `fuzziness: AUTO` -- kitne edits allow karein?
+
+Fixed `fuzziness: 2` sabke liye galat hai:
+
+- `go` (2 chars) par 2 edits = practically **har** 2-4 letter word match ho jaayega.
+- `refrigerator` (12 chars) par 1 edit bahut kam hai -- lambi typing mein 2 galtiyaan aam hain.
+
+Isliye `AUTO` length ke hisaab se decide karta hai:
+
+| Term length | Max edits allowed | Example |
+|---|---|---|
+| **1-2** | **0** (exact hi chahiye) | `tv`, `ac`, `hp` |
+| **3-5** | **1** | `iphon`(5) -> `iphone` [OK], `sony`(4) -> `sona`, `tony`, `song` |
+| **> 5** | **2** | `samsung`(7) -> `samsnug`, `samsang`, `smasung` |
+
+Hamare spec ki query mein: `"fuzziness": "AUTO"`. `iphon` 5 chars ka hai -> 1 edit allowed -> `iphone` distance 1 par hai -> **match**. [OK] Problem solved.
+
+#### Cost model: fuzzy mehenga kyun hai?
+
+ES har term ke saath `iphon` ka DP nahi chalata. Woh **Levenshtein automaton** banata hai -- ek finite state machine jo "woh saare strings jo `iphon` se <= 1 edit door hain" ko accept karta hai. Phir us automaton ko **term dictionary ke FST ke saath intersect** karta hai (dono automata hain, toh intersection ek graph walk hai).
+
+Fir bhi mehenga hai. Kyun?
+
+```
+Normal term query:   "iphone" -> FST mein binary-search jaisa walk -> 1 postings list
+Fuzzy term query:    "iphon"  -> automaton walk -> N matching terms milte hain
+                                 -> har ek ki postings list
+                                 -> N postings lists ka UNION (bool should)
+```
+
+Yaani **ek term N terms ban gaya**, aur query cost N guna ho gayi. 3M terms wali dictionary mein `iphon` se 1-edit door terms ho sakte hain: `iphone`, `iphons`, `iphonx`, `phon`, `ipho`, `iphony`, `ihon`, ... aasaani se 40-100.
+
+**Do brakes lagte hain:**
+
+**1. `prefix_length: 1`** -- "pehla character exactly match hona chahiye, uspar koi edit allowed nahi."
+
+| | Kya hota |
+|---|---|
+| `prefix_length: 0` | Automaton ko **poore** FST ka root se walk karna padta hai -- `a` se lekar `z` tak saari branches. `iphon` ke liye `aphon`, `bphon`, `phon`... sab explore. |
+| **`prefix_length: 1`** | Walk seedha `i` wali branch se shuru hota hai. **Dictionary ka ~96% hissa chhua hi nahi jaata.** |
+
+Trade-off: pehle character ki typo pakad mein nahi aayegi (`uphone` -> `iphone` miss). Ye acceptable hai -- log pehla akshar kam hi galat type karte hain (aur autocomplete waise bhi pehle akshar se hi kaam karta hai).
+
+**2. `max_expansions: 50`** -- "automaton se jitne bhi terms mile, unme se **maximum 50** hi use karo."
+
+Ye ek **hard cap** hai jo query ko unbounded hone se rokta hai. Bina iske ek chhoti fuzzy query 500 term queries ka `bool should` ban sakti hai aur ek shard par seconds le sakti hai.
+
+> **Honest gotcha jo log nahi batate:** `max_expansions` **best 50 nahi chunta -- pehle 50 chunta hai**, term order mein (alphabetical-ish, jaise FST walk se milte hain). Matlab agar aapka sahi term `z` se shuru hone wale region mein hai aur 50 slots pehle hi bhar gaye, toh **woh miss ho jaayega**. Ye fuzzy search ka sabse confusing "kabhi kaam karta hai kabhi nahi" wala bug hai. `prefix_length: 1` isko bahut kam kar deta hai (kyunki candidates pehle se hi ek branch tak simit hain).
+
+#### Fuzzy kab **nuksaan** karta hai
+
+Ye section interview mein sabse zyada impress karta hai, kyunki log fuzzy ko "free win" samajhte hain.
+
+| Case | Kya hota hai | Kya karo |
+|---|---|---|
+| **Chhoti queries** | `sony` (4 chars, 1 edit) match karega `sona`, `song`, `tony`, `sont`, `soni`, `pony`. User ko Sony ke headphones ke beech mein "Sona jewellery" dikhega. | `AUTO` already 1-2 chars par 0 edits deta hai. Aur 3-4 char terms par fuzzy off karne ka option rakho (`AUTO:4,7` syntax se thresholds badal sakte ho). |
+| **Brand names** | `nike` vs `bike`, `puma` vs `pumo`, `boat` vs `coat`/`goat`/`boot`. Brand ek `keyword` field hai jispar hum boost `^2` de rahe hain -- galat brand match hone se poora result set kharab. | Brand field par fuzzy **mat** lagao. `multi_match` ki jagah `bool should` mein `brand` ka exact/prefix match alag rakho. |
+| **Part numbers / model numbers** | `MQ8F3HN/A`, `WH-1000XM5`. Yahan har character meaning rakhta hai. `WH-1000XM5` se 2 edits door `WH-1000XM4` hai -- jo ek **alag product** hai! | In fields par fuzzy off. Agar query mein digits + uppercase pattern dikhe, toh exact match mode par switch karo. |
+| **Query already perfect ho** | User ne `iphone` bilkul sahi likha, phir bhi ES `iphonr`, `iphons`, `phone` ki postings lists bhi union kar raha hai. Extra kaam, aur neeche kachra results. | **Two-pass strategy (recommended):** pehle exact query chalao; agar results < threshold (e.g. 5) tab fuzzy retry karo. Isse 95% queries par fuzzy ka cost hi nahi lagta. |
+| **Lambi queries** | `q` 100 chars = ~15 terms, har ek 50 expansions tak = 750 term queries. | Spec ka validation: **`q` max 100 chars**. Yahi uski asli wajah hai. |
+
+> **Interview line:** "`fuzziness: AUTO` lunga taaki chhote terms par fuzzy off rahe, `prefix_length: 1` taaki automaton poore term dictionary ko na chhue, aur `max_expansions: 50` taaki ek query unbounded `bool should` na ban jaaye. Production mein main fuzzy ko **conditional** rakhta hoon -- pehle exact, results kam aaye tabhi fuzzy retry -- kyunki fuzzy 95% queries mein sirf cost hai, fayda nahi. Aur brand/model-number fields par fuzzy bilkul nahi, wahan 1 edit ka matlab alag product hota hai."
+
+---
+
+### 13.6 -- Synonyms
+
+Stemmer ne `mobiles -> mobil` solve kar diya. Lekin ye nahi kar sakta:
+
+```
+mobile  =  smartphone  =  cell phone  =  handset
+laptop  =  notebook
+sofa    =  couch
+tv      =  television
+men     =  man   (irregular plural, stemmer fail)
+```
+
+Ye **semantic** relations hain, spelling relations nahi. Iske liye ek explicit list chahiye: `synonyms.txt` (spec: Postgres `search_synonyms` table se export hoti hai).
+
+#### Index time vs Search time
+
+| | **Index time** synonyms | **Search time** synonyms (hamara choice) |
+|---|---|---|
+| Kahan lagta hai | `product_index` analyzer mein | `product_search` analyzer mein |
+| Kya hota hai | Doc `"Samsung Mobile"` index hota hai as `samsung, mobil, smartphon, cell, phone` | Doc waise ka waisa (`samsung, mobil`); **query** expand hoti hai |
+| Query speed | **Fast** -- query mein 1 term, exact lookup | Thoda slow -- 1 term se 3-4 terms banti hain |
+| Index size | **Bada** -- har synonym ka posting store hota hai | Normal |
+| Synonym list badle toh | **Poora reindex** -- 50M docs, ghanton ka kaam, alias swap | `POST /products/_reload_search_analyzers` -- **seconds** |
+| IDF par asar | **Kharab** -- inject kiye gaye synonyms `df` bigaad dete hain. `smartphone` ka df artificially 2M ho jaayega, uska idf gir jaayega | Saaf -- `df` asli text ka hi rehta hai |
+| Multi-word synonyms | Behtar handle hote hain (index time par positions fix ho jaati hain) | **Graph chahiye** (`synonym_graph`), warna phrase queries tootti hain |
+
+**Hamara decision (spec):** **search time**, `synonym_graph` filter ke saath.
+
+**Kyun:** synonym list ek **operations artifact** hai -- weekly badalti hai. Merchandising team dekhti hai ki `"cell phone"` par zero results aa rahe hain, ek row add karti hai, aur usko **aaj** live chahiye. 50M docs ka reindex har hafte karna business ko block kar dega. Search-time ka query cost (ek term se 3 terms) hum affordable maante hain.
+
+**Trade-off jo hum accept kar rahe hain:** har query par thoda extra kaam, aur "graph-aware" queries hi use kar sakte hain (`match`, `match_phrase`, `multi_match` -- ye sab theek hain; `query_string` ke kuch modes graph synonyms par exception dete hain).
+
+#### Multi-word synonym ka worked example
+
+Rule file mein:
+
+```
+cell phone, cellphone, handset => mobile
+```
+
+(`=>` ka matlab: bayin taraf wale sab ko dayin taraf wale se **replace** karo. `,` se likhte toh sab ek doosre ke equivalent hote.)
+
+Query: **`cell phone cover`**
+
+Search analyzer chain: `lowercase -> syn_graph -> en_stop -> en_stemmer`
+
+**Step A -- tokenizer + lowercase:**
+```
+pos:   0       1        2
+     cell    phone    cover
+```
+
+**Step B -- `synonym_graph` filter:** Ye filter **multi-token sequence** ko pehchanta hai. `cell` + `phone` milkar ek rule match karte hain, toh woh ek naya token `mobile` emit karta hai jo **2 positions ko span** karta hai (`positionLength = 2`):
+
+```
+             +-------- mobile (positionLength = 2) --------+
+             |                                             |
+pos:   0     |   1                2
+           cell  ------------  phone  ----------------  cover
+```
+
+Isko **token graph** kehte hain -- ek linear token stream nahi, balki **alternate paths** wala graph.
+
+**Step C -- stemmer:** `cell -> cell`, `phone -> phone`, `mobile -> mobil`, `cover -> cover`.
+
+**Step D -- ES is graph se query banata hai:**
+
+```
+( ( +cell +phone )  OR  mobil )   AND/OR-per-operator   cover
+```
+
+Yaani: doc match karega agar usme **ya toh** `cell` aur `phone` **bagal-bagal** hain, **ya** `mobil` hai -- aur saath mein `cover`.
+
+Ab dono products match honge:
+- `"Cell Phone Cover Transparent"` -> literal path se
+- `"Mobile Back Cover Silicone"` -> synonym path se [OK]
+
+**Agar `synonym_graph` ki jagah purana `synonym` filter hota:** woh `mobile` ko sirf position 0 par chipka deta, `positionLength` ke bina. Tab query effectively `(cell OR mobil) AND phone AND cover` ban jaati -- yaani `"Mobile Back Cover"` match **nahi** hota kyunki usme `phone` nahi hai. **Yahi wajah hai ki hamesha `synonym_graph` use karo, `synonym` nahi.**
+
+#### Operations flow (spec ke hisaab se)
+
+```
+Ops user  ->  POST /api/v1/admin/synonyms
+                   |
+                   v
+              Postgres `search_synonyms` table (terms, enabled)
+                   |
+                   v  (export job)
+              synonyms.txt  -> saare ES data nodes par (config dir / S3 se sync)
+                   |
+                   v
+              POST /products/_reload_search_analyzers
+                   |
+                   v
+              Nayi queries turant naye synonyms use karti hain. REINDEX NAHI.
+```
+
+> **Yaad rakho ye rule:** **"Analyzer badla = reindex chahiye."** Lekin `product_index` analyzer nahi badla -- sirf `product_search` badla. Search analyzer sirf query time par chalta hai, isliye reindex ki zarurat **nahi**. Yahi poora fayda hai search-time synonyms ka.
+
+---
+
+### 13.7 -- Autocomplete
+
+Spec ke numbers dobara dekho, kyunki yahi poora design drive karte hain:
+
+```
+Search:        20M/day  = 231 QPS avg, ~1,000 QPS peak
+Autocomplete:  80M/day  = 925 QPS avg, ~4,000 QPS peak     <- 4x ZYADA
+Latency budget: search p99 400 ms, autocomplete p99 100 ms  <- 4x TIGHT
+```
+
+**Autocomplete search se 4 guna zyada traffic hai aur usko 4 guna tez hona hai.** Agar aap isko same `products_v3` index par chalayenge, toh autocomplete hi aapka cluster kha jaayega aur asli search bhi mar jaayegi. Isliye alag index (`suggestions_v2`) aur alag cache.
+
+Kyun 4x? User `iphone 15 case` type karta hai = 14 characters. 150 ms debounce ke baad, har "typing pause" par ek request -- average ~4 requests per search. Aur user 4 mein se 1 baar hi Enter dabata hai.
+
+#### Teen designs ka poora comparison
+
+**Design 1 -- `match_phrase_prefix` main index par**
+
+```json
+GET /products/_search
+{ "size": 10,
+  "query": { "match_phrase_prefix": { "title": { "query": "iphone ca", "max_expansions": 50 } } } }
+```
+
+Kaam kaise karta hai: `iphone` ko normal term maanta hai, **last token** `ca` ko **prefix query** banata hai -- yaani term dictionary mein `ca` se shuru hone wale saare terms dhoondhta hai (`case`, `car`, `cable`, `camera`, `cap`, ...) aur unka union leta hai, phir phrase positions check karta hai.
+
+**Design 2 -- Edge n-gram index (hamara choice)**
+
+**Term: edge n-gram.** Ek shabd ke **shuruat se** banne wale saare prefixes.
+
+Spec ka filter: `{ "type": "edge_ngram", "min_gram": 2, "max_gram": 20 }`
+
+```
+"iphone"  ->  ip, iph, ipho, iphon, iphone          (5 tokens; min_gram 2 isliye "i" nahi)
+"case"    ->  ca, cas, case                          (3 tokens)
+```
+
+Ye **index time** par hota hai (`autocomplete_index` analyzer). Query time par `search_analyzer: standard` -- yaani query ke saath **koi n-gram nahi** banta:
+
+```
+Index time:   "iPhone 15 Pro Max Case"  ->  ip iph ipho iphon iphone 15 pr pro ma max ca cas case
+Query time:   "iphon"                   ->  iphon        (bas, ek term)
+Lookup:       ek exact term lookup. O(1)-ish.
+```
+
+**Agar `search_analyzer` bhi `autocomplete_index` hota** (ye ek **bahut common bug** hai), toh query `iphon` bhi `ip, iph, ipho, iphon` ban jaati aur woh `ip` wale sab documents match kar leti -- results poore kharab.
+
+Index size ka cost:
+
+| word | length | edge n-grams (min 2) |
+|---|---|---|
+| `iphone` | 6 | 5 |
+| `15` | 2 | 1 |
+| `pro` | 3 | 2 |
+| `max` | 3 | 2 |
+| `case` | 4 | 3 |
+| **total** | 5 tokens | **13 tokens** |
+
+**~2.6x term volume.** Agar hum ye poore `products_v3` par (description sameth) karte toh index phat jaata. Isliye spec ne `suggestions_v2` ko **alag aur chhota** rakha hai -- usme sirf suggestion strings hain (queries, category names, product titles), descriptions nahi. Woh chhota hai, RAM mein fit ho jaata hai.
+
+**Design 3 -- Completion suggester (FST)**
+
+```json
+"suggest": { "s": { "prefix": "iphon", "completion": { "field": "suggest", "size": 10, "fuzzy": { "fuzziness": 1 } } } }
+```
+
+Ye Lucene ka special data structure hai: ek **FST (Finite State Transducer)** jo **poora JVM heap mein** rehta hai. Prefix lookup = FST par ek walk = **microseconds**. Har entry ke saath ek `weight` store hota hai, toh top-N by weight bhi free mein mil jaata hai.
+
+#### Poora comparison table
+
+| | **1. `match_phrase_prefix`** | **2. Edge n-gram index** (hamara) | **3. Completion suggester (FST)** |
+|---|---|---|---|
+| **Kaam kahan hota** | **Query time** -- prefix expansion har request par | **Index time** -- prefixes pehle se bane hue | **Index time** -- FST build |
+| **Query time cost** | High: term dictionary scan + union of N terms + phrase check | **Low: ek term lookup** | **Lowest: in-memory FST walk** |
+| **Index time cost** | Zero (existing index) | ~2.6x tokens, alag index maintain | FST build + heap |
+| **Memory** | Normal | Alag chhota index (page cache mein fit) | **JVM heap** -- aur heap 31 GB par capped hai |
+| **Typo tolerance** | **Nahi** | Haan, `fuzziness` laga sakte ho | Haan (`fuzzy` option) |
+| **Filters (category, in-stock)** | Haan, poori query DSL | **Haan, poori query DSL** | **Limited** -- sirf `context` fields (pehle se declare karne padte hain) |
+| **Ranking control** | BM25 (jo suggestions ke liye galat signal hai) | **Poora** -- `function_score`, `searches_30d` se sort | Sirf static `weight` field |
+| **Middle-of-word match** (`"pro max"` par `"iPhone Pro Max"`) | Haan | Haan (har word ke apne grams) | **Nahi** -- sirf poore string ka prefix |
+| **Update** | Live | Live (normal indexing) | Doc reindex, aur FST rebuild |
+| **p99 at 4,000 QPS** | **[X] 150-400 ms** -- fail | **[OK] 20-40 ms** | **[OK] 5-15 ms** |
+| **Verdict** | Prototype ke liye theek, production mein nahi | **CHOSEN** | Bahut fast, par filters aur ranking ki flexibility nahi |
+
+**Hamara final choice aur uska ek-line justification:**
+
+> **Edge n-gram, kyunki hum kaam ko query time se index time par shift kar rahe hain.** Autocomplete mein index writes 58/sec hain aur reads 4,000/sec -- yaani read:write ratio **~70:1**. Aise system mein **hamesha** index time par mehnat karo. Completion suggester aur bhi fast hai, lekin uska heap cost aur "filters + ranking nahi kar sakte" wali limitation hamare liye deal-breaker hai (hume `searches_30d` se rank karna hai aur category-scoped suggestions chahiye).
+
+#### Redis popular-prefix precompute
+
+Ab bhi 4,000 QPS ES par bhejna waste hai. Kyun? Kyunki **prefixes ka distribution aur bhi zyada Zipf hai queries se**.
+
+Socho: 20M alag-alag queries ho sakti hain, lekin **`ip` se shuru hone wale** prefixes sirf ek hi hain -- `ip`. Har `iphone`, `iphone 15`, `ipad`, `iphone case` search karne wala user pehle `ip` type karta hai. **Pehle 2-4 characters bahut zyada concentrated hote hain.**
+
+```
+sug:<prefix>   ->  JSON of top 10 suggestions       TTL 600 s (10 min)
+```
+
+**Precompute job (nightly):**
+
+```
+1. Postgres `query_popularity` se top 50,000 queries by `searches_30d` uthao
+2. Har query ke prefixes nikalo: length 1 se 6 tak
+      "iphone 15 case" -> i, ip, iph, ipho, iphon, iphone
+3. Har prefix ke liye: us prefix se shuru hone wali saari queries ko
+   `searches_30d` se sort karke top 10 rakho
+4. Redis mein SET karo: sug:iph -> [{text:"iphone 15", type:"query"}, ...]  TTL 600 s
+   -> ~10,000 prefixes (spec)
+```
+
+**Runtime flow:**
+
+```
+GET /api/v1/suggest?q=iph
+      |
+      v
+  Redis GET sug:iph  ---- HIT (~85% traffic) ----> return, ~2 ms total
+      | MISS
+      v
+  ES suggestions_v2 query (edge n-gram)  ----> ~25 ms
+      |
+      v
+  Redis SETEX sug:iph 600 <json>   (ab agle 10 min ke liye cached)
+      |
+      v
+  return
+```
+
+Spec ka 4,000 QPS peak yahan ~600 QPS ban jaata hai jo ES tak jaata hai -- aur **wahi lamba-tail wala hissa hai** (`iphone 15 pro max cas` jaise lambe prefixes), jo waise bhi kam documents match karta hai aur sasta hai.
+
+#### Suggest karna kya hai?
+
+API contract: `{ suggestions: [{ text, type: 'query' | 'product' | 'category' }] }` -- teen types hain, aur teenon ka source alag hai:
+
+| `type` | Source | Ranking signal | Kyun rakha |
+|---|---|---|---|
+| **`query`** | `query_popularity` table (`searches_30d`, `ctr`) | `searches_30d` **desc** | Sabse valuable. "Jo doosre log dhoondh rahe hain" -- ye user ko **behtar query likhna sikhata hai**, aur us query ke results humne already tune kiye hain. |
+| **`category`** | `categoryPath` values | Category ka total search volume | User ko browse ki taraf le jaata hai. `"mobiles"` type karne par "Electronics > Mobiles" scope offer karo. |
+| **`product`** | `products_v3` ke titles (top popularity wale) | `popularityScore` | Jab user ka intent bahut specific ho (`"iphone 15 pro max 256"`), toh seedha product page par bhej do -- ek click bacha. |
+
+**Mix (typical):** 6 query suggestions + 2 categories + 2 products. Kabhi 10 products mat dikhao -- user ko option chahiye, catalog nahi.
+
+**`query_popularity` kaise feed karta hai:**
+
+```
+Browser -> Search API -> Kafka `search-queries` topic  (har search: q, filters, resultCount, clickedPosition)
+                                |
+                                v
+                       S3 / warehouse (7 din Kafka retention)
+                                |
+                                v  nightly aggregation job
+                    Postgres `query_popularity` (query, searches_30d, ctr, updated_at)
+                                |
+                    +-----------+-----------+
+                    v                       v
+           suggestions_v2 index       Redis sug:<prefix> precompute
+```
+
+**Do zaruri filters is job mein (warna production incident):**
+
+1. **Zero-result queries ko suggest mat karo.** Agar 5,000 logon ne `"iphone 16"` search kiya aur sabko 0 results mile, toh usko suggest karna user ko **guaranteed dead end** par bhejna hai. Rule: `searches_30d > 50 AND avg_result_count > 0`.
+2. **Adult / abusive / brand-infringing queries block karo.** Ye ek **user-generated content surface** hai -- jo log type karte hain woh doosron ko dikhta hai. Ek deny-list rakho aur nayi entries ko review queue mein daalo. (Google ne yahi galti 2010s mein ki thi aur uske baad se autocomplete manually curated hai.)
+
+> **Interview line:** "Autocomplete traffic search se 4x zyada aur latency budget 4x tight hai, isliye main use main index se alag karta hoon. Design mein main kaam ko **query time se index time** par shift karta hoon -- edge n-grams pehle se bana kar rakhta hoon taaki query sirf ek term lookup ho. Uske upar Redis mein top ~10K prefixes precomputed hain, TTL 10 min, jo peak ka bada hissa kha jaata hai. Suggest karne ke liye main **past queries by popularity** use karta hoon, product titles nahi, kyunki popular query ka result set already tuned hota hai -- lekin zero-result queries ko explicitly filter karta hoon."
+
+---
+
+## PART 14 -- Concurrency aur Ordering in Indexing
+
+Search ka read path stateless hai -- 50 Node instances same query chalayenge, same result aayega. **Saara concurrency danger write path mein hai:** Postgres -> outbox -> Kafka -> indexer -> ES. Is chain mein **saat** alag jagah race conditions hain. Ek-ek karke.
+
+---
+
+### 14.1 -- Ek hi product ke do updates ulte order mein process ho gaye
+
+#### Problem
+
+Seller ne 200 ms ke andar do baar price badla:
+
+```
+10:00:00.000   price = 999   (Postgres version 7)
+10:00:00.200   price = 899   (Postgres version 8)
+```
+
+Dono outbox rows Kafka mein gayi. Ab teen tareeke se ye ulti ho sakti hain:
+
+1. **Retry:** v7 wali bulk request ES par 429 khaa gayi, indexer ne 200 ms baad retry ki. Tab tak v8 ja chuki thi.
+2. **Do consumers:** agar partitioning galat hai (14.2) toh v7 aur v8 alag partitions mein, alag workers, alag speed.
+3. **Ek hi bulk batch ke andar:** ES bulk request ke items **independently** execute hote hain -- bulk **ek transaction nahi hai** aur item order ki koi guarantee nahi.
+
+#### Kya hota hai (agar kuch na karein)
+
+```
+ES par: doc likha gaya price=899 (v8)
+        phir  doc likha gaya price=999 (v7)     <- PURANA data ne NAYA overwrite kar diya
+
+Result: search mein hamesha 899 ke bajaye 999 dikhega.
+        Postgres mein 899 hai. ES mein 999. Ye divergence apne aap KABHI theek nahi hoga.
+```
+
+Ye eventual consistency ka sabse bura version hai -- **"eventually WRONG"**. Agla update aane tak (jo mahino baad ho sakta hai) ye galat rahega.
+
+#### Fix -- `version_type: 'external'`
+
+ES har document ke saath ek version number rakhta hai. Normally woh ES khud manage karta hai (`_version` auto-increment). **External versioning** mein aap kehte ho: "**version main dunga -- Postgres ka `version` column. Tum sirf itna dekho ki naya version purane se bada hai ya nahi.**"
+
+```
+Rule: ES document likhta hai SIRF agar  incoming_version > stored_version
+      warna  409 version_conflict_engine_exception
+```
+
+Spec ka `products.version BIGINT NOT NULL DEFAULT 1` column exactly isliye hai, aur `product_outbox.version` usko carry karta hai.
+
+#### Worked example -- woh 409 jo aapko bacha leta hai
+
+```
+Event   version   ES ka stored version   Decision                       Result
+-----   -------   --------------------   ----------------------------   --------------------
+v8      8         (doc nahi hai)         8 > 0                          [OK] WRITE, stored = 8, price 899
+v7      7         8                      7 > 8 ? NAHI                   [X] 409 version_conflict
+                                                                        doc untouched, price 899 [OK]
+v9      9         8                      9 > 8                          [OK] WRITE, stored = 9
+v9      9         9                      9 > 9 ? NAHI (strictly greater) [X] 409  (duplicate delivery -- idempotent!)
+```
+
+Dekho row 4 -- **wahi event dobara aaya (at-least-once delivery) aur 409 mila**. Yaani external versioning aapko **out-of-order protection aur duplicate protection dono** ek saath deti hai.
+
+**Sabse important line:** `409` yahan **error nahi hai, ye success hai**. Uska matlab hai "mere paas isse naya data pehle se hai". Indexer ko usko **retry nahi karna** aur offset commit kar dena hai.
+
+#### Code
+
+```ts
+// src/workers/product-indexer.worker.ts
+
+import type { ProductDoc } from '../types';
+
+/**
+ * Ek Kafka batch mein ek hi productId ke kai events ho sakte hain.
+ * ES bulk items ka execution order guaranteed nahi hai,
+ * isliye batch ke andar hi sirf sabse naya version rakho.
+ */
+function dedupeToLatestVersion(events: ProductDoc[]): ProductDoc[] {
+  const latest = new Map<string, ProductDoc>();
+  for (const doc of events) {
+    const prev = latest.get(doc.productId);
+    if (!prev || doc.version > prev.version) latest.set(doc.productId, doc);
+  }
+  return [...latest.values()];
+}
+
+function buildBulkBody(docs: ProductDoc[]): object[] {
+  const body: object[] = [];
+  for (const doc of docs) {
+    body.push({
+      index: {
+        _index: 'products',          // ALIAS, kabhi products_v3 hardcode mat karo
+        _id: doc.productId,          // _id = productId  -> indexing hamesha UPSERT hai
+        version: doc.version,        // Postgres ka version column
+        version_type: 'external',    // "mera version use karo, apna auto-increment nahi"
+      },
+    });
+    body.push(doc);                  // agli line = actual document
+  }
+  return body;
+}
+
+export async function indexBatch(es: Client, events: ProductDoc[]) {
+  const docs = dedupeToLatestVersion(events);
+  if (docs.length === 0) return;
+  const res = await es.bulk({ body: buildBulkBody(docs), refresh: false });
+  handleBulkResponse(res, docs);     // 14.5 mein
+}
+```
+
+**Code Explanation:**
+
+- `dedupeToLatestVersion` -- flash sale mein ek product ke 5 price updates 1 second mein aa sakte hain. Sabko ES bhejne ka koi fayda nahi: pehle 4 ya toh overwrite honge ya 409 khaayenge, aur har ek ek **segment write** banayega (ES mein update = delete + insert). Batch mein hi sirf latest rakho -> **bulk size chhota, segment churn kam**.
+- `doc.version > prev.version` -- **timestamp se compare mat karna**. Do updates same millisecond mein ho sakte hain, aur Postgres ka `version` column monotonic guaranteed hai (`UPDATE ... SET version = version + 1`).
+- `_index: 'products'` -- ye **alias** hai. Spec ka zero-downtime reindex alias ko `products_v3` se `products_v4` par swap karta hai; agar indexer ne concrete index name hardcode kiya, toh swap ke baad woh **purane index** mein likhta rahega aur naya index chupchaap stale ho jaayega. (Alias ko **write index** flag ke saath configure karo taaki `index` operation allowed ho.)
+- `_id: doc.productId` -- yahi poori idempotency ki jad hai (14.4). Same id = same document slot = insert ya replace, kabhi duplicate nahi.
+- `version_type: 'external'` -- bina iske ES apna version use karega aur **har write accept** kar lega, chahe woh purana data ho.
+- `refresh: false` -- **sabse important flag.** Iska matlab "refresh mat karo, `refresh_interval: 1s` apne aap kar lega". `refresh: true` yahan ek production incident hai (14.6 dekho).
+
+---
+
+### 14.2 -- Kafka partitioning: `productId` key kyun
+
+#### Problem
+
+Kafka ordering ki guarantee **sirf ek partition ke andar** hai. `product-changes` topic ke **12 partitions** hain aur consumer group `product-indexer` ke, maan lo, 6 workers hain. Agar ek product ke v7 aur v8 **alag partitions** mein chale gaye, toh woh do alag workers parallel mein process karenge aur ordering ka koi concept hi nahi bachega.
+
+#### Kaise fix hota hai
+
+Kafka producer ka rule: `partition = hash(key) % numPartitions`.
+
+```
+key = productId = "a3f1-...-9c2d"
+hash("a3f1-...-9c2d") % 12  =  7       <- HAMESHA 7
+
+v7 -> partition 7
+v8 -> partition 7        (same key, same partition)
+v9 -> partition 7
+```
+
+Ek partition = ek consumer group member ko assigned = **ek worker, sequentially** padhta hai. Ordering **per product** guaranteed. [OK]
+
+Dhyan do: hume **global ordering ki zarurat hi nahi hai**. P1 ka update P2 ke update se pehle ya baad -- kisi ko fark nahi padta. Hume sirf **per-product ordering** chahiye. Aur yahi Kafka key-based partitioning ka poora point hai: **"apna ordering ka smallest unit dhoondho, usko key banao."**
+
+#### Agar key `sellerId` hoti toh?
+
+Ye interview ka classic sawaal hai, aur iska jawab do hisso mein hai (log usually pehla hi bolte hain):
+
+**Hissa 1 -- "Ordering turant toot jaayegi"? Nahi, technically nahi.** Ek product ek hi seller ka hota hai, toh us product ke saare events same `sellerId` carry karenge -> same partition -> ordering **accidentally** bach jaayegi.
+
+**Hissa 2 -- Asli problems ye hain:**
+
+| Problem | Detail |
+|---|---|
+| **Hot partition (sabse bada)** | 20,000 sellers hain par distribution Zipf hai -- top 50 sellers ke paas catalog ka bada hissa hai. Ek bada seller apne 500,000 products ka bulk price update chalaayega -> **saare events ek partition mein**. Baaki 11 partitions khali, ek partition 500K deep. `indexer_lag_seconds` us partition ke liye **ghanton** mein chala jaayega, jabki metrics "average lag" theek dikhayenge. Spec ka requirement `<= 30 s` toot gaya. |
+| **Ordering guarantee "accidental" hai, designed nahi** | Jis din product transfer feature aayega (seller merge, ya marketplace product ko doosre seller ko assign kare), us product ka `sellerId` badal jaayega -> naya key -> **naya partition** -> purane partition ka pending v7 aur naye partition ka v8 parallel process -> silent corruption. Aur ye bug 6 mahine baad aayega jab kisi ko ye design yaad bhi nahi hoga. |
+| **Parallelism ka nuksaan** | 12 partitions ka matlab hai max 12 parallel consumers. `sellerId` key ke saath ek slow seller poore partition ko block karta hai. `productId` key ke saath load statistically even hai (UUID hash uniform hai). |
+
+**Aur agar koi key hi na do (round-robin)?** Tab **kuch bhi** guarantee nahi. Har out-of-order case possible hai. Sirf external versioning aapko bachayegi -- aur woh purane events ko **drop** kar degi, jo kabhi-kabhi sahi hai aur kabhi nahi (agar v8 kabhi aaya hi nahi aur v7 drop ho gaya toh?).
+
+> **Rule:** **Kafka key = woh smallest entity jiske liye aapko ordering chahiye.** Yahan woh `productId` hai. Aur **external versioning ko phir bhi rakho** -- partitioning "happy path" ordering deti hai, versioning "kuch bhi ho jaaye" wali guarantee.
+
+---
+
+### 14.3 -- Outbox poller do instances par chal raha hai
+
+#### Problem
+
+Deployment ne 2 replicas chala diye (ya ek rolling deploy ke dauran 30 seconds ke liye purana aur naya dono zinda the). Dono yahi chala rahe hain:
+
+```sql
+SELECT * FROM product_outbox WHERE published_at IS NULL ORDER BY id LIMIT 500;
+```
+
+#### Kya hota hai
+
+```
+t1   Poller A:  SELECT ... -> rows 1001..1500
+t2   Poller B:  SELECT ... -> rows 1001..1500       <- BILKUL WAHI rows
+t3   Poller A:  Kafka par 500 messages bheje
+t4   Poller B:  Kafka par WAHI 500 messages dobara bheje
+t5   Poller A:  UPDATE ... SET published_at = now() WHERE id IN (...)
+t6   Poller B:  UPDATE ... -> t5 wali rows par lock ka wait, phir same update
+```
+
+- **Duplicate Kafka messages** -- 2x indexing load. (Idempotent hai isliye data corrupt nahi hoga, par 2x waste.)
+- **Lock contention** -- dono same rows ko `UPDATE` kar rahe hain. Ek block hoga. 500 rows par chhota hai, 5,000 par transaction timeout.
+- **Aur bura scenario:** agar poller "claim karke phir bhejta" (pehle `UPDATE published_at` phir Kafka), toh dono same rows claim karte -- aur agar ek crash kar gaya Kafka bhejne se pehle, toh woh rows **published mark hain par Kafka mein gayi hi nahi** -> **permanently missing updates**.
+
+#### Fix -- `FOR UPDATE SKIP LOCKED`
+
+```sql
+SELECT id, product_id, op, version
+FROM product_outbox
+WHERE published_at IS NULL
+ORDER BY id
+LIMIT 500
+FOR UPDATE SKIP LOCKED;
+```
+
+- **`FOR UPDATE`** -- in rows par row-level lock lo. Transaction khatam hone tak koi aur inhe `FOR UPDATE` nahi kar sakta.
+- **`SKIP LOCKED`** -- **jo rows already kisi aur ne lock ki hain, unhe chhod do aur agli rows le lo** (wait mat karo).
+
+Result: Poller A ko rows 1001-1500 milti hain, Poller B ko 1501-2000. **Dono kaam karte hain, koi overlap nahi, koi wait nahi.** Ye poller ko horizontally scalable bhi bana deta hai (flash sale mein 500/sec updates ke liye 3 pollers chala sakte ho).
+
+#### Code
+
+```ts
+// src/workers/outbox-poller.ts
+
+export async function pollOnce(pg: PoolClient, producer: Producer): Promise<number> {
+  await pg.query('BEGIN');
+  try {
+    const { rows } = await pg.query(
+      `SELECT o.id, o.product_id, o.op, o.version
+         FROM product_outbox o
+        WHERE o.published_at IS NULL
+        ORDER BY o.id
+        LIMIT 500
+        FOR UPDATE SKIP LOCKED`
+    );
+    if (rows.length === 0) { await pg.query('COMMIT'); return 0; }
+
+    const products = await loadProducts(pg, rows.filter(r => r.op === 'upsert').map(r => r.product_id));
+
+    await producer.send({
+      topic: 'product-changes',
+      messages: rows.map(r => ({
+        key: r.product_id,                       // PARTITION KEY -- 14.2
+        value: JSON.stringify({
+          op: r.op,
+          version: Number(r.version),
+          doc: r.op === 'upsert' ? products.get(r.product_id) : undefined,
+        }),
+      })),
+      acks: -1,                                  // saare in-sync replicas confirm karein
+    });
+
+    await pg.query(
+      `UPDATE product_outbox SET published_at = now() WHERE id = ANY($1::bigint[])`,
+      [rows.map(r => r.id)]
+    );
+    await pg.query('COMMIT');
+    return rows.length;
+  } catch (err) {
+    await pg.query('ROLLBACK');
+    throw err;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `BEGIN` / `COMMIT` -- `FOR UPDATE` ke locks **transaction ke saath** jeete hain. Bina explicit transaction ke har statement apni auto-commit transaction mein hoga aur lock turant chhoot jaayega -- `SKIP LOCKED` ka koi matlab hi nahi rahega. **Ye sabse common galti hai.**
+- `ORDER BY o.id` -- outbox `BIGSERIAL` hai, toh `id` order hi **insertion order** hai. Isse ek poller ke andar events roughly order mein jaate hain. (Poori ordering guarantee Kafka key + version se aati hai, isse nahi.)
+- `LIMIT 500` -- spec ka bulk batch size. Isse transaction chhota rehta hai aur ek crash 500 rows se zyada replay nahi karwata.
+- `FOR UPDATE SKIP LOCKED` -- upar explained. Note: spec ka partial index `product_outbox_unpublished ON (id) WHERE published_at IS NULL` isi query ko fast rakhta hai -- table mein crores rows ho sakti hain, par index mein sirf unpublished.
+- `key: r.product_id` -- **partition key**. Ye ek line 14.2 ki poori guarantee deti hai.
+- `acks: -1` (`all`) -- Kafka tab tak OK nahi bolega jab tak saare in-sync replicas ne message likh nahi liya. `acks: 1` (sirf leader) tez hai par leader crash par message kho sakta hai -- aur outbox row toh `published` mark ho chuki hogi -> **silently lost update**. Yahan durability speed se zyada important hai.
+- **Order dhyan se dekho:** pehle Kafka bhejo, **phir** `published_at` set karo. Agar beech mein crash hua toh rows unpublished rehti hain aur agli poll par **dobara** bhejti hain -> **at-least-once**. Ulta karte (pehle mark, phir send) toh crash par message **kho** jaata -> at-most-once, jo yahan unacceptable hai.
+- Duplicate ka darr nahi kyunki indexing idempotent hai (14.4).
+
+---
+
+### 14.4 -- At-least-once delivery: wahi doc do baar index hoga
+
+#### Problem
+
+Upar wali design **jaan-boojh kar** at-least-once hai. Duplicates aayenge:
+
+- Poller crash Kafka send ke baad, `UPDATE` se pehle -> dobara send.
+- Kafka consumer offset commit se pehle crash -> consumer group rebalance -> wahi messages dobara.
+- Consumer rebalance (deploy, scale-up, ek worker slow hone par) -> uncommitted messages reprocess.
+
+Production mein ye **roz hota hai**, exception nahi.
+
+#### Kyun ye problem nahi hai
+
+Kyunki hamara index operation **idempotent** hai:
+
+**Term: Idempotent.** Ek operation jisko 1 baar chalao ya 100 baar, result same rehta hai.
+
+```
+PUT /products/_doc/a3f1-9c2d   { title: "...", price: 899, ... }
+```
+
+- `_id` = `productId` -> **fixed slot**. Ye "insert a new row" nahi hai, ye "**is slot ko ye value do**" hai -- yaani **upsert / replace**.
+- Chaliye 10 baar chalao -- document ki final state **bilkul same**.
+- Aur `version_type: 'external'` ke saath: doosri baar `version` barabar hoga, toh 409 -> **write hoga hi nahi**, ek segment write bhi bacha.
+
+```
+Bhejo                              ES state              Segment write?
+PUT _doc/P1 {price:899} v=8        price 899, ver 8      haan
+PUT _doc/P1 {price:899} v=8        price 899, ver 8      NAHI (409)   <- duplicate free
+PUT _doc/P1 {price:899} v=8        price 899, ver 8      NAHI (409)
+```
+
+#### Kya idempotent NAHI hota (yahan mat karna)
+
+```ts
+// [X] GALAT -- ye kabhi indexing pipeline mein mat daalo
+await es.update({
+  index: 'products', id: productId,
+  script: { source: 'ctx._source.viewCount += params.n', params: { n: 1 } },
+});
+```
+
+**Code Explanation (kyun ye galat hai):**
+
+- `+=` ek **read-modify-write** hai. Duplicate delivery par counter 2 badh jaayega -- aur ye galti **permanent** hai, koi replay theek nahi kar sakta.
+- `version_type: 'external'` yahan bacha bhi nahi sakta, kyunki har increment ek naya logical version hai jiska Postgres mein koi source hi nahi.
+- **Rule:** counters kabhi search index ke write path mein mat badhao. `popularityScore` spec mein **nightly batch job** se aata hai jo warehouse se poora recompute karke likhta hai -- woh **idempotent** hai (`SET`, `+=` nahi).
+- General rule: **"index karo, accumulate mat karo."** Search index ek **derived projection** hai, ek ledger nahi.
+
+> Isliye poori chain mein kahin bhi "exactly once" ki zarurat nahi padi. **At-least-once + idempotent = effectively exactly once**, aur ye distributed systems ka sabse important practical patterns mein se ek hai.
+
+---
+
+### 14.5 -- Bulk request partially fail hoti hai
+
+#### Problem
+
+Ye sabse zyada ignore ki jaane wali cheez hai:
+
+```
+POST /_bulk  ->  HTTP 200 OK
+```
+
+**HTTP 200 ka matlab "sab index ho gaya" NAHI hai.** Iska matlab sirf itna hai ki "bulk request parse ho gayi aur main tumhe har item ka status bata raha hoon". Response body mein `errors: true` ho sakta hai aur uske andar har item ka apna status.
+
+```json
+{
+  "took": 142, "errors": true,
+  "items": [
+    { "index": { "_id": "p1", "status": 200 } },
+    { "index": { "_id": "p2", "status": 409, "error": { "type": "version_conflict_engine_exception" } } },
+    { "index": { "_id": "p3", "status": 429, "error": { "type": "es_rejected_execution_exception" } } },
+    { "index": { "_id": "p4", "status": 400, "error": { "type": "mapper_parsing_exception",
+                 "reason": "failed to parse field [price] of type [scaled_float]" } } }
+  ]
+}
+```
+
+Agar aapne sirf `if (res.statusCode === 200)` check kiya, toh p3 (jo retry hona chahiye tha) **hamesha ke liye kho gaya** aur p4 (jo alert hona chahiye tha) chupchaap gayab. 3 mahine baad koi bolega "mera product search mein aata hi nahi".
+
+#### Per-item handling matrix
+
+| Status | ES error type | Asli wajah | Retry? | Action |
+|---|---|---|---|---|
+| **200 / 201** | -- | Index ho gaya | -- | `bulk_indexed_total++` |
+| **409** | `version_conflict_engine_exception` | Mere paas already naya (ya same) version hai | **NAHI** | **Success maano.** `stale_skipped_total++`. Offset commit karo. Ye 14.1 ka designed behaviour hai. |
+| **429** | `es_rejected_execution_exception` | Data node ka **write thread pool queue full** hai. ES backpressure de raha hai. | **HAAN** | Exponential backoff + jitter. Aur **Kafka consumer ko pause karo** (14.7). Ye sabse important retry hai. |
+| **400** | `mapper_parsing_exception`, `illegal_argument_exception`, `strict_dynamic_mapping_exception` | Document hi kharab hai -- `price: "N/A"`, ya mapping mein na hone wala field strict mode mein | **KABHI NAHI** | **DLQ topic** (`product-changes-dlq`) + `bulk_index_errors_total{type="bad_doc"}++` + alert. Retry karoge toh **infinite loop** -- poora consumer atak jaayega aur indexer lag badhta rahega. |
+| **404** | `index_not_found_exception` | Alias toot gaya (reindex ke beech mein), ya galat index name | **NAHI** | **Loud failure.** Consumer pause + page on-call. Ye config/deployment bug hai. |
+| **503** | `unavailable_shards_exception`, `no shard available` | Shard relocate ho raha hai, ya node restart | **HAAN** | Backoff + retry. Usually 10-30 s mein theek. |
+| **413** | (HTTP level) `http.max_content_length` exceeded | Batch 100 MB se bada (default) | **HAAN, par batch split karke** | Batch ko aadha karke retry. Spec ka 5 MB limit isse bachata hai. |
+
+#### Code
+
+```ts
+// src/workers/product-indexer.worker.ts (continued)
+
+interface BulkOutcome { ok: number; stale: number; retry: ProductDoc[]; dead: ProductDoc[]; }
+
+function handleBulkResponse(res: BulkResponse, sent: ProductDoc[]): BulkOutcome {
+  const out: BulkOutcome = { ok: 0, stale: 0, retry: [], dead: [] };
+  if (!res.errors) { out.ok = sent.length; return out; }
+
+  res.items.forEach((item, i) => {
+    const r = item.index ?? item.create!;
+    const doc = sent[i];                       // items ka order request ke order jaisa hi hota hai
+    const status = r.status;
+
+    if (status >= 200 && status < 300) { out.ok++; return; }
+
+    if (status === 409) {                      // designed behaviour, error nahi
+      out.stale++;
+      metrics.staleSkipped.inc();
+      return;
+    }
+    if (status === 429 || status === 503) {    // transient -- ES bhara hua hai
+      out.retry.push(doc);
+      metrics.bulkErrors.inc({ type: 'backpressure' });
+      return;
+    }
+    // 400, 404, ya kuch aur -- retry se theek NAHI hoga
+    out.dead.push(doc);
+    metrics.bulkErrors.inc({ type: r.error?.type ?? 'unknown' });
+    logger.error({ productId: doc.productId, status, error: r.error }, 'bulk item permanently failed');
+  });
+  return out;
+}
+```
+
+**Code Explanation:**
+
+- `if (!res.errors)` -- fast path. `errors: false` ka matlab hai har item success. Iske bina har request par 500 items loop karna padta.
+- `item.index ?? item.create` -- bulk response mein key wahi hoti hai jo aapka action tha (`index` / `create` / `update` / `delete`). Hum `index` use karte hain (upsert), par delete events ke liye `delete` bhi aayega.
+- `sent[i]` -- **ES `items` array request ke items ke exact order mein return karta hai.** Ye guaranteed hai aur isi par ye poora mapping tika hai. (Execution order guaranteed nahi hai, sirf **response order** guaranteed hai.)
+- `status === 409` par `out.ok` nahi, `out.stale++` -- alag metric isliye ki agar `stale_skipped` suddenly spike kare, toh iska matlab hai ki **ordering toot rahi hai** (partitioning bug, ya double consumer). Ye ek bahut achha early-warning signal hai.
+- `429 || 503` -> `retry` array. Ye docs wapas bulk mein jaayenge, backoff ke baad.
+- **Baaki sab `dead`** -- yahi sabse important design decision hai. Ek `400` ko retry karna = us Kafka partition ko **permanently block** kar dena. Ek kharab document (jo shayad ek buggy seller CSV import se aaya) poore catalog ki indexing rok dega. DLQ mein daalo, alert karo, aage badho.
+- `logger.error({ productId, status, error })` -- structured log. `productId` ke bina aap us document ko dhoondh hi nahi paoge.
+
+---
+
+### 14.6 -- Refresh vs visibility: 200 ms pehle indexed doc search mein kyun nahi hai
+
+#### Problem
+
+QA ne ticket kaata: "API ne 200 return kiya, maine turant search kiya, product nahi mila. **Bug hai.**"
+
+#### Kya ho raha hai
+
+Lucene segments **immutable** hain. ES ka write path:
+
+```
+bulk request
+    |
+    v
+[1] In-memory buffer + translog (durability ke liye)      <- yahan doc "likha" hua hai
+    |                                                        par SEARCHABLE NAHI
+    |  ... refresh_interval: 1s ...
+    v
+[2] REFRESH: buffer -> naya segment (abhi bhi memory/page cache mein)
+    |                                                     <- AB searchable hai
+    v
+[3] FLUSH (periodic): segment disk par fsync, translog clear
+    |
+    v
+[4] MERGE (background): chhote segments milkar bade bante hain
+```
+
+**Ek document `refresh` ke baad hi searchable hota hai.** `refresh_interval: 1s` ka matlab: har shard har 1 second mein refresh karta hai (**agar us second mein koi search hui ho** -- warna ES idle shards ka refresh skip kar deta hai).
+
+```
+t = 0 ms      bulk indexed, ES ne 200 diya
+t = 200 ms    search  ->  DOC NAHI MILA          <- "bug"
+t = 1000 ms   scheduled refresh
+t = 1001 ms   search  ->  DOC MIL GAYA
+```
+
+Ye **bug nahi hai, ye design hai**, aur iska naam **NRT (near real-time)** search hai. Spec ka `<= 30 s` requirement iske saath bilkul theek hai.
+
+#### `refresh` parameter ke teen options
+
+| Value | Kya karta hai | Latency | Cost | Kab use karo |
+|---|---|---|---|---|
+| **`false`** (default) | Kuch nahi. Scheduled refresh ka wait. | 0 ms extra | Zero | **Indexing pipeline mein HAMESHA yahi.** |
+| **`'wait_for'`** | Request **rukti hai** jab tak agla scheduled refresh na ho jaaye. Refresh **force nahi** karta. | 0-1000 ms extra | **Zero extra segments** | Admin endpoints, integration tests, "seller ne save kiya, ab dikhna chahiye" wala ek-off flow |
+| **`true`** | **Turant refresh force karo.** | ~10-50 ms | **[X] Ek naya segment per call** | **Lagbhag kabhi nahi.** |
+
+#### `refresh: true` production ko kaise maarta hai
+
+```
+Spec: 5M updates/day = 58/sec average, flash sale par ~500/sec
+
+refresh: true ke saath:
+  58 forced refreshes/sec  ->  58 naye chhote segments/sec
+  ->  3,480 segments/minute
+  ->  merge scheduler pagal ho jaata hai (har naya segment ko merge karna hai)
+  ->  merge threads disk I/O aur CPU kha jaate hain
+  ->  search queries slow (zyada segments = har query ko har segment mein dekhna padta hai)
+  ->  search latency p99 400 ms se 3 s
+  ->  aur sabse bura: merge backlog "too many open files" / throttling tak pahunch jaata hai
+```
+
+Aur dhyan do -- ye **search** ko maarta hai, indexing ko nahi. Toh on-call engineer search cluster debug karta rahega aur asli wajah (indexer ka ek flag) kabhi nahi milegi. **Isliye `refresh: true` ko code review mein block karo.**
+
+`'wait_for'` safe kyun hai: woh koi **naya** refresh trigger nahi karta, bas **agle wale ka wait** karta hai. 100 requests `wait_for` karein toh sab ek hi refresh par chhoot jaayengi. Max 1 second ka wait, zero extra cost.
+
+#### Code
+
+```ts
+// Indexing path -- normal
+await es.bulk({ body, refresh: false });
+
+// Admin / test path -- "save karke turant verify karna hai"
+await es.index({ index: 'products', id, document: doc,
+  version: doc.version, version_type: 'external',
+  refresh: 'wait_for' });     // max ~1s wait, ZERO extra segments
+
+// [X] KABHI NAHI (code review mein reject)
+await es.bulk({ body, refresh: true });
+```
+
+**Code Explanation:**
+
+- Pehla: hamara 58/sec wala hot path. `refresh: false` explicit likha hai (default hone ke bawajood) taaki koi galti se badle na.
+- Doosra: ek single admin write. `wait_for` se caller ko guarantee milti hai ki return hone ke baad doc searchable hai. Latency 0-1000 ms, **par sirf is ek request ke liye**.
+- Teesra: `refresh: true` on a **bulk** -- ye ek batch ke 500 docs ke liye ek refresh nahi, poore shard ka forced refresh hai, aur 58/sec par cluster kha jaata hai.
+- **Bonus rule:** spec ka `refresh_interval: -1` (refresh bilkul band) sirf **initial full reindex** ke dauran, `number_of_replicas: 0` ke saath. Uske baad **wapas set karna mat bhoolna** -- yahi woh "risky" hissa hai jo spec mention karta hai: agar aap reset bhool gaye, toh naya index kabhi searchable hi nahi hoga aur alias swap ke baad search **zero results** dene lagegi.
+
+---
+
+### 14.7 -- Read-your-writes: seller ne abhi product edit kiya
+
+#### Problem
+
+```
+10:00:00  Seller "Price 899 karo" -> Save
+10:00:00  API 200 OK -> browser "Saved!" dikhata hai -> product page par redirect
+10:00:01  Product page load hota hai -> price 999 dikhta hai       <- "Tumhara system toota hua hai"
+10:00:18  Seller refresh karta hai -> ab 899                        <- "Ab theek hai?"
+```
+
+Seller ka trust gaya. Aur support ticket mein "intermittent bug" likha jaayega, jo debug karna narak hai.
+
+#### Kya hua
+
+Poori chain ka latency budget jodo:
+
+```
+Postgres commit                      ~5 ms
+Outbox poller ka next tick           0-1000 ms
+Kafka produce + consumer fetch       ~50-200 ms
+Indexer batching window              0-1000 ms  (spec: 500 docs / 5 MB / 1 s)
+ES bulk indexing                     ~50 ms
+ES refresh_interval                  0-1000 ms
+------------------------------------------------
+Typical: ~1-3 seconds.  Backlog mein: 30 seconds (spec ka SLA).
+```
+
+Yaani ES **kabhi bhi** us write ko turant nahi dikha paayega. Ye eventual consistency hai aur hum isko **jaan-boojh kar** accept kar chuke hain (spec: "Eventual consistency acceptable").
+
+#### Fix -- read path ko source of truth se serve karo
+
+**Ye problem ko technically solve karne ki koshish mat karo.** Isko **routing** se solve karo:
+
+| Screen | Kahan se padho | Kyun |
+|---|---|---|
+| **Seller ka "My Listings"** | **Postgres** (`products_seller_idx (seller_id, updated_at DESC)`) | Ek seller ke ~1,000 products hain. Ye ek **filtered list** hai, search nahi. Postgres isko 5 ms mein deta hai. |
+| **Seller ka product edit page** | **Postgres** | Woh apna hi data edit kar raha hai. Source of truth se hi dikhao. |
+| **Product detail page (koi bhi user)** | **Postgres** (ya Postgres-backed Redis cache) | Yahan `price` aur `stock_qty` **exact** chahiye -- spec ka rule: "exact `stock_qty` product page par DB/Redis se". |
+| **Search results** | **ES** | Yahan discovery ho rahi hai. 30 s stale bilkul theek hai. |
+| **Category browse + facets** | **ES** | Same. |
+
+**General rule (ye interview mein bolne wali line hai):**
+
+> **"Write ke turant baad ka read hamesha source of truth se aata hai. Derived index sirf discovery ke liye hai."**
+
+Ye rule har CQRS/derived-index system par lagta hai -- search, analytics, recommendations, sab.
+
+**Agar business bole "seller ko apne product search mein bhi turant dikhna chahiye":** tab ek **hybrid** karo -- ES se search karo, aur Postgres se seller ke `updated_at > now() - 60s` wale products uthakar result mein **merge** kar do (dedupe by `productId`). Ye chhota, bounded kaam hai (ek seller ke 60 second ke andar ke edits usually 0-5 products). Par ye complexity tabhi add karo jab business genuinely maange.
+
+#### Bounded concurrency aur backpressure (Node.js)
+
+Aakhri concurrency topic: indexer ES par kitne parallel bulk requests maar sakta hai?
+
+**Naive galti:**
+
+```ts
+// [X] GALAT
+await Promise.all(batches.map(b => es.bulk({ body: b })));
+```
+
+100 batches = 100 parallel HTTP requests. ES ke write thread pool ka queue (default size 10,000 per node, threads = CPU count) bhar jaayega -> **sab 429** -> sab retry -> aur bura. Aur Node side par 100 parallel responses ka JSON parse heap spike karega.
+
+**Sahi tareeka -- bounded concurrency + consumer pause:**
+
+```ts
+// src/workers/product-indexer.worker.ts
+
+const MAX_IN_FLIGHT = 4;          // ek time par max 4 bulk requests
+let inFlight = 0;
+const waiters: Array<() => void> = [];
+
+async function acquire(): Promise<void> {
+  if (inFlight < MAX_IN_FLIGHT) { inFlight++; return; }
+  await new Promise<void>(resolve => waiters.push(resolve));
+  inFlight++;
+}
+function release(): void {
+  inFlight--;
+  waiters.shift()?.();
+}
+
+export async function runBulkWithBackpressure(
+  consumer: Consumer, topic: string, partition: number, docs: ProductDoc[]
+) {
+  await acquire();
+  try {
+    const res = await es.bulk({ body: buildBulkBody(docs), refresh: false });
+    const outcome = handleBulkResponse(res, docs);
+
+    if (outcome.retry.length > 0) {
+      // ES ne 429 diya -- yaani woh keh raha hai "mujhe saans lene do"
+      consumer.pause([{ topic, partitions: [partition] }]);
+      metrics.indexerPaused.inc();
+      const delay = 1000 + Math.floor(Math.random() * 1000);   // backoff + JITTER
+      setTimeout(() => consumer.resume([{ topic, partitions: [partition] }]), delay);
+      await runBulkWithBackpressure(consumer, topic, partition, outcome.retry);
+    }
+    if (outcome.dead.length > 0) await sendToDlq(outcome.dead);
+  } finally {
+    release();
+  }
+}
+```
+
+**Code Explanation:**
+
+- `MAX_IN_FLIGHT = 4` -- ES ko flood karne ke bajaye steady pressure. Sahi number aapke shard count aur node CPU par depend karta hai; rule of thumb: **data nodes x 1**, phir `es_rejected_execution` metric dekh kar tune karo. 6 data nodes par 4-8 theek hai.
+- `acquire` / `release` -- ek **counting semaphore** hai, 20 lines mein. `waiters` ek FIFO queue hai; slot khali hote hi sabse purana waiter chalta hai. (`p-limit` library yahi karti hai -- yahan manually likha hai taaki mechanism dikhe.)
+- `await new Promise(resolve => waiters.push(resolve))` -- ye Node ka standard "async block" pattern hai. Promise tab tak pending rehta hai jab tak koi uska `resolve` call na kare. Koi busy-wait nahi, koi CPU waste nahi -- event loop doosra kaam karta rehta hai.
+- `finally { release() }` -- **`finally` mein hona zaruri hai.** Agar `es.bulk` throw kare aur release na ho, toh semaphore leak ho jaayega aur 4 exceptions ke baad indexer **permanently frozen** ho jaayega. Ye ek real production bug hai jo ek try/catch bhool jaane se aata hai.
+- `consumer.pause([...])` -- **yahi asli backpressure hai.** ES ne 429 bola = "queue full". Agar hum Kafka se aur messages kheenchte rahe, toh hum bas apni memory mein backlog banayenge aur ES ko aur zyada maarenge. Pause karke hum **poori chain ko slow** kar dete hain -- Kafka mein messages pade rehna bilkul theek hai, woh uska kaam hi hai.
+- `partitions: [partition]` -- sirf us partition ko pause karo, poore consumer ko nahi. Baaki partitions ka kaam chalta rahe.
+- `1000 + random(0..1000)` -- **jitter**. Agar 6 indexer workers sabko ek saath 429 mila aur sab exactly 1000 ms baad retry karein, toh 1000 ms par exactly wahi thundering herd wapas aayega. Random se unhe spread kar do. (Ye Rate Limiter Part 3 ka wahi "synchronized retries" wala lesson hai, dusri jagah.)
+- `await runBulkWithBackpressure(..., outcome.retry)` -- **sirf failed docs** retry ho rahe hain, poora batch nahi. Jo already index ho gaye unhe dobara bhejna waste (aur 409 khaayenge).
+
+---
+
+## PART 15 -- Caching Layers
+
+Search system mein **saat** alag caches hain, aur unme se sirf **do** aapke control mein hain. Interview mein log usually ek hi (Redis) bataate hain. Poori list:
+
+| # | Cache | Kya store hota hai | Kahan rehta hai | TTL / invalidation | Hamara control |
+|---|---|---|---|---|---|
+| 1 | **Browser HTTP cache** | `/suggest` response | User ka browser | `Cache-Control: max-age=30` | Haan (header) |
+| 2 | **CDN** | **(kuch nahi)** -- results volatile hain | Edge | -- | Jaan-boojh kar **off** |
+| 3 | **Redis query cache** | Poora `SearchResponse`, page 1 | Redis | **TTL 60 s** | **Haan (hamara code)** |
+| 4 | **Redis popular-prefix** | Top 10 suggestions per prefix | Redis | TTL 600 s + nightly overwrite | **Haan (hamara code)** |
+| 5 | **ES node query cache** | Filter clause ka **bitset** | Data node JVM heap (10% heap) | LRU + segment merge par invalid | Indirect (query shape) |
+| 6 | **ES shard request cache** | Poora response of **`size: 0`** requests | Data node heap (1% heap) | **Har refresh par wipe (1 s!)** | Indirect |
+| 7 | **OS page cache** | Lucene segment files | Node ki non-heap RAM | OS ka LRU | Indirect (heap sizing) |
+
+Aur ek "cache nahi par log samajhte hain": **doc values** (disk par, page cache se serve) vs **fielddata** (heap par, khatarnak).
+
+---
+
+### 15.1 -- Browser / HTTP cache (suggest ke liye)
+
+Autocomplete par 4,000 QPS hai. Uska ek **free** hissa browser hi kha sakta hai.
+
+```
+HTTP/1.1 200 OK
+Cache-Control: private, max-age=30
+Vary: Accept-Encoding
+```
+
+**Kyun kaam karta hai:** user `iphone 15 case` type karta hai aur beech mein **backspace** maarta hai -- `iphone 15 cas` -> `iphone 15 ca`. Ye prefixes woh 3 second pehle hi maang chuka tha. Browser wahi response **bina network** ke de deta hai. Aam typing pattern mein ye ~10-20% suggest requests kha jaata hai, aur woh bhi **0 ms** latency par.
+
+**`max-age=30` hi kyun?**
+
+| Value | Problem |
+|---|---|
+| `0` / `no-store` | Backspace wala fayda gaya. 4,000 QPS poora backend par. |
+| `30` | **Sweet spot** -- ek typing session cover ho jaati hai. |
+| `600` | Suggestions 10 minute purani. Sale start hui, naye trending terms aaye -- user ko purane dikhenge. Aur ek galat/abusive suggestion hatane par 10 min tak logon ko dikhta rahega. |
+
+**`private` kyun?** Iska matlab "sirf end-user ka browser cache kare, koi shared proxy/CDN nahi". v1 mein suggestions personalized **nahi** hain, toh technically `public` bhi chal jaata aur CDN edge par cache ho sakta tha -- jo ek genuinely achha optimization hai. Lekin hum `private` rakh rahe hain kyunki jis din koi personalization add karega (aur woh din aata hai), `public` ek **privacy incident** ban jaayega: ek user ki suggestions doosre ko serve ho jaayengi. `private` default safe hai.
+
+**Search results par kya?**
+
+```
+Cache-Control: no-store
+```
+
+**Kyun bilkul nahi cache karte:** results mein `price` aur `inStock` hai. Browser back button se 10 minute purana price dikhna = user cart mein daalega aur checkout par alag price milega = **support ticket + trust loss**. Ye ek business decision hai, technical nahi. (Isi wajah se spec CDN ko bhi explicitly reject karta hai -- sirf static category/facet pages CDN-able hain.)
+
+---
+
+### 15.2 -- Redis query cache (hamara main cache)
+
+```
+Key:    q:<sha1(normalizedQuery + filters + sort + page)>
+Value:  JSON of SearchResponse
+TTL:    60 s
+Scope:  page 1 only, no personalization
+```
+
+#### Normalization kyun life-or-death hai
+
+Cache ka poora fayda **hit ratio** par hai, aur hit ratio **key collision** par hai -- yaani alag-alag users ki "same" request ko **same key** milni chahiye.
+
+In teen requests ko dekho:
+
+```
+A:  /search?q=iPhone%20Case&brand=Apple&sort=relevance&page=1
+B:  /search?q=iphone++case&sort=relevance&brand=Apple
+C:  /search?q=%20iphone%20case%20&brand=Apple&page=1
+```
+
+**Teenon ka result bilkul identical hoga.** Bina normalization ke ye **3 alag keys** hain -> 3 ES queries -> hit ratio tihaai ho gaya.
+
+Normalization steps:
+
+| Step | Kya karta hai | Example |
+|---|---|---|
+| 1. `trim()` | Aage-peeche ka space | `" iphone case "` -> `"iphone case"` |
+| 2. `toLowerCase()` | Case fold | `"iPhone Case"` -> `"iphone case"` |
+| 3. `replace(/\s+/g, ' ')` | Multiple spaces -> ek | `"iphone   case"` -> `"iphone case"` |
+| 4. Unicode NFKC normalize | Same dikhne wale characters ek jaise | full-width vs normal characters |
+| 5. Filter **values** sort karo | `brand=[Sony,Apple]` aur `brand=[Apple,Sony]` same | `["apple","sony"]` |
+| 6. Filter **keys** canonical order | Object key order deterministic ho | `brand, category, price, rating, stock` |
+| 7. Default params drop karo | `sort=relevance` aur `sort` absent same | -- |
+
+#### `sha1` kyun, raw string kyun nahi
+
+- **Bounded key length.** `q` 100 chars tak ho sakta hai + filters 500 bytes tak. Redis key 600 bytes x har request = extra network bytes aur memory. `sha1` = fixed **40 hex chars**.
+- **Safe characters.** Raw query mein space, newline, `:`, emoji -- sab ho sakta hai. Hash ke baad sirf `[0-9a-f]`.
+- **Monitoring aasaan** -- `MEMORY USAGE` aur `SCAN q:*` predictable rehte hain.
+
+> **Honest security note:** `sha1` cryptographically toota hua hai (collisions banayi ja sakti hain). Yahan iska impact kam hai -- ek collision ka matlab hai ek public search result doosre public search result ke jagah serve hona, 60 seconds ke liye. Koi secret leak nahi. Par agar aapko paranoid hona hai, `sha256` ka pehla 128 bits use karo -- cost wahi hai.
+
+#### Page 1 only kyun
+
+| Page | Traffic ka hissa | Repeat rate | Cache karna? |
+|---|---|---|---|
+| 1 | **~80%** | High -- popular queries baar-baar | **Haan** |
+| 2-3 | ~15% | Medium | Borderline (hum nahi kar rahe) |
+| 4+ | ~5% | **Bahut kam** -- har user apni journey par | **Nahi** |
+
+Page 5 of a rare query cache karne ka matlab hai Redis memory bharna un entries se jo **kabhi hit nahi hongi**. Ye "cache pollution" hai -- aur ye aapke asli hot entries ko evict kar sakta hai.
+
+#### Kya cache mein **NAHI** jaana chahiye
+
+| Kya | Kyun |
+|---|---|
+| **Personalized results** | Har user ke liye alag -> hit ratio ~0 -> cache useless. **Aur khatarnak:** agar aapne key mein `userId` add karna bhool gaye, toh ek user ka personalized result doosre ko serve ho jaayega. Yahi wajah hai ki spec personalization ko v1 se **explicitly bahar** rakhta hai. |
+| **Logged-in-specific filters** | "Meri wishlist mein hai", "meri pin code par deliverable" -- ye per-user hain. |
+| **Seller dashboard search** | `sellerId` scoped -- per-seller cache banana toh possible hai, par woh traffic chhota hai, fayda nahi. |
+| **`degraded: true` wale responses** | **Ye sabse important hai.** ES down tha, humne Postgres fallback se 20 results diye. Us degraded response ko 60 s cache karna matlab: **ES wapas aa gaya, par hum agle 60 seconds tak sabko kharab results de rahe hain.** Cache write se pehle explicitly check karo: `if (response.degraded) return;` |
+| **`5xx` responses** | Obviously. Par log ye bhool jaate hain jab cache wrapper generic ho. |
+
+**Kya cache karna chahiye jo log nahi karte: zero-result responses.** Ek query jiske 0 results aaye woh usually **sabse mehengi** hoti hai -- fuzzy expansion poora chala, koi early termination nahi hui, saare shards ne poora kaam kiya. Aur `zero-result` queries repeat hoti hain (`"iphone 16"` hazaaron log search karte hain). Inhe zarur cache karo.
+
+#### Memory math -- ye cache practically free hai
+
+```
+Peak: 1,000 QPS,  TTL 60 s
+  -> ek TTL window mein  1,000 x 60 = 60,000 requests
+  -> distinct (query + filters + sort) page-1 combinations: maan lo ~25,000
+  -> har cached response: 24 hits x ~300 B + facets ~2 KB  =  ~10 KB
+
+  25,000 x 10 KB = ~256 MB
+```
+
+**256 MB.** Ek chhote Redis instance ka bhi ek hissa. Isliye "cache ka size kitna rakhein" is system mein ek **non-question** hai -- bas `maxmemory` set karo aur aage badho.
+
+#### Hit ratio -- spec ka 30% asal mein kahan se aata hai
+
+Spec kehta hai "top 1,000 queries = traffic ka ~30% (Zipf)". Log isko galat padh lete hain ki "hit ratio 30% hogi". Hisaab karke dekho -- baat isse zyada interesting hai.
+
+**Ek query cache hit tabhi degi jab woh pichle 60 seconds mein kam se kam ek baar aur aayi ho.**
+
+```
+Average traffic: 231 QPS
+Head (top 1,000 queries) = 30% = 69.3 QPS, 1,000 queries mein bata hua
+
+Sabse top query (~1% of all traffic):
+    0.01 x 231 = 2.31 QPS  ->  60 s window mein 139 requests
+    Inme se 1 miss, 138 hit  ->  hit ratio 99.3%          [OK] shaandaar
+
+Head ka sabse neeche wala (1000th query):
+    69.3 / 1000 = 0.069 QPS  ->  60 s window mein 4.2 requests
+    1 miss, 3.2 hit  ->  hit ratio ~76%                    [OK] theek
+
+Long tail (baaki 70% traffic, laakhon distinct queries):
+    Har query 60 s mein 0-1 baar  ->  hit ratio ~0%        [X]
+```
+
+**Overall:** ~30% traffic (head) par ~85% average hit ratio + ~70% traffic (tail) par ~2% = **effective hit ratio ~27-30%**. Spec ka "~30% requests ES tak jaati hi nahi" bilkul sahi nikla.
+
+**Aur ye TTL se kaise badalta hai:**
+
+| TTL | Effective hit ratio | Staleness |
+|---|---|---|
+| 10 s | ~15% | ~10 s |
+| **60 s** | **~30%** | ~60 s |
+| 300 s | ~42% | **~5 min -- price stale, bahut zyada** |
+
+TTL badhane se return **diminishing** hai (60 -> 300 = 5x TTL, par sirf +12% hit ratio) jabki staleness ka risk **linear** badhta hai. **60 s ek achha knee-of-the-curve point hai.**
+
+#### 30% ka ES CPU mein kya matlab hai
+
+Ab woh 30% asal mein **kya kharidta hai**:
+
+```
+Maan lo: har search = 6 shards parallel, har shard query ~15 ms CPU (aggregations sameth),
+         6 data nodes, 16 vCPU each.
+
+Peak 1,000 QPS, cache BINA:
+  1,000 x 6 = 6,000 shard queries/sec  /  6 nodes  = 1,000 per node/sec
+  1,000 x 15 ms = 15,000 ms CPU/sec    =  15.0 cores busy   (16 vCPU ka 94%)  [X] khatra
+
+Peak 1,000 QPS, cache 30% ke saath (700 QPS ES tak):
+  700 x 6 = 4,200 shard queries/sec    /  6 nodes  = 700 per node/sec
+  700 x 15 ms = 10,500 ms CPU/sec      =  10.5 cores busy   (16 vCPU ka 66%)  [OK]
+```
+
+**30% cache = per node ~4.5 cores bach gaye = 94% utilization aur 66% utilization ka farak.** Aur ye woh farak hai jispar p99 latency poori tarah depend karti hai -- 94% par queue build hoti hai aur p99 exponentially badhti hai; 66% par system ke paas headroom hai.
+
+**Aur sale day par cache aur behtar hota hai.** Kyun? Kyunki sale par query distribution **aur zyada concentrated** ho jaati hai -- sab log wahi 50 trending terms search karte hain jo homepage banner par hain. Head ka hissa 30% se badh kar 45-50% ho jaata hai:
+
+```
+Sale day 4,600 QPS, cache 45%  ->  2,530 QPS ES tak
+  2,530 x 6 / 6 nodes = 2,530 shard queries per node/sec
+  x 15 ms = 38 cores busy per node                          <- 16 vCPU par IMPOSSIBLE
+```
+
+Yaani cache ke bawajood sale day par 6 nodes se **kaam nahi chalega** -- wahan aur replicas chahiye. **Ye Part 4 ka poora topic hai.** Lekin point ye hai: cache ne 69 cores ki zarurat ko 38 par le aaya, yaani **scaling ka aadha kaam cache ne kar diya**, aur woh exactly tab kiya jab sabse zyada zarurat thi.
+
+#### Code -- cache-aside with stale-while-revalidate aur single-flight
+
+```ts
+// src/middleware/cache.ts
+import { createHash } from 'node:crypto';
+import type { SearchRequest, SearchResponse } from '../types';
+
+const TTL_SEC = 60;
+const STALE_GRACE_SEC = 120;                 // TTL ke baad itni der stale serve kar sakte hain
+
+function normalize(req: SearchRequest): string {
+  const q = req.q.normalize('NFKC').trim().toLowerCase().replace(/\s+/g, ' ');
+  const f = req.filters;
+  const canonical = {
+    q,
+    brand: [...(f.brand ?? [])].sort(),
+    categoryPath: [...(f.categoryPath ?? [])].sort(),
+    priceMin: f.priceMin ?? null,
+    priceMax: f.priceMax ?? null,
+    minRating: f.minRating ?? null,
+    inStockOnly: f.inStockOnly ?? false,
+    sort: req.sort,
+    page: req.page,
+  };
+  return JSON.stringify(canonical);          // key order upar fix hai -> deterministic
+}
+
+export function cacheKey(req: SearchRequest): string {
+  return 'q:' + createHash('sha1').update(normalize(req)).digest('hex');
+}
+
+interface Entry { body: SearchResponse; expiresAt: number }
+
+export async function searchWithCache(
+  req: SearchRequest,
+  runQuery: () => Promise<SearchResponse>
+): Promise<SearchResponse> {
+  if (req.page !== 1) return runQuery();     // page 1 hi cache hoti hai
+
+  const key = cacheKey(req);
+  let raw: string | null = null;
+  try {
+    raw = await redis.get(key);              // Redis client par commandTimeout set hai
+  } catch (err) {
+    metrics.cacheErrors.inc();               // Redis down -> FAIL OPEN, 503 nahi
+    logger.warn({ err }, 'redis get failed, bypassing cache');
+    return runQuery();
+  }
+
+  if (raw) {
+    const entry: Entry = JSON.parse(raw);
+    if (Date.now() < entry.expiresAt) {
+      metrics.cacheHits.inc({ kind: 'fresh' });
+      return entry.body;                     // FRESH HIT
+    }
+    metrics.cacheHits.inc({ kind: 'stale' });
+    void revalidateInBackground(key, runQuery);
+    return entry.body;                       // STALE HIT -- user waits 0 ms
+  }
+
+  metrics.cacheMisses.inc();
+  const body = await runQuery();
+  await store(key, body);
+  return body;
+}
+
+async function revalidateInBackground(key: string, runQuery: () => Promise<SearchResponse>) {
+  const lockKey = key + ':lock';
+  const got = await redis.set(lockKey, '1', 'PX', 5000, 'NX');   // SINGLE FLIGHT
+  if (got !== 'OK') return;                  // koi aur pehle se refresh kar raha hai
+  try {
+    const fresh = await runQuery();
+    await store(key, fresh);
+  } catch (err) {
+    logger.warn({ err, key }, 'background revalidate failed');   // stale value zinda rehti hai
+  } finally {
+    await redis.del(lockKey);
+  }
+}
+
+async function store(key: string, body: SearchResponse) {
+  if (body.degraded) return;                 // degraded fallback KABHI cache mat karo
+  const jitter = Math.floor(Math.random() * 10);                 // 0-9 s
+  const entry: Entry = { body, expiresAt: Date.now() + TTL_SEC * 1000 };
+  await redis.set(key, JSON.stringify(entry), 'EX', TTL_SEC + STALE_GRACE_SEC + jitter);
+}
+```
+
+**Code Explanation:**
+
+- `normalize()` -- upar wali 7 steps. `JSON.stringify` par ek object literal ka key order **source code ka order** hota hai (non-integer keys ke liye), isliye ye deterministic hai -- lekin isi wajah se yahan **spread (`...req.filters`) mat karna**, kyunki uska order runtime par vary kar sakta hai.
+- `[...(f.brand ?? [])].sort()` -- copy banake sort. Bina copy ke aap **caller ka array mutate** kar rahe hoge (`sort` in-place hai) -- ek classic silent bug.
+- `req.page !== 1` -> seedha `runQuery()`. Cache pollution se bacha.
+- **`try/catch` around `redis.get`** -- **cache ki failure kabhi request ki failure nahi banni chahiye.** Redis down = thoda slow, 503 nahi. Ye "fail open" hai.
+- **Do tarah ke hits:** `expiresAt` **JSON ke andar** hai, aur Redis ki TTL usse **lambi** hai (`60 + 120 + jitter`). Isliye TTL "expire" hone ke baad bhi value **Redis mein maujood** rehti hai -- hum usko **stale** kehkar turant serve kar dete hain.
+- **Stale-while-revalidate ka poora point:** us user ko jiski request par cache expire hua, usko **saza nahi milti**. Woh 2 ms mein stale (max 60 s purana) result leke chala jaata hai, aur refresh **background** mein hota hai. Bina iske, har 60 second mein ek unlucky user ko poori ES latency jhelni padti.
+- `redis.set(lockKey, '1', 'PX', 5000, 'NX')` -- **single flight**. `NX` = "sirf tab set karo jab key exist na kare" -- ye Redis ka atomic **compare-and-set** hai. Sirf ek process ko `'OK'` milta hai; baaki turant lautte hain. `PX 5000` = agar refresh karne wala process crash kar gaya, lock 5 s mein khud chhoot jaayega (**deadlock se bachaav**).
+- `void revalidateInBackground(...)` -- `void` TypeScript ko batata hai "ye floating promise jaan-boojh kar hai, `await` nahi karna". Request path **block nahi** hota.
+- `catch` in revalidate -- refresh fail hua (ES slow)? Koi baat nahi, **purani value abhi bhi Redis mein hai** aur agle 120 s tak serve hoti rahegi. Ye ek achha **degradation** behaviour hai: ES thoda hichki le toh users ko kuch dikhta toh rahe.
+- `if (body.degraded) return` -- upar wala important rule, code mein.
+- `jitter` -- agar 5,000 keys ek hi sale-start burst mein bani, toh sab exactly 60 s baad ek saath expire hongi -> **synchronized stampede**. 0-9 s ka random unhe spread kar deta hai. (Rate Limiter Part 3 ka "synchronized retries" wala hi lesson.)
+
+#### Cache stampede -- sale ke waqt ek hot query par
+
+**Scenario:** 12:00:00 par "Big Billion Sale" live hui. `"iphone sale"` query par 4,600 QPS ka bada hissa aa raha hai -- maan lo us ek query par 500 QPS.
+
+**Bina protection ke kya hota:**
+
+```
+12:00:00.000   key set hui (TTL 60 s)
+12:01:00.000   key expire
+12:01:00.001   500 concurrent requests -> SAB ko cache MISS
+12:01:00.002   500 identical ES queries ek saath
+               -> ES search thread pool queue (default 1000) bhar gaya
+               -> `es_rejected_execution_exception` (429)
+               -> Search API ne 503 diya ya retry kiya
+               -> retry se aur load  ->  cascading failure
+12:01:00.800   koi ek response aaya, cache set hui
+               -> par tab tak 500 requests ya fail ho chuki ya 800 ms le chuki
+```
+
+Isko **cache stampede** (ya "thundering herd", ya "dogpile") kehte hain. Aur dhyan do -- **ye tab hota hai jab traffic sabse zyada ho**, yaani sabse bura waqt.
+
+**Teen defences, aur hum teeno use kar rahe hain:**
+
+| Defence | Kya karta hai | Hamare code mein |
+|---|---|---|
+| **Stale-while-revalidate** | Expiry par bhi purani value turant do; refresh background mein | `expiresAt` inside JSON + lambi Redis TTL |
+| **Single flight (lock)** | 500 mein se sirf **1** ES tak jaaye | `SET lockKey NX PX 5000` |
+| **TTL jitter** | Keys ek saath expire na ho | `+ random(0..9)` seconds |
+
+**Stale-while-revalidate aur akela lock mein farak (ye important hai):**
+
+- **Sirf lock:** 1 request ES par jaati hai, baaki 499 ko **wait** karna padta hai (poll karke retry). Unki latency ES ki latency ban jaati hai. Better than 500 queries, par phir bhi users ko 300 ms feel hota hai.
+- **Stale-while-revalidate + lock:** 1 request background mein ES par jaati hai, baaki 499 ko **turant** 60 s purana result mil jaata hai. **Kisi ka bhi wait 0 ms.** Search results mein 60 s staleness bilkul acceptable hai.
+
+**Ek aur layer jo pro log lagate hain:** popular queries ko **proactively warm** karo. Sale se 10 minute pehle ek job top 200 expected sale queries chala kar cache bhar deti hai, aur ek background refresher unhe har 30 s par refresh karta rehta hai. Tab woh keys kabhi cold hi nahi hoti.
+
+---
+
+### 15.3 -- Redis popular-prefix cache (suggest)
+
+```
+Key:    sug:<prefix>          e.g.  sug:iph
+Value:  JSON  [{ text: "iphone 15", type: "query" }, ...]
+TTL:    600 s (10 min)
+Count:  ~10,000 prefixes precomputed
+```
+
+Ye query cache se **teen tareekon se alag** hai:
+
+| | `q:` query cache | `sug:` prefix cache |
+|---|---|---|
+| Kaise bharti hai | **Lazily** -- user ki request se (cache-aside) | **Proactively** -- nightly job (cache-ahead), plus lazy fill for misses |
+| Key space | Unbounded (koi bhi query) | **Bounded** -- ~10,000 prefixes, poora enumerate kiya ja sakta hai |
+| Hit ratio | ~30% | **~85%** |
+| TTL | 60 s (data volatile -- price/stock) | 600 s (suggestions slow-moving hain) |
+
+**Hit ratio 85% kyun?** Kyunki prefix space **collapsed** hai. 20M distinct queries ho sakti hain, par unke pehle 3 characters sirf kuch hazaar combinations hain, aur usme bhi traffic `ip`, `sa`, `la`, `sh` jaise chhote set par concentrated hai. Har `iphone*` search karne wala pehle `i`, `ip`, `iph` type karta hai.
+
+**Ye price/stock wali problem se kyun nahi jhoojhta:** kyunki suggestions mein **price nahi hoti** -- sirf text. `"iphone 15"` 10 minute purana hone se kuch nahi bigadta. Isliye TTL 10x lamba rakh sakte hain.
+
+---
+
+### 15.4 -- Elasticsearch ke apne caches
+
+Ab woh caches jo aapke code mein nahi hain, par jinka behaviour aapki **query shape** decide karti hai.
+
+#### (a) Node query cache -- filter bitsets
+
+**Kya cache hota:** ek **filter clause** ka result, ek **bitset** ke roop mein, **per segment**.
+
+```
+{ "term": { "brand": "Apple" } }   ->   segment 0: [0,1,0,0,1,1,0,...]  (8.3M bits = ~1 MB)
+                                        segment 1: [1,0,0,1,...]
+                                        ...
+```
+
+**Kahan:** data node ke JVM heap mein, default `indices.queries.cache.size: 10%` (hamare 31 GB heap par ~3.1 GB per node).
+
+**Kab cache hota:** ES har filter cache nahi karta -- uski ek policy hai:
+- Clause `filter` context mein honi chahiye (`must` mein nahi).
+- Segment kaafi bada hona chahiye (chhote segments jaldi merge ho jaate hain, cache waste).
+- Clause ko **kai baar** dikhna chahiye (ek "frequently used" heuristic) -- ek-baar ki filter cache nahi hoti.
+
+**Invalidate kab hota:** bitsets **per-segment** hain aur segments **immutable** hain -- toh bitset kabhi "galat" nahi ho sakti. Jab segment **merge** hota hai, purani bitsets ka koi matlab nahi rehta aur woh drop ho jaati hain. Ye ek bahut elegant design hai: **immutability ne invalidation ki problem hi khatam kar di.**
+
+**Practical tuning insight (ye sabse kaam ki baat hai):**
+
+```json
+[OK] CACHEABLE:     { "term":  { "brand": "Apple" } }              <- fixed set of values
+[OK] CACHEABLE:     { "term":  { "inStock": true } }               <- 2 values
+[OK] CACHEABLE:     { "range": { "price": { "lte": 500 } } }       <- FIXED bucket
+[X] KHARAB:        { "range": { "price": { "gte": 517, "lte": 1843 } } }   <- arbitrary
+```
+
+Agar aapka UI user ko ek **slider** deta hai (`517` se `1843`), toh har user ka filter **unique** hoga -> koi bhi filter dobara nahi dikhega -> **kuch bhi cache nahi hoga**, aur ulta cache mein kachra bhar jaayega jo asli useful entries ko evict karega.
+
+**Fix:** price ranges ko **fixed buckets** mein round karo -- exactly wahi buckets jo spec ki aggregation mein hain:
+
+```json
+"price_ranges": { "range": { "field": "price",
+  "ranges": [ { "to": 500 }, { "from": 500, "to": 2000 }, { "from": 2000 } ] } }
+```
+
+UI mein slider ki jagah clickable ranges do (`Under 500` / `500-2000` / `2000+`). Ab teen distinct filters hain, teeno cache ho jaate hain, aur facet counts bhi unhi buckets ke hain toh sab consistent hai. **Ek UI decision ne cache hit ratio ko 0% se 100% kar diya.**
+
+#### (b) Shard request cache -- aggregations ke liye
+
+**Kya cache hota:** ek **poori shard-level response**, poore request body par keyed.
+
+**Sabse important restriction:** ye cache **sirf `size: 0` requests par** kaam karta hai. Yaani jab aap sirf aggregations ya count maang rahe ho, documents nahi.
+
+**Kyun?** Kyunki documents wali response (a) bahut badi hoti hai aur (b) har refresh par badal sakti hai. Sirf-aggregation wali response chhoti aur deterministic hoti hai.
+
+**Hamari canonical query mein `"size": 24` hai -> shard request cache ka fayda ZERO hai.**
+
+**Invalidation:** shard ke har **refresh** par poora cache us shard ke liye wipe ho jaata hai. Hamara `refresh_interval: 1s` hai -> **har second cache saaf**. Toh iska window sirf 1 second ka hai.
+
+Kya ye bekaar hai? Nahi -- 1,000 QPS par ek second mein 1,000 requests hoti hain, toh ek identical agg request 1 second mein kai baar aa sakti hai. Par fayda chhota hai.
+
+**Kaise iska poora fayda uthaayein (architectural move):**
+
+```
+Aaj:      ek request  ->  hits (size 24) + 3 aggregations      -> request cache use NAHI hoti
+Behtar:   do requests:
+          (1) GET /search  -> hits only (size 24, no aggs)     -> tez, kam CPU
+          (2) GET /facets  -> size: 0, aggs only               -> REQUEST CACHE HIT
+                              + `request_cache=true` explicitly
+```
+
+Facets ek hi query ke liye poore result set par compute hote hain aur woh **query + filters ke combination** par depend karte hain -- jo repeat hota hai. Category browse pages (`/mobiles`, `/shoes`) par toh query hi khali hoti hai aur facets bilkul same -- wahan ye cache **90%+ hit** deti hai.
+
+Trade-off: 2 requests = 2 network round trips. Par dono **parallel** bheje ja sakte hain (`Promise.all`), toh latency nahi badhti, aur ES par total CPU kam ho jaata hai.
+
+> Aur yaad rakho: `track_total_hits: 10000` bhi yahin fit hota hai -- exact total count maangne se ES ka **early termination** band ho jaata hai aur har matching doc ginna padta hai. "10,000+ results" dikhana kaafi hai aur sasta hai.
+
+#### (c) OS page cache -- sabse bada aur sabse ignored
+
+ES apne segment files ko **khud cache nahi karta**. Woh unhe `mmap` karta hai (default `hybridfs` store type) aur **operating system ke page cache** par bharosa karta hai.
+
+**Isliye ye rule hai:**
+
+```
+Node RAM:        64 GB
+JVM heap:        31 GB    <- ES ka apna memory (query execution, caches, indexing buffers)
+Page cache:     ~30 GB    <- OS ke paas bacha hua -- LUCENE FILES YAHAN CACHE HOTI HAIN
+OS overhead:     ~3 GB
+```
+
+**Do alag rules jo log mila dete hain:**
+
+1. **Heap kabhi 32 GB se upar mat karo.** JVM 32 GB tak "compressed ordinary object pointers" (compressed oops) use karta hai -- 32-bit pointers with a scaling factor. 32 GB paar karte hi pointers 64-bit ho jaate hain aur aap **effectively memory kho dete ho** -- 33 GB heap practically 30 GB se kam useful memory deta hai. 31 GB safe boundary hai.
+2. **ES ko RAM ka aadha se zyada mat do.** Kyunki baaki aadha page cache ka hai, aur page cache hi aapki disk reads bacha raha hai.
+
+**Kya hamara data fit hota hai?**
+
+```
+Cluster data (spec):   ~260 GB  (130 GB primary + 130 GB replica)
+Nodes:                 6
+Per node:              ~43 GB
+Page cache available:  ~30 GB per node
+
+43 GB > 30 GB  ->  poora data RAM mein fit NAHI hota (70%)
+```
+
+**Kya ye problem hai? Nahi -- aur 13.1 ka storage breakdown batata hai kyun:**
+
+| Hissa | Size (per node) | Kitni baar padha jaata | Hot rehta? |
+|---|---|---|---|
+| Term dictionary (FST) | < 0.5 GB | **Har query, har term** | **Haan, hamesha** |
+| Postings lists | ~5 GB | Har query | **Haan** (common terms) |
+| doc values (sort, facets, function_score) | ~4 GB | Har query with sort/agg | **Haan** |
+| `norms` | ~0.5 GB | Har scored query | **Haan** |
+| **`_source`** | **~33 GB** | **Sirf final 24 docs ke liye** | **Nahi, aur koi baat nahi** |
+
+Jo hissa **har query mein** chahiye woh ~10 GB hai -- woh 30 GB page cache mein **aaram se** rehta hai. Jo hissa bada hai (`_source`) woh sirf **fetch phase** mein, sirf 24 documents ke liye padha jaata hai -- 24 random disk reads NVMe SSD par ~1-2 ms. Bilkul acceptable.
+
+**Ye interview mein bolne wali insight hai:** *"Index poora RAM mein nahi hota aur na hone ki zarurat hai. Jo cheez har query mein chahiye -- dictionary, postings, doc values -- woh index ka sirf ~25% hai aur woh page cache mein rehti hai. `_source` bada hai par usko sirf top-k documents ke liye padha jaata hai."*
+
+**Aur isliye ye cheezein turant page cache ko maar deti hain:**
+- Node par koi aur heavy process chalana (log shipper jo GBs padhta ho).
+- `_source` ko bina zarurat ke fetch karna (`_source: false` ya `"_source": ["productId","title","price"]` use karo agar poora doc nahi chahiye).
+- Ek bada `_reindex` ya snapshot -- woh **poora** data padhta hai aur page cache ko **flush** kar deta hai (aapki hot data evict ho jaati hai). **Isliye snapshots aur reindex off-peak hours mein.**
+
+#### (d) doc values vs fielddata -- ek purana jaal
+
+Ye "cache" nahi hai par isi family mein aata hai, aur isse ek classic production outage hota hai.
+
+**Problem:** inverted index `term -> docs` deta hai. Lekin sorting, aggregation aur `function_score` ke liye ulta chahiye: **`doc -> value`**. "Doc 4,529,102 ka `brand` kya hai?" Inverted index se ye nikalne ke liye poore index ko scan karna padega.
+
+| | **doc values** | **fielddata** |
+|---|---|---|
+| Kya hai | Column-oriented `doc -> value` store, **index time par** likha jaata hai | Inverted index ko runtime par **un-invert** karke banaya gaya `doc -> value` map |
+| Kahan rehta | **Disk**, page cache se serve | **JVM heap** |
+| Kin fields par | `keyword`, numeric, `date`, `boolean`, `ip` -- **default ON** | `text` fields -- **default OFF** |
+| Cost | Index size thoda bada, memory safe | **Poora field heap mein load hota hai** |
+| Failure mode | Koi nahi (page cache miss = disk read) | **OutOfMemoryError -> node crash** |
+
+**Hamare mapping mein ye sab jaan-boojh kar hai:**
+
+```json
+"brand":        { "type": "keyword" },                                  <- doc values ON
+"categoryPath": { "type": "keyword" },                                  <- doc values ON
+"title": { "type": "text", ...,
+           "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } }   <- sub-field
+"popularityScore": { "type": "float" },                                 <- function_score isse padhta hai
+```
+
+**`brand` `keyword` kyun hai, `text` kyun nahi?** Kyunki hum uspar **aggregate** karte hain (`"brands": { "terms": { "field": "brand" } }` -- facet counts). Agar `brand` `text` hota, toh ye error milta:
+
+```
+Fielddata is disabled on text fields by default. Set fielddata=true on [brand]
+in order to load fielddata in memory by uninverting the inverted index.
+```
+
+**Aur ye error message hi jaal hai.** Woh literally aapko batata hai ki `fielddata: true` set karo. **Mat karo.** 50M documents ke `brand` values ko heap mein load karna = GB of heap = node OOM = shard unassigned = cluster red.
+
+**Sahi jawab hamesha ek hi hai:** `keyword` sub-field use karo (`brand.keyword` ya, jaise hamare mapping mein hai, `brand` ko seedhe `keyword` banao). Agar aapko **dono** chahiye -- search bhi aur aggregate bhi -- toh multi-field pattern:
+
+```json
+"brand": { "type": "text", "analyzer": "product_index",
+           "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } }
+```
+
+Ab `brand` par search karo aur `brand.keyword` par aggregate. Do alag data structures, ek hi source field.
+
+**`ignore_above: 256`** ka matlab: 256 characters se lambi values ko `keyword` field mein index hi mat karo. Kyun? Kyunki ek bahut lamba title ya brand string doc values mein jaake memory waste karta hai aur uspar aggregate karne ka koi matlab nahi (koi facet "Premium Quality Pure Cotton Casual Regular Fit..." nahi hoga). Ye ek chhota sa **guardrail** hai jo galat data se bachata hai.
+
+---
+
+### 15.5 -- Cache invalidation on product update: honest jawab
+
+Ab woh sawaal jo har interview mein aata hai: **"Product update hua, aapki cache stale ho gayi -- aap invalidate kaise karte ho?"**
+
+**Hamara jawab: hum mostly invalidate karte hi nahi. Hum 60 second ki TTL par bharosa karte hain.**
+
+Ye lazy nahi, ye ek soch-samajh kar liya gaya decision hai. Wajah:
+
+#### Kyun invalidation practically impossible hai
+
+Sochiye product `P4711` ka price badla. Ab aapko **un saari cache keys ko dhoondhna hai jinke results mein P4711 hai**. Woh ho sakti hain:
+
+```
+q:sha1("iphone case" + {} + relevance + 1)
+q:sha1("phone cover" + {brand:Apple} + relevance + 1)
+q:sha1("apple accessories" + {price:500-2000} + price_asc + 1)
+q:sha1("case" + {inStock:true} + rating + 1)
+... aur shayad 500 aur
+```
+
+Iske liye aapko ek **reverse index chahiye: `productId -> Set<cacheKey>`**. Uske problems:
+
+| Problem | Detail |
+|---|---|
+| **Woh khud ek index hai** | Har cached response (24 products) par 24 reverse entries likhni padengi. 25,000 cached responses x 24 = **600,000 reverse entries**, jo har 60 s mein badalti hain. Aapne cache ko sasta banane ke liye ek aur mehenga system bana diya. |
+| **Fan-out bahut bada hai** | Ek popular product (`iPhone 15`) hazaaron cached result sets mein hai. Uska ek price change = hazaaron `DEL` commands = Redis spike. |
+| **5M updates/day** | 58/sec average. Har update par ye fan-out? Flash sale par 500/sec? Ye system apne aap ko hi DoS kar dega. |
+| **Aur sabse bada:** ye problem solve hi nahi karta | ES khud **eventually consistent** hai (indexer lag + refresh). Cache invalidate karke bhi aapko ES se **wahi purana data** milega. Aapne ek problem ke liye bahut kaam kiya jo waise bhi bani rehti. |
+
+#### Latency ka poora budget (honest hisaab)
+
+```
+Postgres commit  ->  ES searchable        : 1-30 s   (spec ka SLA)
+ES searchable    ->  cache expire         : 0-60 s   (hamari TTL)
+------------------------------------------------------
+Worst case seller ke update se search mein dikhne tak:  ~90 s
+```
+
+Spec ka requirement `<= 30 s` tha. **Toh kya humne SLA tod diya?**
+
+**Technically haan, agar aap "search results mein dikhne wala data" maanein. Aur iska solution cache invalidation nahi hai -- ye hai:**
+
+#### Asli fix: cache mein volatile data mat rakho
+
+Ye ek design pattern hai jo bade marketplaces actually use karte hain:
+
+```
+[X] Aaj (simple):  cache mein POORA SearchResponse hai, price aur inStock ke saath
+                   -> price change 60 s tak invisible
+
+[OK] Behtar:        cache mein sirf RANKING store karo:
+                     { productIds: ["p1","p2",...,"p24"], facets: {...}, total: 10000 }
+                   -> har request par un 24 productIds ka price/stock
+                      Redis hash (ya Postgres) se HYDRATE karo
+                   -> ranking 60 s stale (bilkul theek)
+                   -> price/stock HAMESHA fresh
+```
+
+**Cost:** ek extra Redis call per request (`HMGET` / `MGET` for 24 ids) = ~1 ms. **Fayda:** cache ka staleness ab **sirf ranking par** lagta hai, price par nahi. Aur ranking ka 60 s purana hona kisi ko pata bhi nahi chalega.
+
+Ye spec ke baaki decisions ke saath perfectly fit hai: "**exact `stock_qty` product page par DB/Redis se**" -- hum bas wahi rule search results par bhi laga rahe hain.
+
+#### Jab 60 s bilkul acceptable NAHI hai
+
+Do asli cases, aur dono ka alag fix:
+
+**Case 1 -- Product ban / takedown (legal, counterfeit, safety recall).** Compliance team ne product hataya. Usko 60 s tak search mein dikhna **legal problem** hai.
+
+Fix: ek chhota **deny-set** rakho aur use cache **read** par apply karo:
+
+```ts
+// cache hit ke baad, return se pehle
+const banned = await redis.smembers('banned:products');     // chhota set, local memory mein bhi cache kar sakte ho (5 s)
+if (banned.length) {
+  entry.body.hits = entry.body.hits.filter(h => !banned.includes(h.productId));
+}
+return entry.body;
+```
+
+**Code Explanation:**
+
+- `banned:products` ek Redis **SET** hai jisme sirf banned productIds hain -- typically kuch sau se kuch hazaar, MBs nahi.
+- Ye check cache **read** par lagta hai, cache **write** par nahi -- isliye purani cached entries par bhi turant asar hota hai. **Invalidation ke bina invalidation.**
+- Practically is set ko Node process mein 5 second ke liye local-cache kar lo, warna har request par ek extra Redis call hai.
+- Ye bounded hai: deny-set chhota rehta hai kyunki banned products ko **index se bhi hataya** jaata hai (delete event) -- ye set sirf us 90 second ki khidki ko cover karta hai.
+
+**Case 2 -- Sale start at exactly 12:00:00.** Naye prices live hone chahiye, 60 s late nahi.
+
+Fix: **cache epoch (version prefix)**:
+
+```
+Redis:  cache:epoch = 7
+Key:    q:v7:<sha1(...)>
+
+12:00:00 par:   INCR cache:epoch   ->  8
+Ab saari nayi keys q:v8:* hain.  Saari purani q:v7:* keys ORPHAN ho gayi
+aur apni TTL par khud mar jaayengi. Koi DEL nahi, koi SCAN nahi, O(1) operation.
+```
+
+**Ye pattern yaad rakho** -- "version prefix in cache key" poore cache ko **ek atomic operation** mein invalidate kar deta hai, bina laakhon keys delete kiye. Iska trade-off: 60 s tak Redis mein purani aur nayi dono keys hongi (memory 2x), jo hamare 256 MB par koi issue nahi. Aur turant ke baad cache hit ratio 0% -- toh ye sirf tab karo jab genuinely zarurat ho (aur pehle se **warm** kar lo, 15.2 ka pre-warming).
+
+> **Interview line:** "Main search result cache ko invalidate nahi karta -- 60 s TTL par chalata hoon, kyunki reverse index `productId -> cacheKeys` maintain karna khud ek system ban jaata hai aur ES waise bhi eventually consistent hai. Staleness ki asli chot price/stock par hoti hai, toh main cache mein sirf ranking (productIds + facets) rakhta hoon aur price/stock har request par Redis se hydrate karta hoon. Do exceptions hain: banned products ke liye ek chhota deny-set jo cache read par filter karta hai, aur sale launch ke liye ek cache epoch counter jisko `INCR` karke poora cache ek operation mein invalidate ho jaata hai."
+
+---
+
+### 15.6 -- Poora caching picture
+
+```
+User types "iphone case"
+   |
+   v
+[1] Browser HTTP cache          max-age=30 (suggest only)      ~15% of suggest traffic, 0 ms
+   |
+   v
+[2] (CDN -- jaan-boojh kar OFF for results; volatile price/stock)
+   |
+   v
+Search API (Node)
+   |
+   +--> [3] Redis  q:v7:<sha1>       TTL 60 s, page 1 only      ~30% of search, ~2 ms
+   |         (stale-while-revalidate + single flight + jitter)
+   |         MISS
+   |         |
+   +--> [4] Redis  sug:<prefix>      TTL 600 s, ~10K prefixes   ~85% of suggest, ~2 ms
+   |
+   v
+Elasticsearch cluster
+   |
+   +--> [5] Node query cache         filter bitsets (10% heap)  ~0.1 ms per cached filter
+   |
+   +--> [6] Shard request cache      size:0 requests only, wiped har refresh (1 s)
+   |
+   +--> [7] OS page cache            ~30 GB/node -- dictionary + postings + doc values HOT
+   |                                 _source cold (theek hai, sirf 24 docs)
+   v
+NVMe disk                            ~1-2 ms per random read (fetch phase)
+```
+
+**Ek line mein har layer ka kaam:**
+
+| Layer | Kya bachata hai |
+|---|---|
+| 1. Browser | Network round trip |
+| 3. Redis query cache | **Poori ES query** (~4.5 CPU cores per node at peak) |
+| 4. Redis prefix cache | **85% suggest traffic** ES tak pahunchti hi nahi |
+| 5. Node query cache | Filter ki bitset dobara banane ka kaam |
+| 6. Shard request cache | Poora agg computation (sirf `size: 0`) |
+| 7. OS page cache | **Disk I/O** -- yahi sabse bada aur sabse silent win hai |
+
+---
+
+## Remember
+
+> **Search do alag problems ka jawab hai, aur dono ka alag hathiyaar hai: speed ke liye INVERTED INDEX (text ko ulta karke `term -> docIds`, taaki 50M rows ki jagah 2 postings lists chalein), aur relevance ke liye BM25 (rare term zyada keemti -- IDF; dasva match pehle jaisa nahi -- `k1`; chhote title mein match zyada strong -- `b`).** Uske upar business signals sirf **multiply** hote hain, replace nahi. Indexing mein ordering ka jawab do cheezein hain: **Kafka key = `productId`** (happy path) aur **`version_type: 'external'`** (kuch bhi ho jaaye) -- aur at-least-once delivery isliye safe hai kyunki indexing `_id = productId` par ek **upsert** hai, accumulate nahi. Aur caching mein: **sabse achhi invalidation woh hai jo karni hi na pade** -- 60 s TTL + cache mein sirf ranking rakho, price/stock hamesha fresh hydrate karo.
+
+## Quick Self-Test
+
+1. `"Cotton Bedsheets for Double Bed"` ko `product_index` analyzer (standard tokenizer -> lowercase -> `en_stop` -> `en_stemmer`) se guzaro. Final terms kya honge aur unki **positions** kya hongi? `for` hatane par `double` ki position 2 kyun nahi hoti? Aur ab is doc ki postings entries likho.
+2. `N = 50,000,000`, `df(shirt) = 400,000`, `avgdl = 9`, `k1 = 1.2`, `b = 0.75`. Ek doc ka title 2 terms ka hai aur usme `shirt` 1 baar hai. BM25 contribution calculate karo (poora hisaab dikhao). Ab wahi doc 14 terms ka hota toh? Ratio kya nikla aur woh kis parameter ki wajah se hai?
+3. Aapki query mein `{ "term": { "brand": "Apple" } }` `must` mein hai. Usko `filter` mein le jaane par **teen** cheezein badalti hain -- teeno batao. Aur ek aisi clause ka example do jise `filter` mein le jaana **galat** hoga.
+4. Ek product ke do updates hain: v7 (price 999) aur v8 (price 899). v8 pehle ES par pahunch gaya. (a) `version_type: 'external'` ke bina final state kya hoga? (b) Uske saath kya hoga aur ES kaunsa status code dega? (c) Us status code par indexer ko retry karna chahiye ya nahi, aur kyun? (d) Agar Kafka key `sellerId` hoti toh ordering turant tootti ya nahi -- aur asli do problems kya hain?
+5. Sale ke waqt ek hot query par 500 QPS hai aur uski cache key expire ho jaati hai. (a) Bina protection ke exactly kya hota hai, step by step? (b) Sirf single-flight lock lagane se kitne users ko kitni latency milegi? (c) Stale-while-revalidate add karne se woh number kya ho jaayega aur uski keemat kya hai? (d) `degraded: true` wale response ko cache karna kyun ek alag aur bada bug hai?
+
+---
+
+**Next (Part 4):** Scaling (shards, replicas, hot nodes, sale-day traffic), failure scenarios (ES yellow/red, node loss, indexer lag, split brain), consistency, security (multi-tenant filters, injection, scraping), observability (slow log, zero-result rate, indexer lag). "next" bolo.

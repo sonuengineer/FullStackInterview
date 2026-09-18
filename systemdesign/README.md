@@ -1,0 +1,46 @@
+# System Design Prep (Hinglish, Node.js)
+
+Spec: [prompt.md](prompt.md). One system at a time; each system split into parts (.md = study note, .html = reading page).
+
+Rebuild HTML after editing any .md: `node systemdesign/build.mjs` (also rebuilds each system's `index.html` reader from `reader.template.html`)
+
+## Progress
+
+1. URL Shortener -- **read all parts in one place: [url-shortener/index.html](url-shortener/index.html)** (Kindle-style reader)
+   - [x] Part 1 -- Basics, Requirements, Clarifying Qs, Capacity, HLD, Component WHY -> [md](url-shortener/part-1-basics-to-hld.md) / [html](url-shortener/part-1-basics-to-hld.html)
+   - [x] Part 2 -- Request Flow, API, Database, LLD, Node.js code line-by-line (prompt parts 7-12) -> [md](url-shortener/part-2-flow-api-db-lld-code.md) / [html](url-shortener/part-2-flow-api-db-lld-code.html)
+   - [x] Part 3 -- Algorithms (Base62, IDs), Concurrency, Caching (13-15) -> [md](url-shortener/part-3-algorithms-concurrency-caching.md) / [html](url-shortener/part-3-algorithms-concurrency-caching.html)
+   - [x] Part 4 -- Scaling, Failures, Consistency, Security, Observability (16-20) -> [md](url-shortener/part-4-scaling-failures-consistency-security-observability.md) / [html](url-shortener/part-4-scaling-failures-consistency-security-observability.html)
+   - [x] Part 5 -- Trade-offs, MVP -> Scalable, Follow-ups, What-ifs, Node.js Qs (21-25) -> [md](url-shortener/part-5-tradeoffs-versions-followups-nodejs.md) / [html](url-shortener/part-5-tradeoffs-versions-followups-nodejs.html)
+   - [x] Part 6 -- Implement it, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30) -> [md](url-shortener/part-6-implement-answers-whiteboard-cheatsheet.md) / [html](url-shortener/part-6-implement-answers-whiteboard-cheatsheet.html)
+2. Rate Limiter -- **read all parts in one place: [rate-limiter/index.html](rate-limiter/index.html)** (shared design decisions: [DESIGN-SPEC.md](rate-limiter/DESIGN-SPEC.md))
+   - [x] Part 1 -- Basics, Requirements, Clarifying Qs, Capacity, HLD, Component WHY (1-6)
+   - [x] Part 2 -- Request Flow, 429 + RateLimit headers, Rules DB, LLD, Node.js code (7-12)
+   - [x] Part 3 -- Algorithms (fixed/sliding/leaky/token bucket, Lua), Concurrency, Redis state (13-15)
+   - [x] Part 4 -- Scaling, Failures, Consistency, Security, Observability (16-20)
+   - [x] Part 5 -- Trade-offs, V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js Qs (21-25)
+   - [x] Part 6 -- Implement it, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
+3. Payment System / Idempotent API -- **read all parts in one place: [payment-system/index.html](payment-system/index.html)** (shared design decisions: [DESIGN-SPEC.md](payment-system/DESIGN-SPEC.md))
+   - [x] Part 1 -- Basics (double charge on retry), Requirements, Clarifying Qs, Capacity, HLD, Component WHY (1-6)
+   - [x] Part 2 -- 4 request flows, APIs with Idempotency-Key, Postgres schema, LLD, Node.js code (7-12)
+   - [x] Part 3 -- Idempotency key lifecycle, atomic phases, state machine, double-entry ledger, backoff, outbox, reconciliation, concurrency, idempotency store (13-15)
+   - [x] Part 4 -- Scaling, Failures (PSP timeout = unknown), Consistency, Security (PCI, webhook HMAC), Observability (16-20)
+   - [x] Part 5 -- Trade-offs, V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js Qs (21-25)
+   - [x] Part 6 -- Implement idempotent payment API, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
+4. [ ] File Storage (S3-style)
+5. [ ] News Feed
+6. [ ] Chat System
+7. Search System -- **read all parts in one place: [search-system/index.html](search-system/index.html)** (shared design decisions: [DESIGN-SPEC.md](search-system/DESIGN-SPEC.md))
+   - [x] Part 1 -- Basics (why `LIKE` dies), Requirements, Clarifying Qs, Capacity (50M products), HLD, Component WHY (1-6)
+   - [x] Part 2 -- Query + indexing flow, search/suggest APIs, Postgres source of truth + ES mapping, LLD, Node.js code (7-12)
+   - [x] Part 3 -- Inverted index from zero, TF-IDF -> BM25, typo tolerance, synonyms, autocomplete, indexing concurrency, caching (13-15)
+   - [x] Part 4 -- Scaling (shards vs replicas), Failures ("degrade, don't die"), Consistency, Security, Observability + search quality (16-20)
+   - [x] Part 5 -- Trade-offs (Postgres FTS vs ES vs Algolia), V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js Qs (21-25)
+   - [x] Part 6 -- Implement a mini search engine (BM25 from scratch), 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
+8. Notification / PagerDuty-style Paging -- **read all parts in one place: [notification-paging/index.html](notification-paging/index.html)** (shared design decisions: [DESIGN-SPEC.md](notification-paging/DESIGN-SPEC.md))
+   - [x] Part 1 -- Basics (3 AM alert nobody saw), Requirements, Clarifying Qs, Capacity (50M events/day), HLD, Component WHY (1-6)
+   - [x] Part 2 -- Event -> page request flow, Events API + incident APIs, Postgres schema, LLD, Node.js code (7-12)
+   - [x] Part 3 -- Dedup, escalation timers (Redis ZSET vs DB polling vs Kafka delay), retries + backoff, concurrency, Redis state (13-15)
+   - [x] Part 4 -- Scaling, Failures (fail closed on ingest), Consistency, Security, Observability + the watchdog paradox (16-20)
+   - [x] Part 5 -- Trade-offs (Kafka vs RabbitMQ, at-least-once vs exactly-once), V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js Qs (21-25)
+   - [x] Part 6 -- Implement a paging service, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)

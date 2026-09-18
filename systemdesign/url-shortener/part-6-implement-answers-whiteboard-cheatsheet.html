@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>URL Shortener -- HLD + LLD (Part 6: Implement It - Interview Answers - Whiteboard - Cheat Sheet)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root { --bg:#fafafa; --fg:#1f2328; --muted:#57606a; --border:#d0d7de; --code-bg:#f6f8fa; --accent:#0969da; --callout-bg:#fff8c5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --border:#30363d; --code-bg:#161b22; --accent:#58a6ff; --callout-bg:#3b3410; }
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.65; max-width:900px; margin:0 auto; padding:40px 24px 100px; }
+  h1,h2,h3 { line-height:1.3; }
+  h1 { font-size:2rem; border-bottom:2px solid var(--border); padding-bottom:10px; }
+  h2 { font-size:1.45rem; margin-top:2.4em; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  h3 { font-size:1.1rem; color:var(--accent); margin-top:1.8em; }
+  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; font-size:0.9em; }
+  pre { background:var(--code-bg); padding:14px 16px; border-radius:8px; overflow-x:auto; border:1px solid var(--border); }
+  pre code { background:none; padding:0; }
+  blockquote { border-left:4px solid var(--accent); background:var(--callout-bg); margin:1.2em 0; padding:0.6em 1em; border-radius:0 6px 6px 0; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:1.2em 0; }
+  th,td { border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul,ol { padding-left:1.4em; }
+  li { margin:0.35em 0; }
+  .mermaid { background:white; border-radius:8px; padding:12px; margin:1.2em 0; }
+  a { color:var(--accent); }
+  hr { border:none; border-top:1px solid var(--border); margin:2.5em 0; }
+  @media (max-width:600px) { body { padding:24px 16px 80px; } h1 { font-size:1.5rem; } }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# URL Shortener -- HLD + LLD (Part 6: Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet)
+
+> Is file mein prompt ke **Parts 26-30** hain: coding round mein "Implement URL shortener" kaise solve karein, 30-second answer, 5-minute answer, whiteboard par diagram kis order mein banayein, aur poore URL Shortener (Parts 1-5) ki final cheat sheet.
+> Ye last file hai. Parts 1-5 mein humne design samjha; yahan hum usko **interview mein bolna, likhna aur draw karna** seekhenge.
+
+---
+
+## PART 26 -- Code Design Question: "Implement URL shortener"
+
+### Pehle samjho: ye system design round nahi hai
+
+Kabhi kabhi interviewer HLD nahi, **coding round** mein bolta hai: "Implement a URL shortener." Yahan woh Postgres, Redis, load balancer nahi dekhna chahta. Woh dekhna chahta hai:
+
+- Tum problem ko **clarify** karte ho ya seedha typing shuru kar dete ho?
+- Tumhara **data structure choice** sahi hai?
+- Code **clean, correct aur edge cases** handle karta hai?
+- Tum **complexity** bata sakte ho?
+
+Iska matlab: **ek file, in-memory, koi DB nahi.** Lekin tumhara in-memory design aisa ho ki baad mein DB lagana easy ho -- aur ye tum bologe bhi.
+
+### Step 1 -- Clarify (1-2 minute, typing se pehle)
+
+> "Code likhne se pehle kuch cheezein confirm kar leta hoon."
+
+| Question | Mera assumption (agar interviewer bole "you decide") |
+|---|---|
+| Sirf `shorten` aur `resolve` chahiye, ya delete/stats bhi? | Sirf `shorten` + `resolve` |
+| Storage in-memory chalega? | Haan, `Map` |
+| Code kaisa ho -- random ya sequential? | Counter + Base62 (collision-free, Part 13 wala logic) |
+| Custom alias chahiye? | Haan, optional, conflict par error |
+| Same long URL do baar aaye toh same code? | Haan (dedup), sirf non-expiring generated links ke liye |
+| Expiry chahiye? | Optional `ttlMs` |
+| Invalid URL par kya? | Error throw |
+
+> Interview tip: 5 questions poocho, 5 answers likh lo board/comment mein, phir code. Isse interviewer ko dikhta hai tum requirement-driven ho.
+
+### Step 2 -- Logic pehle bolo (code se pehle, Hinglish mein)
+
+> "Main do `Map` rakhunga. Pehla `code -> { longUrl, expiresAt }` -- ye redirect ke liye hai, O(1) lookup. Doosra `longUrl -> code` -- ye dedup ke liye, taaki same URL par naya code na bane.
+>
+> Code banane ke liye ek counter rakhunga jo `62^6` se start hoga, aur usko Base62 mein encode karunga -- toh har code 7 characters ka hoga aur counter unique hai isliye collision ka sawaal nahi. Sirf ek case bachta hai: agar kisi ne custom alias `1000001` le liya aur baad mein counter bhi wahi code banaye -- us case mein main counter aage badha dunga.
+>
+> Custom alias aaya toh format check, phir map mein already hai toh `ALIAS_TAKEN`.
+>
+> `resolve` mein map se entry nikaalunga; nahi mili toh `NOT_FOUND`, expire ho gayi toh `EXPIRED`, warna long URL."
+
+Ab code.
+
+### Step 3 -- TypeScript code (single file, self-contained)
+
+```ts
+const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const ALIAS_PATTERN = /^[a-zA-Z0-9_-]{4,30}$/;
+const MAX_URL_LENGTH = 2048;
+const FIRST_ID = 62n ** 6n; // pehla code hi 7 chars ka: "1000000"
+
+type ErrorCode = 'INVALID_URL' | 'INVALID_ALIAS' | 'ALIAS_TAKEN' | 'NOT_FOUND' | 'EXPIRED';
+
+export class ShortenerError extends Error {
+  constructor(public readonly code: ErrorCode) {
+    super(code);
+  }
+}
+
+interface Entry {
+  longUrl: string;
+  expiresAt: number | null; // epoch ms, null = kabhi expire nahi
+}
+
+export function encodeBase62(num: bigint): string {
+  if (num === 0n) return ALPHABET[0];
+  let code = '';
+  while (num > 0n) {
+    code = ALPHABET[Number(num % 62n)] + code;
+    num = num / 62n;
+  }
+  return code;
+}
+
+export class UrlShortener {
+  private readonly codeToEntry = new Map<string, Entry>();
+  private readonly urlToCode = new Map<string, string>();
+  private counter = FIRST_ID;
+
+  constructor(
+    private readonly baseUrl = 'https://sho.rt',
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  shorten(longUrl: string, opts: { alias?: string; ttlMs?: number } = {}): string {
+    const url = this.normalize(longUrl);
+    const expiresAt = opts.ttlMs !== undefined ? this.now() + opts.ttlMs : null;
+
+    if (opts.alias !== undefined) {
+      if (!ALIAS_PATTERN.test(opts.alias)) throw new ShortenerError('INVALID_ALIAS');
+      if (this.codeToEntry.has(opts.alias)) throw new ShortenerError('ALIAS_TAKEN');
+      this.codeToEntry.set(opts.alias, { longUrl: url, expiresAt });
+      return `${this.baseUrl}/${opts.alias}`;
+    }
+
+    if (expiresAt === null) {
+      const existing = this.urlToCode.get(url);
+      if (existing) return `${this.baseUrl}/${existing}`;
+    }
+
+    let code = encodeBase62(this.counter++);
+    while (this.codeToEntry.has(code)) code = encodeBase62(this.counter++);
+
+    this.codeToEntry.set(code, { longUrl: url, expiresAt });
+    if (expiresAt === null) this.urlToCode.set(url, code);
+    return `${this.baseUrl}/${code}`;
+  }
+
+  resolve(code: string): string {
+    const entry = this.codeToEntry.get(code);
+    if (!entry) throw new ShortenerError('NOT_FOUND');
+    if (entry.expiresAt !== null && entry.expiresAt <= this.now()) {
+      throw new ShortenerError('EXPIRED');
+    }
+    return entry.longUrl;
+  }
+
+  private normalize(raw: string): string {
+    if (raw.length > MAX_URL_LENGTH) throw new ShortenerError('INVALID_URL');
+    let parsed: URL;
+    try {
+      parsed = new URL(raw.trim());
+    } catch {
+      throw new ShortenerError('INVALID_URL');
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new ShortenerError('INVALID_URL');
+    }
+    if (parsed.hostname === new URL(this.baseUrl).hostname) {
+      throw new ShortenerError('INVALID_URL');
+    }
+    return parsed.href;
+  }
+}
+```
+
+> Ye code `tsc --strict` se bina error compile hota hai, aur neeche ke saare outputs actually run karke nikaale gaye hain.
+
+### Step 4 -- Line-by-line explanation
+
+**Code Explanation -- constants aur types:**
+
+- `ALPHABET` -- Part 2/13 wala same 62 characters: `0-9`, `a-z`, `A-Z`. Index hi Base62 digit ki value hai.
+- `ALIAS_PATTERN = /^[a-zA-Z0-9_-]{4,30}$/` -- alias sirf URL-safe characters, 4-30 length. Same rule jo Part 8 ki API validation mein tha.
+- `MAX_URL_LENGTH = 2048` -- bahut lambe URL memory bharenge aur browsers bhi handle nahi karte.
+- `FIRST_ID = 62n ** 6n` -- counter `56,800,235,584` se start. `Base62(62^6) = "1000000"`, toh **pehla code hi 7 characters** ka. Warna pehle codes `"1"`, `"2"` jaise hote.
+- `type ErrorCode = ...` -- string literal union. Galat error code likha toh TypeScript compile time par pakad lega.
+- `class ShortenerError extends Error` -- ek hi error class, `code` field ke saath. Caller `e.code === 'ALIAS_TAKEN'` check kar sakta hai -- message text par depend nahi. Ye Part 2 ke `AppError` jaisa idea hai, bas HTTP status ke bina.
+- `public readonly code` -- **parameter property**: constructor argument hi class field ban jaata hai. Kam boilerplate.
+- `interface Entry { longUrl; expiresAt }` -- map ki value. Sirf string nahi rakha, kyunki expiry bhi chahiye. `null` = kabhi expire nahi.
+
+**Code Explanation -- `encodeBase62`:**
+
+- `num: bigint` -- counter 56 billion se start hota hai, jo JS `number` ki safe limit (2^53, ~9 x 10^15) se chhota hai, lekin long run mein `bigint` safe hai aur DB `BIGINT` se match karta hai.
+- `if (num === 0n) return ALPHABET[0];` -- 0 ka edge case, warna loop chalta hi nahi aur empty string aati.
+- `num % 62n` -- last Base62 digit. `ALPHABET[...] + code` -- usko **aage** jodo, kyunki digits right se left nikal rahe hain.
+- `num = num / 62n` -- bigint division floor karta hai. Agle digit par jao.
+
+**Code Explanation -- class fields aur constructor:**
+
+- `codeToEntry = new Map<string, Entry>()` -- **main store**: short code -> entry. Redirect isi se hota hai. `Map` ka `get/set/has` average O(1).
+- `urlToCode = new Map<string, string>()` -- **reverse index** dedup ke liye. DB mein ye `long_url_hash` par index jaisa hai (Part 9).
+- `private counter = FIRST_ID` -- agla ID. In-memory hai, isliye ek hi process ke andar unique. (Multi-server ka issue edge cases mein.)
+- `constructor(baseUrl = 'https://sho.rt', now = Date.now)` -- dono **inject** kiye. `baseUrl` config se aana chahiye, hardcode nahi. `now` inject kiya taaki test mein **fake clock** de sakein aur expiry test karne ke liye 60 second wait na karna pade. Interviewer ko ye testability bahut pasand aati hai.
+
+**Code Explanation -- `shorten`:**
+
+- `opts: { alias?; ttlMs? } = {}` -- optional cheezein ek object mein. `shorten(url, undefined, 5000)` jaisi ugly calls nahi karni padti.
+- `const url = this.normalize(longUrl);` -- sabse pehle validation + normalize. Galat input aage jaana hi nahi chahiye.
+- `expiresAt = ttlMs !== undefined ? now() + ttlMs : null` -- relative TTL ko absolute time mein badlo. `!== undefined` isliye, `if (opts.ttlMs)` likhte toh `ttlMs = 0` false ban jaata.
+- `if (opts.alias !== undefined)` -- custom alias branch.
+- `if (!ALIAS_PATTERN.test(opts.alias)) throw ... 'INVALID_ALIAS'` -- format galat.
+- `if (this.codeToEntry.has(opts.alias)) throw ... 'ALIAS_TAKEN'` -- ye alias pehle se kisi generated code ya alias ke roop mein hai. Note: **expired alias bhi taken** hai -- purana printed link kisi aur ki site par nahi jaana chahiye (Part 9 ka `is_active` / "ye code dobara mat do" wala idea).
+- `this.codeToEntry.set(opts.alias, ...)` + `return` -- alias save. Alias ko dedup map mein **nahi** daala -- alias user ki explicit choice hai, "same URL ka default code" nahi.
+- `if (expiresAt === null) { existing = urlToCode.get(url) ... }` -- **dedup sirf non-expiring links ke liye.** Kyun? Agar pehle link 1 ghante ka tha aur ab user permanent chahta hai, toh purana code dena galat hoga.
+- `let code = encodeBase62(this.counter++);` -- counter se naya code. `counter++` pehle current value deta hai, phir badhata hai.
+- `while (this.codeToEntry.has(code)) code = encodeBase62(this.counter++);` -- **alias vs generated code clash.** Kisi ne alias `1000001` le liya tha; counter jab wahan pahunchega toh skip karke agla le lega. Total skips kabhi aliases ki count se zyada nahi ho sakte, toh ye loop cheap hai.
+- `codeToEntry.set(...)` + `if (expiresAt === null) urlToCode.set(url, code)` -- dono maps update, taaki agli baar same URL par same code mile.
+- `` return `${this.baseUrl}/${code}` `` -- poora short URL, sirf code nahi. Caller ko khud join na karna pade.
+
+**Code Explanation -- `resolve`:**
+
+- `const entry = this.codeToEntry.get(code);` -- ek O(1) lookup. Yahi redirect ka hot path hai.
+- `if (!entry) throw ... 'NOT_FOUND'` -- real API mein 404.
+- `entry.expiresAt !== null && entry.expiresAt <= this.now()` -- **lazy expiry**: expire hone par koi timer delete nahi karta; read ke time check karte hain. Real API mein ye 410 Gone.
+- `return entry.longUrl` -- real API mein ye `302 Location: ...` banega.
+
+**Code Explanation -- `normalize`:**
+
+- `raw.length > MAX_URL_LENGTH` -- sabse sasta check pehle. 1 MB string ko parse karne ka matlab nahi.
+- `new URL(raw.trim())` -- Node ka built-in WHATWG URL parser. Invalid string par throw karta hai. `trim()` -- copy-paste mein aaye spaces hatao.
+- `catch { throw ... 'INVALID_URL' }` -- parser ka generic `TypeError` apne domain error mein translate.
+- `protocol !== 'http:' && protocol !== 'https:'` -- `javascript:alert(1)`, `file:///etc/passwd`, `data:` block. Security (Part 19).
+- `parsed.hostname === new URL(this.baseUrl).hostname` -- apne hi domain ka link shorten nahi hoga, warna `sho.rt/a -> sho.rt/b -> sho.rt/a` redirect loop.
+- `return parsed.href` -- **normalized** URL: host lowercase ho jaata hai (`AMAZON.in` -> `amazon.in`). Isi wajah se dedup do alag likhawat wale same URL ko pakad leta hai.
+
+### Step 5 -- Chalake dikhao (usage + real output)
+
+```ts
+import { UrlShortener, ShortenerError } from './url-shortener';
+
+let fakeNow = 0;
+const s = new UrlShortener('https://sho.rt', () => fakeNow);
+
+function tryIt(label: string, fn: () => string) {
+  try {
+    console.log(label, '->', fn());
+  } catch (e) {
+    console.log(label, '->', e instanceof ShortenerError ? e.code : e);
+  }
+}
+
+tryIt('A', () => s.shorten('https://amazon.in/dp/B0CHX1W1XY'));
+tryIt('B', () => s.shorten('  https://AMAZON.in/dp/B0CHX1W1XY '));
+tryIt('C', () => s.shorten('https://flipkart.com/sale', { alias: 'priya-deal' }));
+tryIt('D', () => s.shorten('https://myntra.com', { alias: 'priya-deal' }));
+tryIt('E', () => s.shorten('https://myntra.com', { alias: '1000001' }));
+tryIt('F', () => s.shorten('https://swiggy.com'));
+tryIt('G', () => s.shorten('https://zomato.com/offer', { ttlMs: 60_000 }));
+tryIt('H', () => s.resolve('1000000'));
+tryIt('I', () => s.resolve('priya-deal'));
+tryIt('J', () => s.resolve('zzzzzzz'));
+tryIt('K', () => s.shorten('javascript:alert(1)'));
+tryIt('L', () => s.shorten('https://sho.rt/1000000'));
+tryIt('M', () => s.shorten('https://a.com', { alias: 'ab' }));
+fakeNow = 60_000;
+tryIt('N', () => s.resolve('1000003'));
+```
+
+**Actual output:**
+
+```
+A -> https://sho.rt/1000000
+B -> https://sho.rt/1000000
+C -> https://sho.rt/priya-deal
+D -> ALIAS_TAKEN
+E -> https://sho.rt/1000001
+F -> https://sho.rt/1000002
+G -> https://sho.rt/1000003
+H -> https://amazon.in/dp/B0CHX1W1XY
+I -> https://flipkart.com/sale
+J -> NOT_FOUND
+K -> INVALID_URL
+L -> INVALID_URL
+M -> INVALID_ALIAS
+N -> EXPIRED
+```
+
+**Code Explanation -- output kya prove karta hai:**
+
+- `let fakeNow = 0` + `() => fakeNow` -- humara fake clock. Baad mein `fakeNow = 60_000` karke "60 second aage" chale gaye, bina wait kiye.
+- `tryIt(label, fn)` -- chhota helper jo success par result, error par sirf `code` print karta hai.
+- **A** -- pehla code `1000000` (7 chars, kyunki counter 62^6 se start).
+- **B** -- spaces aur capital host ke saath same URL -> normalize ke baad same -> **dedup**, same code.
+- **C / D** -- alias mila; dobara wahi alias maanga -> `ALIAS_TAKEN` (real API mein 409).
+- **E / F** -- kisi ne alias `1000001` le liya. Counter jab `1000001` par aaya toh skip karke **`1000002`** diya. Clash handle ho gaya.
+- **G** -- expiring link, dedup map mein nahi gaya.
+- **H / I / J** -- resolve: mila, mila, nahi mila.
+- **K / L / M** -- `javascript:` scheme, apna domain, aur 2-char alias -- teeno reject.
+- **N** -- `fakeNow = 60_000` = exactly expiry time. `<=` check ki wajah se **EXPIRED**.
+
+### Step 6 -- Edge cases (interviewer zaroor poochega)
+
+| Edge case | Humara code kya karta hai | Real system mein (Parts 2-4) |
+|---|---|---|
+| Invalid URL / `javascript:` / bahut lamba | `INVALID_URL` throw | zod validation -> 400 |
+| Apne domain ka URL (`sho.rt/...`) | `INVALID_URL` -- redirect loop se bachao | Same refine rule |
+| Alias galat format (`ab`, `a b`, `@x`) | `INVALID_ALIAS` | 400 |
+| Duplicate alias | `ALIAS_TAKEN` | UNIQUE index -> `23505` -> 409 |
+| Alias kisi future generated code jaisa (`1000001`) | Counter skip kar deta hai (`while has`) | Retry loop in `createShortUrl`; better: aliases ke liye alag rule (jaise min 8 chars ya `-` zaruri) taaki clash possible hi na ho |
+| Same long URL do baar | Same code (dedup map) | `long_url_hash` index; default design mein dedup off |
+| Unknown code | `NOT_FOUND` | 404 + negative cache 60s |
+| Expired code | `EXPIRED` (lazy check) | 410 + cleanup cron (distributed lock ke saath) |
+| Expired entries memory mein pade rehte hain | Abhi haan (memory leak jaisa) | Periodic sweep / cron; in-memory mein ek min-heap by `expiresAt` |
+| Counter overflow | `bigint` hai, overflow nahi. 62^7 ke baad codes 8 chars ke ho jaayenge (~950 saal at 10M/day) | DB `BIGINT` max ~9.2 x 10^18 -- practically kabhi nahi |
+| Process restart | **Saara data gayab** (in-memory) | Isliye Postgres source of truth |
+| Multiple servers | Har server ka counter `62^6` se start -> **dono `1000000` denge** | Block allocation from DB sequence + UNIQUE index (Part 13/14) |
+| Concurrency (ek process) | Safe -- `shorten` synchronous hai, koi `await` nahi, toh event loop isko beech mein nahi todta | Jaise hi DB `await` aaya, check-then-insert race aayega -> UNIQUE constraint |
+
+> Interview line: "Ye in-memory version single process ke liye correct hai. Isko production mein le jaane ke liye teen cheezein badlengi: `Map` ki jagah Postgres with unique index, counter ki jagah DB sequence se ID blocks, aur resolve ke aage Redis cache-aside. Class ka public interface same rahega -- sirf storage badlega."
+
+### Step 7 -- Complexity
+
+Pehle symbols fix karo:
+
+- **N** = total stored URLs
+- **L** = URL ki length (max 2048)
+- **k** = code ki length (7 ya alias <= 30)
+- **id** = counter ki value
+
+| Operation | Time | Kyun |
+|---|---|---|
+| `encodeBase62(id)` | **O(log62 id)** | Har loop mein number 62 se divide hota hai. id ~ 62^6-62^7 ke beech hai toh sirf **7 iterations** -- practically constant |
+| `normalize(url)` | **O(L)** | URL parse karna poori string padhta hai |
+| `shorten` (generated) | **O(L)** average | normalize O(L) + Map lookup (string hashing O(L), phir O(1) average) + encode O(7). `while` skip loop poori life mein aliases ki count se zyada nahi chalta, toh **amortized O(1)** extra |
+| `shorten` (alias) | **O(L + k)** average | normalize + regex O(k) + ek Map lookup |
+| `resolve(code)` | **O(k)**, yaani effectively **O(1)** average | Ek Map `get` -- code ko hash karna O(k), k <= 30 |
+| Worst case Map op | O(N) theoretically (sab keys ek hash bucket mein) | Practically nahi hota; interview mein "average O(1)" bolo aur worst case mention kar do |
+
+**Space Complexity: O(N x L)**
+
+- `codeToEntry` -- N entries, har ek mein URL (L) + code (k) -> O(N x (L + k)) = **O(N x L)** kyunki L >> k.
+- `urlToCode` -- dedup ke liye URL **dobara** store hota hai (key ke roop mein) -> ye bhi O(N x L). Constant factor 2x, Big-O same.
+- Optimization agar interviewer pooche: reverse map mein poora URL ki jagah **SHA-256 hash (32 bytes)** rakho -> reverse map O(N) ho jaata hai. Yahi Part 9 ka `long_url_hash` idea hai.
+
+> Interview line: "`resolve` average O(1) hai kyunki ek hash map lookup hai; `shorten` O(L) hai URL parsing ki wajah se, aur Base62 encoding O(log base 62 of id) hai jo 7 steps hai. Space O(N times L) hai -- dedup map ki wajah se URLs do baar store ho rahe hain, jo main hash rakh ke kam kar sakta hoon."
+
+---
+
+## PART 27 -- 30-Second Answer
+
+> "At a high level, I would use ek stateless Node.js API load balancer ke peeche, Postgres ko source of truth, aur Redis ko cache. Ye system heavily read-heavy hai -- roughly 100 reads per write, around 10-12K redirects per second average aur peak par 35K -- isliye redirect path cache-aside se Redis se serve hoga, aur DB read replica sirf cache miss par hit hoga. Short code ke liye counter-based ID ko Base62 mein encode karunga -- 7 characters mein 3.5 trillion codes, koi collision nahi -- aur har server DB sequence se 1000 IDs ka block reserve karega. Short code par unique index uniqueness ki final guarantee hai. Redirect 302 hoga taaki analytics mil sake, aur click events queue ke through async process honge. Scale badhne par main DB ko short_code se shard karunga."
+
+(Bolne mein ~40 seconds. Numbers, 3 components, 1 algorithm, 1 trade-off -- bas.)
+
+---
+
+## PART 28 -- 5-Minute Interview Answer (natural Hinglish)
+
+> Ise ratna nahi hai. Har minute ka **goal** yaad rakho; words apne aap aayenge. Beech beech mein interviewer ko check-in karo: "Is this direction okay?"
+
+### 0:00 - 0:45 -- Requirements clarify karo
+
+"Main pehle requirements clarify karunga. Core features mere hisaab se teen hain: user long URL dega, hum short URL denge, aur short URL open karne par redirect hoga. Custom alias, expiry, aur analytics -- ye chahiye? ... Theek hai, main maan leta hoon custom alias aur expiry chahiye, analytics basic click count.
+
+Non-functional side par, mere liye sabse important hai redirect ki **availability aur low latency** -- kyunki ye links SMS, QR codes, posters mein already phaile hote hain, down hue toh sab toot jaate hain. Aur **durability** -- ek baar bana link 5 saal baad bhi kaam kare. Analytics thoda late ho toh chalega."
+
+### 0:45 - 1:30 -- Scale estimate
+
+"Scale ke liye maan lete hain 100 million users aur 10 million naye URLs per day. Toh writes roughly 116 per second, peak par ~300. Read:write 100:1 hai, toh ~11-12K redirects per second, peak par ~35K.
+
+Storage -- ek record ~500 bytes, toh 5 GB per day, 5 saal mein ~10 TB aur ~18 billion URLs. Isliye main 7-character Base62 code lunga -- 62 ki power 7 matlab 3.5 trillion, bahut margin.
+
+Iska matlab: **writes easy hain, reads heavy hain.** Design ka poora focus read path par hoga."
+
+### 1:30 - 2:30 -- High-level architecture + dono flows
+
+"Initially main simple architecture rakhunga: client, load balancer, multiple stateless Node.js instances, aur Postgres. Node.js yahan fit hai kyunki kaam I/O-bound hai -- CPU kam, DB/cache calls zyada.
+
+**Create flow:** request aayi, rate limit, URL validate kiya -- sirf http/https, hamara domain nahi. Phir unique ID generate ki, Base62 kiya, Postgres primary mein insert kiya, 201 return.
+
+**Redirect flow:** `GET /aB92xK`, pehle Redis dekho. Hit hua toh seedha 302 with Location header. Miss hua toh Postgres read replica se laao, Redis mein 24 ghante TTL ke saath daalo, phir redirect.
+
+At scale, yahan bottleneck database ho sakta hai -- 35K reads per second seedha DB par nahi bhejna. Isliye hum Redis introduce kar sakte hain. Hot data ~10 GB hai, jo ek Redis node plus replica mein fit ho jaata hai, toh cluster ki abhi zarurat nahi. However, Redis source of truth nahi hoga -- Redis down hua toh hum DB se serve karenge, slow but working."
+
+### 2:30 - 3:15 -- API, DB, ID generation
+
+"APIs simple hain: `POST /api/v1/urls` jo longUrl, optional customAlias aur expiresAt leta hai -- 201, ya 409 agar alias taken. Aur `GET /:shortCode` -- 302, 404 ya expired hone par 410.
+
+DB mein ek `urls` table: id, short_code, long_url, user_id, created_at, expires_at, is_active. Sabse important cheez `short_code` par **unique index** hai -- ye fast lookup bhi deta hai aur uniqueness ki guarantee bhi.
+
+ID ke liye counter plus Base62. Ek problem hai -- multiple servers apna apna counter rakhenge toh same ID banegi. Isliye har server Postgres sequence se 1000 IDs ka block reserve karta hai. Matlab 1000 creates mein sirf ek DB call. Custom alias ke liye main pehle check nahi karta, seedha insert karta hoon -- duplicate hua toh unique constraint error deta hai aur main 409 return karta hoon. Check-then-insert mein race condition hoti."
+
+### 3:15 - 4:15 -- Caching details + scaling
+
+"Cache-aside use kar raha hoon: key `url:<code>`, value long URL. TTL mein thoda jitter, taaki saari keys ek saath expire na hon. Not-found ko bhi 60 second cache karta hoon, warna bots random codes try karke DB ko maar denge. Viral link ke liye har Node instance mein 5 second ka local LRU cache, aur cache stampede se bachne ke liye single-flight -- ek key ke liye ek process se ek hi DB query.
+
+Scaling: 10x par aur Node instances aur read replicas. 100x par Redis Cluster aur connection pooling -- PgBouncer. 1000x par data 10s of TB hoga, toh main `short_code` se shard karunga ya DynamoDB/Cassandra jaisa key-value store lunga, kyunki access pattern pure key lookup hai. Global users hain toh multi-region read path."
+
+### 4:15 - 5:00 -- Failures, consistency, security, trade-offs, wrap-up
+
+"Failures: Redis down -- DB fallback, lekin DB par load 20x ho sakta hai, isliye Redis ko replica ke saath HA rakhunga aur circuit breaker lagaunga. DB primary down -- redirects cache aur replicas se chalte rahenge, sirf create fail hoga jab tak failover na ho.
+
+Consistency: short code uniqueness ke liye strong consistency -- DB constraint. Link banate hi turant click kiya toh replica lag se 404 aa sakta hai, isliye miss par primary fallback ya create par cache warm. Analytics eventual.
+
+Security: rate limiting Redis se, sirf http/https URLs, malware scanning, aur codes sequential hain toh private links ke liye random 8-char codes.
+
+One trade-off here is 301 vs 302: 301 browser cache karta hai, server load kam, lekin clicks count nahi honge aur link edit/disable nahi hoga. Analytics chahiye isliye main 302 le raha hoon. Doosra trade-off -- counter predictable hai lekin collision-free; random guess-proof hai lekin retries chahiye.
+
+Summary: read-heavy system, Redis cache se fast reads, Postgres unique constraint se correctness, aur async analytics. Kisi part mein deep dive karein?"
+
+---
+
+## PART 29 -- Whiteboard Drawing Order
+
+**Rule:** diagram ek saath mat banao. Har box tab draw karo jab uska **reason** bol rahe ho. Board par jo bhi hai, uska "kyun" tumhare paas hona chahiye.
+
+### Step 1 -- Client
+
+```
+[Client: Browser / App]
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Do tarah ke clients hain -- ek jo link banata hai (`POST`), aur lakhon jo link click karte hain (`GET /code`). Traffic 100:1 read-heavy hai, toh main neeche jo bhi banaunga uska focus read path hoga."
+
+**Abhi mat draw karo:** CDN, DNS details. Pehle core flow.
+
+### Step 2 -- Load Balancer
+
+```
+[Client]
+   |
+   v
+[Load Balancer]   (TLS yahan terminate)
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Peak 35K requests per second ek server nahi sambhalega, aur ek server single point of failure hai. LB traffic multiple instances mein baantega aur health checks se crashed instance ko hata dega. HTTPS yahin terminate hoga."
+
+### Step 3 -- Node.js API
+
+```
+[Client]
+   |
+   v
+[Load Balancer]
+   |
+   +------------+------------+
+   v            v            v
+[Node API]  [Node API]  [Node API]    stateless, N instances
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Node.js instances stateless hain -- koi mapping ya session memory mein nahi -- isliye koi bhi request kisi bhi instance par jaa sakti hai aur scaling matlab bas naya instance add karna. Yahan dono APIs hain: `POST /api/v1/urls` aur `GET /:shortCode`. Validation, rate limiting, ID generation yahin hota hai."
+
+Side mein chhota sa likh do: `POST /api/v1/urls -> 201`, `GET /:code -> 302 / 404 / 410`.
+
+### Step 4 -- Cache (Redis)
+
+```
+[Node API] ----> [Redis]   url:<code> -> longUrl, TTL 24h
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Reads 100 guna zyada hain, toh redirect pehle Redis dekhega -- cache-aside. Hit par ~1 ms mein 302. Hot data ~10 GB hai, toh ek Redis node plus replica kaafi hai. Redis sirf cache hai -- down hua toh DB se serve karenge."
+
+**Ek trick:** abhi Database draw nahi kiya, lekin bolte hi arrow ke saath "miss -> DB" likh do. Interviewer ko flow clear rehta hai.
+
+### Step 5 -- Database
+
+```
+[Node API] ----> [Redis]
+     |              (miss)
+     v
+[Postgres Primary] ----replication----> [Read Replica]
+   writes                                  cache-miss reads
+
+urls(id PK, short_code UNIQUE, long_url, user_id, created_at, expires_at, is_active)
+seq: url_id_block_seq -> 1000 IDs per block
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Postgres source of truth hai. `short_code` par unique index -- fast lookup plus uniqueness guarantee. Writes primary par, cache-miss reads replica par. ID ke liye har server sequence se 1000 IDs ka block leta hai aur Base62 encode karta hai. 1000x scale par yahi table short_code se shard hogi."
+
+Schema board ke kone mein ek line mein likho -- poori SQL nahi.
+
+### Step 6 -- Queue
+
+```
+[Node API] - - click event - - > [Queue: Kafka / SQS]
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Analytics ke liye har redirect par DB update karna redirect ko slow karega aur viral link ki row par lock contention hoga. Isliye click event queue mein fire-and-forget, aur user ko turant redirect. Agar analytics requirement nahi hai toh ye box hai hi nahi."
+
+**Dotted line** use karo -- dikhata hai ye optional/async hai.
+
+### Step 7 -- Workers
+
+```
+[Queue] ----> [Analytics Worker] ----> [Analytics Store]
+                  (batch: clicks = clicks + N)
+
+[Cleanup Cron] ----> [Postgres]   expired links (distributed lock)
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Worker events batch mein padhta hai aur har minute ek aggregated update karta hai. Worker crash hua toh queue mein messages bache rehte hain -- restart par wahin se. Duplicate message aa sakta hai, isliye event ID se dedupe. Ek cleanup job expired links hataata hai -- sirf ek instance chale isliye Redis lock."
+
+### Step 8 -- External services
+
+```
+[Node API] ----> [Malware / Safe Browsing API]   (create time par, timeout ke saath)
+[Client]  ----> [DNS] ----> [LB]
+                 (future) [CDN] -- sirf global latency ya 301 ke liye
+```
+
+**Ab interviewer ko kya explain karna hai?**
+
+> "Create par URL ko malware/phishing API se check kar sakte hain -- lekin timeout ke saath, aur API down ho toh link ko 'pending review' mein daal ke create hone do ya async scan karo, taaki third-party ki wajah se hamara create down na ho. CDN abhi nahi -- bandwidth sirf ~17 MB/s peak hai, aur 302 + analytics ke saath CDN clicks chhupa dega."
+
+### Final board (aisa dikhna chahiye)
+
+```
+                  [Client]
+                     |
+                  [DNS]
+                     |
+             [Load Balancer]
+                     |
+     +---------------+---------------+
+     v               v               v
+ [Node API]     [Node API]      [Node API] ----> [Malware API]
+     |
+     +------> [Redis]  url:<code>  (L1 local LRU 5s inside Node)
+     |           | miss
+     v           v
+ [Postgres Primary] --repl--> [Read Replica]
+     ^
+     |  [Cleanup Cron + lock]
+     |
+     + - - click - - > [Queue] ----> [Analytics Worker] ----> [Analytics Store]
+```
+
+### Kya **bilkul** draw nahi karna (jab tak pooche nahi)
+
+- Kafka + Elasticsearch + S3 + MongoDB sab ek saath -- "resume-driven design" lagta hai.
+- Sharding, Redis Cluster, multi-region -- ye scaling discussion mein **baad mein** aate hain, pehle diagram mein nahi.
+- Microservices (alag "ID service", "redirect service") -- is scale par ek service kaafi hai.
+
+---
+
+## PART 30 -- Final Cheat Sheet (5 minute revision)
+
+### Problem
+
+Long URL -> 7-char code (`sho.rt/aB92xK`) -> `302` redirect. **Ek baar likho, lakhon baar padho.** 2 flows: create (write) + redirect (read).
+
+### Requirements
+
+| Type | Points |
+|---|---|
+| Functional (core) | Shorten, redirect |
+| Functional (extra) | Custom alias, expiry, analytics, my-links / delete |
+| NFR sabse important | Redirect availability + low latency, durability of mappings |
+| NFR relaxed | Analytics eventual, replica lag ~1-2 sec chalega |
+| Clarify first | Users, URLs/day, read:write, expiry, alias, analytics (301 vs 302), auth, dedup, global? |
+
+### Numbers (yaad rakho)
+
+| Metric | Value | Isse kya decide hua |
+|---|---|---|
+| Writes | 10M/day, ~116/s avg, ~300/s peak | Ek Postgres primary kaafi |
+| Reads | 1B/day, ~11.6K/s avg, ~35K/s peak | Redis + ~8-12 Node instances |
+| Ratio | 100:1 | Cache-first read path |
+| Record | ~500 B | -- |
+| Storage | 5 GB/day, ~10 TB / 5 yrs, ~18B URLs | Future sharding |
+| Code | 7 chars Base62 = 62^7 = 3.52T | ~950 saal ka space |
+| Hot cache | ~10 GB | 1 Redis node + replica, cluster nahi |
+| Bandwidth | ~5-17 MB/s | CDN bandwidth ke liye nahi chahiye |
+
+### APIs
+
+| API | Success | Errors |
+|---|---|---|
+| `POST /api/v1/urls {longUrl, customAlias?, expiresAt?}` | `201 {shortCode, shortUrl, longUrl, expiresAt}` | 400, 401, 409 `ALIAS_TAKEN`, 429, 500 |
+| `GET /:shortCode` | `302 Location` + `Cache-Control: private, max-age=0` | 404, 410 |
+| `GET /api/v1/urls/:shortCode` | details (owner only) | 404 |
+| `DELETE /api/v1/urls/:shortCode` | 204 (owner only), DB then cache `DEL` | 404 |
+
+### HLD
+
+```
+Client -> DNS -> LB -> Node.js (stateless, N) -> Redis (cache)
+                                           |-> Postgres primary (writes) + replica (miss reads)
+                                           |- -> Queue -> Analytics worker   (optional)
+```
+
+No CDN, no Elasticsearch, no S3 initially -- har component ka reason bolo.
+
+### LLD
+
+```
+routes -> middleware (rate-limit, validate(zod), error-handler) -> controller -> service -> repository -> Postgres
+                                                               service -> Redis, IdGenerator
+app.ts = composition root (sab `new` yahin)
+```
+
+- Controller: HTTP only. Service: logic, cache-aside, IDs. Repository: sirf SQL, `23505` -> `DuplicateShortCodeError`.
+- Express 5 (async errors auto), `pg` Pool max 20, ioredis `enableOfflineQueue: false`, `commandTimeout: 50`.
+
+### Database
+
+```sql
+urls(id BIGINT PK, short_code VARCHAR(32) UNIQUE, long_url TEXT, user_id,
+     created_at, expires_at, is_active)
+-- UNIQUE(short_code) | (user_id, created_at DESC) | partial (expires_at)
+-- SEQUENCE url_id_block_seq START WITH 56800236  (x1000 >= 62^6)
+```
+
+Postgres kyun: simple key lookup, unique constraint, replicas easy. 1000x: shard by `short_code` / DynamoDB.
+
+### Redis
+
+| Cheez | Value |
+|---|---|
+| Pattern | Cache-aside, lazy fill (create par cache nahi) |
+| Key / value | `url:<code>` -> long URL |
+| TTL | 24h, **downward** jitter, `min(24h, time till expiry)` |
+| Negative cache | `__404__` / `__410__` for 60s; create ke baad `DEL` |
+| Hot key | L1 in-process LRU 5s |
+| Stampede | Single-flight (in-flight promise map) + jitter |
+| Invalidation | DB update first, then `DEL` (set nahi) |
+| Failure | `.catch(() => null)` -> DB; HA replica + circuit breaker; eviction `allkeys-lru` |
+| Other uses | Rate limiting counters, cleanup-cron lock |
+
+### Queue
+
+Sirf analytics ke liye. Redirect -> click event fire-and-forget -> worker batch update. Queue down -> redirect chalta rahe, events drop/local buffer. Duplicate message -> event ID dedupe. Worker crash -> messages queue mein, offset/ack ke baad hi commit. Analytics nahi chahiye -> **queue hi nahi**.
+
+### Main Algorithm
+
+`id = block counter` -> `Base62(id)` -> 7-char code.
+
+```
+Base62: baar baar % 62, remainders ulta.   125 -> "21"   11157 -> "2TX"   62^6 -> "1000000"
+Block:  nextval(seq) x 1000 -> [start, start+999] in memory; refill ??= (single refill)
+```
+
+| Option | Kab |
+|---|---|
+| **Counter + Base62** | Default: unique, 7 chars, no collision check |
+| Random 7-8 + retry | Private links, guess-proof |
+| Hash (MD5) | Dedup requirement |
+| UUID | Internal IDs only (22 chars) |
+| Snowflake | Huge write scale (11 chars, clock issues) |
+
+### Scaling
+
+| Traffic | Change |
+|---|---|
+| 1x | LB + few Node + Postgres (+ replica) + Redis |
+| 10x | More Node instances, more read replicas, PgBouncer |
+| 100x | Redis Cluster, bigger L1 cache, partitioning, async everything non-critical |
+| 1000x | Shard by `short_code` / DynamoDB-Cassandra, multi-region reads, CDN/edge if 301 allowed |
+
+### Consistency
+
+| Where | Level | How |
+|---|---|---|
+| Code uniqueness | **Strong** | UNIQUE index on primary |
+| Redirect right after create | **Read-after-write** | Miss par primary fallback, ya create par write-through |
+| Delete / edit | Bounded stale | DB then `DEL`, TTL, L1 5s |
+| Analytics | **Eventual** | Queue + batch worker |
+
+### Failure Handling
+
+| Failure | Impact | Fix |
+|---|---|---|
+| Redis down | DB par ~20x load | DB fallback, HA, circuit breaker, L1 cache |
+| DB primary down | Create fail | Failover; redirects cache + replica se chalte rahein |
+| Node crash | Kuch in-flight requests | LB health check, stateless, graceful shutdown |
+| Queue down | Analytics loss | Redirect unaffected; buffer / drop |
+| Timeout | Slow responses | Har call par timeout (Redis 50ms), retry with backoff sirf idempotent par |
+| Duplicate create request | 2 links | `Idempotency-Key` header |
+| Duplicate message | Double count | Event ID dedupe |
+| Worker crash | Lag | Ack after process, restart from offset |
+| Malware API down | Create slow/fail | Timeout + async scan / pending state |
+
+### Security
+
+HTTPS (TLS at LB), auth (JWT/API key) + owner check (authorization), zod validation (http/https only, no own domain, 2048 max), parameterized SQL, rate limiting (Redis) on create **and** redirect, malware/phishing scanning, secrets in env/secret manager, `helmet`, body limit 10kb, no internal errors in 500, random codes for private links (enumeration).
+
+### Observability (bonus)
+
+pino structured logs, metrics: RPS, p99 latency, error rate, **Redis hit ratio**, DB latency, queue lag, CPU/memory, event loop lag; OpenTelemetry tracing.
+
+### Top 5 Trade-offs
+
+| Decision | Chosen | Kyun | Kab badlega |
+|---|---|---|---|
+| 301 vs 302 | 302 | Analytics + edit/disable | No analytics -> 301, server load kam |
+| Counter vs random | Counter + Base62 | No collisions, 7 chars | Private links -> random 8 chars |
+| Postgres vs NoSQL | Postgres | Unique constraint, simple, replicas | 10s of TB / multi-region writes -> DynamoDB/Cassandra |
+| Cache vs no cache | Redis cache-aside | 100:1 reads, 35K peak | MVP / low traffic -> no Redis |
+| Sync vs async analytics | Async queue | Redirect latency safe | No analytics -> no queue |
+
+### Top 10 Follow-up Questions (one-line answers)
+
+| # | Question | One-line answer |
+|---|---|---|
+| 1 | Redis down ho gaya? | Cache hai, source of truth nahi -- DB se serve, HA + circuit breaker taaki DB na gire |
+| 2 | Do servers same ID banayein? | Nahi -- har server DB sequence se alag 1000-ID block leta hai, aur UNIQUE index last defence |
+| 3 | Do users same alias ek saath? | Seedha INSERT, UNIQUE violation `23505` -> 409; check-then-insert nahi |
+| 4 | Viral link / hot key? | 5s in-process LRU + single-flight; Redis replicas |
+| 5 | Banate hi click kiya, 404 aaya? | Replica lag -- miss par primary fallback ya create par cache warm |
+| 6 | 301 ya 302? | Analytics chahiye toh 302; warna 301 (browser cache, kam load) |
+| 7 | Traffic 1000x? | Shard by short_code / DynamoDB, Redis Cluster, multi-region reads |
+| 8 | Bots random codes try kar rahe? | Negative cache 60s + redirect par rate limit; private links ke liye random codes |
+| 9 | Expired links? | `expires_at` check on read (410), cleanup cron with distributed lock |
+| 10 | Duplicate create request (client retry)? | `Idempotency-Key` header -> same response, naya link nahi |
+
+### 30-second answer
+
+PART 27 dekho. Skeleton: **read-heavy (100:1) -> stateless Node + LB -> Redis cache-aside -> Postgres source of truth + unique index -> counter blocks + Base62 (7 chars) -> 302 + async analytics -> shard at scale.**
+
+### 5-minute answer (skeleton -- full text PART 28 mein)
+
+1. **0:00** Requirements: core 3 + alias/expiry/analytics; NFR = availability, latency, durability.
+2. **0:45** Numbers: 116 w/s, 11.6K r/s (35K peak), 10 TB, 18B -> 7 chars.
+3. **1:30** HLD + create flow + redirect flow; "bottleneck DB -> Redis; Redis source of truth nahi".
+4. **2:30** APIs, `urls` table + unique index, ID blocks, insert-and-catch for alias.
+5. **3:15** Cache details (TTL jitter, negative cache, L1, single-flight) + scaling 10x/100x/1000x.
+6. **4:15** Failures, consistency levels, security, 2 trade-offs (301/302, counter/random), "deep dive kahan?"
+
+### MOST IMPORTANT RULE -- 5 sawaal, 3 key decisions par
+
+| Sawaal | Redis cache | Counter + Base62 | Postgres |
+|---|---|---|---|
+| **Hum ye kyun kar rahe hain?** | 100:1 reads, 35K peak; ~1 ms hit, DB load 90%+ kam | Unique number -> unique code, collision check hi nahi; 7 chars | Durability + UNIQUE constraint + simple key lookup + easy replicas |
+| **Agar ye nahi kiya toh?** | Saara read load DB par -> zyada replicas, latency badhegi, viral link par DB CPU spike | Random codes -> collisions + retries; plain auto-increment -> lamba aur guessable | Sirf Redis -> crash par data loss, 10 TB RAM mehenga, uniqueness guarantee nahi |
+| **Iska alternative kya hai?** | DB replicas only, in-process cache, CDN (301 ke saath) | Random + retry, hash (MD5), Snowflake, UUID | MySQL, MongoDB, DynamoDB/Cassandra |
+| **Alternative kab choose karenge?** | Low traffic / MVP -> no Redis; no analytics + global -> CDN + 301 | Private links -> random 8 chars; dedup -> hash; huge writes multi-region -> Snowflake | Team MySQL jaanti hai -> MySQL; flexible metadata -> Mongo; 10s of TB / 100K+ r/s -> DynamoDB |
+| **Scale badhne par kya change hoga?** | Single node -> Redis Cluster; hot keys -> L1 LRU + replicas | Block size badhao; multi-region -> region prefix / Snowflake | Replicas -> PgBouncer -> partitioning -> shard by `short_code` |
+
+### Most Important Things To Remember
+
+1. **Read-heavy (100:1)** -- har decision read path ke liye hai.
+2. **Postgres = truth, Redis = speed.** Redis girne se system slow ho, down nahi.
+3. **Uniqueness database se lo** -- UNIQUE index, insert-and-catch; check-then-insert kabhi nahi.
+4. **Counter blocks + Base62 = 7 chars, no collisions**; private links ke liye random.
+5. **302 for analytics**, analytics async via queue -- redirect ko kabhi slow mat karo.
+6. **Cache ke 3 dushman:** stale data (DB then `DEL`), stampede (single-flight + jitter), hot key (L1 LRU).
+7. **Components tabhi jab reason ho** -- queue sirf analytics ke liye, CDN/cluster/sharding sirf scale par.
+8. Har jagah **timeouts**, create par **Idempotency-Key**, create + redirect par **rate limit**.
+9. Numbers bolo: **116 w/s, 11.6K r/s, 35K peak, 10 TB, 18B, 3.5T, 10 GB cache.**
+10. Har decision ke saath **trade-off** bolo -- "X always better" kabhi nahi.
+
+---
+
+## Remember
+
+> **Coding round mein: clarify -> logic bolo -> clean code -> edge cases -> complexity. Design round mein: requirements -> numbers -> simple diagram -> bottleneck -> ek-ek component uske reason ke saath.** URL shortener ka dil ek line hai: "Postgres se correctness, Redis se speed, aur redirect path ko kisi bhi cheez ke liye slow mat hone do."
+
+## Quick Self-Test
+
+1. In-memory `UrlShortener` ko 3 servers par chala diya -- kaunsa bug aayega aur production design mein woh kaise solve hua?
+2. Dedup map (`urlToCode`) mein expiring links kyun nahi daale? Ek example ke saath batao.
+3. `shorten` ka time complexity O(L) kyun hai, O(1) kyun nahi? Aur space O(N x L) ko kaise kam karoge?
+4. Whiteboard par Queue kis step par aata hai, aur interviewer bole "analytics nahi chahiye" toh board se kya mitaoge?
+5. 5-minute answer mein "Redis source of truth nahi hoga" line kis minute mein aati hai, aur uske turant baad kaunsa risk batana zaruri hai?
+
+---
+
+**URL Shortener complete.** Next system: **Rate Limiter**. "next" bolo.
+
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') return '<div class="mermaid">' + code + '</div>';
+    return '<pre><code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</code></pre>';
+  };
+  renderer.table = function(header, body) {
+    return '<div class="table-wrap"><table><thead>' + header + '</thead><tbody>' + body + '</tbody></table></div>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>
