@@ -292,6 +292,23 @@
   }
   .suggest-nav button.next { text-align: right; }
   .suggest-nav button:hover { border-color: var(--accent); }
+  /* Links page */
+  .link-list { display: grid; gap: 12px; margin-top: 18px; }
+  #reader a.link-card {
+    display: block;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-decoration: none;
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  }
+  #reader a.link-card:hover { border-color: var(--accent); }
+  .link-card .num { color: var(--accent); font-weight: 700; margin-right: 6px; }
+  .link-card .ttl { font-size: 1rem; font-weight: 600; }
+  .link-card .desc { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+  .link-card .url { color: var(--accent); font-size: 0.78rem; margin-top: 6px; overflow-wrap: anywhere; }
   /* Long unbroken strings (e.g. "REST/SOAP/GraphQL/gRPC") must wrap instead of widening the page */
   .home-card .ttl, .toc-item, .suggest-card, .suggest-nav button, #reader h1, #reader h2, #reader h3,
   #reader p, #reader li, #reader td, #reader th { overflow-wrap: anywhere; }
@@ -329,6 +346,7 @@
     <button id="sidebar-toggle" aria-label="Toggle topics">&#9776; Topics</button>
     <button id="btn-home">Home</button>
     <button id="btn-prep" title="Private interview prep (password protected)">&#128274; Interview Prep</button>
+    <button id="btn-links" title="Useful learning links">&#128279; Links</button>
     <button id="theme-sepia">Sepia</button>
     <button id="theme-light">Light</button>
     <button id="theme-dark">Dark</button>
@@ -6165,6 +6183,37 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
 });
 sidebarBackdropEl.addEventListener('click', closeMobileSidebar);
 
+// ---- Links page: add a new entry here to show it on the page ----
+const LINKS = [
+  { title: 'Backend from First Principles', desc: '25-chapter backend engineering reference: HTTP, routing, databases, caching, Kafka and more', url: 'https://backend-from-first-principle.vercel.app/' },
+  { title: 'Backend Engineering - First Principles (Sonu)', desc: 'My own backend engineering first-principles guide', url: 'https://backend-first-principle.vercel.app/' },
+  { title: 'AI Guide - How AI Thinks', desc: 'How AI models work, explained simply', url: 'https://how-ai-thinks.vercel.app' },
+  { title: 'The 21-Day AI Engineer Course', desc: 'A day-by-day course to become an AI engineer', url: 'https://ai-agent-course-21-days.vercel.app' },
+  { title: 'Engineering Lab - Backend / Platform / SRE', desc: 'Interactive code lab for backend, platform engineering, SRE and distributed systems', url: 'https://sreplatform.vercel.app/code-lab' },
+  { title: 'API Design v5 (Node.js)', desc: 'Course on building production-ready APIs with Node.js', url: 'https://api-design-with-node-v5.super.site/' },
+  { title: 'AI Engineering Handbook', desc: 'From zero to AI engineer: computer fundamentals to production AI systems', url: 'https://ai-engineering-handbook-ruby.vercel.app/' },
+  { title: 'Job GPS Dashboard (jobAi)', desc: 'My job-search dashboard - pick your track', url: 'https://sonuengineer.github.io/jobAi/' },
+];
+
+function renderLinks() {
+  currentId = null;
+  document.title = 'Links - Learning Dashboard';
+  progressEl.textContent = LINKS.length + ' links';
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  readerEl.innerHTML = '<h1>&#128279; Useful Links</h1>' +
+    '<p style="color:var(--muted)">Learning resources and my own projects. Each link opens in a new tab.</p>' +
+    '<div class="link-list">' + LINKS.map((l, i) =>
+      '<a class="link-card" href="' + esc(l.url) + '" target="_blank" rel="noopener noreferrer">' +
+        '<div class="ttl"><span class="num">' + (i + 1) + '.</span>' + esc(l.title) + '</div>' +
+        '<div class="desc">' + esc(l.desc) + '</div>' +
+        '<div class="url">' + esc(l.url) + '</div></a>').join('') +
+    '</div>';
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+
+document.getElementById('btn-links').addEventListener('click', renderLinks);
 document.getElementById('btn-home').addEventListener('click', renderHome);
 // Relative link: works on GitHub Pages (/FullStackInterview/prep/) and when opened locally
 document.getElementById('btn-prep').addEventListener('click', () => { location.href = 'prep/index.html'; });
