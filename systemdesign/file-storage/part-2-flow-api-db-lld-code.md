@@ -1,0 +1,1035 @@
+# File Storage (S3-style) -- HLD + LLD (Part 2: Request Flow -> API -> Database -> LLD -> Code)
+
+> Is file mein prompt ke **Parts 7-12** hain: request flow, API design, database design, LLD folder structure, Node.js/TypeScript code, aur code ka line-by-line explanation.
+> Part 1 mein humne decide kiya tha: **ShopKart ka apna S3-style object storage "StoreBox". ~1,000 PUT/s aur ~7K GET/s plan, average object 500 KB, 3.65 PB/year logical. Sabse bada idea: metadata alag, data alag. Metadata (bucket, key, size, version, chunks kahan hain) Postgres mein; bytes 8 MB chunks mein storage nodes ki append-only volumes mein, 3 AZs mein 3 copies, W = 2 fsynced acks ke baad hi "durable". Ek metadata commit = object visible (strong read-after-write). API layer stateless Node.js jo bytes sirf stream karta hai, kabhi poori file memory mein nahi.** Ab wahi design request flow se code tak le jaayenge.
+
+---
+
+## PART 7 -- HLD Request Flow (shuru se end tak)
+
+Payment system mein ek request ke andar "teen duniya" thi (DB, PSP, client). Yahan bhi teen hain, lekin alag:
+
+1. **Metadata DB** -- chhota data, ACID, "object exist karta hai ya nahi" ka final faisla.
+2. **Storage nodes** -- bhaari bytes, slow disks (HDD), kabhi node mara, kabhi disk ne bit flip kiya.
+3. **Client** -- slow mobile upload, beech mein disconnect, retry.
+
+Poore write path ka ek hi rule hai: **pehle bytes durable, phir metadata commit.** Ulta kabhi nahi. Agar metadata pehle likha aur bytes nahi pahunche -> GET par object "hai" lekin data gayab = durability bug. Bytes pehle likhe aur metadata commit fail hua -> sirf kuch orphan chunks bache, jinhe GC saaf kar dega = sirf thoda disk waste. **Waste chalega, data loss nahi.**
+
+Chaar flows dekhenge: (A) single PUT, (B) GET with Range, (C) multipart upload, (D) presigned URL.
+
+### Flow A -- Single PUT (20 MB seller CSV)
+
+Scenario: Seller portal ka backend `sellers/42/catalog.csv` (20 MB) upload karta hai. 20 MB / 8 MB = **3 chunks** (8 + 8 + 4 MB).
+
+```mermaid
+sequenceDiagram
+    participant C as Client (seller backend)
+    participant A as API (Node)
+    participant P as Placement
+    participant N1 as Node AZ-1 (primary)
+    participant N2 as Node AZ-2
+    participant N3 as Node AZ-3
+    participant DB as Postgres (metadata)
+    C->>A: PUT /v1/buckets/seller-files/objects/sellers/42/catalog.csv (signed, Content-Length 20971520)
+    A->>A: verify HMAC, bucket owner, size <= 100 MB
+    A->>P: pickNodes(ch_01..., 3)
+    P-->>A: [node-az1-017, node-az2-004, node-az3-021]
+    A->>N1: chunk 0 (8 MB) stream
+    N1->>N2: forward (chain)
+    N2->>N3: forward (chain)
+    N1-->>A: fsynced, crc32c
+    N2-->>A: fsynced (2 of 3 = quorum)
+    Note over A: chunk 0 durable. Same for chunk 1, chunk 2
+    N3-->>A: fsynced (late, async ok)
+    A->>DB: ONE tx: objects + object_chunks + chunk_locations + is_latest flip + outbox
+    DB-->>A: COMMIT (object ab visible)
+    A-->>C: 200 { etag, versionId }
+```
+
+**Step by step (Hinglish mein):**
+
+1. **Auth** -- `Authorization: SBX1-HMAC-SHA256 ...` header verify (detail 8.7 mein). Rate Limiter pehle hi LB par per API key limit laga chuka hai.
+2. **Validate** -- bucket exist karta hai, caller uska owner hai, `Content-Length` diya hai aur `<= 100 MB` (zyada hai toh `413 USE_MULTIPART`). Body abhi padhi bhi nahi -- reject sasta hai.
+3. **Chunking** -- request body ek **stream** hai (socket se ~64 KB ke tukde aate hain). `Chunker` inhe jodke exactly 8 MB ke Buffers banata hai. Memory mein ek time par sirf ek-do chunk.
+4. **Placement** -- har chunk ke liye 3 nodes, **3 alag AZs**, jinme disk space hai aur jo heartbeat de rahe hain.
+5. **Chain replication** -- API chunk primary ko bhejta hai, primary AZ-2 ko forward karta hai, AZ-2 AZ-3 ko. Har node **CRC32C** compute karta hai aur **fsync** karke hi ack deta hai. ("Page cache mein likh diya" ack nahi hai -- power gaya toh data gaya.)
+6. **Quorum W = 2** -- 2 nodes (2 alag AZs) ne fsync kar diya = chunk durable. Teesra slow hai toh uska wait nahi; wo async complete hoga, fail hua toh `storage.repair` par task.
+7. **Metadata commit** -- teeno chunks durable hone ke baad **ek transaction**: naya `objects` row (naya `version_id`), 3 `object_chunks` rows, `chunk_locations` rows, purane latest ka `is_latest = false`, outbox row. **COMMIT = object visible.** Ek millisecond pehle GET karo toh purana version, baad mein naya -- beech ka koi half state nahi.
+8. **Response** -- `200 { "etag": "\"9b2c...\"", "versionId": "01J8..." }`. Relay baad mein outbox se `object.created` ko Kafka `storage.events` par bhejega.
+
+**Beech mein kuch toota toh?**
+
+| Kya hua | Result | Kaun saaf karega |
+|---|---|---|
+| Client ne chunk 2 ke beech disconnect kiya | Commit hua hi nahi -> object exist nahi karta | Chunk 0, 1 orphan -> GC (24h baad, koi `object_chunks` reference nahi) |
+| Ek node fsync se pehle mara | Baaki 2 ne ack diya -> quorum ok | Repair worker 3rd copy banayega |
+| 2 nodes fail | Quorum impossible -> `503 SLOW_DOWN`, client retry | Jo 1 copy likhi, wo orphan -> GC |
+| Metadata commit fail (DB down) | `503`, object nahi bana | Saare chunks orphan -> GC |
+
+> Interview line: "Write path mein **order hi guarantee hai**: bytes W = 2 fsynced, phir ek metadata transaction. Commit se pehle crash = object kabhi exist hi nahi kiya; sirf garbage bacha jo GC saaf karta hai."
+
+### Flow B -- GET with Range (video seek)
+
+Scenario: ShopKart app mein 1 GB product video (`videos/p-901.mp4`, 128 chunks). User slider ko 100 MB par le jaata hai. Player bhejta hai: `Range: bytes=104857600-105906175` (1 MB).
+
+```mermaid
+sequenceDiagram
+    participant C as Video player
+    participant CDN as CDN
+    participant A as API (Node)
+    participant DB as Postgres (primary / sync standby)
+    participant N as Nearest replica
+    participant N2 as Next replica
+    C->>CDN: GET .../videos/p-901.mp4 Range bytes=104857600-105906175
+    CDN->>A: cache miss -> origin
+    A->>DB: latest version + chunks + locations
+    DB-->>A: size 1073741824, 128 chunks
+    Note over A: 104857600 / 8388608 = 12.5 -> sirf chunk seq 12, offset 4194304..5242879
+    A->>N: getChunk(ch_..12)
+    N-->>A: 8 MB bytes
+    A->>A: CRC32C check
+    alt CRC mismatch / timeout
+        A->>N2: getChunk (next replica) + publish storage.repair
+    end
+    A-->>C: 206 Partial Content, Content-Range bytes 104857600-105906175/1073741824
+```
+
+**Step by step:**
+
+1. **CDN** -- public objects (product images) ka zyada traffic CDN hi serve karta hai. Private (invoice PDF) CDN par cache nahi hota.
+2. **Metadata read** -- latest version + chunk list. **Primary ya synchronous standby se**, async replica se kabhi nahi -- warna "PUT kiya, turant GET kiya, 404 aaya" (read-after-write toot gaya).
+3. **Range -> chunk math** -- sirf wo chunks jo range se overlap karte hain. 1 MB range ke liye 128 mein se **sirf 1 chunk** padhna hai. (Code mein `chunksForRange` dekhenge -- general case mein chunks ke sizes jodke chalna padta hai, kyunki multipart objects mein har chunk 8 MB nahi hota.)
+4. **Nearest replica** -- same AZ wala node pehle (cross-AZ traffic ka paisa lagta hai + latency).
+5. **CRC32C verify** -- node ne jo bytes diye unka CRC metadata wale CRC se match hona chahiye. Mismatch = bit rot / bad disk -> agla replica try + `storage.repair` task. User ko **kabhi corrupt bytes nahi** jaate.
+6. **Stream** -- `206 Partial Content` + `Content-Range`. `stream.pipeline` backpressure deta hai: player slow hai toh hum node se bhi dheere padhte hain, memory nahi bharti.
+
+### Flow C -- Multipart upload (2 GB DB backup)
+
+Scenario: Nightly Postgres backup, 2 GB. 100 MB single PUT limit se bada -> multipart. Client **21 parts** (20 x 100 MB + last 48 MB), **4 parallel**.
+
+```mermaid
+sequenceDiagram
+    participant C as Backup job
+    participant A as API (Node)
+    participant DB as Postgres
+    participant SN as Storage nodes
+    C->>A: POST /v1/buckets/backups/uploads { key, contentType }
+    A->>DB: INSERT multipart_uploads IN_PROGRESS
+    A-->>C: { uploadId: up_01J9... }
+    par part 1..21 (4 at a time)
+        C->>A: PUT .../uploads/up_01J9.../parts/1 (100 MB)
+        A->>SN: 13 chunks, W=2 each
+        A->>DB: UPSERT upload_parts (1, md5, chunk_ids)
+        A-->>C: { etag: "md5 of part 1" }
+    end
+    C->>A: POST .../uploads/up_01J9.../complete { parts: [{partNumber, etag}...] }
+    A->>DB: validate parts, ONE tx: objects + object_chunks (all parts in order) + locations + upload COMPLETED + outbox
+    A-->>C: 200 { etag: ...-21, versionId }
+```
+
+**Step by step:**
+
+1. **Initiate** -- `multipart_uploads` row `IN_PROGRESS`, `uploadId` wapas. Abhi koi object nahi.
+2. **Parts** -- har part normal write path jaisa: chunk -> W = 2 -> phir `upload_parts` row (`md5_hex`, `chunk_ids`). Object abhi bhi **invisible** hai. Part fail hua? **Sirf wahi part** dobara bhejo (2 GB dobara nahi -- yahi multipart ka poora fayda). Same `partNumber` dobara aaya toh row replace (PK `(upload_id, part_number)`), purane chunks garbage.
+3. **Complete** -- client apni list bhejta hai. Server check karta hai: part numbers ascending (`400 INVALID_PART_ORDER`), har etag DB wale md5 se match, last ko chhodke har part `>= 5 MB` (`400 ENTITY_TOO_SMALL`). Phir **ek transaction** mein saare parts ke chunks ko ek continuous `seq` (0, 1, 2 ... 265 -- 20 parts x 13 chunks + last part ke 6) dekar `object_chunks` mein daalo, object insert, upload `COMPLETED`. Bytes dobara copy nahi hote -- sirf metadata jodi.
+4. **ETag** -- `MD5(md5(part1) || md5(part2) || ... || md5(part21)) + "-21"`. Isliye multipart object ka ETag poori file ka MD5 **nahi** hota (S3 bhi aisa hi karta hai).
+5. **Abort** -- `DELETE .../uploads/:uploadId` -> state `ABORTED`, parts ke chunks GC ke liye. Koi abort bhi na kare toh lifecycle job 7 din purane `IN_PROGRESS` uploads abort karta hai (`ix_mpu_stale` index isi query ke liye).
+
+### Flow D -- Presigned URL (browser se direct upload)
+
+Scenario: Customer return request ke liye 30 MB video upload karta hai. Browser ke paas hamara API secret nahi ho sakta. Aur video ko ShopKart app server se guzarna bekaar bandwidth hai.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as ShopKart app backend
+    participant A as StoreBox API
+    participant SN as Storage nodes
+    B->>S: "mujhe video upload karna hai" (user logged in)
+    S->>A: POST /v1/presign { bucket: returns, key: r/9981/v.mp4, method: PUT, expiresInSec: 900 } (HMAC signed)
+    A-->>S: { url: ...?X-Sbx-KeyId=...&X-Sbx-Expires=...&X-Sbx-Signature=..., expiresAt }
+    S-->>B: url
+    B->>A: PUT url (30 MB body)
+    A->>A: verify presigned signature: method + path + keyId + expiry
+    A->>SN: same write path (chunks, W=2)
+    A-->>B: 200 { etag, versionId }
+```
+
+1. App backend (jiske paas API key hai) presign mangta hai. **Key/secret kabhi browser tak nahi jaata** -- sirf ek signature jo sirf **is method + is key + is expiry** ke liye valid hai.
+2. Browser seedha StoreBox API ko PUT karta hai. Iske baad bilkul Flow A wala write path.
+3. Ye wahi cheez hai jo lesson 87 (2 GB upload direct to S3) mein client side se dekhi thi. Ab server side: signature verify kaise hota hai, woh 8.7 mein.
+
+### Latency budget
+
+**GET (time to first byte, TTFB):**
+
+| Step | 500 KB image (1 chunk) | 1 MB range of 1 GB video |
+|---|---|---|
+| LB + TLS + rate limit | ~1 ms | ~1 ms |
+| HMAC verify + key lookup (cached) | ~1 ms | ~1 ms |
+| Metadata read (PK/index lookup) | ~2-5 ms | ~2-5 ms |
+| HDD seek | ~5-10 ms | ~5-10 ms |
+| Disk read of the chunk | 500 KB @ ~200 MB/s = ~2.5 ms | **8 MB @ ~200 MB/s = ~40 ms** |
+| Node -> API (10 Gbps, same AZ) | ~0.4 ms | ~7 ms |
+| CRC32C (hardware) | < 1 ms | ~1-2 ms |
+| **TTFB** | **~15-20 ms** | **~60-65 ms** |
+
+Right column dekho: 1 MB maanga lekin **poora 8 MB chunk** padhna pada, kyunki CRC poore chunk par hai. Isse **read amplification** kehte hain. Fix options (Part 3/4): chunk ke andar har 64 KB par alag checksum (tab sirf zaroori blocks padho), hot objects ke liye node ka page cache / SSD.
+
+**PUT (per 8 MB chunk, server side):**
+
+| Step | Time |
+|---|---|
+| API -> primary (10 Gbps) | ~7 ms |
+| Chain forward (pipelined, overlaps) | ~+2-7 ms |
+| Sequential disk write 8 MB @ ~200 MB/s | ~40 ms |
+| fsync | ~5-10 ms |
+| **W = 2 ack** | **~55-65 ms per chunk** |
+| Metadata commit (once per object) | ~5 ms |
+
+- 500 KB image PUT server side ~20-30 ms. Asli time client ki upload speed hai: 100 Mbps mobile par 8 MB = **~670 ms**. Server side ka hissa usme chhota hai.
+- Hamara V1 code chunks **ek ke baad ek** likhta hai: 100 MB = 13 chunks x ~60 ms = ~0.8 s. Bade uploads ke liye 2-4 chunks parallel (memory budget ke andar) -- Part 4.
+
+---
+
+## PART 8 -- API Design
+
+S3-inspired lekin simple REST. Bytes **raw body** mein jaate hain (JSON/base64 nahi -- base64 size 33% badha deta aur streaming tod deta).
+
+### 8.1 Buckets
+
+```
+PUT /v1/buckets/seller-files                -> 201 Created   { "name": "seller-files" }
+DELETE /v1/buckets/seller-files             -> 204 No Content
+                                            -> 409 { "error": "BUCKET_NOT_EMPTY", "message": "bucket has 1,204 objects" }
+```
+
+- Bucket name **globally unique** (DB mein `UNIQUE`), kyunki URL mein aata hai. Pehle se hai -> `409 BUCKET_ALREADY_EXISTS`. Non-empty bucket delete nahi -- galti se 1 lakh invoices uda dena bahut aasaan ho jaata. Pehle objects delete karo (ya lifecycle expire).
+
+### 8.2 Objects -- PUT / GET / HEAD / DELETE
+
+**PUT:**
+
+```
+PUT /v1/buckets/seller-files/objects/sellers/42/catalog.csv
+Authorization: SBX1-HMAC-SHA256 Credential=AK7Q..., SignedHeaders=content-length;host;x-sbx-content-sha256;x-sbx-date, Signature=3f9a...
+x-sbx-date: 2026-09-18T10:15:00Z
+x-sbx-content-sha256: UNSIGNED-PAYLOAD
+Content-Length: 20971520
+Content-Type: text/csv
+Content-MD5: mywK1v8b2cXWmRkSkqVZEA==        (optional)
+If-None-Match: *                              (optional: create-only)
+
+<20 MB raw bytes>
+
+200 OK
+ETag: "9b2c0ad6ff1bd9c5d699191292a55910"
+{ "etag": "\"9b2c0ad6ff1bd9c5d699191292a55910\"", "versionId": "01J8XK3M9QZ7B2K4W6TPN0R1FE" }
+```
+
+| Header | Kyun |
+|---|---|
+| `Content-Length` (**required**) | Pehle hi pata chale ki 100 MB se bada hai (reject bina padhe), aur end mein check ki poore bytes aaye (connection beech mein toota toh bytes kam aayenge -> `400 INCOMPLETE_BODY`, half object kabhi commit nahi) |
+| `Content-MD5` | Client ka apna checksum (base64). Hum stream karte waqt MD5 nikalte hain; match nahi = raaste mein corruption -> `400 BAD_DIGEST`, commit nahi |
+| `If-None-Match: *` | "Sirf tab likho jab ye key exist **nahi** karti". Do jobs ek hi report file likhein toh doosra `412 PRECONDITION_FAILED` paata hai -- overwrite nahi |
+
+**GET / HEAD / DELETE:**
+
+```
+GET /v1/buckets/videos/objects/p-901.mp4
+Range: bytes=104857600-105906175
+
+206 Partial Content
+Content-Range: bytes 104857600-105906175/1073741824
+Content-Length: 1048576
+Accept-Ranges: bytes
+ETag: "5d41402abc4b2a76b9719d911017c592-128"
+Content-Type: video/mp4
+Last-Modified: Fri, 18 Sep 2026 10:15:02 GMT
+
+GET ... If-None-Match: "5d41...-128"   -> 304 Not Modified (no body)
+GET ... Range: bytes=2000000000-       -> 416 Range Not Satisfiable, Content-Range: bytes */1073741824
+GET ...?versionId=01J8...              -> purana version (versioned bucket)
+HEAD ...                               -> GET wale headers, body nahi
+DELETE ...                             -> 204 (key thi ya nahi, dono case mein)
+```
+
+- **`Range`** -- video seek, resumable download (download 70% par toota -> `bytes=<already>-` se aage). Server sirf zaroori chunks padhta hai.
+- **`206` vs `200`** -- range maangi aur valid hai -> `206` + `Content-Range`. Range header hi nahi ya samajh nahi aaya (e.g. multi-range `bytes=0-1,5-9`, jo hum support nahi karte) -> poora object `200` (HTTP rules server ko Range ignore karne dete hain).
+- **`416`** -- start object size se bahar; `Content-Range: bytes */<size>` asli size batata hai. **`If-None-Match` -> `304`** -- browser/CDN ke paas same version hai toh body dobara mat bhejo. **`Accept-Ranges: bytes`** -- signal ki range requests chalenge.
+
+### 8.3 LIST
+
+```
+GET /v1/buckets/invoices/objects?prefix=2026/09/&delimiter=/&limit=1000&cursor=MjAyNi8wOS8xNy8=
+
+200 OK
+{
+  "items": [ { "key": "2026/09/summary.csv", "size": 48213, "etag": "\"a1b2...\"", "lastModified": "2026-09-18T10:15:02Z" } ],
+  "commonPrefixes": [ "2026/09/18/", "2026/09/19/", "2026/09/20/" ],
+  "nextCursor": "MjAyNi8wOS8yMC8="
+}
+```
+
+- **Prefix** -- S3 mein folders nahi hote; `2026/09/18/inv-992.pdf` ek flat key hai. "Folder" = common prefix.
+- **`delimiter=/`** -- "is level ke andar ke sub-folders" ko `commonPrefixes` mein collapse karo (UI mein folder dikhane ke liye). Upar ke example mein `2026/09/18/inv-992.pdf` item nahi, `2026/09/18/` "folder" ban ke aaya; `summary.csv` seedha `2026/09/` ke andar hai isliye item. Cursor `MjAyNi8wOS8xNy8=` = base64(`2026/09/17/`) -- pichhla page yahan khatam hua tha.
+- **`limit`** max 1000, **`cursor`** = last returned key, base64 (opaque -- client iske andar jhaanke nahi). Kyun offset nahi? PART 9 mein keyset pagination.
+
+### 8.4 Multipart + Presign
+
+```
+POST   /v1/buckets/backups/uploads                          { "key": "pg/2026-09-18.dump", "contentType": "application/octet-stream" }
+                                                            -> 200 { "uploadId": "up_01J9A2..." }
+PUT    /v1/buckets/backups/uploads/up_01J9A2.../parts/7     (raw bytes, 5-100 MB)  -> 200 { "etag": "\"c3fc...\"" }
+POST   /v1/buckets/backups/uploads/up_01J9A2.../complete    { "parts": [ { "partNumber": 1, "etag": "\"...\"" }, ... ] }
+                                                            -> 200 { "etag": "\"4d9e...-21\"", "versionId": "01J9..." }
+DELETE /v1/buckets/backups/uploads/up_01J9A2...             -> 204
+
+POST   /v1/presign  { "bucket": "returns", "key": "r/9981/v.mp4", "method": "PUT", "expiresInSec": 900 }
+                    -> 200 { "url": "https://storebox.shopkart.in/v1/buckets/returns/objects/r/9981/v.mp4?X-Sbx-KeyId=AK7Q...&X-Sbx-Expires=1789727400&X-Sbx-Signature=8c1d...", "expiresAt": "2026-09-18T10:30:00Z" }
+```
+
+### 8.5 Error table
+
+| Status | Code | Kab | Client kya kare |
+|---|---|---|---|
+| `400` | `INVALID_BUCKET_NAME` / `KEY_TOO_LONG` | Name regex fail / key > 1024 bytes | Bug fix |
+| `400` | `INCOMPLETE_BODY` / `BAD_DIGEST` | Bytes kam-zyada aaye / MD5 match nahi | Same request retry |
+| `400` | `INVALID_PART_ORDER` / `ENTITY_TOO_SMALL` | Complete mein parts ascending nahi / non-last part < 5 MB | Bug fix |
+| `403` | `SIGNATURE_MISMATCH` | Signature galat / key unknown | Secret, clock, canonical request check karo |
+| `403` | `REQUEST_EXPIRED` | Clock skew > 15 min / presigned URL expire | Clock sync (NTP) / naya presign |
+| `404` | `NO_SUCH_BUCKET` / `NO_SUCH_KEY` / `NO_SUCH_UPLOAD` | Exist nahi karta | Mat retry karo |
+| `409` | `BUCKET_ALREADY_EXISTS` / `BUCKET_NOT_EMPTY` | -- | Doosra naam / pehle objects hatao |
+| `411` | `MISSING_CONTENT_LENGTH` | PUT bina `Content-Length` | Header bhejo (chunked encoding nahi) |
+| `412` | `PRECONDITION_FAILED` | `If-None-Match: *` aur key exist karti hai | Expected hai -- kisi aur ne pehle likha |
+| `413` | `USE_MULTIPART` | Single PUT > 100 MB | Multipart use karo |
+| `416` | -- | Range object ke bahar | Size dekh ke range theek karo |
+| `429` | `RATE_LIMITED` | API key limit | `Retry-After` ke baad |
+| `503` | `SLOW_DOWN` | Prefix/shard overloaded, ya W = 2 quorum nahi mila | Exponential backoff + jitter, retry |
+
+Format hamesha: `{ "error": "NO_SUCH_KEY", "message": "..." }` -- `error` stable code (client isi par `if` lagaye), `message` sirf insaan ke liye.
+
+### 8.6 Validation
+
+| Field | Rule | Kyun |
+|---|---|---|
+| Bucket name | `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$` (3-63 chars) | DNS-safe (kal `seller-files.storebox...` subdomain bane), URL mein encode ka jhanjhat nahi |
+| Key | 1..1024 **bytes** UTF-8 (`Buffer.byteLength`, `.length` nahi) | Hindi (Devanagari) naam mein har character UTF-8 mein 3 bytes -- characters kam, bytes zyada. Limit DB index ke size ko bound karti hai |
+| `Content-Length` | required, integer, `<= 100 MB` (part: `<= 100 MB`, non-last `>= 5 MB`) | Memory/abuse bound, aur truncated upload detect |
+| `partNumber` | 1..10,000 | DB `CHECK` bhi hai. 10,000 x 100 MB = ~1 TB max object |
+| `expiresInSec` | 1..604,800 (7 din) | Leaked URL hamesha kaam na kare |
+| `limit` (LIST) | 1..1000 | Ek request DB se 1 crore rows na maang le |
+
+### 8.7 Authentication -- HMAC request signing aur presigned URL
+
+**Kyun HMAC, simple Bearer API key kyun nahi?** Bearer key har request ke saath jaati hai; ek bhi log line / proxy / bug ne key leak ki toh attacker **kuch bhi** kar sakta hai, hamesha. HMAC mein **secret kabhi wire par nahi jaata** -- client sirf `HMAC(secret, request ka summary)` bhejta hai. Payment System mein webhook signature yahi tha; yahan har request par.
+
+**Kya sign hota hai (canonical request):**
+
+```
+PUT                                            <- method
+/v1/buckets/seller-files/objects/sellers/42/catalog.csv   <- path
+                                               <- sorted query string (yahan khaali)
+content-length:20971520                        <- signed headers, lowercase, sorted
+host:storebox.shopkart.in
+x-sbx-content-sha256:UNSIGNED-PAYLOAD
+x-sbx-date:2026-09-18T10:15:00Z
+
+content-length;host;x-sbx-content-sha256;x-sbx-date
+UNSIGNED-PAYLOAD                               <- payload hash (ya body ka sha256 hex)
+```
+
+| Signed part | Na ho toh attack |
+|---|---|
+| Method | GET ka signature leke DELETE bhej do |
+| Path | `invoices/a.pdf` ka signature `invoices/b.pdf` par use |
+| Query | `?versionId=` badal ke purana version padh lo |
+| `host` | Doosre environment (staging) par replay |
+| `x-sbx-date` + 15 min skew check | Captured request ko kal replay karo |
+| Payload hash | Body badal do, signature phir bhi valid. (`UNSIGNED-PAYLOAD` = client ne body hash nahi diya; tab TLS + `Content-MD5` par bharosa. Bade streaming uploads mein pehle se hash nikalna mehenga hota hai) |
+
+**Server ka kaam:** same canonical request khud banao, secret DB/KMS se lo, HMAC nikalo, `timingSafeEqual` se compare. Dhyan do: HMAC ke liye server ko secret **wapas chahiye** (password ki tarah sirf hash store nahi kar sakte) -- isliye secrets encrypted (KMS) store hote hain.
+
+**Presigned URL:** signature = `HMAC(secret, "SBX1-PRESIGN\n" + method + path + keyId + expires)`.
+
+- **Expiry-bound** -- `X-Sbx-Expires` signed hai; badla toh signature toota. Max 7 din.
+- **Method-bound** -- GET ke liye bana URL se PUT nahi ho sakta (koi aapki invoice overwrite nahi kar sakta).
+- **Key-bound** -- path signed hai; `r/9981/v.mp4` ka URL `r/9982/...` par kaam nahi karega.
+- Nuksaan: expiry se pehle URL **revoke nahi** hota (stateless hai). Isliye chhota expiry (upload ke liye 15 min), aur emergency ke liye API key hi rotate karo.
+
+**Authorization:** signature se pata chala "kaun hai" (`keyId -> owner`). Phir check: `bucket.owner_id` == caller ka owner? Nahi toh `403 ACCESS_DENIED`. Private bucket ke object ka existence leak na ho, isliye kuch systems yahan `404` dete hain (Payment mein bhi yahi pattern tha).
+
+### 8.8 Idempotency angle
+
+Payment mein `Idempotency-Key` table chahiye tha. Yahan zyadatar operations **naturally** idempotent-ish hain:
+
+| Operation | Retry safe? | Kyun |
+|---|---|---|
+| `PUT` same key, same bytes | Haan (effectively) | Doosra PUT naya `version_id` banata hai lekin content same, ETag same. Last writer wins. Versioned bucket mein ek extra version -- chalta hai |
+| `PUT` jiska response kho gaya | Haan | Retry = same result. Pata karna ho ki pehla pahuncha ya nahi -> `HEAD` karke ETag compare |
+| `DELETE` | Haan, fully | Missing key par bhi `204`. Doosra DELETE kuch nahi badalta |
+| Part upload | Haan | Same `partNumber` dobara = row replace |
+| `complete` | Haan | Upload pehle se `COMPLETED` aur same parts list -> pehla result (`etag`, `versionId`) wapas. Double object nahi |
+| `POST /uploads` (initiate) | Nahi (naya uploadId) | Nuksaan nahi -- extra upload 7 din baad lifecycle abort karega |
+| `PUT` with `If-None-Match: *` retry | Careful | Pehla succeed hua tha toh retry `412` paayega -- client ko `412` ko "shayad main hi pehle likh chuka" samajhna chahiye (ETag compare) |
+
+---
+
+## PART 9 -- Database Design
+
+### Pehla faisla: bytes DB mein kabhi nahi
+
+Tempting approach: `objects` table mein `data BYTEA` column. Ek hi jagah sab, ek hi backup. Kya tootega?
+
+- **WAL aur replication** -- 10 TB/day ingest = 10 TB/day WAL. Sync standby ko bhi 10 TB/day bhejna. Replica lag, network bharaa.
+- **Backups** -- metadata ~7.3 TB/year (manageable), bytes 3.65 PB/year. Ab DB backup PBs ka -- restore mein hafte.
+- **Buffer cache** -- Postgres ka shared memory 1 GB videos se bhar jaata, chhoti metadata queries (jo sabse zyada hain) slow.
+- **Limits** -- Postgres ek value max 1 GB. Multi-GB backup fit hi nahi.
+- **Cost** -- DB servers SSD + bade RAM wale hote hain. Petabytes HDD par sasta hai. Aur DB mein erasure coding (1.5x) nahi kar sakte -- 3x replication hi milega.
+
+**Isliye:** metadata (~1 KB per object) Postgres mein, bytes storage nodes par. Yahi Part 1 ka core idea hai.
+
+### Metadata ke liye kaunsa DB?
+
+Metadata ki zaruratein: (1) **ek transaction** mein object + chunks + locations + `is_latest` flip, (2) "ek key ka ek hi latest" guarantee, (3) **prefix LIST ordered** (`invoices/2026/09/...` sorted order mein), (4) 7.3B objects/year tak scale.
+
+| Option | Fit | Kyun |
+|---|---|---|
+| **PostgreSQL** | **V1 choice** | ACID multi-table tx, partial unique index (`ux_objects_latest`), B-tree par sorted prefix range scan, team jaanti hai. Ek primary ~few thousand writes/s -- 1,000 PUT/s (har PUT ~5-8 row writes) peak par tight, isliye shard karna padega (neeche) |
+| **Cassandra / DynamoDB** | Scale ke liye possible, LIST awkward | Hash partitioning = infinite write scale. Lekin prefix LIST ke liye rows **sorted aur saath** chahiye: partition key = bucket rakho toh ek bade bucket ka ek hi partition (hot, size limits); partition key = hash(key) rakho toh LIST ko saare partitions scan karne padenge. Multi-row transactions bhi limited (Cassandra LWT slow, DynamoDB `TransactWriteItems` max 100 items) |
+| **FoundationDB / TiKV-style ordered KV** | Bahut bade scale ka natural fit | **Sorted keys + ACID transactions + range sharding with auto split** -- exactly hamari teen zaruratein. Kuch bade storage systems publicly aisa hi ordered KV use karte batate hain. Nuksaan: operate karna mushkil, team ke liye naya, SQL nahi (ad-hoc query / debugging mehenga) |
+| **MongoDB** | Chal sakta hai | Range-sharded collections + transactions (4.0+). Lekin partial unique + multi-table tx Postgres mein zyada natural. Team Mongo-first ho tab |
+
+> "Main V1 mein **PostgreSQL** choose kar raha hoon kyunki metadata ka core ek atomic commit hai (object + chunks + locations + latest flip), aur LIST ek sorted range scan hai -- dono Postgres ka B-tree + transactions natively dete hain. 7.3B objects/year par ek node nahi chalega, toh **(bucket_id, key) range se shard** karunga. Aur agar scale aur badhe toh FoundationDB/TiKV jaisa ordered transactional KV -- same model, auto-splitting ke saath."
+
+### Schema (spec wala, exact + ek outbox table)
+
+```sql
+CREATE TABLE buckets (
+  id                 BIGSERIAL PRIMARY KEY,
+  name               TEXT NOT NULL UNIQUE CHECK (name ~ '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'),
+  owner_id           TEXT NOT NULL,
+  versioning_enabled BOOLEAN NOT NULL DEFAULT false,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE objects (
+  version_id       TEXT PRIMARY KEY,                     -- ULID, sortable
+  bucket_id        BIGINT NOT NULL REFERENCES buckets(id),
+  key              TEXT NOT NULL,                        -- up to 1024 bytes UTF-8
+  is_latest        BOOLEAN NOT NULL,
+  is_delete_marker BOOLEAN NOT NULL DEFAULT false,
+  size_bytes       BIGINT NOT NULL CHECK (size_bytes >= 0),
+  etag             TEXT NOT NULL,
+  content_type     TEXT NOT NULL DEFAULT 'application/octet-stream',
+  storage_class    TEXT NOT NULL DEFAULT 'STANDARD' CHECK (storage_class IN ('STANDARD','COLD')),
+  user_metadata    JSONB NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX ux_objects_latest ON objects (bucket_id, key) WHERE is_latest;   -- one latest version per key
+CREATE INDEX ix_objects_list ON objects (bucket_id, key, created_at DESC);           -- prefix LIST + version history
+CREATE TABLE object_chunks (
+  version_id   TEXT NOT NULL REFERENCES objects(version_id),
+  seq          INT  NOT NULL,                 -- 0,1,2... order of chunks
+  chunk_id     TEXT NOT NULL,                 -- 'ch_<ULID>'
+  size_bytes   INT  NOT NULL,
+  crc32c       BIGINT NOT NULL,
+  PRIMARY KEY (version_id, seq)
+);
+CREATE TABLE chunk_locations (
+  chunk_id   TEXT NOT NULL,
+  node_id    TEXT NOT NULL,                   -- 'node-az1-017'
+  volume_id  TEXT NOT NULL,
+  offset_bytes BIGINT NOT NULL,
+  state      TEXT NOT NULL CHECK (state IN ('WRITING','DURABLE','CORRUPT','DELETED')),
+  PRIMARY KEY (chunk_id, node_id)
+);
+CREATE TABLE multipart_uploads (
+  upload_id  TEXT PRIMARY KEY,                -- 'up_<ULID>'
+  bucket_id  BIGINT NOT NULL REFERENCES buckets(id),
+  key        TEXT NOT NULL,
+  state      TEXT NOT NULL CHECK (state IN ('IN_PROGRESS','COMPLETED','ABORTED')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_mpu_stale ON multipart_uploads (created_at) WHERE state = 'IN_PROGRESS';
+CREATE TABLE upload_parts (
+  upload_id   TEXT NOT NULL REFERENCES multipart_uploads(upload_id),
+  part_number INT  NOT NULL CHECK (part_number BETWEEN 1 AND 10000),
+  size_bytes  BIGINT NOT NULL,
+  md5_hex     TEXT NOT NULL,
+  chunk_ids   TEXT[] NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (upload_id, part_number)        -- re-uploading a part replaces it (last one wins)
+);
+-- transactional outbox (Payment System wala pattern) -> relay -> Kafka storage.events
+CREATE TABLE outbox (
+  id           BIGSERIAL PRIMARY KEY,
+  event_type   TEXT NOT NULL,                 -- 'object.created' | 'object.deleted'
+  aggregate_id TEXT NOT NULL,                 -- version_id
+  payload      JSONB NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  published_at TIMESTAMPTZ NULL
+);
+CREATE INDEX ix_outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+```
+
+### Har table kyun hai
+
+- **`buckets`** -- naam -> id. `objects` mein `bucket_id BIGINT` (8 bytes) hai, naam (63 bytes tak) nahi -- 7.3B rows mein index chhota.
+- **`objects`** -- **ek row = ek version**. PK `version_id` (ULID: time-sortable, app generate karta hai). `is_latest` batata hai ki GET bina `versionId` ke kaunsa row de. `is_delete_marker` -- versioned bucket mein DELETE purane versions ko nahi mitata, ek "marker" version daalta hai; GET ko marker dikhe toh `404`.
+- **`object_chunks`** -- version ke bytes kaunse chunks mein, **kis order** (`seq`) mein, har chunk ka CRC32C. PK `(version_id, seq)` = "is version ke chunks order mein do" ek index range scan hai.
+- **`chunk_locations`** -- chunk ki copies kis node / volume / offset par, aur `state`. Alag table kyun, `object_chunks` mein 3 columns kyun nahi? Kyunki replicas badalte rehte hain (node mara, repair ne nayi copy banayi, COLD mein 12 fragments) -- object row chhue bina. `WRITING` = 3rd copy abhi aa rahi thi jab commit hua; repair worker verify karke `DURABLE` karta hai.
+- **`multipart_uploads` + `upload_parts`** -- adhoore uploads ka state, object table se alag. Complete hone tak ye objects mein dikhte hi nahi.
+
+### Indexes + constraints -- kyun, aur na ho toh kya bigdega
+
+| Index / Constraint | Kyun | Na ho toh |
+|---|---|---|
+| `ux_objects_latest` (partial unique `(bucket_id, key) WHERE is_latest`) | **Ek key ka ek hi latest.** Do PUTs same key par ek saath commit karein -> doosre ko unique violation `23505` -> wo retry karta hai aur pehle wale ko flip karta hai. Result: last committer wins, dono kabhi "latest" nahi. Plus ye GET latest ka index bhi hai. Partial isliye: purane versions (lakhon) index mein nahi, index chhota | Race mein ek key ke **do latest** -> GET kabhi A, kabhi B -> strong consistency gayi |
+| `ix_objects_list (bucket_id, key, created_at DESC)` | Prefix LIST = B-tree **range scan**; `?versions` listing (ek key ke saare versions newest first) bhi isi se | LIST ko bucket ki saari rows (crores) padh ke filter + sort karna padta -> seconds, DB CPU khatam |
+| `object_chunks PK (version_id, seq)` | GET: "is version ke chunks order mein" | Har GET par table scan |
+| `chunk_locations PK (chunk_id, node_id)` | Chunk ki copies; same node par same chunk do baar record nahi | Repair duplicate rows banata, copies ki ginti galat |
+| `ix_mpu_stale` (partial `WHERE state = 'IN_PROGRESS'`) | Lifecycle: "7 din purane adhoore uploads". Index mein sirf in-progress rows | Har run par saare (lakhon completed) uploads scan |
+| `upload_parts PK (upload_id, part_number)` | Part retry = replace (`ON CONFLICT DO UPDATE`), duplicate part nahi | Same part do baar -> complete galat bytes jodta |
+| `CHECK (part_number BETWEEN 1 AND 10000)`, `size_bytes >= 0`, `storage_class IN (...)` | Galat values DB hi reject kare | App ka bug -> garbage metadata jo baad mein GC/lifecycle ko confuse kare |
+
+**Missing index (worth adding, interview mein bolo):** `chunk_locations(node_id)` -- node mara toh repair ko "is node par kaunse chunks the" chahiye. Iske bina node failure par full table scan (billions of rows).
+
+### Prefix LIST ek range scan kaise hai
+
+Keys sorted hain: `2026/09/17/a.pdf < 2026/09/18/inv-1.pdf < 2026/09/18/inv-2.pdf < 2026/09/19/...`. Prefix `2026/09/18/` wali saari keys **ek continuous range** hain: `>= '2026/09/18/'` aur `< '2026/09/180'` (prefix ka last char `/` (0x2F) +1 = `0` (0x30)).
+
+```sql
+SELECT key, size_bytes, etag, created_at
+FROM objects
+WHERE bucket_id = $1
+  AND is_latest AND NOT is_delete_marker
+  AND key >= $2                 -- prefix            '2026/09/18/'
+  AND key <  $3                 -- prefixUpperBound  '2026/09/180'
+  AND key >  $4                 -- cursor (last key of previous page), '' for page 1
+ORDER BY key
+LIMIT 1001;                     -- limit + 1 -> pata chale next page hai ya nahi
+```
+
+- DB B-tree mein seedha `2026/09/18/` par jump karta hai (log n), phir aage 1001 entries padhta hai. Bucket mein 10 crore objects hon ya 100 -- kaam same.
+- Latest-only LIST ke liye planner `ux_objects_latest` (partial, `WHERE is_latest`) bhi use kar sakta hai -- usme purane versions hain hi nahi.
+- **Collation trap:** `key` ka comparison **byte order** mein hona chahiye (`COLLATE "C"`). Default locale collation (`en_US.UTF-8`) mein ordering "human" hoti hai (case/punctuation ignore) -- tab `>= prefix AND < upperBound` galat rows de sakta hai aur index range scan ke liye use hi nahi hota. Isliye `key TEXT COLLATE "C"` rakho (ya DB hi `C` collation mein banao).
+
+**Keyset pagination (cursor), OFFSET kyun nahi?** `OFFSET 5,000,000` ka matlab DB ko 50 lakh rows padh ke phenkni hain -- page jitna aage, utna slow. Aur beech mein koi object add/delete hua toh items skip ya repeat. Cursor = "last key jo tumne dekhi" -> `key > cursor` -> har page ek fresh index seek. `nextCursor = base64(lastKey)`.
+
+**`delimiter=/`** -- `2026/09/` prefix par `18/`, `19/` jaise sub-folders. Naive way: saari rows padh ke group karo (ek folder mein 10 lakh files ho toh bekaar). Better: `2026/09/18/x` mila -> `2026/09/18/` ko `commonPrefixes` mein daalo aur agli query `key >= '2026/09/180'` se -- poora folder **skip**.
+
+### Sharding preview (Part 4 mein detail)
+
+- ~7.3B objects/year -> ek Postgres nahi chalega. Shard key: **range of `(bucket_id, key)`**.
+- **Range sharding:** ek prefix ki keys ek (ya kuch) shards par -> LIST ek shard ki range scan. Nuksaan: hot range (sab `logs/2026-09-18/...` par likh rahe) -> ek shard garam -> us range ko **split** karo. Yahi wajah hai ki S3 jaise systems "per prefix" request rates publicly batate hain aur overload par `503 SLOW_DOWN` dete hain.
+- **Hash sharding:** load barabar, hot shard kam. Lekin LIST ko **saare shards** se puchna padega aur merge-sort -- har LIST N queries. Object storage mein LIST common hai, isliye range jeeta.
+
+> Interview line: "Metadata ka sabse important access pattern sorted prefix scan hai, isliye main B-tree + range sharding choose karta hoon. Hash sharding writes barabar baantega lekin har LIST ko scatter-gather bana dega."
+
+---
+
+## PART 10 -- LLD (Low-Level Design): Node.js project structure
+
+```
+storebox/
++-- src/
+|   +-- routes/        bucket | object | multipart | presign .routes.ts
+|   +-- middleware/
+|   |   +-- sigv-auth.ts              # canonical request -> HMAC -> timingSafeEqual, presigned verify
+|   |   +-- rate-limit.ts             # per API key (Rate Limiter system)
+|   +-- controllers/
+|   |   +-- object.controller.ts      # headers, Range parse, 206/304/416, stream response
+|   |   +-- multipart.controller.ts
+|   +-- services/
+|   |   +-- object.service.ts         # putObject (chunk -> quorum -> commit), getObject, range math
+|   |   +-- multipart.service.ts      # parts, complete validation, multipart ETag
+|   |   +-- presign.service.ts
+|   +-- storage/
+|   |   +-- chunker.ts                # Transform: stream -> 8 MB Buffers
+|   |   +-- placement.client.ts       # pickNodes (3 AZs)
+|   |   +-- storage-node.client.ts    # HTTP to data nodes: putChunk / getChunk
+|   |   +-- replicated-writer.ts      # 3 writes, resolve on W = 2, timeout, repair task
+|   +-- repositories/  bucket | object | upload .repository.ts   # object: commitObject tx, findLatest, list
+|   +-- workers/       repair | gc | scrubber | lifecycle .worker.ts
+|   +-- datanode/
+|   |   +-- server.ts                 # simplified data node HTTP server
+|   |   +-- volume.ts                 # append-only volume + in-memory index
+|   +-- domain/types.ts               # constants, TS types, AppError
+|   +-- utils/         crc32c.ts | etag.ts | signature.ts (presign / verify)
+|   +-- infra/         postgres.ts (Pool + withTransaction) | kafka.ts | logger.ts | metrics.ts
+|   +-- app.ts                        # composition root
+|   +-- server.ts                     # listen + graceful shutdown
++-- migrations/001_metadata.sql
++-- tests/
+```
+
+(`domain/types.ts` spec ki file list se extra hai -- constants aur types ek jagah.)
+
+| Folder | Kaam | Kya yahan NAHI hona chahiye |
+|---|---|---|
+| `routes/` | URL -> controller; is route par body parser **nahi** (raw stream chahiye) | Logic |
+| `middleware/` | Auth (signature), rate limit, bucket load + owner check | Business rules, SQL for objects |
+| `controllers/` | HTTP: headers, Range/ETag, status codes, `pipeline(stream, res)` | Chunking, quorum, SQL |
+| `services/` | Orchestration: chunk -> write -> verify -> commit, range math | `req`/`res`, raw SQL |
+| `storage/` | Data plane: chunking, placement, node calls, quorum | Metadata DB, HTTP status codes |
+| `repositories/` | Sirf SQL, transaction ke andar (`tx` parameter) | Node calls, business decisions |
+| `workers/` | Background loops (Kafka / scheduled) | Apna alag write path -- same storage/repositories reuse |
+| `datanode/` | Alag process: disk par append + fsync + index | Metadata DB ka koi knowledge |
+| `utils/`, `infra/` | Pure helpers; connections, logger, metrics | Business logic |
+
+**Dependency direction:**
+
+```
+routes -> middleware -> controllers -> services -> repositories -> Postgres
+                                          |     -> storage (chunker, replicated-writer -> placement.client, storage-node.client) -> data nodes
+                                          +-> domain/types, utils (pure)  <- sab use karte hain, ye kisi ko nahi
+workers -> services / storage / repositories (same code paths)
+datanode (separate process) -> utils/crc32c only
+```
+
+**Kyun aise layers?**
+
+- **Data plane (`storage/`) aur metadata (`repositories/`) alag** -- yahi Part 1 ka "metadata alag, data alag" code mein. Kal data nodes Go mein rewrite hon, service ko sirf `StorageNodeClient` interface dikhta hai.
+- **Service commit ka order control karti hai** -- "saare chunks durable -> phir `withTransaction(commitObject)`" ek jagah dikhe, review mein pakda jaaye.
+- **Interfaces (`PlacementService`, `StorageNodeClient`)** -- tests mein fake node jo slow ho, fail ho, galat CRC de. Quorum logic bina asli disks ke test.
+
+> Interview tip: "Main 3 cheezein alag rakhunga: **HTTP (controller)**, **orchestration + ordering (service)**, aur **do storage duniya** -- metadata (repository, SQL) aur bytes (storage clients, data nodes)."
+
+---
+
+## PART 11 + 12 -- Node.js / TypeScript Code (line-by-line explanation ke saath)
+
+Stack: **Express 5**, **pg**, **ulid**, `node:stream`, `node:crypto`, `node:fs/promises`. Code `tsc --strict` se type-check aur chhote node tests (chunker, range math, quorum, volume, presign) se check kiya gaya tha; imports kuch jagah chhote kiye hain.
+
+Constants (`domain/types.ts`): `CHUNK_SIZE = 8 MB`, `MAX_SINGLE_PUT = 100 MB`, `MIN_PART = 5 MB`, `MAX_PARTS = 10_000`, `REPLICAS = 3`, `WRITE_QUORUM = 2`. Types spec wale (`ObjectMeta`, `ChunkRef`, `PlacementService`, `StorageNodeClient`) + `AppError(status, code)` jise error handler `{ error, message }` JSON banata hai. **8 MB kyun?** Chhota chunk = zyada metadata rows (1 GB = 128 rows; 1 MB chunks par 1,024). Bada chunk = range read par zyada read amplification. 8 MB beech ka balance.
+
+### 1. `storage/chunker.ts` -- stream ko 8 MB chunks mein todna
+
+```ts
+import { Transform, type TransformCallback } from 'node:stream';
+import { CHUNK_SIZE } from '../domain/types';
+export class Chunker extends Transform {
+  private parts: Buffer[] = [];
+  private filled = 0;
+  constructor(private readonly chunkSize = CHUNK_SIZE) {
+    super({ readableObjectMode: true, readableHighWaterMark: 1 }); // at most 1 ready chunk waiting
+  }
+  _transform(data: Buffer, _enc: BufferEncoding, cb: TransformCallback): void {
+    let rest = data;
+    while (this.filled + rest.length >= this.chunkSize) {
+      const need = this.chunkSize - this.filled;
+      this.parts.push(rest.subarray(0, need));
+      this.push(Buffer.concat(this.parts, this.chunkSize)); // one full chunk
+      this.parts = [];
+      this.filled = 0;
+      rest = rest.subarray(need);
+    }
+    if (rest.length > 0) { this.parts.push(rest); this.filled += rest.length; }
+    cb();
+  }
+  _flush(cb: TransformCallback): void {
+    if (this.filled > 0) this.push(Buffer.concat(this.parts, this.filled)); // last, smaller chunk
+    cb();
+  }
+}
+```
+
+**Code Explanation:**
+
+- `extends Transform` -- ek taraf bytes aate hain (writable side), doosri taraf chunks nikalte hain (readable side). Beech mein hum jodte hain.
+- `readableObjectMode: true` -- output side par har `push` ek poora "object" (8 MB Buffer) hai, bytes ka stream nahi. Consumer ko hamesha poora chunk milta hai.
+- `readableHighWaterMark: 1` -- **backpressure ki chaabi.** Output mein ek chunk pada hai aur consumer (replicated writer) abhi pichhla likh raha hai -> Transform `_transform` ka callback rok deta hai -> writable side ka buffer bharta hai -> `req` pause hota hai -> socket se padhna band -> TCP window chhoti -> **client ki upload speed khud dheemi**. Memory per upload bounded (~2-3 chunks), chahe file 100 MB ho.
+- `parts: Buffer[]` + `filled` -- 8 MB pehle se allocate nahi karte. 500 KB image ke liye 8 MB allocate karna 16x waste hota; ab memory = asli size.
+- `rest.subarray(0, need)` -- incoming piece chunk boundary ke paar jaaye toh do tukde. `subarray` copy nahi karta, sirf view.
+- `Buffer.concat(this.parts, this.chunkSize)` -- ek hi baar copy karke continuous 8 MB Buffer.
+- `_flush` -- stream khatam, bache bytes (e.g. 20 MB file ka last 4 MB) = last chunk. Test: 20 MB + 123 bytes -> `[8388608, 8388608, 4194427]` aur concat karke original ke equal.
+
+### 2. `utils/crc32c.ts` + `utils/etag.ts`
+
+```ts
+// crc32c.ts -- CRC32C (Castagnoli). Production: hardware-accelerated lib (SSE4.2 / ARM CRC instructions)
+export function crc32c(buf: Buffer, prev = 0): number { /* 256-entry table, polynomial 0x82f63b78 */ }
+// usage: const crc = crc32c(chunk);  streaming: crc32c(b, crc32c(a)) === crc32c(Buffer.concat([a, b]))
+// etag.ts
+import { createHash, type Hash } from 'node:crypto';
+export const newMd5 = (): Hash => createHash('md5');   // update() per chunk while streaming
+export const singlePutEtag = (md5: Hash): string => `"${md5.digest('hex')}"`;
+export function multipartEtag(partMd5Hex: string[]): string {
+  const h = createHash('md5');
+  for (const hex of partMd5Hex) h.update(Buffer.from(hex, 'hex')); // 16 raw bytes each, not the hex text
+  return `"${h.digest('hex')}-${partMd5Hex.length}"`;
+}
+```
+
+**Code Explanation:**
+
+- **CRC32C kyun, MD5 kyun nahi, dono kyun?** CRC32C = sasta **integrity check** (disk/network ne bit badla?), CPU instruction se GB/s speed -- har chunk, har read, scrubber sab isi se. MD5 = **ETag** (client-facing "content fingerprint"), S3 compatible. Dono alag kaam.
+- `0x82f63b78` -- Castagnoli polynomial. Node ka `zlib.crc32` (naye versions mein) **CRC-32 IEEE** hai, CRC32C nahi -- confuse mat karna. Test vector: `crc32c("123456789") = e3069283`. `prev` se tukdon par streaming CRC.
+- `newMd5()` + `update()` per chunk -- poori file memory mein rakhe bina MD5. Stream ke saath hi hash.
+- `singlePutEtag` -- quotes ke saath (`"9b2c..."`), HTTP ETag format.
+- `multipartEtag` -- **binary** md5s concat (16 bytes each), hex strings nahi. Hex text jodoge toh S3-compatible tools (aws cli etc.) ka ETag match nahi karega. End mein `-<partCount>`, jisse client ko pata chale "ye poori file ka MD5 nahi hai".
+
+### 3. `storage/replicated-writer.ts` -- 3 writes, W = 2 par resolve
+
+```ts
+export interface WrittenChunk {
+  chunkId: string; sizeBytes: number; crc32c: number;
+  durable: { nodeId: string; volumeId: string; offsetBytes: number }[]; // >= WRITE_QUORUM nodes
+  pending: string[];                                                    // 3rd node still writing
+}
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+export class ReplicatedWriter {
+  constructor(private readonly placement: PlacementService, private readonly nodes: StorageNodeClient,
+              private readonly repair: RepairPublisher, private readonly timeoutMs = 10_000) {}
+  async writeChunk(data: Buffer): Promise<WrittenChunk> {
+    const chunkId = `ch_${ulid()}`;
+    const expected = crc32c(data);
+    const nodeIds = await this.placement.pickNodes(chunkId, REPLICAS);  // 3 nodes, 3 AZs
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    const durable: WrittenChunk['durable'] = [];
+    let failures = 0;
+    return new Promise<WrittenChunk>((resolve, reject) => {
+      for (const nodeId of nodeIds) {
+        abortable(this.nodes.putChunk(nodeId, chunkId, data, []), signal)
+          .then((ack) => {
+            if (ack.crc32c !== expected) throw new Error('CRC_MISMATCH');   // bytes got corrupted on the way
+            durable.push({ nodeId, volumeId: ack.volumeId, offsetBytes: ack.offsetBytes });
+            if (durable.length === WRITE_QUORUM) {
+              const pending = nodeIds.filter((n) => !durable.some((d) => d.nodeId === n));
+              resolve({ chunkId, sizeBytes: data.length, crc32c: expected, durable: [...durable], pending });
+            }
+          })
+          .catch((err: unknown) => {
+            failures++;
+            if (failures > REPLICAS - WRITE_QUORUM) {   // 2 of 3 failed -> quorum impossible
+              reject(new AppError(503, 'SLOW_DOWN', `chunk ${chunkId} quorum failed`));
+            } else {                                     // 1 failed -> object still durable, fix it later
+              void this.repair.publish({ chunkId, nodeId, reason: String(err) }).catch(() => undefined);
+            }
+          });
+      }
+    });
+  }
+}
+```
+
+**Code Explanation:**
+
+- **Fan-out vs chain:** Flow A mein chain replication dikhaya (API sirf primary ko 8 MB bhejta hai, API ka NIC bachta hai). Yahan quorum logic saaf dikhane ke liye **fan-out** version hai: API teeno nodes ko direct bhejta hai (`replicas = []` = aage forward mat karo). Chain mode mein yahi counting primary node ke andar chalti hai. (`putChunk` ka ack spec ke `{ crc32c }` ke saath `volumeId` + `offsetBytes` bhi lautata hai, `chunk_locations` bharne ke liye.)
+- `chunkId = ch_<ULID>` -- **har write ka naya id**, content-hash nahi (dedupe nahi; content-addressed chunks ko GC mein reference counting chahiye). `expected = crc32c(data)` -- node ka lautaaya CRC match hona chahiye; network/NIC/RAM ne bit badla toh yahin pakda. `pickNodes` -- 3 alag AZs, warna ek AZ ki power cut mein teeno copies gayi.
+- `AbortSignal.timeout(10_000)` -- ek hi signal teeno writes par. Koi node 10 s mein fsync ack nahi deta toh wo write "failed" gina jaata hai. Bina timeout ke ek atka hua node poore upload ko hamesha ke liye latka deta.
+- `abortable()` -- `putChunk` signal nahi leta, isliye wrapper: signal fire hua toh promise reject. (Asli HTTP client mein signal seedha `fetch(url, { signal })` mein jaata, jisse socket bhi band ho.) `finally` mein listener hatana -- warna har chunk par ek listener leak.
+- `durable.length === WRITE_QUORUM` -- **2 fsynced acks par resolve**, teesre ka wait nahi (sabse slow node request ko slow nahi karta). `pending` = teesra node, metadata mein `WRITING` state se jaayega.
+- `failures > REPLICAS - WRITE_QUORUM` -- 3 - 2 = 1 failure tak chalega; doosri failure = quorum impossible -> `503 SLOW_DOWN`, client retry. Jo ek copy likhi thi wo orphan -> GC.
+- Ek failure -> `storage.repair` task. `void ... .catch()` -- repair publish fail hone se upload fail nahi hona chahiye; scrubber / `chunks_under_replicated` gauge baad mein pakad lega.
+- Tested: sab healthy -> `durable [a,b], pending [c]`; `a` down -> `[b,c]` + repair(a); `a`,`b` down -> `503`; `a` hang -> 100 ms timeout -> repair(a).
+
+### 4. `repositories/object.repository.ts` -- `commitObject` (ek transaction)
+
+```ts
+export class ObjectRepository {
+  // ONE transaction = the moment the object becomes visible
+  async commitObject(tx: Tx, o: ObjectMeta, chunks: WrittenChunk[], opts: { versioning: boolean; createOnly: boolean }): Promise<void> {
+    const prev = await tx.query<{ version_id: string; is_delete_marker: boolean }>(
+      `SELECT version_id, is_delete_marker FROM objects
+        WHERE bucket_id = $1 AND key = $2 AND is_latest FOR UPDATE`, [o.bucketId, o.key]);
+    const old = prev.rows[0];
+    if (opts.createOnly && old && !old.is_delete_marker) throw new AppError(412, 'PRECONDITION_FAILED');
+    if (old && opts.versioning) {
+      await tx.query(`UPDATE objects SET is_latest = false WHERE version_id = $1`, [old.version_id]);
+    } else if (old) {  // versioning off: old version goes away, its chunks become garbage for GC
+      await tx.query(`DELETE FROM object_chunks WHERE version_id = $1`, [old.version_id]);
+      await tx.query(`DELETE FROM objects WHERE version_id = $1`, [old.version_id]);
+    }
+    await tx.query(
+      `INSERT INTO objects (version_id, bucket_id, key, is_latest, size_bytes, etag, content_type, storage_class)
+       VALUES ($1, $2, $3, true, $4, $5, $6, 'STANDARD')`,
+      [o.versionId, o.bucketId, o.key, o.sizeBytes, o.etag, o.contentType]);
+    await tx.query(
+      `INSERT INTO object_chunks (version_id, seq, chunk_id, size_bytes, crc32c)
+       SELECT $1, s - 1, c, sz, crc FROM unnest($2::text[], $3::int[], $4::bigint[]) WITH ORDINALITY AS t(c, sz, crc, s)`,
+      [o.versionId, chunks.map((c) => c.chunkId), chunks.map((c) => c.sizeBytes), chunks.map((c) => c.crc32c)]);
+    const locs = chunks.flatMap((c) => [
+      ...c.durable.map((d) => [c.chunkId, d.nodeId, d.volumeId, d.offsetBytes, 'DURABLE'] as const),
+      ...c.pending.map((n) => [c.chunkId, n, 'pending', 0, 'WRITING'] as const),
+    ]);
+    await tx.query(
+      `INSERT INTO chunk_locations (chunk_id, node_id, volume_id, offset_bytes, state)
+       SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::bigint[], $5::text[])`,
+      [0, 1, 2, 3, 4].map((i) => locs.map((l) => l[i])));
+    await tx.query(
+      `INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ('object.created', $1, $2)`,
+      [o.versionId, JSON.stringify({ bucketId: o.bucketId, key: o.key, versionId: o.versionId, size: o.sizeBytes, etag: o.etag })]);
+  }
+}
+```
+
+**Code Explanation:**
+
+- `tx: Tx` -- repository khud `BEGIN/COMMIT` nahi karta; service `withTransaction` (Payment System wala helper) mein call karti hai. `SELECT ... FOR UPDATE` -- purane latest row par lock; same key ka doosra PUT yahan **ruk jaata hai** jab tak pehla commit na ho.
+- `createOnly && old` -> `412` -- `If-None-Match: *` ka check **transaction ke andar**, lock ke saath. Bahar check karte toh do parallel create-only requests dono "key nahi hai" dekhte.
+- `versioning` on -> purane ka `is_latest = false` (history rehti hai). Off -> purana version row + `object_chunks` delete; uske chunks ab kisi ke referenced nahi -> GC unhe dhoondh ke volumes se reclaim karega. **Bytes abhi disk par hain, lekin metadata se gayab = object turant "overwritten".**
+- `INSERT objects ... is_latest = true` -- yahan `ux_objects_latest` kaam aata hai: agar koi concurrent tx is key ka latest insert karke commit kar chuka (dono ko pehle koi row nahi mili thi), toh ye insert `23505` unique violation deta hai -> poora tx rollback -> service retry karti hai -> is baar `SELECT FOR UPDATE` naya row dekhta hai aur use flip karta hai. **Last committer wins, kabhi do latest nahi.**
+- `unnest(...) WITH ORDINALITY` -- saare chunk rows **ek statement** mein (100 MB = 13 chunks = 13 rows, ek round trip). `s - 1` = `seq` 0 se shuru.
+- `chunk_locations` -- `durable` nodes `DURABLE` (asli volume/offset), `pending` node `WRITING` (placeholder volume/offset). Repair worker `WRITING` rows (e.g. 10 min se purani) ko node se verify karta hai: copy hai -> `DURABLE` + asli offset; nahi -> nayi copy banao.
+- `outbox` insert **same tx** mein -- commit hua toh event pakka jaayega; rollback hua toh event bhi nahi. Thumbnailer ko kabhi aisi image ka event nahi milega jo exist hi nahi karti.
+
+### 5. `services/object.service.ts` -- `putObject`, `getObject`, range math
+
+```ts
+// Which chunks overlap [start, end] (inclusive), and which bytes inside each chunk
+export function chunksForRange(chunks: { seq: number; sizeBytes: number }[], start: number, end: number) {
+  const out: { seq: number; from: number; to: number }[] = [];
+  let chunkStart = 0;                                    // absolute offset where this chunk begins
+  for (const c of chunks) {                              // sorted by seq
+    const chunkEnd = chunkStart + c.sizeBytes - 1;
+    if (chunkEnd >= start && chunkStart <= end) {
+      out.push({ seq: c.seq, from: Math.max(start, chunkStart) - chunkStart, to: Math.min(end, chunkEnd) - chunkStart });
+    }
+    if (chunkStart > end) break;
+    chunkStart += c.sizeBytes;
+  }
+  return out;
+}
+export class ObjectService {
+  async putObject(input: PutInput): Promise<{ etag: string; versionId: string }> {
+    const md5 = newMd5();
+    const written: WrittenChunk[] = [];
+    let total = 0;
+    await pipeline(input.body, new Chunker(), async (chunks: AsyncIterable<Buffer>) => {
+      for await (const chunk of chunks) {
+        total += chunk.length;
+        if (total > input.contentLength) throw new AppError(400, 'INCOMPLETE_BODY', 'body longer than Content-Length');
+        md5.update(chunk);
+        written.push(await this.writer.writeChunk(chunk)); // W=2 fsynced before next chunk
+      }
+    });
+    if (total !== input.contentLength) throw new AppError(400, 'INCOMPLETE_BODY');
+    const etag = singlePutEtag(md5);
+    if (input.contentMd5 && Buffer.from(input.contentMd5, 'base64').toString('hex') !== etag.slice(1, -1)) {
+      throw new AppError(400, 'BAD_DIGEST');                // chunks become orphans -> GC
+    }
+    const meta: ObjectMeta = { versionId: ulid(), bucketId: input.bucket.id, key: input.key, sizeBytes: total, etag,
+      contentType: input.contentType, storageClass: 'STANDARD', isDeleteMarker: false, createdAt: new Date() };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await withTransaction(this.pool, (tx) => this.objects.commitObject(tx, meta, written,
+          { versioning: input.bucket.versioningEnabled, createOnly: input.createOnly }));
+        return { etag, versionId: meta.versionId };
+      } catch (e) {
+        const racedSameKey = (e as { code?: string }).code === '23505'; // ux_objects_latest: another PUT committed first
+        if (!racedSameKey || attempt === 3) throw e;
+      }
+    }
+  }
+  async getObject(bucketId: number, key: string) {
+    const found = await this.readRepo.findLatest(bucketId, key);   // primary / sync standby only
+    if (!found || found.meta.isDeleteMarker) throw new AppError(404, 'NO_SUCH_KEY');
+    return found;                                                  // { meta, chunks } -- ONE metadata read
+  }
+  openStream(chunks: ChunkRef[], start: number, end: number): Readable {
+    const pieces = chunksForRange(chunks, start, end);
+    const bySeq = new Map(chunks.map((c) => [c.seq, c]));
+    const readChunk = (ref: ChunkRef) => this.readChunkVerified(ref);
+    async function* bytes() {
+      for (const p of pieces) {                                    // one chunk at a time -> bounded memory
+        const data = await readChunk(bySeq.get(p.seq)!);
+        yield data.subarray(p.from, p.to + 1);
+      }
+    }
+    return Readable.from(bytes());
+  }
+  // readChunkVerified(ref): try ref.locations in order (same AZ first) -> collect bytes -> crc32c === ref.crc32c ?
+  //   return : publish storage.repair + try next; all failed -> AppError(503, 'SLOW_DOWN')
+}
+```
+
+**Code Explanation:**
+
+- **`chunksForRange`** -- chunks ko order mein chalte hue har chunk ka absolute start/end nikalo; jo `[start, end]` se overlap kare wo lo, aur uske andar `from..to` offsets.
+  - Example 1: 3 chunks (8 MB, 8 MB, 4 MB), range `8388000-8389000` (chunk boundary ke paar) -> `[{seq 0, 8388000..8388607}, {seq 1, 0..392}]` = 608 + 393 = 1001 bytes. Sahi.
+  - Example 2: multipart object: part 1 = 12 MB -> chunks 8 MB + **4 MB**, part 2 = 8 MB. Byte `12582912` (12 MB) seq **2** mein hai. `Math.floor(12582912 / 8388608) = 1` galat chunk deta -- isliye simple division nahi, sizes ka running sum.
+  - `if (chunkStart > end) break` -- range ke baad ke chunks mat dekho (128 chunks mein se 12th par ruk jao). (Hazaron chunks wale objects ke liye `seq` + cumulative offset DB mein store karke binary search -- optimisation.)
+- **`pipeline(input.body, new Chunker(), async (chunks) => ...)`** -- `pipeline` ka last stage ek async function ho sakta hai jo `for await` se consume kare. Fayde: (1) error kisi bhi stage mein -> saare streams destroy, (2) `await this.writer.writeChunk()` jab tak chal raha hai, loop agla chunk nahi maangta -> Chunker rukta -> `req` pause -> **backpressure client tak**.
+- `total > contentLength` -- client jhooth bole (header 1 MB, body 1 GB) toh turant ruk jao. `total !== contentLength` -- connection beech mein toota -> `400`, **kuch commit nahi**, half file kabhi object nahi banti.
+- `md5.update(chunk)` -- MD5 stream ke saath. `Content-MD5` base64 hai, ETag hex -- convert karke compare; mismatch -> commit nahi -> chunks orphan -> GC.
+- **Retry loop on `23505`** -- concurrent PUT same key (repository mein samjhaya). Max 3 attempts; bytes dobara nahi likhte, sirf metadata tx dobara.
+- **`getObject`** -- ek hi metadata read se `meta` + `chunks`; controller isi se ETag/304/Range decide karta hai aur isi chunk list se stream. Do alag reads karte toh beech mein naya PUT aa sakta tha -- headers ek version ke, bytes doosre ke.
+- **`openStream`** -- async generator -> `Readable.from`. Ek time par ek chunk memory mein (max 8 MB), aur generator tabhi aage badhta hai jab `res` ko aur data chahiye (pull-based = backpressure). `data.subarray(p.from, p.to + 1)` -- `to` inclusive hai, `subarray` ka end exclusive.
+
+### 6. `controllers/object.controller.ts` -- Range parsing, 206, streaming
+
+```ts
+// "bytes=0-1023" | "bytes=1000-" | "bytes=-500"  (single range only)
+export function parseRange(header: string | undefined, size: number): { start: number; end: number } | undefined | 'UNSATISFIABLE' {
+  if (!header) return undefined;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m || (m[1] === '' && m[2] === '')) return undefined;          // multi-range / garbage -> ignore, send 200 full
+  let start: number, end: number;
+  if (m[1] === '') {                                                 // suffix: last N bytes
+    const n = Number(m[2]);
+    if (n === 0) return 'UNSATISFIABLE';
+    start = Math.max(0, size - n); end = size - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+    if (m[2] !== '' && Number(m[2]) < start) return undefined;       // "bytes=500-100" is invalid -> ignore
+  }
+  return start >= size ? 'UNSATISFIABLE' : { start, end };
+}
+const keyOf = (req: Request): string => ([] as string[]).concat(req.params.key ?? []).join('/'); // Express 5: *key = segments
+get = async (req: Request, res: Response) => {
+  const bucket = res.locals.bucket as Bucket;
+  const key = keyOf(req);
+  const { meta, chunks } = await this.service.getObject(bucket.id, key);
+  res.setHeader('ETag', meta.etag);
+  res.setHeader('Accept-Ranges', 'bytes');
+  if (req.header('if-none-match') === meta.etag) { res.status(304).end(); return; }
+  const range = parseRange(req.header('range'), meta.sizeBytes);
+  if (range === 'UNSATISFIABLE') {
+    res.status(416).setHeader('Content-Range', `bytes */${meta.sizeBytes}`).end();
+    return;
+  }
+  const start = range?.start ?? 0;
+  const end = range?.end ?? meta.sizeBytes - 1;
+  res.status(range ? 206 : 200);
+  if (range) res.setHeader('Content-Range', `bytes ${start}-${end}/${meta.sizeBytes}`);
+  res.setHeader('Content-Length', String(meta.sizeBytes === 0 ? 0 : end - start + 1));
+  res.setHeader('Content-Type', meta.contentType);
+  res.setHeader('Last-Modified', meta.createdAt.toUTCString());
+  if (meta.sizeBytes === 0) { res.end(); return; }
+  await pipeline(this.service.openStream(chunks, start, end), res); // backpressure + cleanup on client abort
+};
+```
+
+**Code Explanation:**
+
+- `parseRange` ke teen forms: `bytes=0-1023` (first 1 KB), `bytes=1000-` (resumable download), `bytes=-500` (**last** 500 bytes -- jaise MP4 ka index file ke end mein). Tested on size 5000: `0-99999` -> clamp to `0-4999` (HTTP rule, error nahi); `5000-` -> `416`; `0-1,5-9` (multi-range) -> ignore -> poora `200`.
+- `keyOf` -- Express 5 mein `/objects/*key` ka `req.params.key` **array of segments** hota hai (`['sellers','42','catalog.csv']`) -> `join('/')`. Express 4 ki tarah string maan liya toh bug.
+- `ETag` pehle set (`304` mein bhi jaana chahiye). `If-None-Match === etag` -> `304`, koi data node call nahi (real header list / `W/` weak tags bhi ho sakte hain -- simplified). `Content-Length = end - start + 1` -- range inclusive hai (`0-1023` = 1024 bytes).
+- **`await pipeline(stream, res)`** -- sabse important line. (1) backpressure: `res.write()` false de (client slow) toh generator ruk jaata hai -> node se agla chunk nahi padhte. (2) Client ne tab band kiya -> `res` close -> pipeline source ko destroy karta hai -> hum bekaar ke chunks padhna band. `stream.pipe()` ye cleanup nahi karta -> memory/socket leak.
+- Headers stream se pehle bhej diye; beech mein data node fail ho (saare replicas) toh status badal nahi sakte -> connection abort hota hai, client ko `Content-Length` se kam bytes milte hain aur wo retry karta hai (Range se wahin se).
+- PUT handler (dikhaya nahi, chhota hai): `Content-Length` missing -> `411`, `> MAX_SINGLE_PUT` -> `413 USE_MULTIPART`, key `> 1024` bytes -> `400`, `If-None-Match: *` -> `createOnly`, aur `body: req` -- **request khud stream hai**; is route par `express.json()`/`express.raw()` nahi, warna Express poori body memory mein padh leta.
+
+### 7. `middleware/sigv-auth.ts` -- HMAC request signing verify
+
+```ts
+const MAX_SKEW_MS = 15 * 60 * 1000;
+const sha256hex = (s: string) => createHash('sha256').update(s).digest('hex');
+const hmacHex = (secret: string, s: string) => createHmac('sha256', secret).update(s).digest('hex');
+function safeEqualHex(a: string, b: string): boolean {
+  const x = Buffer.from(a, 'hex'), y = Buffer.from(b, 'hex');
+  return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
+}
+export function canonicalRequest(req: Request, signedHeaders: string[]): string {
+  const url = new URL(req.originalUrl, 'http://x');
+  const query = [...url.searchParams].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+  const headers = signedHeaders.map((h) => `${h}:${String(req.headers[h] ?? '').trim()}\n`).join('');
+  const payloadHash = String(req.headers['x-sbx-content-sha256'] ?? 'UNSIGNED-PAYLOAD');
+  return [req.method, url.pathname, query, headers, signedHeaders.join(';'), payloadHash].join('\n');
+}
+export const sigvAuth = (keys: KeyStore) => async (req: Request, res: Response, next: NextFunction) => {
+  const m = /^SBX1-HMAC-SHA256 Credential=([^,]+), SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$/
+    .exec(req.header('authorization') ?? '');
+  if (!m) throw new AppError(403, 'SIGNATURE_MISMATCH', 'missing or malformed Authorization');
+  const [, keyId, signedList, signature] = m;
+  const signed = signedList.split(';');
+  if (!signed.includes('host') || !signed.includes('x-sbx-date')) throw new AppError(403, 'SIGNATURE_MISMATCH');
+  const date = Date.parse(req.header('x-sbx-date') ?? '');
+  if (!Number.isFinite(date) || Math.abs(Date.now() - date) > MAX_SKEW_MS) throw new AppError(403, 'REQUEST_EXPIRED');
+  const secret = await keys.findSecret(keyId);
+  if (!secret) throw new AppError(403, 'SIGNATURE_MISMATCH');                  // same error: don't reveal which keys exist
+  const stringToSign = ['SBX1-HMAC-SHA256', req.header('x-sbx-date'), sha256hex(canonicalRequest(req, signed))].join('\n');
+  if (!safeEqualHex(hmacHex(secret, stringToSign), signature)) throw new AppError(403, 'SIGNATURE_MISMATCH');
+  res.locals.keyId = keyId;                                                      // bucket ownership check comes next
+  next();
+};
+```
+
+**Code Explanation:**
+
+- **Canonical request** -- client aur server dono ko **byte-for-byte same string** banani hai. Isliye rules fixed: query params sorted, header names lowercase + sorted, values trimmed. Ek space ka farak = alag hash = `403`.
+- `req.originalUrl` -- router mount ke baad `req.url` badal jaata hai; client ne full path sign kiya tha. `host` + `x-sbx-date` sign karna **mandatory** -- warna date sign hi nahi hui aur replay protection bekaar.
+- **Clock skew 15 min** -- request ka date purana/future -> `REQUEST_EXPIRED`. Kisi ne request capture karke kal replay ki toh reject. (15 min ke andar replay possible hai -- TLS isliye zaroori; aur PUT same bytes ka replay waise bhi idempotent-ish hai.)
+- `findSecret` null -> **same** `SIGNATURE_MISMATCH`, "key not found" nahi -- attacker ko pata na chale kaunse key ids valid hain.
+- `stringToSign` mein canonical request ka **sha256** -- lamba canonical string seedha HMAC karne ke bajaye fixed-size hash (AWS SigV4 ka pattern). Real SigV4 secret se date/region-scoped **derived key** bhi banata hai, taaki leak hua derived key sirf ek din/region ka ho -- yahan simple rakha.
+- `timingSafeEqual` -- `===` pehle alag character par ruk jaata hai; response time naap ke attacker signature byte-by-byte guess kar sakta hai. Length check pehle, kyunki `timingSafeEqual` alag length par throw karta hai.
+- **Presigned request** -- agar query mein `X-Sbx-Signature` hai toh ye middleware `utils/signature.ts` ka `verifyPresigned(method, path, query, secret)` chalata hai: `expires * 1000 < Date.now()` -> `REQUEST_EXPIRED`; HMAC of `SBX1-PRESIGN\nmethod\npath\nkeyId\nexpires` match nahi -> `SIGNATURE_MISMATCH`. Test: PUT ke liye bana URL PUT par `OK`, GET par `BAD`.
+
+### 8. `datanode/volume.ts` -- simplified append-only volume
+
+```ts
+interface IndexEntry { offset: number; length: number; crc32c: number }
+export const VOLUME_MAX_BYTES = 1024 * 1024 * 1024;   // 1 GB, then seal and open a new volume
+export class Volume {
+  private readonly index = new Map<string, IndexEntry>();   // chunkId -> where it lives
+  private size = 0;
+  private tail: Promise<unknown> = Promise.resolve();       // appends run one at a time
+  private constructor(readonly volumeId: string, private readonly fh: FileHandle) {}
+  static async open(volumeId: string, path: string): Promise<Volume> {
+    const fh = await open(path, constants.O_RDWR | constants.O_CREAT); // NOT 'a': O_APPEND ignores offsets on Linux
+    const v = new Volume(volumeId, fh);
+    v.size = (await fh.stat()).size;                         // real code: rebuild index by scanning record headers
+    return v;
+  }
+  append(chunkId: string, data: Buffer): Promise<{ offset: number; crc32c: number }> {
+    const run = async () => {
+      const offset = this.size;
+      await this.fh.write(data, 0, data.length, offset);   // sequential write at the end
+      await this.fh.datasync();                             // fsync: bytes on disk BEFORE we ack
+      this.size += data.length;
+      const crc = crc32c(data);
+      this.index.set(chunkId, { offset, length: data.length, crc32c: crc });
+      return { offset, crc32c: crc };
+    };
+    const p = this.tail.then(run);
+    this.tail = p.catch(() => undefined);                   // one failure must not block later appends
+    return p;
+  }
+  async read(chunkId: string): Promise<Buffer> {
+    const e = this.index.get(chunkId);
+    if (!e) throw new Error('NOT_FOUND');
+    const buf = Buffer.allocUnsafe(e.length);
+    await this.fh.read(buf, 0, e.length, e.offset);
+    if (crc32c(buf) !== e.crc32c) throw new Error('CORRUPT');   // bit rot -> caller tries another replica
+    return buf;
+  }
+}
+```
+
+**Code Explanation:** (Honest note: asli data nodes usually Go/Rust/C++ mein hote hain -- disk aur memory par zyada control. Ye Node version sirf idea samjhane ke liye.)
+
+- **Har chunk ki alag file kyun nahi?** 7.3B objects/year = arbon files. Filesystem inodes/metadata khatam, `ls`/backup/fsck marne lagte hain, aur har chhoti file = random disk writes. **Badi append-only volume file (1 GB)** mein chunks ek ke baad ek -> HDD par **sequential writes** (HDD ka sabse fast mode), aur file count 1,000x kam. (Facebook Haystack ne photos ke liye yahi idea publicly describe kiya tha.)
+- `index: Map<chunkId, {offset, length, crc}>` -- chunk kahan hai. Read = ek Map lookup + ek disk seek. Restart par index RAM se gayab -> asli volume har record ke saath header (chunkId, length, crc) likhta hai aur startup par scan karke index rebuild karta hai (ya index ki alag file).
+- `O_RDWR | O_CREAT`, `'a'` nahi -- `'a'` (O_APPEND) mode mein Linux positional `write(..., offset)` ko ignore karke hamesha end mein likhta hai. Hum offset khud track karte hain, isliye normal read-write mode.
+- `tail` promise chain -- **appends ek-ek karke**. Do concurrent `append` ek hi `size` padhte toh dono same offset par likhte = ek doosre ko overwrite. Ye mini mutex hai. `p.catch(() => undefined)` -- ek failed append baaki queue ko na roke.
+- `datasync()` -- **fsync, ack se pehle.** Iske bina bytes sirf OS page cache mein hain; power cut = gayab, lekin humne "durable" bol diya tha. Write quorum ka poora matlab isi line par tika hai. Cost: HDD par fsync ~5-10 ms -> real systems **group commit** karte hain (kai chunks ek fsync mein).
+- `read()` mein CRC dobara -- disk ne bit flip kiya (bit rot) toh `CORRUPT` -> API agla replica try karega aur repair publish. Scrubber bhi yahi check poori volume par periodically karta hai.
+- Volume `VOLUME_MAX_BYTES` (1 GB) par pahunchi -> seal (read-only), naya volume open. Delete ke baad garbage volumes mein pada rehta hai -> **compaction** (> 30% garbage wali volume ke live chunks nayi volume mein copy, purani delete) -- Part 3.
+- Test: do parallel appends `hello`, `world!` -> offsets `0` aur `5` (overlap nahi), `read('c2')` = `world!`.
+
+---
+
+## Remember
+
+> **Pehle bytes durable (har 8 MB chunk 3 AZs mein bheja, 2 fsynced acks), phir ek metadata transaction jo object ko visible banata hai -- ulta kabhi nahi.** Bytes kabhi DB mein nahi, kabhi poori file memory mein nahi (`pipeline` + Chunker = backpressure client tak), har read par CRC check, aur LIST sirf ek sorted B-tree range scan hai jise keyset cursor se page karte hain.
+
+## Quick Self-Test
+
+1. Write path mein metadata commit **pehle** aur chunk writes **baad mein** karte toh kaunsa failure scenario data loss dikhata? Aur hamare order mein wahi failure sirf "garbage" kyun banata hai?
+2. `Range: bytes=12582912-12583011` ek multipart object par aaya jiska part 1 = 12 MB hai (chunks 8 MB + 4 MB). Kaunsa `seq` padhoge, kis offset se? `Math.floor(start / CHUNK_SIZE)` yahan galat kyun hai?
+3. Do clients same key par ek saath PUT karte hain aur key pehle exist nahi karti. Step by step batao `ux_objects_latest`, `23505` aur retry loop milke "last writer wins, kabhi do latest nahi" kaise guarantee karte hain.
+4. Prefix LIST ko `OFFSET` ke bajaye `key > cursor` se kyun page karte hain? Aur `key` column par `COLLATE "C"` na ho toh kya bigad sakta hai?
+5. Presigned URL mein method, path aur expiry teeno sign kyun hote hain? Har ek ko sign na karne par ek attack batao. Aur presigned URL ko expiry se pehle revoke kaise karoge?
+
+---
+
+**Next (Part 3):** Algorithms (chunking, placement with consistent hashing, replication quorum, erasure coding, checksums + ETag, append-only volumes + GC), Concurrency, Caching + CDN. "next" bolo.

@@ -1,0 +1,713 @@
+# News Feed -- HLD + LLD (Part 1: Basics -> Requirements -> Estimation -> HLD)
+
+> Is file mein prompt ke **Parts 1-6** hain: problem basics, requirements, clarifying questions, capacity estimation, HLD, aur har component ka WHY.
+> Next file: request flows (create post + fan-out, read feed hybrid merge, follow, delete), API design, Postgres + Cassandra schema, LLD, Node.js code line-by-line.
+>
+> **Pichhle systems se connection:** URL Shortener Part 3 ka **Snowflake ID** (time-sortable) ab hamara **post ID** banega. Rate Limiter spam bots ko posting/following se rokega. Payment System se do cheezein seedhi aayengi: **`Idempotency-Key`** (retry par post do baar publish na ho) aur **outbox pattern** (`post.created` event DB ke saath atomically). File Storage (StoreBox) mein images/videos jaayengi -- feed sirf **media keys** rakhega, bytes CDN se aayenge. Repo lessons bhi kaam aayenge: [infinite scroll pagination at scale](../../lessons/84-infinite-scroll-pagination-at-scale.md) aur [Redis down -> database stampede](../../lessons/83-redis-down-database-stampede.md).
+>
+> **Honest note:** Asli Twitter / Facebook / Instagram feeds isse bahut zyada complex hain -- ML ranking, dozens of candidate sources, ads, experiments. Unke internals ka sirf kuch hissa publicly described hai. Hum woh design banayenge jo interviewer "Design the Twitter home timeline / Facebook News Feed" mein expect karta hai.
+
+---
+
+## PART 1 -- Problem ko bilkul basic se samjho
+
+### Ek kahani se shuru karte hain
+
+Ek startup hai **Chirp** -- Twitter/Instagram jaisa social app. Users posts likhte hain, doosre users ko **follow** karte hain, aur app kholte hi home screen par ek **news feed** dikhta hai: jin logon ko tum follow karte ho unke recent posts, newest first, neeche scroll karte jaao aur aate jaao.
+
+MVP ek hafte mein bana. Ek Postgres, ek Node.js server, aur feed ke liye ye ek query:
+
+```js
+// MVP -- feed har baar read time par compute hota hai (GALAT, scale par)
+app.get('/feed', async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT * FROM posts
+      WHERE author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)
+      ORDER BY created_at DESC
+      LIMIT 20`,
+    [req.user.id]
+  );
+  res.json(rows);
+});
+```
+
+**Code Explanation:**
+
+- `SELECT followee_id FROM follows WHERE follower_id = $1` -- pehle "main kis-kis ko follow karta hoon" ki list nikali.
+- `WHERE author_id IN (...)` -- un sab authors ke **saare** posts candidate ban gaye.
+- `ORDER BY created_at DESC LIMIT 20` -- DB ko un sab authors ke posts ko time se sort karke top 20 dene hain. Matlab har request par ek **merge** ho raha hai.
+- `res.json(rows)` -- 20 posts wapas. Demo mein 30 ms.
+
+1,000 users par sab mast chala. Phir Chirp viral hua:
+
+```
+Month 1  : 1K users, har user ~20 logon ko follow karta hai. Query 30 ms.
+Month 6  : 1M users. Riya 500 logon ko follow karti hai.
+           Uski query: 500 authors ke index mein jaao, har author ke recent posts nikalo,
+           sab ko merge-sort karo, top 20 do. Query 400 ms.
+Month 12 : 100M DAU. Har user din mein ~10 baar app kholta hai.
+           Peak par ~35,000 feed opens/sec.
+           35,000 x 500 authors = ~17.5 MILLION index lookups/sec -- sirf feed ke liye.
+           DB CPU 100%, connections full, feed 5-10 sec, timeouts.
+Month 12 : Ek cricket match ke time sab ek saath app kholte hain -> DB down -> poora app down.
+```
+
+Team ne pehle try kiya:
+
+- **Bada DB server** -- kuch hafte chala. Lekin kaam har read par **wahi merge dobara** ho raha hai -- Riya 10 baar app khole toh 10 baar same 500 authors merge.
+- **Read replicas** -- load baant diya, lekin har replica par wahi 17.5M lookups/sec ka kaam. Problem kaam ki **quantity** hai, machine ki nahi.
+- **Pura feed 30 sec cache karo** -- stale feed, aur cache miss par phir wahi query. Match ke time cache expire hua -> stampede (lesson 83 wala scene).
+
+Jadd kya hai?
+
+> **Feed padhna = hundreds of followees ke posts ko merge karna.** Aur hum ye merge har read par, har baar, zero se kar rahe hain. Reads writes se ~100x zyada hain -- toh mehenga kaam galat jagah (read path) par hai.
+
+### Key idea: har user ka ek "personal mailbox"
+
+Socho post office. Do tareeke hain:
+
+1. **Pull (fan-out on read):** Tum roz 500 doston ke ghar jaake poochho "kuch naya likha?" -- tumhari yatra lambi, har baar.
+2. **Push (fan-out on write):** Jab koi dost kuch likhta hai, post office uski copy uske **har follower ke mailbox** mein daal deta hai. Tum app kholo -> apna mailbox kholo -> ready feed. Ek lookup.
+
+**Fan-out ka simple matlab:** ek cheez ko bahut jagah bhejna. **Fan-out on write** = post likhte time hi followers ke feeds mein daal do. **Fan-out on read** = padhte time sab followees se jama karo.
+
+Chirp mein mailbox = Redis mein har user ka ek sorted list: `feed:{userId}` (latest 200 post IDs, time se sorted). Feed read = ek Redis call. 35K/s? Redis ke liye aaram se.
+
+**Lekin turant ek problem:** ek cricketer hai jiske **50M followers** hain. Usne ek post kiya -> 50 million mailboxes mein insert. 1M inserts/sec ki speed se bhi ~50 sec. Aur woh din mein 10 post kare toh? Uske followers ke feed mein post minutes late, aur baaki sab ki fan-out queue mein atak jaati hai. Isko kehte hain **celebrity problem (hot key / "Justin Bieber problem")**.
+
+**Solution preview -- Hybrid:**
+
+- Normal user (< **10,000** followers) -> **push** (mailbox mein daalo).
+- Celebrity (>= 10,000 followers) -> **push nahi**. Unka post sirf unki apni `timeline:{authorId}` mein. Jab tum feed kholte ho, tumhare mailbox ke saath tumhare followed celebrities ki timelines **pull** karke merge kar lete hain (tum typically kuch hi celebrities follow karte ho).
+
+Deep dive (threshold, merge algorithm, Redis commands) Part 3 mein. Abhi bas itna yaad rakho: **push normal logon ke liye, pull celebrities ke liye.**
+
+### Pehle kuch terms (ek-ek line mein)
+
+| Term | Simple matlab |
+|---|---|
+| **Feed / home timeline** | Jinko tum follow karte ho, unke posts ka merged, sorted stream. |
+| **User timeline** | Ek hi user ke apne posts (profile page). |
+| **Followee / follower** | Jisko tum follow karte ho = followee. Jo tumhe follow karta hai = follower. |
+| **Fan-out on write (push)** | Post create par hi followers ke feeds mein entry daal do. Read sasta, write mehenga. |
+| **Fan-out on read (pull)** | Read par followees ke posts jama karke merge karo. Write sasta, read mehenga. |
+| **Hybrid** | Normal authors push, celebrities pull. Threshold = 10,000 followers. |
+| **Hydration** | Feed mein sirf post IDs hain; unhe poore post + author + like count mein badalna. |
+| **Cursor pagination** | "Yahan tak dekh liya, iske aage do" -- page number/offset nahi (lesson 84). |
+| **Snowflake ID** | 64-bit, time-sortable unique ID (URL Shortener Part 3). Post ID yahi. |
+| **Eventual consistency** | Naya post followers ke feed mein **kuch seconds** baad dikhe -- chalega. |
+
+### Ye system actually karta kya hai?
+
+**News Feed ka simple matlab:** users posts banate hain aur doosron ko follow karte hain; system har user ko uske followees ke recent posts ek fast, scrollable, newest-first list mein dikhata hai -- chahe 100M log ek saath padh rahe hon aur kuch authors ke 50M followers hon.
+
+| Chirp kya karta hai | Kya NAHI karta (is design mein) |
+|---|---|
+| Post create (500 chars + 4 media), delete | Comment threads |
+| Follow / unfollow | DMs (woh Chat System hai) |
+| Home feed: reverse-chronological, 20 per page, infinite scroll | Notifications ("X ne like kiya") -- Notification system |
+| User timeline (profile) | Search posts/users -- Search system |
+| Like / unlike, like count, "maine like kiya?" | Ads, stories |
+
+### Real life mein iska example kya hai?
+
+- **Twitter/X home timeline** -- publicly described design commonly quoted: normal users ke tweets fan-out on write se Redis timelines mein, bahut bade accounts ke tweets read time par merge. Hamara hybrid yahi idea hai.
+- **Facebook News Feed** -- publicly described as mostly read-time aggregation + heavy ranking. Hum V1 mein ranking nahi karenge.
+- **Instagram home feed, LinkedIn feed** -- same basic problem: "followees ke posts merge karo, fast dikhao".
+- **Hamara lesson 84** -- infinite scroll par offset pagination kyun tootta hai. Feed ka cursor wahi lesson hai.
+
+### User kya request karega? System internally kya karega? Response kya milega?
+
+**Flow 1 -- Post create karna (Aman, 300 followers)**
+
+```
+Client:   POST /v1/posts
+          Authorization: Bearer <token>
+          Idempotency-Key: 7f3c...
+          { "text": "Aaj ka match zabardast tha!", "mediaKeys": ["media/u1/abc.jpg"] }
+
+System:   1. Auth, rate limit, validate (<= 500 chars, <= 4 media)
+          2. Snowflake ID banao, post Cassandra mein save (posts_by_id + posts_by_author)
+          3. Outbox -> Kafka `posts.created`
+          4. Aman ki apni timeline:{aman} mein add (read-your-own-writes)
+          5. (Async) fan-out worker: 300 < 10,000 -> har active follower ke feed:{followerId} mein ZADD
+
+Response: 201 Created
+          { "id": "2100907437367230464", "authorId": "...", "text": "...",
+            "mediaUrls": ["https://cdn.chirp.app/media/u1/abc.jpg"], "createdAt": "..." }
+```
+
+**Flow 2 -- Feed kholna (Riya: 500 followees, unmein 3 celebrities)**
+
+```
+Client:   GET /v1/feed?limit=20
+
+System:   1. feed:{riya} se newest entries (pushed posts)
+          2. timeline:{celeb1}, timeline:{celeb2}, timeline:{celeb3} se recent posts (pull)
+          3. timeline:{riya} se apne recent posts (read-your-own-writes)
+          4. Sab ko time se merge (k-way merge), deleted/blocked/unfollowed filter, top 20
+          5. Hydrate: post:{id} cache (MGET) + author info + like counts
+
+Response: 200 OK
+          { "items": [ { "post": {...}, "author": {...}, "likeCount": 12, "viewerHasLiked": false }, ... ],
+            "nextCursor": "eyJzIjox..." }
+```
+
+**Flow 3 -- Neeche scroll**
+
+```
+Client:   GET /v1/feed?limit=20&cursor=eyJzIjox...
+System:   cursor = "last dekha post ka time + id" -> uske baad wale 20 do
+Response: agle 20 items + naya nextCursor (khatam toh null)
+```
+
+> **Dhyan do:** post ID response mein **string** hai (`"2100907437367230464"`). Kyun? Ye number 2^53 se bada hai -- JavaScript `number` isse exactly nahi rakh sakta. Part 4 mein detail.
+
+### Ek simple real-world example
+
+Wapas Chirp par, ab hybrid laga hai:
+
+- Aman (300 followers) ne match ki photo post ki. Photo pehle StoreBox mein presigned URL se gayi, post mein sirf `media/u1/abc.jpg` key.
+- Post Cassandra mein save, `201` turant. Aman ko apna post **turant** dikha (timeline se).
+- Fan-out worker ne Kafka se event uthaya aur 2 sec mein Aman ke ~250 active followers ke mailboxes mein post ID daal di.
+- Wahi time par ek 50M-follower cricketer ne post kiya -> **koi fan-out nahi**, sirf uski timeline mein.
+- Riya ne app khola: mailbox (Aman ka post) + cricketer ki timeline merge -> dono posts, sahi order mein, ~50 ms mein.
+
+### Interview mein 30 seconds mein kya bolun?
+
+> "News feed ka core problem hai: feed padhna matlab sainkdon followees ke posts merge karna, aur reads writes se ~100x zyada hain. Isliye main har user ka feed precompute karunga -- fan-out on write -- Redis sorted set `feed:{userId}` mein latest 200 post IDs. Post create par Kafka event jaata hai aur workers followers ke feeds mein push karte hain. Lekin celebrities ke 50M followers hain, unke liye push nahi -- 10,000 followers se upar wale authors ke posts read time par pull karke merge karta hoon. Toh hybrid. Posts Cassandra mein, follow graph Postgres mein, feed read par ek k-way merge, cursor pagination, aur hydration Redis post cache se. Consistency eventual hai -- follower ko post kuch seconds baad dikhe chalega -- lekin author ko apna post turant dikhta hai."
+
+---
+
+## PART 2 -- Requirements
+
+### Functional Requirements (system kya karega)
+
+**Must-have (core):**
+
+1. **Create post** -- text **max 500 chars** + **max 4 media** items (images/videos StoreBox mein, post mein sirf keys).
+2. **Follow / unfollow** -- idempotent (do baar follow = ek hi follow).
+3. **Home feed** -- followees ke posts, **reverse-chronological in V1** (ranking V2 mein), **cursor-paginated infinite scroll, 20 per page**.
+4. **User timeline** -- ek user ke apne posts (profile page).
+5. **Like / unlike** -- like count dikhao, aur "viewer ne like kiya ya nahi".
+6. **Delete post** -- feeds se bhi **gayab hona chahiye**.
+
+**Out of scope (clearly bolo):** comment threads, DMs (Chat System), notifications (Notification system), search (Search system), ads, stories.
+
+> Interview tip: core 6 par design banao. "Comments, DMs, notifications alag systems hain -- main unhe events ke through connect karunga, design nahi" -- ye bolna scope control dikhata hai. Ranking ka zikr karo, lekin V2 bolke park karo.
+
+### Non-Functional Requirements (system kaisa hona chahiye)
+
+| Requirement | Simple meaning | Is system mein KYUN important hai? |
+|---|---|---|
+| **Low latency: feed read p99 < 200 ms (server side)** | 100 mein se 99 requests 200 ms ke andar | Feed **app ka home screen** hai. App khola aur spinner ghooma -> user band karke doosra app khol leta hai. Har feed open par ye latency lagti hai, 35K/s peak par. Isliye feed **precomputed** Redis mein, read par DB merge nahi. |
+| **High availability** | System hamesha khule -- **stale feed chalega, down feed nahi** | Feed nahi khula = app "toota hua" lagta hai. Lekin 3 sec purana feed koi notice nahi karta. Isliye design **AP-leaning** hai: Redis/Kafka mein dikkat ho toh bhi kuch na kuch dikhao (rebuild, fallback). |
+| **Eventual consistency (fan-out lag p99 < 5 s)** | Naya post followers ko kuch seconds baad dikhe | Payment System jaisa strong consistency yahan zaroori nahi -- Riya ko Aman ka post 2 sec baad dikha toh koi nuksaan nahi. Ye relaxation hi fan-out ko **async (Kafka)** banane deta hai. |
+| **Read-your-own-writes (author ke liye)** | Maine post kiya toh **mujhe** turant dikhe | Author post karke refresh kare aur post na dikhe -> woh dobara post karega (duplicate) ya bug report. Isliye apna post `timeline:{me}` se har read mein merge hota hai, fan-out ka wait nahi. |
+| **Scalability (celebrities)** | Tens of millions followers wale author bhi system na giraayein | Ek 50M-follower post = 50M writes. Push-only design isi par marta hai. Isliye **hybrid** -- ye requirement poore design ko shape deti hai. |
+| **Durability** | Post kabhi lost na ho | Post user ka content hai -- lost hua toh trust gaya. **Lekin feeds lost ho sakte hain** -- Redis feed ek derived cache hai, Cassandra (posts) + Postgres (follows) se rebuild ho jaata hai. Durable = posts + graph; rebuildable = feeds. |
+| **Scalability (reads)** | 35K feed reads/s peak, aage 10x | Stateless Node.js Feed Service, Redis Cluster sharded, hydration cache. |
+| **Security / abuse** | Spam bots, private accounts, blocks | Bots 1000 posts/min ya 10K follows/hour -> **Rate Limiter**. Blocked user ke posts feed mein nahi (read-time filter). Auth har API par. |
+
+### Consistency ka trade-off -- number se samjho
+
+```
+Aman ne 10:00:00.000 par post kiya
+  Author (Aman)     -> 10:00:00.050 par apne feed mein dekh sakta hai  (read-your-own-writes)
+  Normal follower   -> ~10:00:01-02 tak feed mein (fan-out lag, target p99 < 5 s)
+  Celebrity post    -> jaise hi Cassandra/timeline mein likha, agle feed read par (pull)
+  Delete            -> source of truth mein turant deleted=true; feeds se read-time filter
+```
+
+> Interview line: "Feed ke liye main availability aur latency choose karta hoon, strong consistency nahi. Follower ko post 5 second ke andar dikhe -- chalega. Lekin author ko read-your-own-writes chahiye, isliye uska apna recent post har feed read mein merge hota hai. Posts durable hain; feeds derived hain aur rebuild ho sakte hain."
+
+### Pichhle systems se comparison
+
+| | URL Shortener | Payment System | File Storage | News Feed |
+|---|---|---|---|---|
+| Galti ki cost | Ek link galat | Paisa | Data hamesha ke liye | Post late ya galat order |
+| Top NFR | Read latency | Correctness | Durability | **Read latency + availability** |
+| Consistency | Eventual OK | Strong | Strong read-after-write | **Eventual + read-your-own-writes** |
+| Read:write | ~100:1 | ~1:1 | 10:1 | **~100:1, lekin fan-out writes ko multiply karta hai** |
+| Main twist | Short code generation | Idempotency | Bytes >> requests | **Merge ka kaam read se write par shift** |
+
+---
+
+## PART 3 -- Clarifying Questions
+
+Architecture se pehle interviewer se ye poochho. Har answer design badalta hai.
+
+| # | Question | Ye KYUN pooch raha hoon? | Answer design ko kaise badlega |
+|---|---|---|---|
+| 1 | Kitne DAU? Kitne feed opens per user per day? | Read QPS -- sabse bada load | 100M DAU x 10 = 1B reads/day -> ~35K/s peak |
+| 2 | Kitne posts/day? | Write QPS + fan-out volume | 10M/day -> ~350/s peak, lekin x followers |
+| 3 | Average aur max followers? | Fan-out cost, celebrity problem | Avg 200, max 50M -> **hybrid** zaroori |
+| 4 | Follow symmetric (Facebook friends) ya asymmetric (Twitter follow)? | Graph shape | Asymmetric -> kuch accounts ke crores followers; symmetric mein friend limit (~5K) hota hai, push aasan |
+| 5 | Feed order: chronological ya ranked? | Ranking service, candidate set | V1 chronological; V2 simple score |
+| 6 | Naya post kitni jaldi dikhna chahiye? | Sync vs async fan-out | Few seconds OK -> Kafka + workers |
+| 7 | Author ko apna post turant? | Read-your-own-writes | Haan -> `timeline:{me}` merge |
+| 8 | Media support? | Storage + bandwidth | Haan, 4 items -> StoreBox + CDN, feed mein sirf keys |
+| 9 | Delete / block / unfollow par feed se turant hatna chahiye? | Cleanup strategy | Source of truth turant; feeds read-time filter + async cleanup |
+| 10 | Kitna purana feed scroll karte hain log? | Feed cache size | Mostly top ~200 -> `FEED_MAX = 200`; aage ka pull se |
+| 11 | Inactive users ka feed bhi maintain karein? | Fan-out waste, Redis size | Nahi -> sirf 30 din active users ko push, baaki on-open rebuild |
+| 12 | Multi-region? | Replication, latency | V1 ek region; Cassandra multi-DC ready |
+
+### Followers wala question sabse important kyun?
+
+- Agar sab ke ~200 followers hain -> **pure push** perfect. Har post = ~200 Redis writes, easy.
+- Agar kuch accounts ke **50M** followers hain -> pure push toot jaata hai (ek post = 50M writes).
+- Agar sab kuch pull hai -> har read 500 followees ka merge -> 17.5M lookups/sec.
+- **Distribution skewed hai** (zyada tar log chhote, kuch log bahut bade) -> isliye **hybrid**. Ye ek question poora architecture decide karta hai.
+
+### Agar interviewer bole: "Assume 100 million users." -- kya badlega?
+
+Hamara spec already **300M registered, 100M DAU** hai. Toh pehle dekho chhote scale se 100M tak kya badla, phir 10x (1B DAU) par kya:
+
+| Area | Chhota scale (~100K DAU) | 100M DAU (hamara design) | 10x: 1B DAU |
+|---|---|---|---|
+| Feed read | Postgres MVP query + index kaafi | **Precomputed Redis feeds**, hybrid | Same design, 10x shards; ~350K reads/s |
+| Feed cache | Zarurat nahi / ek Redis | **~1.28 TB Redis Cluster (~20 x 64 GB)** | ~12.8 TB, ~200 shards; `FEED_MAX` 200 se kam karna socho |
+| Fan-out | Synchronous loop chalega | **Kafka + worker consumer group**, ~69K inserts/s peak | ~690K/s; threshold 10K se neeche laane ka option |
+| Posts DB | Postgres | **Cassandra** (3.65 TB/yr metadata, append-heavy) | Same, zyada nodes, multi-DC |
+| Follow graph | Postgres ek table | Postgres + Redis cache of lists, shard by user id later | Sharded graph store, forward + reverse lists alag |
+| Media | Server disk | StoreBox + CDN (~600 GB/day) | ~6 TB/day, CDN aur zaroori |
+| Ranking | Chronological | Chronological V1, simple score V2 | ML ranking realistic ho jaata hai (V3) |
+| Observability | Logs | `fanout_lag_seconds`, `feed_cache_hit_ratio`, consumer lag | Per-region dashboards, capacity alerts |
+
+> **Key insight:** File Storage mein scale ka matlab tha "zyada bytes". Yahan scale ka matlab hai **zyada reads + write amplification**. 10M posts ek chhota number hai (~350/s) -- lekin fan-out usse **2B feed writes/day** bana deta hai. Is system mein sabse bada lever hai: **merge ka kaam read par karo ya write par, aur kiske liye.**
+
+> Interview line: "100M DAU par ~35K feed reads/s peak hain, jo DB merge se possible nahi -- isliye precomputed Redis feeds. Posts sirf ~350/s hain, lekin 200 followers ke fan-out se 2B feed writes/day ban jaate hain, isliye fan-out async Kafka workers karte hain aur celebrities ko push se bahar rakhta hoon. 10x par design same rehta hai -- Redis shards, Kafka partitions aur workers horizontally badhte hain."
+
+---
+
+## PART 4 -- Capacity Estimation
+
+Goal: **exact number nahi, order of magnitude**. Is system ka twist: **reads bahut zyada, aur writes chhote dikhte hain lekin fan-out unhe multiply karta hai.**
+
+**Assume (interviewer se confirm karo):**
+
+- **300M registered users, 100M DAU**
+- **10 feed opens** per DAU per day
+- **10M posts/day**
+- Average **200 followers** per user; celebrities up to **50M**
+- Peak = **3x average**
+- 1 din = 86,400 sec, decimal units (1 TB = 1,000 GB)
+
+### Step 1 -- Feed reads/sec (sabse bada load)
+
+```
+Feed reads/day = 100M DAU x 10       = 1,000,000,000 (1B)/day
+Average        = 1,000,000,000 / 86,400 = ~11,574 = ~11.6K reads/s
+Peak           = 11.6K x 3           = ~34.7K = ~35K feed reads/s
+```
+
+**Kahan useful hai?** Ye number batata hai ki feed read **ek-do Redis calls** ka hona chahiye, DB merge nahi. Story wala MVP query 500 followees ke saath 35K x 500 = **17.5M index lookups/sec** karta. Ye number Feed Service ke instances, Redis Cluster ke read throughput, aur hydration cache ka size decide karta hai. Aur har feed read 20 posts hydrate karta hai -> 35K x 20 = **~700K post lookups/s** -- isliye `post:{postId}` cache zaroori.
+
+> Interview line: "100M DAU x 10 opens = 1B feed reads/day, ~11.6K/s average, ~35K/s peak. Ye read path ko precomputed aur cache-first banata hai."
+
+### Step 2 -- Posts/sec (writes)
+
+```
+Posts/day = 10,000,000
+Average   = 10,000,000 / 86,400 = ~116 posts/s
+Peak      = 116 x 3             = ~350 posts/s
+Plan for  = ~1K posts/s  (bade events -- match, election -- ke spikes ke liye)
+```
+
+**Kahan useful hai?** 350/s bahut chhota hai -- Post Service ke kuch Node instances aur Cassandra aaram se le lenge. **Read:write = 1B / 10M = 100:1.** Matlab: read ko sasta banane ke liye write par extra kaam karna bilkul sahi deal hai. Yahi fan-out on write ka justification hai.
+
+> Interview line: "10M posts/day sirf ~116/s average, ~350 peak -- main 1K/s spikes ke liye plan karunga. Read:write 100:1 hai, isliye kaam write time par shift karna worth it hai."
+
+### Step 3 -- Fan-out writes (hidden multiplier)
+
+```
+Pure push (sabko push):
+  Feed inserts/day = 10M posts x 200 followers = 2,000,000,000 (2B)/day
+  Average          = 2B / 86,400             = ~23,148 = ~23K inserts/s
+  Peak             = 23K x 3                  = ~69K inserts/s
+
+Ek celebrity post (50M followers):
+  50,000,000 inserts
+  1M inserts/s par bhi = 50 sec
+  Hamare ~69K/s peak fan-out capacity par = ~725 sec (~12 min!)  -- aur baaki sab ka fan-out ruka
+```
+
+**Kahan useful hai?** Do cheezein nikalti hain:
+
+1. **2B inserts/day async hone chahiye** -- post API mein synchronous loop nahi. Isliye **Kafka `posts.created` -> `feed-fanout` consumer group** -- workers horizontally badhao, retry free mein. Aur har worker Redis pipeline use karta hai (`FANOUT_BATCH = 1,000` followers per pipeline).
+2. **Celebrities push se bahar** -- ek post 50M writes aur minutes ka lag. Isliye `CELEBRITY_THRESHOLD = 10,000`: iske upar wale authors ka post sirf `timeline:{authorId}` mein, readers pull karte hain.
+
+Bonus: sirf **30 din active** followers ko push karo -- inactive users ke feeds mein likhna waste hai. Woh jab wapas aayenge, feed rebuild ho jaayega.
+
+> Interview line: "Posts kam hain lekin fan-out 200x karta hai -- 2B feed inserts/day, ~69K/s peak. Isliye fan-out async Kafka workers se, aur 10K+ followers wale authors ko push nahi karta -- ek 50M-follower post akele 50 million writes hota."
+
+### Step 4 -- Feed cache size (Redis kitna bada?)
+
+```
+Per user feed   = latest 200 entries (FEED_MAX)
+Per ZSET entry  = ~64 bytes (member postId string + score + Redis overhead)
+Per user        = 200 x 64 B        = 12,800 B = ~12.8 KB
+All DAU         = 100M x 12.8 KB    = 1,280,000,000,000 B = ~1.28 TB
+Shards          = 1.28 TB / 64 GB   = ~20 shards (+ replicas, + headroom)
+```
+
+**Kahan useful hai?** 1.28 TB ek Redis machine mein nahi aata -> **Redis Cluster**, ~20 primary shards of 64 GB, har ek ka replica. `feed:{userId}` key hash se shard par jaati hai. Ye bhi batata hai ki **FEED_MAX** chhota kyun rakhte hain: 200 ki jagah 1,000 rakho toh 6.4 TB. Log mostly top 200 hi scroll karte hain; usse neeche gaye toh pull se Cassandra se la sakte hain. Real mein memory 100% nahi bharte, toh shards thode zyada.
+
+> Interview line: "200 entries x ~64 bytes = ~12.8 KB per user, 100M users par ~1.28 TB -- toh ~20 shards ka Redis Cluster with replicas. Feed sirf post IDs rakhta hai, poore posts nahi -- isliye chhota hai."
+
+### Step 5 -- Post metadata storage
+
+```
+Per post      = ~1 KB (text 500 chars + ids + media keys + timestamps)
+Per day       = 10M x 1 KB     = 10 GB/day
+Per year      = 10 GB x 365    = 3,650 GB = ~3.65 TB/year
+```
+
+**Kahan useful hai?** 3.65 TB/year ek Postgres mein fit ho jaata (V1 mein Postgres chalega -- honestly bolo). Lekin: har saal 3.65B rows, **append-heavy** (posts rarely edit), query hamesha "is author ke latest posts" ya "is ID ka post" -- joins nahi. Ye **Cassandra** ka perfect shape hai: `posts_by_id` + `posts_by_author (author_id, bucket)` partitions, linear scaling, multi-DC. Replication factor 3 se raw ~11 TB/year.
+
+> Interview line: "Post metadata ~1 KB per post, 10 GB/day, ~3.65 TB/year. V1 Postgres mein chal jaayega; scale par Cassandra kyunki writes append-only hain aur queries key-based hain."
+
+### Step 6 -- Media (sabse bada, lekin hamare DB mein nahi)
+
+```
+Posts with image = 20% of 10M      = 2M/day
+Per image        = ~300 KB (compressed)
+Per day          = 2M x 300 KB     = 600 GB/day
+Per year         = 600 GB x 365    = 219,000 GB = ~219 TB/year
+```
+
+**Kahan useful hai?** 219 TB/year feed databases mein bilkul nahi jaana chahiye. Ye **File Storage system (StoreBox)** ka kaam hai: client presigned URL se direct upload karta hai, post mein sirf `mediaKeys: ["media/u1/abc.jpg"]`, aur reads **CDN** se. Hamari services images ke bytes kabhi touch nahi karti. Ye wahi "metadata ko data se alag karo" wala principle hai jo File Storage mein dekha tha.
+
+> Interview line: "Media ~600 GB/day, ~219 TB/year -- ye StoreBox/S3 mein jaata hai aur CDN se serve hota hai. Feed aur post tables sirf media keys rakhte hain."
+
+### Step 7 -- Feed response bandwidth
+
+```
+Per feed response = 20 hydrated posts x ~1 KB = ~20 KB
+Peak              = 35K/s x 20 KB = 700,000 KB/s = ~700 MB/s
+In bits           = 700 MB/s x 8   = ~5.6 Gbps (Feed Service se, peak)
+```
+
+**Kahan useful hai?** 5.6 Gbps JSON -- kai Feed Service instances mein baantna padega (har instance ki NIC aur CPU JSON serialize karne mein). **gzip/brotli** compression response par zaroor. Images is number mein nahi hain -- woh CDN se alag aati hain. Ye bhi batata hai ki hydration mein sirf zaroori fields bhejo, poora author profile nahi.
+
+### Step 8 -- Snowflake IDs aur JavaScript (chhota number, bada bug)
+
+```
+Snowflake ID (aaj ka)     ~ 2,100,000,000,000,000,000   (~2.1e18)
+2^53 (JS safe integer)    =     9,007,199,254,740,992   (~9.0e15)
+
+node -e 'console.log(Number("2100907437367230464"))'
+-> 2100907437367230500     (last digits badal gaye!)
+```
+
+**Kahan useful hai?** 3 jagah:
+
+1. **JSON/JS mein IDs strings** -- `"id": "2100907437367230464"`. Number rakha toh browser ya Node galat ID bana dega -> like/delete galat post par.
+2. **Redis ZSET score double hai** (53-bit precision) -> post ID ko score nahi bana sakte. Isliye **score = `createdAtMs`**, **member = postId string**.
+3. **Equal scores** (same millisecond ke do posts) -> tie-break postId se (BigInt ya string length + lexicographic compare). Cursor mein dono: `{ s: lastScoreMs, id: lastPostId }`.
+
+> Interview line: "Snowflake IDs ~2e18 hain, 2^53 se bade, toh JS aur JSON mein strings. Redis ZSET score double hota hai, isliye score createdAt milliseconds, member post ID."
+
+### Step 9 -- Follow graph size (bonus)
+
+```
+Follow edges = 300M users x 200 avg followees = 60,000,000,000 (60B) rows
+~100 B/row with indexes -> ~6 TB
+```
+
+**Kahan useful hai?** Ye bataata hai ki graph bhi chhota nahi -- ek Postgres ke liye bada hai. V1 mein ek Postgres + `ix_follows_followee` index; scale par **user id se shard** aur follower/followee lists Redis mein cache (`following:{userId}`, `celebs:{userId}`, TTL 10 min). Part 4 mein detail.
+
+### Summary table
+
+| Metric | Value | Design decision |
+|---|---|---|
+| Feed reads | 1B/day, ~11.6K avg, **~35K/s peak** | Precomputed Redis feeds, stateless Feed Service |
+| Posts | 10M/day, ~116 avg, ~350 peak, **plan 1K/s** | Chhota; Post Service + Cassandra |
+| Read:write | **100:1** | Kaam write time par shift (fan-out on write) |
+| Fan-out | **2B inserts/day**, ~23K avg, ~69K/s peak | Kafka + `feed-fanout` workers, pipelines |
+| Celebrity post | 50M inserts = ~50 s even at 1M/s | **Hybrid**, threshold 10K followers -> pull |
+| Feed cache | 200 x 64 B = 12.8 KB/user -> **~1.28 TB** | Redis Cluster ~20 x 64 GB + replicas |
+| Hydration | 35K x 20 = ~700K post lookups/s | `post:{postId}` cache, MGET, TTL 24 h |
+| Post metadata | 10 GB/day, **~3.65 TB/yr** | Cassandra (Postgres OK in V1) |
+| Media | 600 GB/day, **~219 TB/yr** | StoreBox + CDN, not our DBs |
+| Feed egress | 20 KB x 35K = ~700 MB/s (**~5.6 Gbps**) | Many instances, compression |
+| IDs | ~2.1e18 > 2^53 | **Strings** in JS/JSON; ZSET score = createdAtMs |
+
+### Interview mein kaise bolun (short)
+
+> "100M DAU x 10 opens = 1B feed reads/day, ~35K/s peak. Posts sirf 10M/day, ~350/s peak -- read:write 100:1. Isliye main feed precompute karta hoon. Lekin 200 average followers se fan-out 2B feed inserts/day banata hai, ~69K/s peak, toh fan-out async Kafka workers se, aur 50M-follower celebrities ko push nahi karta. Feed cache 200 entries x 64 bytes = 12.8 KB per user, 100M par ~1.28 TB -- ~20 shard Redis Cluster. Posts 3.65 TB/year Cassandra mein; media 219 TB/year StoreBox aur CDN mein. Aur Snowflake IDs 2^53 se bade hain, isliye JSON mein strings."
+
+---
+
+## PART 5 -- HLD (High-Level Design)
+
+### Step 1: Sabse simple design (aur woh kyun toot jaata hai)
+
+```
+Client -> LB -> Node API (x N) -> Postgres (users, follows, posts)
+                                  feed = JOIN + ORDER BY + LIMIT 20 on every read
+```
+
+| Problem | Kya hota hai |
+|---|---|
+| Feed = read time merge | 35K/s x 500 followees = 17.5M lookups/s, DB melt |
+| Read replicas | Load baantte hain, kaam kam nahi karte |
+| Poora feed short TTL cache | Stale, aur expiry par stampede (lesson 83) |
+| Post API mein synchronous fan-out | 50M-follower post par API minutes tak atki |
+| Posts + images ek DB mein | 219 TB/year media DB mein -- impossible |
+| Offset pagination | Naye posts aane par duplicates/skips (lesson 84) |
+
+### Step 2: Har problem ke liye ek piece add karo
+
+| Problem | Fix | Component |
+|---|---|---|
+| Read par mehenga merge | Har user ka precomputed mailbox | **Redis Cluster `feed:{userId}`** (ZSET) |
+| Post create par followers ko batana | Async event, retryable | **Kafka `posts.created`** + outbox |
+| 2B inserts/day | Horizontally scaled consumers | **Fan-out workers** (consumer group `feed-fanout`) |
+| Celebrity = 50M writes | Push mat karo, read par pull | **`timeline:{authorId}`** + hybrid merge in Feed Service |
+| Apna post turant dikhe | Apni timeline har read mein merge | `timeline:{me}` (read-your-own-writes) |
+| Posts ka append-heavy storage | Partitioned, query-driven tables | **Cassandra** (`posts_by_id`, `posts_by_author`) |
+| Follow graph, unique follows | Relational + constraints | **PostgreSQL** (`users`, `follows`) + Redis cache |
+| IDs se post data | Batch lookup cache | **`post:{postId}` hydration cache** |
+| Likes ki hot counters | In-memory counters, async flush | **Like Service** + Redis `likes:{postId}` |
+| Media | Direct upload, edge serve | **StoreBox + CDN** |
+| Spam bots | Per-user limits | **API Gateway rate limits** (Rate Limiter system) |
+| Retried POST = do posts | Idempotency key | **`Idempotency-Key`** (Payment System) |
+
+### Step 3: Final architecture diagram
+
+```
+   Mobile / Web clients
+        |                                  \
+        | (API calls)                       \ (images/videos)
+        v                                    v
+   LB / API Gateway                         CDN  <---- StoreBox (S3-style, File Storage system)
+   (auth, rate limits)
+        |
+   +----+----------------+-----------------+----------------+
+   v                     v                 v                v
+ Post Service        Feed Service      Graph Service     Like Service      (all Node.js, stateless)
+   |                     |                 |                |
+   |                     |                 +--> PostgreSQL (users, follows)
+   |                     |                 +--> Redis: following:{uid}, celebs:{uid}
+   |                     |
+   |                     +--> Redis Cluster:
+   |                     |      feed:{userId}      (pushed post IDs, ZSET, latest 200)
+   |                     |      timeline:{authorId}(celebs + own recent posts, ZSET)
+   |                     |      post:{postId}      (hydration cache, TTL 24 h)
+   |                     |      likes:{postId}     (counters)
+   |                     +--> Cassandra posts_by_author (rebuild / deep scroll)
+   |
+   +--> Cassandra: posts_by_id, posts_by_author    (source of truth for posts)
+   +--> outbox -> Kafka: posts.created / posts.deleted   (key = authorId)
+                          |
+                          v
+            Fan-out workers (kafkajs, consumer group `feed-fanout`)
+              followers < 10,000  -> ZADD into feed:{followerId} for each
+                                     follower active in last 30 days, trim to 200
+              followers >= 10,000 -> NO push (only timeline:{authorId})
+
+   Like Service -> Cassandra post_likes + post_counters (Redis counters flushed async)
+```
+
+```mermaid
+flowchart TD
+    C[Mobile / Web clients] -->|media| CDN[CDN]
+    CDN --> SB[(StoreBox<br/>S3-style)]
+    C -->|API| GW[LB / API Gateway<br/>auth, rate limits]
+    GW --> PS[Post Service<br/>Node.js]
+    GW --> FS[Feed Service<br/>Node.js]
+    GW --> GS[Graph Service<br/>Node.js]
+    GW --> LS[Like Service<br/>Node.js]
+    PS --> CA[(Cassandra<br/>posts_by_id, posts_by_author)]
+    PS -->|outbox| K[Kafka<br/>posts.created / posts.deleted]
+    K --> FW[Fan-out workers<br/>group feed-fanout]
+    FW -->|followers lt 10K: ZADD| R[(Redis Cluster<br/>feed, timeline, post, likes)]
+    FW -->|who follows author| GS
+    GS --> PG[(PostgreSQL<br/>users, follows)]
+    FS --> R
+    FS -->|rebuild / miss| CA
+    FS --> GS
+    LS --> R
+    LS --> CA
+```
+
+> Dhyan do: **write path aur read path alag hain.** Write: Post Service -> Cassandra -> Kafka -> workers -> Redis feeds (async). Read: Feed Service -> Redis (mostly) -> hydrate. Feed read kabhi Kafka ka wait nahi karta, aur post create kabhi 200 followers ka wait nahi karta.
+
+> **Redis yahan cache hai, source of truth nahi.** Har feed Cassandra (posts) + Postgres (follows) se rebuild ho sakta hai. Elasticsearch diagram mein nahi hai (search alag system hai), aur ML ranking bhi nahi (V1 chronological).
+
+### Har component ka kaam (Hinglish mein)
+
+**1. Mobile / Web clients**
+App feed kholta hai (`GET /v1/feed`), scroll par `cursor` bhejta hai. Post karte waqt pehle media StoreBox mein presigned URL se upload karta hai, phir `POST /v1/posts` mein sirf media keys + `Idempotency-Key`. IDs hamesha strings ki tarah handle karta hai.
+
+**2. CDN (media only)**
+Images/videos edge se. Feed ka JSON CDN par nahi (har user ka alag, personalized). Media 219 TB/year hai aur har feed mein dikhta hai -- CDN ke bina StoreBox par bahut load.
+
+**3. LB / API Gateway**
+Traffic ko services ke instances mein baantta hai, TLS terminate, **auth** (token verify) aur **rate limits** (Rate Limiter system: e.g. posts/hour, follows/day per user -- spam bots rokne ke liye). Route se decide karta hai kaunsi service: `/v1/posts` -> Post Service, `/v1/feed` -> Feed Service.
+
+**4. Post Service (Node.js)**
+Post create/delete ka owner. Validate (500 chars, 4 media), Snowflake ID, Cassandra mein `posts_by_id` + `posts_by_author` write, author ki `timeline:{authorId}` update, aur **outbox** se Kafka `posts.created` (Payment System wala dual-write fix). `Idempotency-Key` se retry par duplicate post nahi. Delete par `deleted = true` + `posts.deleted` event.
+
+**5. Kafka (`posts.created`, `posts.deleted`, `follows.changed`)**
+Post Service aur fan-out ke beech ka **buffer**. Message key = `authorId` -> ek author ke events ek partition mein, order mein. Worker crash hua toh event wahin hai, dobara process. Match ke time post spike aaya toh Kafka absorb kar leta hai, workers apni speed se chalte hain.
+
+**6. Fan-out workers (Node.js, kafkajs, group `feed-fanout`)**
+Event uthao -> Graph Service/Redis se author ke followers lo -> agar followers < 10,000: 1,000-1,000 ke batches mein Redis pipeline: `ZADD feed:{followerId} <createdAtMs> <postId>` + trim to 200, sirf 30-din-active followers ke liye. Agar >= 10,000: kuch nahi (celebrity -- pull hoga). Metric: `fanout_lag_seconds` (target p99 < 5 s).
+
+**7. Feed Service (Node.js)**
+Read path ka dimaag. `feed:{me}` + har followed celebrity ki `timeline:{celebId}` + `timeline:{me}` -> **k-way merge** by score -> filter (deleted, blocked, unfollowed) -> 20 -> **hydrate** (`MGET post:{id}...`, misses Cassandra se) -> author info + like counts -> `nextCursor`. Agar `feed:{me}` Redis mein nahi (inactive user ya Redis node gaya) -> **rebuild** by pull from `posts_by_author`, wapas Redis mein likho.
+
+**8. Graph Service (Node.js) + PostgreSQL**
+Users aur follows ka owner. "Main kisko follow karta hoon?" (primary key `(follower_id, followee_id)`) aur "X ko kaun follow karta hai?" (`ix_follows_followee`) -- dono index-backed. Hot lists Redis mein: `following:{userId}`, `celebs:{userId}` (TTL 10 min). Follow par `follows.changed` event -> naye followee ke last 20 posts feed mein backfill (async).
+
+**9. Cassandra (posts, likes)**
+Posts ka **source of truth**. `posts_by_id` (ID se post), `posts_by_author` (author + month bucket, newest first). Append-heavy, key-based queries, linear scaling, multi-DC. Joins nahi -- isliye denormalized tables. Likes bhi yahin: `post_likes`, `post_counters`.
+
+**10. Redis Cluster**
+Chaar tarah ki keys: `feed:{userId}` (pushed mailbox), `timeline:{authorId}` (author ke latest 200 -- celebrity pull + own posts), `post:{postId}` (hydration cache, TTL 24 h), `likes:{postId}` (counters). ~1.28 TB feeds -> ~20 shards + replicas. **Derived data** -- gaya toh rebuild, lekin rebuild storm se DB bachana padega (lesson 83).
+
+**11. Like Service (Node.js)**
+`PUT /v1/posts/:id/like` idempotent: `post_likes` mein (post_id, user_id) primary key -> do baar like = ek like. Count `INCR likes:{postId}` Redis mein, periodically Cassandra counters mein flush. Viral post par 1 lakh likes/min -> DB par har like ka counter update nahi, Redis absorb karta hai.
+
+---
+
+## PART 6 -- Har Component ka WHY
+
+> Rule: koi bhi component tabhi add karo jab uska reason bol sako. Feed design mein "Cassandra, Kafka, ML, Elasticsearch, graph DB" sab lagane ka man karta hai. Soch ke lagao, aur jo V1 mein nahi chahiye woh clearly bolo.
+
+### Component: Redis Cluster (feed cache)
+
+- **Kya hai?** In-memory data store. Hum iske **sorted sets (ZSET)** use karte hain -- ek key ke andar members, har ek ka score, score se sorted. `feed:{userId}` = post IDs sorted by time.
+- **Kyun use kar rahe hain?** 35K feed reads/s, p99 < 200 ms. Precomputed feed se read = `ZREVRANGEBYSCORE` ek call, sub-millisecond. ZSET naturally "time se sorted, top N, cursor ke baad wale" support karta hai -- feed ka exact shape.
+- **Agar hata dein toh?** Feed har read par DB se merge -- story wala 17.5M lookups/s. Ya Cassandra mein feed table rakho -- possible hai (kuch companies karti hain), lekin 69K writes/s + 35K reads/s latency ke saath mehenga aur trim karna awkward.
+- **Kab zarurat nahi?** Chhota app (lakhs users, kam followees) -- Postgres query + index kaafi. Story ka MVP 1K users par bilkul theek tha. **"Yahan initially iski zarurat nahi hai"** -- jab tak feed query slow na ho.
+- **Interview mein kaise explain karun?** "Har user ka feed Redis ZSET mein -- score createdAt ms, member postId, latest 200. Read ek range call hai. Redis derived data hai; lost ho toh Cassandra aur Postgres se rebuild kar sakta hoon."
+
+### Component: Hybrid fan-out (push + pull)
+
+- **Kya hai?** Normal authors (< 10,000 followers) ke posts followers ke feeds mein push; celebrities ke posts sirf unki timeline mein, read par pull.
+- **Kyun use kar rahe hain?** Pure push celebrity par marta hai (50M writes/post). Pure pull har read par marta hai (500 followees merge). Hybrid dono ka best: zyada tar content push se ready, aur read par sirf **kuch** celebrity timelines merge (typically ek user kuch hi celebrities follow karta hai).
+- **Agar hata dein toh?** Push-only: celebrity post par fan-out queue minutes peeche, sab ke feeds late. Pull-only: DB/cache par read load 500x.
+- **Kab zarurat nahi?** Agar koi bhi account bahut bada nahi (e.g. office social network, symmetric friends with 5K limit) -- pure push kaafi. Ya bahut chhota app -- pure pull (MVP query) kaafi.
+- **Interview mein kaise explain karun?** "Main hybrid use karta hoon: 10K followers se kam wale authors push, baaki pull. Read par pushed feed + celebrity timelines + meri apni timeline ka k-way merge. Threshold tunable hai -- read cost aur write cost balance karne ka knob."
+
+### Component: Kafka + outbox (`posts.created`)
+
+- **Kya hai?** Durable, partitioned event log. Post Service outbox ke through `posts.created` publish karta hai; fan-out workers consumer group `feed-fanout` mein padhte hain.
+- **Kyun use kar rahe hain?** (1) Post API fast rahe -- 200 followers ka fan-out uska kaam nahi. (2) Worker crash -> event lost nahi, retry. (3) Spikes absorb -- match ke time posts 3x, workers apni speed se. (4) Doosre consumers (Notification system, Search indexer) bhi wahi event sun sakte hain. Outbox isliye ki "post saved but event lost" na ho (Payment System ka dual write problem).
+- **Agar hata dein toh?** Ya toh synchronous fan-out (slow API, partial failure = aadhe followers ko post), ya fire-and-forget (events lost -> followers ko post kabhi nahi dikha).
+- **Kab zarurat nahi?** Chhote scale par DB outbox table + ek poller worker, ya RabbitMQ/SQS bhi chalega. Kafka ki zarurat tab jab throughput bada ho, replay chahiye aur multiple consumers hon.
+- **Interview mein kaise explain karun?** "Post save aur event publish outbox se atomic hain. Kafka key authorId hai taaki ek author ke events order mein aayein. Fan-out workers ek consumer group mein horizontally scale hote hain aur idempotent hain -- ZADD same member dobara karna safe hai."
+
+### Component: Fan-out workers
+
+- **Kya hai?** Node.js consumers jo har `posts.created` ke liye followers ke feeds mein entries likhte hain (aur `posts.deleted` par cleanup).
+- **Kyun use kar rahe hain?** 2B inserts/day, ~69K/s peak -- ye alag scale hone wala kaam hai. Redis pipelining (1,000 followers per batch) se ek round-trip mein 1,000 writes.
+- **Agar hata dein toh?** Push hi nahi hoga -- ya Post Service mein daalna padega (galat, upar dekha).
+- **Kab zarurat nahi?** Pure pull design mein (chhota app).
+- **Interview mein kaise explain karun?** "Workers author ke active followers ko 1,000 ke batches mein pipeline karke ZADD + trim karte hain. Main `fanout_lag_seconds` aur consumer lag monitor karta hoon -- target p99 5 second."
+
+### Component: Cassandra (posts, likes)
+
+- **Kya hai?** Distributed wide-column DB -- data partition key se nodes par baanta jaata hai, har partition ke andar clustering key se sorted.
+- **Kyun use kar rahe hain?** Posts **append-heavy** hain (10M/day, 1K/s spikes), kabhi edit nahi, queries sirf key-based ("ID se post", "author ke latest posts"). Cassandra: nodes add karo -> linear scale, multi-DC replication built-in, writes bahut sasti. `posts_by_author` partition `(author_id, month)` -> prolific authors ka partition bhi bounded.
+- **Agar hata dein toh?** Postgres mein posts -- 3.65B rows/year, sharding khud karni padegi. Chalega, lekin operationally mehenga.
+- **Kab zarurat nahi?** **V1 / small scale: Postgres bilkul theek hai.** 3.65 TB/year Postgres ek primary + partitioning + read replicas se aaram se le leta hai, aur team ko ek hi DB chalana padta hai. Cassandra tab lao jab write volume, multi-DC, ya table size Postgres ke liye pain bane. Interview mein ye honestly bolna plus point hai.
+- **Interview mein kaise explain karun?** "Posts Cassandra mein kyunki writes append-only aur queries key-based hain -- posts_by_id aur posts_by_author, author plus month se partitioned. Joins nahi hain, isliye denormalized tables. V1 mein Postgres bhi chal jaata."
+
+### Component: PostgreSQL (users, follows)
+
+- **Kya hai?** Relational DB with transactions, unique constraints, indexes.
+- **Kyun use kar rahe hain?** Follow graph ko constraints chahiye: `PRIMARY KEY (follower_id, followee_id)` -> duplicate follow impossible, `CHECK (follower_id <> followee_id)` -> khud ko follow nahi. Follow/unfollow par `follower_count` update ek transaction mein. Handles unique (`@aman`). Relational data, moderate query patterns.
+- **Agar hata dein toh?** Uniqueness app code mein -- race condition par double follow, counts galat.
+- **Kab zarurat nahi?** Kabhi nahi hatate V1 mein. Scale par (60B edges) user id se shard, ya dedicated graph store -- lekin **graph database (Neo4j) ki zarurat nahi**: humein multi-hop traversal nahi chahiye, sirf "X ke followers" aur "X ke followees" -- simple adjacency lists.
+- **Interview mein kaise explain karun?** "Follows Postgres mein -- composite primary key follower-followee se 'kisko follow karta hoon' aur duplicate prevention, aur reverse index followee se fan-out ke liye 'kaun follow karta hai'. Hot lists Redis mein cache."
+
+### Component: Hydration cache (`post:{postId}`)
+
+- **Kya hai?** Post ID -> post JSON, Redis mein, TTL 24 h.
+- **Kyun use kar rahe hain?** Feed mein sirf IDs hain. 35K reads/s x 20 = ~700K post lookups/s -- Cassandra par direct bahut. Popular posts lakhon feeds mein hain -- ek baar cache, sab ke liye `MGET`.
+- **Agar hata dein toh?** Har feed read = 20 Cassandra reads. Viral post ka partition hot.
+- **Kab zarurat nahi?** Chhote scale par DB `IN (...)` query kaafi.
+- **Interview mein kaise explain karun?** "Feed IDs rakhta hai, content nahi -- ek post edit/delete ho toh ek jagah badlo. Hydration batch MGET se, misses Cassandra se ek batch mein, phir cache."
+
+### Component: Graph cache (`following:{userId}`, `celebs:{userId}`)
+
+- **Kya hai?** "Main kisko follow karta hoon" aur "unmein celebrities kaun" -- Redis sets, TTL 10 min.
+- **Kyun use kar rahe hain?** Har feed read ko celebrity list chahiye (pull ke liye). Har baar Postgres se nahi.
+- **Agar hata dein toh?** 35K/s Postgres queries sirf is list ke liye.
+- **Kab zarurat nahi?** Chhote scale par.
+- **Interview mein kaise explain karun?** "Celebs I follow ki list cache mein, 10 min TTL. Follow/unfollow par invalidate."
+
+### Component: Like Service + counters
+
+- **Kya hai?** Likes ka owner -- `post_likes` (kisne like kiya, idempotent) + Redis `likes:{postId}` counters, async flush to Cassandra counters.
+- **Kyun use kar rahe hain?** Viral post par ek hi row par hazaron updates/sec -- DB hot row. Redis `INCR` absorb karta hai.
+- **Agar hata dein toh?** Likes Post Service mein -- feed ke saath coupled, hot counter DB ko maarega.
+- **Kab zarurat nahi?** Chhote scale par `likes` table + `COUNT(*)` ya ek counter column bhi theek. Separate service V1 mein optional -- ek module bhi ho sakta hai (modular monolith).
+- **Interview mein kaise explain karun?** "Like idempotent hai -- (post_id, user_id) primary key. Count Redis mein, async flush -- count thoda eventually consistent chalega."
+
+### Component: API Gateway + rate limits
+
+- **Kya hai?** Front door: auth, routing, rate limits.
+- **Kyun use kar rahe hain?** Spam bots ek minute mein 1000 posts ya 10K follows karein toh fan-out load bhi 200x -- rate limiting yahan fan-out ko bhi bachaata hai.
+- **Agar hata dein toh?** Har service apna auth + limit -- duplicate logic, gaps.
+- **Kab zarurat nahi?** Ek monolith ho toh middleware kaafi.
+- **Interview mein kaise explain karun?** "Gateway par auth aur per-user rate limits -- posts aur follows par tight, kyunki ek spam post 200 followers par fan-out hota hai."
+
+### Component: CDN + StoreBox (media)
+
+- **Kya hai?** Media ke bytes object storage mein, edge par cache.
+- **Kyun use kar rahe hain?** 219 TB/year media, har feed par images. DB aur Node services ko bytes touch nahi karne chahiye.
+- **Agar hata dein toh?** Media API servers se -- bandwidth, RAM, latency sab kharab.
+- **Kab zarurat nahi?** Text-only feed (e.g. internal announcements) -- tab CDN optional.
+- **Interview mein kaise explain karun?** "Client presigned URL se StoreBox mein direct upload karta hai, post sirf media keys rakhta hai, aur feed response mein CDN URLs jaate hain."
+
+### Components jinki zarurat NAHI hai (V1 mein)
+
+| Component | Kyun nahi? |
+|---|---|
+| **Cassandra (small scale / V1)** | 3.65 TB/year Postgres sambhal leta hai. **"Yahan initially iski zarurat nahi hai."** Jab write volume, multi-DC, ya table size pain bane tab migrate -- posts ka access pattern pehle se key-based rakho taaki migration aasan ho. |
+| **ML ranking** | V1 reverse-chronological. V2 simple score (recency decay + engagement + affinity) ~500 candidates par. ML (V3) ke liye training data, feature store, experiments chahiye -- bina data ke ML bekaar. Mention karo, design mat karo. |
+| **Elasticsearch** | Feed mein text search nahi hai. Feed = "IDs by time" -- Redis ZSET + Cassandra clustering order kaafi. Search alag system hai jo `posts.created` sunke index karega. |
+| **Graph database (Neo4j)** | Sirf one-hop queries ("followers of X"). Postgres adjacency table + index kaafi. "Friends of friends" recommendations aayein tab socho. |
+| **Poore posts feed cache mein** | Feed mein sirf IDs -- warna 1.28 TB ki jagah ~20x, aur edit/delete par lakhon copies update. |
+| **WebSockets / real-time push of new posts** | V1 pull-to-refresh / "New posts" banner on poll. Live push Chat/Notification system ka territory. |
+| **Microservices from day 1** | Post, Feed, Graph, Like -- chhote team ke liye ek modular monolith + alag worker process kaafi. Services boundaries scale par nikaalo. |
+| **Strong consistency / distributed transactions** | Post save + feed update ek transaction mein nahi -- outbox + async fan-out + rebuildable feeds. 2PC yahan overkill. |
+
+### Final component checklist
+
+| Component | MVP mein? | Scale par? | Reason |
+|---|---|---|---|
+| LB / API Gateway | Yes | Yes | Auth, rate limits, HA |
+| Node.js services | 1 modular monolith | Post / Feed / Graph / Like services | Stateless, horizontal |
+| Postgres (users, follows) | Yes (posts bhi yahin) | Sharded by user id | Constraints, graph |
+| Cassandra (posts, likes) | No | Yes | Append-heavy, linear scale, multi-DC |
+| Redis feeds (`feed:{uid}`) | No (SQL query) | Redis Cluster ~20 shards | 35K reads/s, p99 < 200 ms |
+| Redis timelines + hydration | No | Yes | Celebrity pull, 700K lookups/s |
+| Kafka + outbox | Outbox + poller | Kafka, `feed-fanout` group | Async fan-out, retries |
+| Fan-out workers | No | Yes | 2B inserts/day |
+| Hybrid threshold | No | 10,000 followers | Celebrity problem |
+| StoreBox + CDN | Yes (if media) | Yes | 219 TB/year media |
+| ML ranking / Elasticsearch / graph DB | No | ML maybe V3 | Not needed |
+
+---
+
+## Remember
+
+> **News feed = "merge ka kaam read se write par shift karo -- lekin celebrities ke liye nahi".** Reads writes se ~100x zyada hain (35K/s vs 350/s), isliye har user ka feed ek precomputed mailbox hai: Redis ZSET `feed:{userId}`, latest 200 post IDs, score = createdAtMs. Fan-out async hai (outbox -> Kafka -> workers) kyunki 200 followers se 10M posts **2B feed writes/day** ban jaate hain. 10,000+ followers wale authors push nahi hote -- unke posts read par pull hokar merge hote hain (hybrid). Posts durable hain (Cassandra), graph Postgres mein, feeds derived hain aur rebuild ho sakte hain. Media StoreBox + CDN mein, aur IDs 2^53 se bade -- JSON mein strings.
+
+## Quick Self-Test (answers baad mein check karna)
+
+1. MVP wali `WHERE author_id IN (SELECT followee_id ...)` query 1K users par fast aur 100M DAU par kyun marti hai? Read replicas isse kyun nahi bachate?
+2. 100M DAU, 10 opens/day, 10M posts/day, 200 avg followers se peak feed reads/s, peak posts/s aur fan-out inserts/day calculate karo. Kaunsa number fan-out ko async banane par majboor karta hai?
+3. Pure push aur pure pull dono kahan fail hote hain? Hybrid mein threshold 10,000 ko 1,000 ya 1,00,000 karne se read aur write cost par kya asar padega?
+4. Feed cache ~1.28 TB kaise aaya? `FEED_MAX` ko 200 se 1,000 karne par kya badlega, aur inactive users ko push kyun nahi karte?
+5. Post ID JSON mein string kyun hai, aur Redis ZSET mein score post ID ki jagah `createdAtMs` kyun hai? Same millisecond ke do posts ko cursor pagination mein kaise order karoge?
+
+---
+
+**Next (Part 2):** Request flows (create post + fan-out, read feed hybrid merge, follow, delete), API design, Postgres + Cassandra schema, LLD, Node.js code line by line. "next" bolo.

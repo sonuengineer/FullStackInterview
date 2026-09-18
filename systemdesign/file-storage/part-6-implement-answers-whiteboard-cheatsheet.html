@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>File Storage (S3-style) -- HLD + LLD (Part 6: Implement It - Interview Answers - Whiteboard - Cheat Sheet)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root { --bg:#fafafa; --fg:#1f2328; --muted:#57606a; --border:#d0d7de; --code-bg:#f6f8fa; --accent:#0969da; --callout-bg:#fff8c5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --border:#30363d; --code-bg:#161b22; --accent:#58a6ff; --callout-bg:#3b3410; }
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.65; max-width:900px; margin:0 auto; padding:40px 24px 100px; }
+  h1,h2,h3 { line-height:1.3; }
+  h1 { font-size:2rem; border-bottom:2px solid var(--border); padding-bottom:10px; }
+  h2 { font-size:1.45rem; margin-top:2.4em; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  h3 { font-size:1.1rem; color:var(--accent); margin-top:1.8em; }
+  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; font-size:0.9em; }
+  pre { background:var(--code-bg); padding:14px 16px; border-radius:8px; overflow-x:auto; border:1px solid var(--border); }
+  pre code { background:none; padding:0; }
+  blockquote { border-left:4px solid var(--accent); background:var(--callout-bg); margin:1.2em 0; padding:0.6em 1em; border-radius:0 6px 6px 0; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:1.2em 0; }
+  th,td { border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul,ol { padding-left:1.4em; }
+  li { margin:0.35em 0; }
+  .mermaid { background:white; border-radius:8px; padding:12px; margin:1.2em 0; }
+  a { color:var(--accent); }
+  hr { border:none; border-top:1px solid var(--border); margin:2.5em 0; }
+  @media (max-width:600px) { body { padding:24px 16px 80px; } h1 { font-size:1.5rem; } }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# File Storage (S3-style) -- HLD + LLD (Part 6: Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet)
+
+> Is file mein prompt ke **Parts 26-30** hain: coding round mein "Implement a mini object store" kaise solve karein, 30-second answer, 5-minute answer, whiteboard par diagram kis order mein banayein, aur poore StoreBox design (Parts 1-5) ki final cheat sheet.
+> Ye last file hai. Parts 1-5 mein humne design samjha (metadata vs data, chunks, W=2 of 3 across AZs, erasure coding 8+4, CRC32C + scrubber, commit = visibility, GC); yahan hum usko **interview mein bolna, likhna aur draw karna** seekhenge.
+> Honest note: real S3 isse kahin bada hai aur uske internals sirf partly public hain. Ye woh design hai jo interviewer "Design S3" par expect karta hai.
+
+---
+
+## PART 26 -- Code Design Question: "Implement a mini object store"
+
+### Pehle samjho: interviewer kya dekh raha hai
+
+Prompt: *"Implement an in-memory object store: buckets, put / get (with range) / delete / list, multipart. No network, no real disks."*
+
+45 minute mein S3 nahi banta. Interviewer ye dekhta hai:
+
+- Kya tum **metadata aur data alag** rakhte ho (ek `Map` mein bytes dump nahi)?
+- Bade object ko **chunks** mein todte ho, har chunk **3 nodes / 3 AZs** par, aur **W=2** ka matlab samajhte ho?
+- **Commit last** -- metadata tab likho jab bytes durable hon? Failed upload ke chunks ka kya (GC)?
+- **Checksum** se corruption pakadte ho aur doosri replica se serve karte ho?
+- Range GET mein **sirf zaroori chunks** padhte ho?
+
+Iska matlab: **ek file, fake `DataNode`s (6 nodes, 3 AZs), metadata in-memory `Map`s.** Aur tum bologe: "production mein metadata Postgres transaction hai aur `DataNode` ek HTTP server jo volume file mein append + fsync karta hai". Connection: Payment System ke Part 26 mein "synchronous claim = event loop mein atomic" tha; yahan wahi trick `commit()` ko ek transaction jaisa banati hai.
+
+### Step 1 -- Clarify (1-2 minute, typing se pehle)
+
+| Question | Mera assumption |
+|---|---|
+| Kitne nodes, kitne AZs? | 6 fake nodes, 3 AZs (2 per AZ). Har chunk 3 copies, har copy alag AZ |
+| Chunk size? | Spec: **8 MB**. Demo mein `CHUNK_SIZE = 4` bytes taaki chunking output mein dikhe |
+| Write kab success? | **W = 2 of 3** copies ne ack kiya. Kam mile toh 503, object commit nahi |
+| Integrity? | Har chunk ka **CRC32C** (table-based, no deps); ETag = MD5 (single PUT) / `md5(part md5s)-N` (multipart) |
+| Overwrite same key? | **Last commit wins**; versioned bucket mein purane versions rehte hain |
+| Delete? | Metadata turant; bytes baad mein `gc()` |
+| Input? | `Buffer` ya `AsyncIterable<Buffer>` (stream) -- poori file memory mein assume nahi |
+| Background jobs? | `repair()` aur `gc()` explicit call -- production mein Kafka workers |
+
+### Step 2 -- Logic pehle bolo (Hinglish mein)
+
+> "Do layers banaunga. **Data layer**: `DataNode` class -- append-only volume + local index `chunkId -> offset`. Ise down kar sakte hain ya ek byte corrupt kar sakte hain.
+>
+> **Metadata layer**: `MiniObjectStore` -- buckets, har key ki versions list, ek **sorted key array** (LIST ke liye), multipart uploads.
+>
+> PUT: stream ko `chunker` 4-byte chunks mein kaatega. Har chunk ke liye placement 3 nodes chunega (har AZ se ek), teeno ko parallel bhejenge, **2 success = chunk durable**, teesra missing ho toh repair queue. Saare chunks durable hone ke baad **ek synchronous `commit()`** -- naya version, purane ka `isLatest = false`. Commit se pehle object kisi ko dikhta hi nahi.
+>
+> GET: latest version, `Range` se overlapping chunks nikaalo, har chunk pehli healthy replica se, **CRC match nahi toh agli replica** + repair queue. Delete: metadata hatao; `gc()` mark-and-sweep karke unreferenced copies mitaega -- lekin in-flight uploads ke chunks nahi."
+
+### Step 3 -- TypeScript code (single file, self-contained)
+
+```ts
+import { createHash } from 'node:crypto';
+
+// ---------- Constants (spec values; demo shrinks CHUNK_SIZE and MIN_PART so chunking is visible) ----------
+export const CHUNK_SIZE = 4;                     // DEMO: 4 bytes. Production: 8 * 1024 * 1024
+export const MIN_PART = 5;                       // DEMO: 5 bytes. Production: 5 * 1024 * 1024
+export const MAX_SINGLE_PUT = 100 * 1024 * 1024;
+export const MAX_PARTS = 10_000;
+export const REPLICAS = 3;
+export const WRITE_QUORUM = 2;
+
+// ---------- Types (same names as the design spec) ----------
+export type StorageClass = 'STANDARD' | 'COLD';
+export interface ObjectMeta {
+  versionId: string; bucketId: number; key: string; sizeBytes: number; etag: string;
+  contentType: string; storageClass: StorageClass; isDeleteMarker: boolean; createdAt: Date;
+}
+export interface ChunkRef {
+  seq: number; chunkId: string; sizeBytes: number; crc32c: number;
+  locations: { nodeId: string; volumeId: string; offsetBytes: number }[];
+}
+interface Version { meta: ObjectMeta; chunks: ChunkRef[]; isLatest: boolean }
+interface Bucket { id: number; name: string; versioning: boolean; keys: string[]; versions: Map<string, Version[]> }
+interface Part { sizeBytes: number; md5: Buffer; chunks: ChunkRef[] }
+interface Upload { bucket: string; key: string; state: 'IN_PROGRESS' | 'COMPLETED' | 'ABORTED'; parts: Map<number, Part> }
+export interface GetResult { status: 200 | 206; body: Buffer; etag: string; contentRange?: string; chunksRead: number }
+
+export class StoreError extends Error {
+  constructor(readonly status: number, readonly code: string) { super(code); }
+}
+
+// ---------- CRC32C (Castagnoli), table-based, no dependencies ----------
+const CRC_TABLE = new Uint32Array(256).map((_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0x82f63b78 ^ (c >>> 1) : c >>> 1;
+  return c;
+});
+export function crc32c(buf: Buffer): number {
+  let c = 0xffffffff;
+  for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+export const md5 = (b: Buffer): Buffer => createHash('md5').update(b).digest();
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+// ---------- Chunker: any Buffer / async stream -> fixed-size chunks ----------
+export async function* chunker(data: Buffer | AsyncIterable<Buffer>): AsyncGenerator<Buffer> {
+  const source = Buffer.isBuffer(data) ? [data] : data;
+  let pending = Buffer.alloc(0);
+  for await (const piece of source) {
+    pending = Buffer.concat([pending, piece]);
+    while (pending.length >= CHUNK_SIZE) {
+      yield pending.subarray(0, CHUNK_SIZE);
+      pending = pending.subarray(CHUNK_SIZE);
+    }
+  }
+  if (pending.length > 0) yield pending;
+}
+
+function lowerBound(arr: string[], x: string): number { // first index with arr[i] >= x
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >>> 1; if (arr[mid] < x) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+// ---------- Fake storage node: append-only volume + local index ----------
+export class DataNode {
+  up = true;
+  private volumeBytes = 0; // next append offset
+  private readonly index = new Map<string, { offset: number; data: Buffer }>();
+  constructor(readonly id: string, readonly az: string) {}
+  async putChunk(chunkId: string, data: Buffer): Promise<{ crc32c: number; volumeId: string; offsetBytes: number }> {
+    await tick(); // network hop
+    if (!this.up) throw new Error(`${this.id} unreachable`);
+    const offset = this.volumeBytes;
+    this.volumeBytes += data.length; // append-only: never overwrite in place
+    const copy = Buffer.from(data);
+    this.index.set(chunkId, { offset, data: copy }); // real node: append to volume file + fsync, THEN ack
+    return { crc32c: crc32c(copy), volumeId: `${this.id}/vol-0001`, offsetBytes: offset };
+  }
+  async getChunk(chunkId: string): Promise<Buffer> {
+    await tick();
+    if (!this.up) throw new Error(`${this.id} unreachable`);
+    const entry = this.index.get(chunkId);
+    if (!entry) throw new Error(`${this.id} has no ${chunkId}`);
+    return entry.data;
+  }
+  deleteChunk(chunkId: string): number {
+    const size = this.index.get(chunkId)?.data.length ?? 0;
+    this.index.delete(chunkId); // real node: mark garbage, compaction rewrites the volume later
+    return size;
+  }
+  chunkIds(): string[] { return [...this.index.keys()]; }
+  corrupt(chunkId: string): void { const e = this.index.get(chunkId); if (e) e.data[0] ^= 0xff; } // simulate bit rot
+}
+
+// ---------- The store: metadata (in memory) + data (on DataNodes) ----------
+export class MiniObjectStore {
+  readonly events: string[] = [];          // demo log (production: metrics + logs)
+  readonly repairQueue = new Set<string>(); // ~ Kafka storage.repair
+  private readonly buckets = new Map<string, Bucket>();
+  private readonly uploads = new Map<string, Upload>();
+  private readonly nodes: Map<string, DataNode>;
+  private readonly chunkRefs = new Map<string, ChunkRef>(); // chunkId -> ref (repair needs it)
+  private readonly inFlight = new Set<string>();            // written but not yet committed
+  private readonly seq = { bucket: 0, version: 0, chunk: 0, upload: 0 };
+  constructor(nodes: DataNode[]) {
+    this.nodes = new Map(nodes.map((n) => [n.id, n]));
+  }
+  createBucket(name: string, versioning = false): void {
+    if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(name)) throw new StoreError(400, 'INVALID_BUCKET_NAME');
+    if (this.buckets.has(name)) throw new StoreError(409, 'BUCKET_ALREADY_EXISTS');
+    this.buckets.set(name, { id: ++this.seq.bucket, name, versioning, keys: [], versions: new Map() });
+  }
+
+  // ----- PUT: stream -> chunks -> W=2 of 3 per chunk -> commit metadata LAST -----
+  async putObject(
+    bucketName: string, key: string, data: Buffer | AsyncIterable<Buffer>, contentType = 'application/octet-stream',
+  ): Promise<{ etag: string; versionId: string }> {
+    const bucket = this.bucket(bucketName);
+    if (key.length === 0 || Buffer.byteLength(key) > 1024) throw new StoreError(400, 'INVALID_KEY');
+    const hash = createHash('md5');
+    const chunks: ChunkRef[] = [];
+    const mine = new Set<string>();
+    let size = 0;
+    try {
+      for await (const piece of chunker(data)) {
+        size += piece.length;
+        if (size > MAX_SINGLE_PUT) throw new StoreError(413, 'USE_MULTIPART');
+        hash.update(piece);
+        chunks.push(await this.writeChunk(piece, chunks.length, mine));
+      }
+      return this.commit(bucket, key, chunks, size, `"${hash.digest('hex')}"`, contentType);
+    } finally {
+      for (const id of mine) this.inFlight.delete(id); // committed -> referenced; failed -> orphan for GC
+    }
+  }
+
+  // ----- GET: latest (or versionId), only chunks overlapping the range, replica fallback -----
+  async getObject(
+    bucketName: string, key: string, range?: { start: number; end: number }, versionId?: string,
+  ): Promise<GetResult> {
+    const v = this.findVersion(this.bucket(bucketName), key, versionId);
+    if (!v || v.meta.isDeleteMarker) throw new StoreError(404, 'NO_SUCH_KEY');
+    const size = v.meta.sizeBytes;
+    let start = 0, end = size - 1;
+    if (range) {
+      if (range.start < 0 || range.start >= size || range.end < range.start) throw new StoreError(416, 'INVALID_RANGE');
+      start = range.start;
+      end = Math.min(range.end, size - 1);
+    }
+    const out: Buffer[] = [];
+    let offset = 0; // byte offset where the current chunk starts
+    for (const c of v.chunks) {
+      if (offset > end) break;
+      if (offset + c.sizeBytes - 1 >= start) { // chunk overlaps [start, end] -> fetch only this one
+        const buf = await this.readChunk(c);
+        out.push(buf.subarray(Math.max(start - offset, 0), Math.min(end - offset + 1, c.sizeBytes)));
+      }
+      offset += c.sizeBytes;
+    }
+    return {
+      status: range ? 206 : 200, body: Buffer.concat(out), etag: v.meta.etag, chunksRead: out.length,
+      contentRange: range ? `bytes ${start}-${end}/${size}` : undefined,
+    };
+  }
+
+  // ----- DELETE: metadata first (instantly invisible), bytes later via gc() -----
+  deleteObject(bucketName: string, key: string): void {
+    const b = this.bucket(bucketName);
+    if (!b.versions.has(key)) return; // idempotent: missing key is still 204
+    if (b.versioning) { this.commit(b, key, [], 0, '""', 'application/octet-stream', true); return; } // delete marker
+    b.versions.delete(key);
+    b.keys.splice(lowerBound(b.keys, key), 1);
+  }
+
+  // ----- LIST: prefix range scan over the sorted key index, cursor = last key (base64) -----
+  list(
+    bucketName: string, prefix = '', limit = 1000, cursor?: string,
+  ): { items: { key: string; sizeBytes: number; etag: string }[]; nextCursor?: string } {
+    const b = this.bucket(bucketName);
+    const after = cursor ? Buffer.from(cursor, 'base64').toString('utf8') : '';
+    let i = lowerBound(b.keys, after > prefix ? after : prefix);
+    if (b.keys[i] === after) i++; // cursor is exclusive
+    const items: { key: string; sizeBytes: number; etag: string }[] = [];
+    for (; i < b.keys.length && items.length < limit; i++) {
+      const key = b.keys[i];
+      if (!key.startsWith(prefix)) break; // sorted: first non-match = end of the prefix range
+      const latest = this.findVersion(b, key);
+      if (latest && !latest.meta.isDeleteMarker) items.push({ key, sizeBytes: latest.meta.sizeBytes, etag: latest.meta.etag });
+    }
+    const more = i < b.keys.length && b.keys[i].startsWith(prefix);
+    return { items, nextCursor: more ? Buffer.from(b.keys[i - 1]).toString('base64') : undefined };
+  }
+
+  // ----- Multipart -----
+  initiateMultipart(bucketName: string, key: string): string {
+    this.bucket(bucketName);
+    const uploadId = `up_${String(++this.seq.upload).padStart(3, '0')}`;
+    this.uploads.set(uploadId, { bucket: bucketName, key, state: 'IN_PROGRESS', parts: new Map() });
+    return uploadId;
+  }
+  async uploadPart(uploadId: string, partNumber: number, data: Buffer): Promise<string> {
+    const up = this.upload(uploadId);
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_PARTS) throw new StoreError(400, 'INVALID_PART_NUMBER');
+    const chunks: ChunkRef[] = [];
+    const mine = new Set<string>();
+    try {
+      for await (const piece of chunker(data)) chunks.push(await this.writeChunk(piece, chunks.length, mine));
+      if (up.state !== 'IN_PROGRESS') throw new StoreError(404, 'NO_SUCH_UPLOAD'); // completed/aborted meanwhile
+      const partMd5 = md5(data);
+      up.parts.set(partNumber, { sizeBytes: data.length, md5: partMd5, chunks }); // re-upload replaces (last wins)
+      return `"${partMd5.toString('hex')}"`;
+    } finally {
+      for (const id of mine) this.inFlight.delete(id);
+    }
+  }
+  completeMultipart(uploadId: string, parts: { partNumber: number; etag: string }[]): { etag: string; versionId: string } {
+    const up = this.upload(uploadId);
+    if (parts.length === 0) throw new StoreError(400, 'INVALID_PART');
+    const chosen: Part[] = [];
+    parts.forEach((p, i) => {
+      if (i > 0 && p.partNumber <= parts[i - 1].partNumber) throw new StoreError(400, 'INVALID_PART_ORDER');
+      const part = up.parts.get(p.partNumber);
+      if (!part || `"${part.md5.toString('hex')}"` !== p.etag) throw new StoreError(400, 'INVALID_PART');
+      if (i < parts.length - 1 && part.sizeBytes < MIN_PART) throw new StoreError(400, 'ENTITY_TOO_SMALL');
+      chosen.push(part);
+    });
+    const etag = `"${md5(Buffer.concat(chosen.map((p) => p.md5))).toString('hex')}-${chosen.length}"`;
+    const chunks = chosen.flatMap((p) => p.chunks);
+    chunks.forEach((c, seq) => (c.seq = seq)); // parts glued in order: 0,1,2...
+    const size = chosen.reduce((sum, p) => sum + p.sizeBytes, 0);
+    const result = this.commit(this.bucket(up.bucket), up.key, chunks, size, etag, 'application/octet-stream');
+    up.state = 'COMPLETED'; // unlisted parts -> garbage for gc()
+    return result;
+  }
+  abortMultipart(uploadId: string): void { this.upload(uploadId).state = 'ABORTED'; }
+
+  // ----- Background helpers -----
+  async repair(): Promise<number> {
+    let fixed = 0;
+    for (const chunkId of [...this.repairQueue]) {
+      const ref = this.chunkRefs.get(chunkId);
+      if (!ref) { this.repairQueue.delete(chunkId); continue; } // already garbage collected
+      const good: ChunkRef['locations'] = [];
+      const bad = new Set<string>();
+      let data: Buffer | undefined;
+      for (const loc of ref.locations) {
+        const buf = await this.nodes.get(loc.nodeId)!.getChunk(chunkId).catch(() => undefined);
+        if (buf && crc32c(buf) === ref.crc32c) {
+          good.push(loc);
+          data ??= buf;
+        } else bad.add(loc.nodeId);
+      }
+      if (!data) { this.events.push(`repair ${chunkId}: NO healthy replica (page on-call)`); continue; }
+      ref.locations = good; // bad copies dropped from metadata; gc() deletes their bytes
+      const usedAz = new Set(good.map((l) => this.nodes.get(l.nodeId)!.az));
+      for (const n of this.nodes.values()) {
+        if (ref.locations.length >= REPLICAS) break;
+        if (!n.up || usedAz.has(n.az) || bad.has(n.id)) continue; // new copy in a MISSING AZ
+        const r = await n.putChunk(chunkId, data);
+        ref.locations.push({ nodeId: n.id, volumeId: r.volumeId, offsetBytes: r.offsetBytes });
+        usedAz.add(n.az);
+        this.events.push(`repair ${chunkId}: copied to ${n.id}`);
+      }
+      if (ref.locations.length >= REPLICAS) { this.repairQueue.delete(chunkId); fixed++; }
+    }
+    return fixed;
+  }
+  gc(): { deletedCopies: number; reclaimedBytes: number } {
+    const live = new Map<string, ChunkRef>(); // mark: everything metadata still points to
+    for (const b of this.buckets.values()) {
+      for (const list of b.versions.values()) for (const v of list) for (const c of v.chunks) live.set(c.chunkId, c);
+    }
+    for (const up of this.uploads.values()) {
+      if (up.state === 'IN_PROGRESS') for (const p of up.parts.values()) for (const c of p.chunks) live.set(c.chunkId, c);
+    }
+    let deletedCopies = 0, reclaimedBytes = 0;
+    for (const node of this.nodes.values()) { // sweep
+      if (!node.up) continue;
+      for (const chunkId of node.chunkIds()) {
+        if (this.inFlight.has(chunkId)) continue; // upload still running: NOT garbage
+        if (live.get(chunkId)?.locations.some((l) => l.nodeId === node.id)) continue;
+        reclaimedBytes += node.deleteChunk(chunkId);
+        deletedCopies++;
+      }
+    }
+    for (const id of this.chunkRefs.keys()) {
+      if (!live.has(id) && !this.inFlight.has(id)) { this.chunkRefs.delete(id); this.repairQueue.delete(id); }
+    }
+    return { deletedCopies, reclaimedBytes };
+  }
+  chunksOf(bucketName: string, key: string): ChunkRef[] { return this.findVersion(this.bucket(bucketName), key)?.chunks ?? []; }
+
+  // ----- internals -----
+  private async writeChunk(data: Buffer, seq: number, mine: Set<string>): Promise<ChunkRef> {
+    const chunkId = `ch_${String(++this.seq.chunk).padStart(3, '0')}`;
+    const crc = crc32c(data);
+    const targets = this.pickNodes(chunkId);
+    mine.add(chunkId);
+    this.inFlight.add(chunkId);
+    const results = await Promise.allSettled(targets.map((n) => n.putChunk(chunkId, data)));
+    const ref: ChunkRef = { seq, chunkId, sizeBytes: data.length, crc32c: crc, locations: [] };
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled' && r.value.crc32c === crc) {
+        ref.locations.push({ nodeId: targets[i].id, volumeId: r.value.volumeId, offsetBytes: r.value.offsetBytes });
+      } else this.events.push(`write ${chunkId} -> ${targets[i].id} FAILED`);
+    });
+    if (ref.locations.length < WRITE_QUORUM) throw new StoreError(503, 'INSUFFICIENT_REPLICAS');
+    if (ref.locations.length < REPLICAS) this.repairQueue.add(chunkId); // 3rd copy later
+    this.chunkRefs.set(chunkId, ref);
+    return ref;
+  }
+  // AZ-aware placement: one node per AZ, chosen by hash. It does NOT know a node just died
+  // (heartbeat timeout is 10 min) -- exactly why W=2 of 3 exists.
+  private pickNodes(chunkId: string): DataNode[] {
+    const byAz = new Map<string, DataNode[]>();
+    for (const n of this.nodes.values()) byAz.set(n.az, [...(byAz.get(n.az) ?? []), n]);
+    const h = createHash('md5').update(chunkId).digest().readUInt32BE(0);
+    return [...byAz.keys()].sort().slice(0, REPLICAS).map((az) => {
+      const inAz = byAz.get(az)!;
+      return inAz[h % inAz.length];
+    });
+  }
+  private async readChunk(ref: ChunkRef): Promise<Buffer> {
+    for (const loc of ref.locations) { // production: nearest AZ first
+      try {
+        const buf = await this.nodes.get(loc.nodeId)!.getChunk(ref.chunkId);
+        if (crc32c(buf) === ref.crc32c) return buf;
+        this.events.push(`CRC mismatch ${ref.chunkId} on ${loc.nodeId} -> next replica`);
+      } catch (err) {
+        this.events.push(`read ${ref.chunkId} on ${loc.nodeId} failed (${(err as Error).message}) -> next replica`);
+      }
+      this.repairQueue.add(ref.chunkId);
+    }
+    throw new StoreError(500, 'ALL_REPLICAS_FAILED');
+  }
+  // ONE synchronous block = ONE metadata transaction. Commit = the moment the object becomes visible.
+  private commit(
+    b: Bucket, key: string, chunks: ChunkRef[], sizeBytes: number, etag: string, contentType: string, isDeleteMarker = false,
+  ): { etag: string; versionId: string } {
+    const versionId = `v${String(++this.seq.version).padStart(3, '0')}`;
+    const meta: ObjectMeta = {
+      versionId, bucketId: b.id, key, sizeBytes, etag, contentType, storageClass: 'STANDARD', isDeleteMarker, createdAt: new Date(),
+    };
+    let list = b.versions.get(key);
+    if (!list) {
+      list = [];
+      b.versions.set(key, list);
+      b.keys.splice(lowerBound(b.keys, key), 0, key); // keep the key index sorted
+    }
+    for (const old of list) old.isLatest = false;
+    if (!b.versioning) list.length = 0; // unversioned: old version gone, its chunks -> gc()
+    list.push({ meta, chunks, isLatest: true });
+    return { etag, versionId };
+  }
+  private findVersion(b: Bucket, key: string, versionId?: string): Version | undefined {
+    const list = b.versions.get(key) ?? [];
+    return versionId ? list.find((v) => v.meta.versionId === versionId) : list.find((v) => v.isLatest);
+  }
+  private bucket(name: string): Bucket {
+    const b = this.buckets.get(name);
+    if (!b) throw new StoreError(404, 'NO_SUCH_BUCKET');
+    return b;
+  }
+  private upload(uploadId: string): Upload { // completed / aborted uploads behave like missing ones
+    const u = this.uploads.get(uploadId);
+    if (!u || u.state !== 'IN_PROGRESS') throw new StoreError(404, 'NO_SUCH_UPLOAD');
+    return u;
+  }
+}
+```
+
+> Ye code `tsc --strict` (TypeScript 5, target ES2022, `@types/node`) se bina error compile hota hai, aur neeche ka output actually run karke nikala gaya hai.
+
+### Step 4 -- Line-by-line explanation
+
+**Code Explanation -- constants, types, helpers:**
+
+- `CHUNK_SIZE = 4`, `MIN_PART = 5` -- sirf demo ke liye chhote; production values comment mein (8 MB, 5 MB). Baaki constants spec ke exact: `MAX_SINGLE_PUT`, `MAX_PARTS`, `REPLICAS = 3`, `WRITE_QUORUM = 2`.
+- `ObjectMeta`, `ChunkRef`, `StorageClass` -- **spec ke exact names**. `ChunkRef.locations` = `chunk_locations` table ki rows. `Version` = `objects` row + uski `object_chunks`.
+- `Bucket.keys` -- **sorted array** of keys = Postgres ka `ix_objects_list (bucket_id, key)` B-tree index. `StoreError(status, code)` -- controller seedha `res.status(status).json({ error: code })` kar sake.
+- `CRC_TABLE` + `crc32c()` -- Castagnoli polynomial `0x82f63b78` (reflected). 256 entries ek baar precompute, phir har byte par ek table lookup + XOR. `>>> 0` result ko unsigned 32-bit banata hai. Output line `0` standard check value `e3069283` se match karti hai -- matlab implementation sahi hai.
+- `md5()` -- `node:crypto`; ETag ke liye. `tick()` = `setImmediate` -- fake network hop, taaki concurrent PUTs sach mein interleave hon.
+- `chunker()` -- async generator. `Buffer` ho ya stream, `pending` mein jodta hai aur har `CHUNK_SIZE` par ek chunk `yield` karta hai. Memory mein kabhi ek chunk + ek piece se zyada nahi -- "never buffer the whole object".
+- `lowerBound()` -- binary search: pehla index jahan `arr[i] >= x`. Insert, delete aur LIST teeno isi par.
+
+**Code Explanation -- `DataNode`:**
+
+- `up` -- test switch: node crash simulate. `putChunk` / `getChunk` down par throw karte hain.
+- `volumeBytes` -- **append-only** offset. Har naya chunk end par judta hai, kabhi in-place overwrite nahi (Part 3). Return `{ crc32c, volumeId, offsetBytes }` -- metadata ko pata chale bytes kahan hain. `Buffer.from(data)` = copy, caller ka buffer badle toh stored data na badle.
+- `deleteChunk` -- index se hatao, bytes wapas lautao (GC metric). Real node: garbage mark, compaction baad mein (> 30% garbage).
+- `corrupt()` -- pehle byte ke bits flip = **bit rot**. Node ko pata bhi nahi chalta; sirf CRC pakadta hai.
+
+**Code Explanation -- `putObject` + `writeChunk` (write path):**
+
+- `bucket()` 404 `NO_SUCH_BUCKET`; key 1-1024 bytes, warna 400.
+- `for await (const piece of chunker(data))` -- streaming: chunk aaya, likha, agla. `size > MAX_SINGLE_PUT` -> **413 `USE_MULTIPART`** (production mein `Content-Length` se pehle hi). `hash.update(piece)` -- MD5 saath saath, file dobara padhni nahi padti.
+- `writeChunk`: naya `ch_###` id, CRC, `pickNodes`, phir `inFlight.add` -- **GC ko batao "ye chunk abhi upload ho raha hai, garbage nahi"**.
+- `Promise.allSettled` -- teeno nodes ko parallel. Location tabhi record jab node ne success diya **aur uska CRC humare CRC se match** kiya (network corruption bhi pakdi).
+- `< WRITE_QUORUM` -> **503 `INSUFFICIENT_REPLICAS`**, poora PUT fail, commit kabhi nahi. `< REPLICAS` -> `repairQueue` (= Kafka `storage.repair`).
+- Simplification: `allSettled` teeno ka wait karta hai; production mein 2 fsync acks aate hi resolve, 3rd background mein (spec). Aur spec mein chain replication hai (primary forward karta hai); yahan client-side fan-out -- idea same.
+- `pickNodes` -- AZs sort, har AZ se ek node `md5(chunkId) % nodesInAz`. **AZ-aware**: ek AZ gaya toh bhi 2 copies. Ye jaan-boojh kar `up` check **nahi** karta: heartbeat timeout 10 min hai, us beech placement ko pata nahi hota ki node mara -- isi liye W=2.
+- `commit()` -- **poora function synchronous**, koi `await` nahi = ek transaction. Naya `versionId`, key naya ho toh sorted insert, sab purane versions `isLatest = false`, unversioned bucket mein purane hata do (unke chunks ab GC ke). `finally` mein `inFlight` saaf: commit hua toh chunks ab referenced, fail hua toh orphan.
+
+**Code Explanation -- `getObject` + `readChunk` (read path):**
+
+- Version nahi ya delete marker -> **404 `NO_SUCH_KEY`**. Range galat (`start >= size`) -> **416**. `end` ko `size - 1` par clamp (S3 bhi aisa karta hai).
+- Loop: `offset` = chunk kahan se shuru. `offset > end` -> break; chunk overlap kare tabhi `readChunk`. `subarray` sirf zaroori bytes kaatta hai. Chunk sizes variable ho sakti hain (multipart), isliye fixed division nahi, running offset.
+- `readChunk` -- locations order mein; **CRC mismatch ya error -> event + `repairQueue.add` + agli replica**. Sab fail -> 500. Client ko galat bytes kabhi nahi jaate.
+- Demo ke liye body `Buffer.concat`; production mein har chunk `stream.pipeline` se seedha response mein (backpressure).
+
+**Code Explanation -- delete, list, multipart:**
+
+- `deleteObject` -- key hi nahi toh bhi return (idempotent **204**). Versioned -> **delete marker** commit; unversioned -> versions + key index se hata do. Bytes ko touch nahi kiya.
+- `list` -- cursor base64 decode, `lowerBound(max(cursor, prefix))`, cursor exclusive. Prefix match band hote hi `break` (sorted hai, aage kuch match nahi karega). Delete-marker keys skip. `nextCursor` = last **scanned** key.
+- `uploadPart` -- part number 1..10,000, chunks likho, **phir se state check** (beech mein complete/abort ho gaya toh 404, chunks orphan), part `Map` mein -- same number dobara = replace (last wins).
+- `completeMultipart` -- order strictly ascending (**400 `INVALID_PART_ORDER`**), etag match (**400 `INVALID_PART`**), last ke alawa har part >= `MIN_PART` (**400 `ENTITY_TOO_SMALL`**). ETag = `md5(concat(binary part md5s))` + `-N`. Chunks jod ke `seq` renumber, phir wahi `commit()`.
+
+**Code Explanation -- `repair()` aur `gc()`:**
+
+- `repair` -- queued chunk ki har location padho, CRC check; good/bad alag. Bad locations metadata se hatao (bytes GC mitaega). Phir **missing AZ** mein ek up node chuno (bad node nahi) aur healthy copy likho. 3 ho gayi -> queue se bahar. Koi healthy copy nahi = data loss alert.
+- `gc` -- **mark**: saare versions + IN_PROGRESS uploads ke chunks `live`. **Sweep**: har node ka har chunk -- `inFlight` hai toh chhodo; `live` mein hai aur **yahi node** uski location mein hai toh chhodo; warna delete. Isse orphan chunks, deleted objects, corrupt purani copies -- sab ek hi rule se saaf. `gc` synchronous hai, toh sweep ke beech koi upload commit nahi ho sakta. Production: 24 h grace period + Kafka `storage.gc`.
+
+### Step 5 -- Chalake dikhao (usage + real output)
+
+```ts
+import { ChunkRef, DataNode, MiniObjectStore, StoreError, crc32c, md5 } from './mini-object-store';
+
+const nodes = ['az1', 'az2', 'az3'].flatMap((az) => [1, 2].map((i) => new DataNode(`${az}-n${i}`, az)));
+const node = (id: string) => nodes.find((n) => n.id === id)!;
+const store = new MiniObjectStore(nodes);
+const INV = 'shopkart-invoices'; // unversioned
+const IMG = 'shopkart-images';   // versioned
+const txt = (b: Buffer) => JSON.stringify(b.toString('utf8'));
+const where = (refs: ChunkRef[]) => refs.map((c) => `${c.chunkId}[${c.locations.map((l) => l.nodeId).join(',')}]`).join(' ');
+const flush = () => { for (const e of store.events.splice(0)) console.log(`     . ${e}`); };
+async function attempt(label: string, fn: () => unknown): Promise<void> {
+  try { await fn(); console.log(`${label} -> ok`); } catch (e) {
+    if (!(e instanceof StoreError)) throw e;
+    console.log(`${label} -> ${e.status} ${e.code}`);
+  }
+}
+
+async function main(): Promise<void> {
+  console.log(`0  crc32c("123456789") = ${crc32c(Buffer.from('123456789')).toString(16)} (standard check value e3069283)`);
+  store.createBucket(INV);
+  store.createBucket(IMG, true);
+
+  const k1 = 'invoices/2026/inv-1001.txt';
+  const body = Buffer.from('INVOICE #1001 total=499');
+  const a = await store.putObject(INV, k1, body, 'text/plain');
+  console.log(`A  PUT ${JSON.stringify(a)} etag==md5(body): ${a.etag === `"${md5(body).toString('hex')}"`}`);
+  console.log(`   ${where(store.chunksOf(INV, k1))}`);
+  const g = await store.getObject(INV, k1);
+  console.log(`   GET ${g.status} ${txt(g.body)} chunksRead=${g.chunksRead}`);
+  const r = await store.getObject(INV, k1, { start: 6, end: 9 });
+  console.log(`B  GET Range 6-9 -> ${r.status} ${r.contentRange} ${txt(r.body)} chunksRead=${r.chunksRead}`);
+  await attempt('   GET Range 50-60', () => store.getObject(INV, k1, { start: 50, end: 60 }));
+
+  node('az2-n1').up = false; // crashed; placement does not know yet
+  async function* phoneUpload(): AsyncGenerator<Buffer> { yield Buffer.from('photo-'); yield Buffer.from('bytes-'); yield Buffer.from('from-app'); }
+  const k2 = 'returns/r-77.jpg';
+  const c = await store.putObject(IMG, k2, phoneUpload(), 'image/jpeg');
+  console.log(`C  PUT (az2-n1 down) -> ${c.versionId} ok; repairQueue=[${[...store.repairQueue].join(',')}]`);
+  flush();
+  console.log(`   before repair: ${where(store.chunksOf(IMG, k2))}`);
+  console.log(`   repair() fixed=${await store.repair()}`);
+  flush();
+  console.log(`   after repair:  ${where(store.chunksOf(IMG, k2))}`);
+
+  for (const id of ['az1-n1', 'az1-n2', 'az2-n2']) node(id).up = false; // only AZ3 alive
+  await attempt('D  PUT with only AZ3 alive', () => store.putObject(INV, 'invoices/2026/inv-1002.txt', Buffer.from('lost')));
+  flush();
+  await attempt('   GET inv-1002 (never committed)', () => store.getObject(INV, 'invoices/2026/inv-1002.txt'));
+  for (const n of nodes) n.up = true;
+
+  const victim = store.chunksOf(INV, k1)[0];
+  node(victim.locations[0].nodeId).corrupt(victim.chunkId);
+  const e = await store.getObject(INV, k1);
+  console.log(`E  bit rot on ${victim.locations[0].nodeId}/${victim.chunkId}; GET still ${txt(e.body)}`);
+  flush();
+  console.log(`   repair() fixed=${await store.repair()}`);
+  flush();
+  console.log(`   ${where([victim])}`);
+
+  const k3 = 'products/p-9.jpg';
+  const [f1, f2] = await Promise.all([
+    store.putObject(IMG, k3, Buffer.from('BIG-IMAGE-v1')), // 3 chunks -> commits later
+    store.putObject(IMG, k3, Buffer.from('v2')),           // 1 chunk -> commits first
+  ]);
+  const latest = await store.getObject(IMG, k3);
+  const old = await store.getObject(IMG, k3, undefined, f2.versionId);
+  console.log(`F  PUT#1 -> ${f1.versionId}, PUT#2 -> ${f2.versionId}; latest=${txt(latest.body)}; ?versionId=${f2.versionId} -> ${txt(old.body)}`);
+  store.deleteObject(IMG, k3);
+  await attempt('   DELETE (versioned) then GET', () => store.getObject(IMG, k3));
+  const back = await store.getObject(IMG, k3, undefined, f1.versionId);
+  console.log(`   GET ?versionId=${f1.versionId} after delete marker -> ${txt(back.body)}`);
+
+  store.deleteObject(INV, k1);
+  await attempt('G  DELETE (unversioned) then GET', () => store.getObject(INV, k1));
+  await attempt('   DELETE again (idempotent 204)', () => store.deleteObject(INV, k1));
+  console.log(`   gc() -> ${JSON.stringify(store.gc())}`);
+
+  for (const k of ['invoices/2026/01.pdf', 'images/logo.png', 'invoices/2026/03.pdf', 'invoices/2025/12.pdf', 'invoices/2026/02.pdf']) {
+    await store.putObject(INV, k, Buffer.from(k));
+  }
+  let cursor: string | undefined;
+  let page = 1;
+  do {
+    const res = store.list(INV, 'invoices/2026/', 2, cursor);
+    console.log(`H  page ${page++}: [${res.items.map((i) => i.key).join(', ')}] nextCursor=${res.nextCursor ?? '-'}`);
+    cursor = res.nextCursor;
+  } while (cursor);
+
+  const up = store.initiateMultipart(INV, 'backups/db-2026-09-18.dump');
+  const bodies = ['part-one!!', 'part-two!!', 'end'].map((s) => Buffer.from(s));
+  const etags: string[] = [];
+  for (const [i, b] of bodies.entries()) etags.push(await store.uploadPart(up, i + 1, b));
+  await attempt('I  complete [2,1]', () => store.completeMultipart(up, [{ partNumber: 2, etag: etags[1] }, { partNumber: 1, etag: etags[0] }]));
+  const done = store.completeMultipart(up, etags.map((etag, i) => ({ partNumber: i + 1, etag })));
+  const expected = `"${md5(Buffer.concat(bodies.map(md5))).toString('hex')}-3"`;
+  console.log(`   complete [1,2,3] -> ${JSON.stringify(done)} matches md5(md5s)-3: ${done.etag === expected}`);
+  const whole = await store.getObject(INV, 'backups/db-2026-09-18.dump');
+  console.log(`   GET ${txt(whole.body)} chunksRead=${whole.chunksRead}`);
+  await attempt('   complete again', () => store.completeMultipart(up, [{ partNumber: 1, etag: etags[0] }]));
+
+  const up2 = store.initiateMultipart(INV, 'backups/tiny.dump');
+  const t1 = await store.uploadPart(up2, 1, Buffer.from('abc'));
+  const t2 = await store.uploadPart(up2, 2, Buffer.from('defgh'));
+  await attempt('J  complete with 3-byte non-last part', () => store.completeMultipart(up2, [{ partNumber: 1, etag: t1 }, { partNumber: 2, etag: t2 }]));
+  store.abortMultipart(up2);
+  console.log(`   abort + gc() -> ${JSON.stringify(store.gc())}; repairQueue size=${store.repairQueue.size}`);
+}
+
+main().catch((err) => { console.error(err); process.exitCode = 1; });
+```
+
+**Actual output:**
+
+```
+0  crc32c("123456789") = e3069283 (standard check value e3069283)
+A  PUT {"etag":"\"937d0ce77d78c3fa110e46f3c694a5b8\"","versionId":"v001"} etag==md5(body): true
+   ch_001[az1-n2,az2-n2,az3-n2] ch_002[az1-n1,az2-n1,az3-n1] ch_003[az1-n1,az2-n1,az3-n1] ch_004[az1-n1,az2-n1,az3-n1] ch_005[az1-n1,az2-n1,az3-n1] ch_006[az1-n2,az2-n2,az3-n2]
+   GET 200 "INVOICE #1001 total=499" chunksRead=6
+B  GET Range 6-9 -> 206 bytes 6-9/23 "E #1" chunksRead=2
+   GET Range 50-60 -> 416 INVALID_RANGE
+C  PUT (az2-n1 down) -> v002 ok; repairQueue=[ch_007]
+     . write ch_007 -> az2-n1 FAILED
+   before repair: ch_007[az1-n1,az3-n1] ch_008[az1-n2,az2-n2,az3-n2] ch_009[az1-n2,az2-n2,az3-n2] ch_010[az1-n2,az2-n2,az3-n2] ch_011[az1-n2,az2-n2,az3-n2]
+   repair() fixed=1
+     . repair ch_007: copied to az2-n2
+   after repair:  ch_007[az1-n1,az3-n1,az2-n2] ch_008[az1-n2,az2-n2,az3-n2] ch_009[az1-n2,az2-n2,az3-n2] ch_010[az1-n2,az2-n2,az3-n2] ch_011[az1-n2,az2-n2,az3-n2]
+D  PUT with only AZ3 alive -> 503 INSUFFICIENT_REPLICAS
+     . write ch_012 -> az1-n2 FAILED
+     . write ch_012 -> az2-n2 FAILED
+   GET inv-1002 (never committed) -> 404 NO_SUCH_KEY
+E  bit rot on az1-n2/ch_001; GET still "INVOICE #1001 total=499"
+     . CRC mismatch ch_001 on az1-n2 -> next replica
+   repair() fixed=1
+     . repair ch_001: copied to az1-n1
+   ch_001[az2-n2,az3-n2,az1-n1]
+F  PUT#1 -> v004, PUT#2 -> v003; latest="BIG-IMAGE-v1"; ?versionId=v003 -> "v2"
+   DELETE (versioned) then GET -> 404 NO_SUCH_KEY
+   GET ?versionId=v004 after delete marker -> "BIG-IMAGE-v1"
+G  DELETE (unversioned) then GET -> 404 NO_SUCH_KEY
+   DELETE again (idempotent 204) -> ok
+   gc() -> {"deletedCopies":20,"reclaimedBytes":77}
+H  page 1: [invoices/2026/01.pdf, invoices/2026/02.pdf] nextCursor=aW52b2ljZXMvMjAyNi8wMi5wZGY=
+H  page 2: [invoices/2026/03.pdf] nextCursor=-
+I  complete [2,1] -> 400 INVALID_PART_ORDER
+   complete [1,2,3] -> {"etag":"\"9b216296d923e8a2059750201177e16d-3\"","versionId":"v011"} matches md5(md5s)-3: true
+   GET "part-one!!part-two!!end" chunksRead=7
+   complete again -> 404 NO_SUCH_UPLOAD
+J  complete with 3-byte non-last part -> 400 ENTITY_TOO_SMALL
+   abort + gc() -> {"deletedCopies":9,"reclaimedBytes":24}; repairQueue size=0
+```
+
+**Code Explanation -- output kya prove karta hai:**
+
+- **0** -- CRC32C sahi (`e3069283` standard check value).
+- **A** -- 23 bytes -> **6 chunks** (4+4+4+4+4+3), har chunk 3 AZs mein. ETag = MD5 of body (`true`).
+- **B** -- `Range 6-9` = `"E #1"`: byte 6-7 chunk 2 mein, 8-9 chunk 3 mein -> **sirf 2 chunks padhe**, 206 + `Content-Range: bytes 6-9/23`. `50-60` -> **416**.
+- **C** -- `az2-n1` down, stream 3 pieces mein aaya. `ch_007` ki az2 copy fail, lekin **2 copies (az1, az3) = W met**, PUT success. Baaki chunks hash se `n2` nodes par gaye, unhe farak nahi. `repair()` ne az2 ke **doosre node** `az2-n2` par copy banayi -> 3 AZs phir se.
+- **D** -- sirf AZ3 zinda -> har chunk ki sirf 1 copy -> **503**, commit nahi, GET **404**. `ch_012` az3 par orphan pada hai.
+- **E** -- `ch_001` ki az1 copy corrupt. GET ne CRC mismatch pakda, **agli replica se sahi bytes diye**, repair queue mein daala. `repair()` ne az1 ke doosre node `az1-n1` par nayi copy likhi.
+- **F** -- same key par `Promise.all`: PUT#1 pehle start hua (3 chunks), PUT#2 (1 chunk) pehle commit hua (`v003`). PUT#1 baad mein commit (`v004`) -> **latest = PUT#1. Start order nahi, commit order jeetta hai.** `?versionId=v003` se purana version abhi bhi milta hai.
+- Versioned DELETE -> delete marker, GET 404, lekin `?versionId=v004` wapas deta hai (accidental delete se recovery).
+- **G** -- unversioned delete -> 404; dobara delete bhi ok (204). `gc()` = **20 copies / 77 bytes**: inv-1001 ke 6 chunks x 3 = 18 copies (69 B) + E wali corrupt copy (4 B) + D ka orphan `ch_012` (4 B).
+- **H** -- 5 keys, prefix `invoices/2026/`, limit 2: page 1 = 01, 02 + cursor (base64 of `invoices/2026/02.pdf`), page 2 = 03, cursor khatam. `images/...` aur `invoices/2025/...` scan hi nahi hue.
+- **I** -- `[2,1]` -> 400 order. `[1,2,3]` -> ETag `...-3`, humari independent calculation se **match**. GET = 7 chunks (10 B part = 3 chunks, 10 B = 3, `end` = 1) -- parts ke chunks merge nahi hote. Dobara complete -> 404.
+- **J** -- 3-byte non-last part -> **`ENTITY_TOO_SMALL`**. Abort + gc -> 3 chunks x 3 = 9 copies, 24 bytes. Repair queue 0.
+
+### Step 6 -- Concurrency: interviewer yahan dabayega
+
+```
+t0  PUT#1: chunker -> writeChunk(ch_a) ... await              PUT#2: writeChunk(ch_b) ... await
+t1  PUT#1: writeChunk(ch_c) ... await                          PUT#2: commit() [sync] -> v003 latest
+t3  PUT#1: commit() [sync] -> v004 latest, v003.isLatest=false
+```
+
+- **Same key, parallel PUTs** -- data nodes par koi lock nahi (har PUT ke apne chunk ids hain, kuch share nahi). Jhagda sirf metadata mein, aur `commit()` synchronous hai -- beech mein doosra commit interleave nahi. Production: Postgres transaction + `ux_objects_latest (bucket_id, key) WHERE is_latest` unique index; do commits race karein toh ek pehle, doosra `is_latest` flip karke baad mein.
+- **GET during PUT** -- GET ko purana version dikhega jab tak commit nahi; commit ke baad naya. Aadha object kabhi nahi (chunks commit se pehle metadata mein hain hi nahi).
+- **GC during upload** -- `inFlight` set. Multi-process mein ye kaam **24 h grace period** karta hai (sirf 24 h se purane unreferenced chunks).
+- **Delete during read** -- humare demo mein GET ke paas chunk refs pehle se hain; bytes tabhi jaate hain jab `gc()` chale. Production: grace period reads ko bachata hai.
+- **Ye guarantee ek process ki hai.** Multiple API instances = Postgres transaction + unique index, wahi logic.
+
+> Interview line: "Object tabhi exist karta hai jab metadata commit ho. Data nodes par concurrency control nahi chahiye kyunki chunks immutable hain aur har upload ke apne ids -- saara conflict ek chhoti metadata transaction mein resolve hota hai."
+
+### Step 7 -- Edge cases
+
+| Edge case | Humara code | Production (Parts 2-4) |
+|---|---|---|
+| Node down during write | W=2 met -> success + repair queue (C) | Same; `chunks_under_replicated` gauge -> 0 |
+| 2 of 3 copies fail | 503, no commit, orphan chunks (D) | Same; client retry; GC after 24 h |
+| Bit rot on one copy | CRC mismatch -> next replica + repair (E) | + scrubber har 2 weeks sab padhta hai |
+| All copies bad / down | 500 `ALL_REPLICAS_FAILED` | Page on-call; 11 nines ka matlab ye almost kabhi nahi |
+| Same key parallel PUTs | Last **commit** wins (F) | Unique partial index + txn |
+| Range beyond size / reversed | 416 / end clamped | Same + `Accept-Ranges: bytes` |
+| Versioned delete | Delete marker; old versions readable | Same; lifecycle expires old versions |
+| Empty object (0 bytes) | 0 chunks, MD5 of empty, GET returns empty | Same |
+| Non-last part < 5 MB / wrong order / bad etag | 400 `ENTITY_TOO_SMALL` / `INVALID_PART_ORDER` / `INVALID_PART` | Same |
+| Part re-uploaded | Replaced, old chunks -> GC | Same (`upload_parts` PK) |
+| Complete / abort twice | 404 `NO_SUCH_UPLOAD` | Same |
+| Abandoned multipart | Chunks live till abort | Lifecycle: abort after 7 days |
+| Unicode keys in LIST | JS `<` = UTF-16 order | S3 lists in UTF-8 binary order -- Postgres `COLLATE "C"` |
+
+### Step 8 -- Complexity
+
+Symbols: **S** = object bytes, **R** = range bytes, **C** = chunk refs in a version, **K** = keys in bucket, **L** = limit, **P** = parts, **T** = total chunk copies on all nodes.
+
+| Operation | Time | Kyun |
+|---|---|---|
+| `putObject` | **O(S)** + O(K) for a new key | Chunker, CRC, MD5 ek pass; 3 copies = 3S bytes. New key ka sorted-array insert O(K) shift (Postgres B-tree: O(log K)) |
+| `getObject` | **O(C + R + CHUNK_SIZE)** | Metadata walk (C chhota: 1 GB = 128 chunks) + sirf range bytes; edge chunks poore padhne padte hain (CRC ke liye), max 2 extra chunks |
+| `list` | **O(log K + L)** | Binary search + L keys (+ skipped delete markers) |
+| `deleteObject` | O(K) unversioned (splice), O(1) versioned | Postgres: O(log K) |
+| `completeMultipart` | O(P + chunks) | Validate parts, ETag = MD5 of P x 16 bytes |
+| `gc` | **O(T)** | Full mark-and-sweep; production incremental, per volume |
+| `repair` | O(queue x 3 x CHUNK_SIZE) | Har queued chunk ki copies verify + 1 write |
+
+| Structure | Space | Note |
+|---|---|---|
+| Data | **O(3S)** per object | Replication 3x; COLD mein EC 8+4 = 1.5x |
+| Metadata | O(C) per version + O(K) index | Spec: ~1 KB/object -> 7.3 TB/year -> sharded Postgres |
+
+> Interview line: "PUT aur GET bytes par linear hain -- O(S) aur O(range), kyunki hum sirf overlapping chunks padhte hain. LIST O(log K + limit) hai sorted index ki wajah se, jo production mein Postgres B-tree hai. Asli cost disk aur network ki hai, CPU ki nahi."
+
+---
+
+## PART 27 -- 30-Second Answer
+
+> "At a high level, I would use **metadata aur data ko alag** rakhne wala design. Stateless Node.js API service auth karti hai aur bytes stream karti hai -- 8 MB chunks, har chunk 3 storage nodes par 3 alag AZs mein, aur 2 fsynced copies milte hi chunk durable. Saare chunks ke baad ek PostgreSQL transaction object ka metadata commit karti hai -- wahi moment object visible hota hai, toh read-after-write strong hai. Reads sirf zaroori chunks padhte hain, CRC32C verify karte hain, aur fail par doosri replica. Background workers repair, scrubbing, garbage collection karte hain, aur 30 din purana cold data 8+4 erasure coding par jaata hai -- 3x ki jagah 1.5x storage. Public reads CDN se."
+
+(~40 seconds. Metadata vs data, chunks + W=2 of 3 AZs, commit = visibility, CRC + repair, EC for cold -- bas.)
+
+---
+
+## PART 28 -- 5-Minute Interview Answer (natural Hinglish)
+
+> Ratna nahi hai. Har minute ka **goal** yaad rakho. Beech mein check-in: "Is this direction okay?"
+
+### 0:00 - 0:45 -- Requirements
+
+"Main pehle requirements clarify karunga. Ye S3 jaisa object storage hai na, Dropbox nahi -- folder sync ya editing nahi? ... Theek. Toh buckets, PUT up to 100 MB, GET with Range, HEAD, DELETE, prefix LIST with pagination, bade files ke liye multipart, presigned URLs, optional versioning, lifecycle rules, aur `object.created` events.
+
+Non-functional mein sabse upar **durability -- 11 nines**, matlab 10 billion objects mein saal ka ~0.1 object loss. Reads 99.99% available, PUT/DELETE/LIST ke baad strong read-after-write, aur bade files stream honge -- memory mein buffer nahi."
+
+### 0:45 - 1:30 -- Numbers
+
+"20 million uploads per day -- ~231 PUT/s, peak ~700, main **1,000 PUT/s** plan karunga. Reads 10x -- **~7K GET/s** peak, zyada tar CDN se. Average 500 KB, toh **10 TB/day, 3.65 PB/year** logical. 3x replication par ~11 PB raw -- 20 TB disks mein ~548 disks per year. Metadata ~1 KB per object, 7.3 TB aur 7.3 billion objects per year -- ek din shard karna padega."
+
+### 1:30 - 2:30 -- Architecture + core idea
+
+"Initially main simple architecture rakhunga. Client, public reads ke liye CDN, LB, aur stateless Node.js API service -- auth, rate limit, streaming.
+
+Sabse important idea: metadata aur data alag. Metadata -- bucket, key, version, size, ETag, chunks kahan hain -- chhota hai aur transactions chahiye, toh PostgreSQL. Data -- bytes -- storage nodes par, bade append-only volume files mein. Ek placement service batati hai har chunk kis node par jaaye, heartbeats se live nodes jaanti hai."
+
+### 2:30 - 3:30 -- Write + read path
+
+"PUT par body 8 MB chunks mein stream hoti hai. Har chunk 3 nodes par, 3 alag AZs mein; primary replicas ko forward karta hai, har node CRC32C compute karke fsync karta hai. **2 copies fsynced = durable**, teesri async ya repair worker se.
+
+However, object tabhi visible hoga jab metadata commit ho -- saare chunks ke baad ek transaction: object row with naya version id, chunk list, locations, `is_latest` flip. Upload beech mein fail hua toh metadata mein kuch nahi, orphan chunks GC saaf karega. Same key par do PUTs -- last commit wins.
+
+GET par metadata primary ya sync standby se, Range ke overlapping chunks, nearest replica, CRC verify, mismatch par agli replica + repair task, aur `stream.pipeline` se backpressure ke saath client ko."
+
+### 3:30 - 4:15 -- Scale + durability
+
+"At scale, bottleneck metadata aur disks honge. Metadata ko `(bucket_id, key)` ke **range** se shard karenge taaki prefix LIST ek-do shards par rahe; hot prefix split, overload par 503 `SLOW_DOWN`. Disks ke liye cost -- 3.65 PB per year par 3x bahut mehenga hai.
+
+Isliye cold data ke liye erasure coding: 30 din purane objects lifecycle se **8+4 Reed-Solomon** -- 12 nodes, koi bhi 4 jaayein toh bhi data safe, sirf 1.5x overhead -- 548 ki jagah ~274 disks. Durability ke liye: scrubber har 2 weeks checksums verify karta hai, node 10 min heartbeat miss kare toh repair workers uske chunks re-replicate karte hain. Security: HMAC request signing, presigned URLs, encryption at rest, TLS."
+
+### 4:15 - 5:00 -- Trade-offs + wrap-up
+
+"One trade-off here is W=2 vs W=3: W=2 latency aur availability deta hai -- ek slow ya dead node PUT nahi rokta -- lekin ack ke waqt sirf 2 copies hain, toh repair queue fast chalni chahiye aur `chunks_under_replicated` ko 0 ki taraf jaana chahiye. Doosra -- erasure coding sasta hai lekin cold reads slow aur repair network-heavy, isliye sirf cold data. Teesra -- range sharding LIST ko fast rakhti hai, lekin hot prefixes handle karne padte hain.
+
+Summary: metadata aur data alag, chunks 3 AZs mein W=2, commit = visibility, CRC + scrubber + repair, cold data EC. Kisi part mein deep dive karein?"
+
+---
+
+## PART 29 -- Whiteboard Drawing Order
+
+**Rule:** har box tab draw karo jab uska **reason** bol rahe ho. Board par do lanes rakho: upar **metadata** (chhota, transactional), neeche **data** (bade bytes). Yahi line poora design samjha deti hai.
+
+### Step 1 -- Client / SDK
+
+```
+[Browser / App / SDK]   PUT / GET / multipart, signed requests or presigned URL
+```
+
+**Ab interviewer ko kya explain karna hai?** "Clients ShopKart services aur browsers hain. Server-to-server SBX1-HMAC signature se, browsers presigned URL se direct upload -- bytes hamare app servers se nahi guzarte (lesson 87 ka server side)." **Abhi mat draw karo:** SDK retry internals, multi-region.
+
+### Step 2 -- CDN (public GETs only)
+
+```
+[Client] --public GET--> [CDN] --miss--> origin
+```
+
+**Ab interviewer ko kya explain karna hai?** "Egress ~9.3 Gbps avg, ~28 Gbps peak -- public product images CDN se. Private objects (invoices) CDN par nahi; unke liye presigned GET."
+
+### Step 3 -- LB
+
+```
+[Client] --> [CDN] --> [LB]  TLS, health checks
+```
+
+**Ab interviewer ko kya explain karna hai?** "L7 LB, TLS termination. Uploads long-lived hain, isliye idle timeouts bade aur connection draining deploy ke waqt."
+
+### Step 4 -- API service (auth, streaming)
+
+```
+[Client] --> [CDN] --> [LB] --> [API svc x N]  stateless Node.js
+                                  auth (HMAC / presigned), rate limit per key,
+                                  chunker 8 MB, stream.pipeline (no buffering)
+```
+
+**Ab interviewer ko kya explain karna hai?** "Stateless, horizontally scale. Node I/O-heavy streaming ke liye theek hai -- event loop bytes copy nahi karta, streams backpressure dete hain. Responses: 200/206/304/404/413/416/429/503."
+
+### Step 5 -- Metadata DB
+
+```
+                                [API svc x N] ----> [Metadata: Postgres primary + sync standby]
+                                                     buckets | objects | object_chunks |
+                                                     chunk_locations | multipart_uploads | upload_parts
+```
+
+**Ab interviewer ko kya explain karna hai?** "Source of truth for 'object exists'. Ek transaction = commit = visibility. `ux_objects_latest` unique partial index = ek latest per key. LIST = B-tree prefix range scan. Reads primary / sync standby se -- async replica nahi, warna PUT ke baad GET stale." **Abhi mat draw karo:** sharding (Step 8 ke baad, poochhe toh), Redis.
+
+### Step 6 -- Placement service
+
+```
+[API svc] --pickNodes(chunkId, 3)--> [Placement]  3 nodes, 3 AZs, capacity-aware
+                                          ^ heartbeats every 5 s (dead after 10 min)
+```
+
+**Ab interviewer ko kya explain karna hai?** "Kaun sa chunk kahan -- AZ-aware aur disk-full-aware. Membership heartbeats se. Consistent hashing / weighted choice Part 3 mein."
+
+### Step 7 -- Storage nodes in 3 AZs
+
+```
+                 METADATA LANE:  [API svc x N] ---- [Postgres] ---- [Placement]
+                                       |
+          DATA LANE:   +---------------+---------------+
+                       v               v               v
+                 [AZ1 nodes]  -->  [AZ2 nodes]  -->  [AZ3 nodes]    chain replication
+                 volumes 1 GB append-only + index chunk_id -> (volume, offset, len, crc32c)
+                 W=2 fsynced acks -> chunk durable
+```
+
+**Ab interviewer ko kya explain karna hai?** "HDD-heavy servers. Chunks bade volume files mein append -- lakhon chhoti files nahi. CRC32C + fsync before ack. W=2 of 3: ek AZ gaya toh bhi reads aur writes chalte hain. Honest note: real data nodes aksar Go/Rust/C++ mein, hum simplified Node version dikhate hain."
+
+### Step 8 -- Kafka + background workers
+
+```
+[Postgres outbox] --> [Kafka: storage.events | storage.repair | storage.gc]
+                          |           |            |            |           |
+                     [Repair]    [GC +        [Scrubber]   [Lifecycle   [Multipart
+                                 compaction]  (2 weeks)    -> EC 8+4]   cleanup 7 d]
+                     consumers: thumbnailer etc. (object.created)
+```
+
+**Ab interviewer ko kya explain karna hai?** "Durability background mein banti hai: repair under-replicated chunks, scrubber bit rot pakadta hai, GC orphans + deletes, compaction > 30% garbage volumes, lifecycle 30 din baad COLD (EC 8+4). Events outbox se, taaki commit aur event dono ho ya dono na ho."
+
+### Final board
+
+```
+[Browser / App / SDK] --public GET--> [CDN]
+          |                              | miss
+          v                              v
+        [LB] --> [API svc x N: auth, rate limit, chunker, streams]
+                   |  metadata lane                       | data lane (8 MB chunks)
+                   v                                      v
+   [Postgres primary + sync standby]   [Placement]   [AZ1 nodes]->[AZ2 nodes]->[AZ3 nodes]
+    objects, chunks, locations, MPU     heartbeats    append-only volumes, CRC32C, W=2 of 3
+                   |
+             outbox v
+   [Kafka storage.events / .repair / .gc] --> [Repair] [GC] [Scrubber] [Lifecycle -> EC 8+4]
+```
+
+### Kya **bilkul** draw nahi karna (jab tak pooche nahi)
+
+- Redis -- optional metadata cache, V1 mein nahi. Elasticsearch -- LIST prefix scan hai.
+- Metadata sharding, multi-region replication -- V3 discussion (Part 5).
+- Dropbox-style sync, file locking -- scope se bahar.
+
+---
+
+## PART 30 -- Final Cheat Sheet (5 minute revision)
+
+### Problem
+
+ShopKart ki images, invoices, videos, CSVs, backups ke liye apna S3-style **object storage (StoreBox)**. Object = key + bytes + metadata, immutable (overwrite = naya version). Core idea: **metadata aur data alag**; durability first.
+
+### Requirements
+
+| Type | Points |
+|---|---|
+| Functional | Buckets create/delete; PUT (<= 100 MB), GET (Range), HEAD, DELETE, LIST (prefix + cursor); multipart (5 MB-100 MB parts, max 10,000, ~1 TB); presigned URLs; versioning (delete marker); lifecycle (30 d -> COLD, expire, abort MPU 7 d); events |
+| NFR | **11 nines durability**; 99.99% read availability; strong read-after-write for PUT/DELETE/LIST; streaming (never buffer); PBs; cost (EC for cold); auth + encryption + TLS |
+| Clarify first | S3 ya Dropbox? Max object size? Versioning? Public vs private? Scale? |
+
+### Numbers
+
+| Metric | Value | Decision |
+|---|---|---|
+| PUT | 20M/day -> ~231/s, peak ~694 -> plan **1,000 PUT/s** | Stateless API scale-out |
+| GET | 10:1 -> ~2,315/s, peak ~6,944 -> plan **~7K GET/s** | CDN for public |
+| Ingest | 500 KB avg -> **10 TB/day** (~116 MB/s) -> **3.65 PB/yr** | Many HDD nodes |
+| Raw storage | 3x -> ~10.95 PB/yr (~548 x 20 TB disks); EC 8+4 -> ~5.5 PB (~274) | EC for cold data |
+| Egress | 100 TB/day -> ~9.3 Gbps avg, ~28 Gbps peak | CDN |
+| Metadata | ~1 KB/object -> 20 GB/day -> **7.3 TB, 7.3B objects/yr** | Shard later (range) |
+| Chunk | 8 MB: 500 KB = 1 chunk, 1 GB = 128 | Metadata rows vs retry cost |
+| Durability | 10B x 1e-11 = **~0.1 object lost/yr** | 3 AZs, repair, scrub |
+
+### APIs
+
+| API | Kya |
+|---|---|
+| `PUT /v1/buckets/:bucket` / `DELETE` | 201 / 204 (409 `BUCKET_NOT_EMPTY`) |
+| `PUT .../objects/*key` | `Content-Length` required, > 100 MB -> 413 `USE_MULTIPART`; `Content-MD5`, `If-None-Match: *` -> `200 { etag, versionId }` |
+| `GET .../objects/*key` | `Range`, `?versionId=`, `If-None-Match` -> 200 / 206 / 304 / 404 `NO_SUCH_KEY` / 416; `HEAD` = headers |
+| `DELETE .../objects/*key` | 204 always (idempotent) |
+| `GET .../objects?prefix=&delimiter=/&limit=&cursor=` | `{ items, commonPrefixes, nextCursor }` |
+| Multipart | `POST .../uploads` -> uploadId; `PUT .../parts/:n` -> etag; `POST .../complete` -> `"...-N"` (400 `INVALID_PART_ORDER` / `ENTITY_TOO_SMALL`, 404 `NO_SUCH_UPLOAD`); `DELETE` abort 204 |
+| `POST /v1/presign` | `{ bucket, key, method, expiresInSec <= 604800 }` -> `{ url, expiresAt }` |
+| Auth / errors | `SBX1-HMAC-SHA256` (skew <= 15 min); 403 `SIGNATURE_MISMATCH` / `REQUEST_EXPIRED`, 429, 503 `SLOW_DOWN` |
+
+### HLD
+
+```
+Client/SDK -> CDN (public GETs) -> LB -> API svc x N (Node.js: auth, rate limit, stream)
+   -> Postgres metadata (primary + sync standby; range-shard (bucket_id, key) at scale)
+   -> Placement (3 nodes / 3 AZs, heartbeats 5 s)
+   -> Storage nodes (1 GB append-only volumes + local index, CRC32C, fsync)
+   -> Kafka storage.events / storage.repair / storage.gc
+   Workers: repair, lifecycle/EC 8+4, GC + compaction, scrubber, multipart cleanup
+```
+
+### LLD
+
+```
+src/routes/{bucket,object,multipart,presign}.routes.ts   src/middleware/{sigv-auth,rate-limit}.ts
+src/controllers/{object,multipart}.controller.ts        src/services/{object,multipart,presign}.service.ts
+src/storage/{chunker,placement.client,storage-node.client,replicated-writer}.ts
+src/repositories/{bucket,object,upload}.repository.ts   src/workers/{repair,gc,scrubber,lifecycle}.worker.ts
+src/datanode/{server,volume}.ts   src/utils/{crc32c,etag,signature}.ts   src/infra/{postgres,kafka,logger,metrics}.ts
+```
+
+Constants: `CHUNK_SIZE = 8 MB`, `MAX_SINGLE_PUT = 100 MB`, `MIN_PART = 5 MB`, `MAX_PARTS = 10_000`, `REPLICAS = 3`, `WRITE_QUORUM = 2`.
+
+### Database (metadata only)
+
+```sql
+buckets(id, name UNIQUE, owner_id, versioning_enabled)
+objects(version_id ULID PK, bucket_id, key, is_latest, is_delete_marker, size_bytes, etag, content_type,
+        storage_class STANDARD|COLD, user_metadata JSONB)
+  ux_objects_latest (bucket_id, key) WHERE is_latest   |   ix_objects_list (bucket_id, key, created_at DESC)
+object_chunks(version_id, seq PK, chunk_id, size_bytes, crc32c)
+chunk_locations(chunk_id, node_id PK, volume_id, offset_bytes, state WRITING|DURABLE|CORRUPT|DELETED)
+multipart_uploads(upload_id, bucket_id, key, state)  |  upload_parts(upload_id, part_number PK, md5_hex, chunk_ids[])
+```
+
+Postgres kyun: object + chunks + `is_latest` flip ek transaction, unique partial index, ordered prefix scans. Bytes **kabhi DB mein nahi**.
+
+### Redis
+
+**Optional, V1 mein nahi.** Sirf bucket/auth lookups aur hot object metadata ka short-TTL cache. Kyun sambhal ke: "latest pointer" cache stale hua toh read-after-write toot jaata hai -- isliye PUT/DELETE par invalidate, ya sirf **immutable** cheez cache karo (`versionId -> chunk list` kabhi nahi badalta). Redis source of truth kabhi nahi, aur bytes Redis mein nahi (woh CDN ka kaam).
+
+### Queue
+
+**Kafka**: `storage.events` (object.created / object.deleted, outbox se), `storage.repair` (under-replicated / corrupt chunks), `storage.gc`. Kyun: multiple consumers (thumbnailer), retry, backlog visibility (`repair_queue_lag_seconds`).
+
+### Main Algorithm
+
+**Write path (6 lines):**
+1. Auth (HMAC / presigned), rate limit, validate (bucket, `Content-Length`, <= 100 MB).
+2. Stream body -> chunker 8 MB; running MD5 for ETag.
+3. Per chunk: placement -> 3 nodes in 3 AZs; primary chains to replicas; each CRC32C + fsync.
+4. **W=2** fsynced acks -> chunk durable; 3rd async / `storage.repair`.
+5. All chunks durable -> ONE Postgres txn: objects (new version_id, `is_latest` flip) + chunks + locations + outbox -> **commit = visible**.
+6. `200 { etag, versionId }`; outbox -> `object.created`. Failure before commit -> no object; orphans -> GC after 24 h.
+
+**Read path (6 lines):**
+1. CDN hit (public) -> done.
+2. Auth; metadata from primary / sync standby: latest version + chunks + locations (404 / delete marker).
+3. `Range` -> only overlapping chunks; 206 + `Content-Range` (416 if invalid).
+4. Per chunk: nearest healthy replica; verify CRC32C; mismatch / timeout -> next replica + repair task.
+5. COLD object: read any 8 of 12 EC fragments and decode (slower).
+6. `stream.pipeline` with backpressure; `ETag` + `If-None-Match` -> 304.
+
+Supporting: AZ-aware placement, erasure coding 8+4, CRC32C, append-only volumes + compaction, mark-and-sweep GC.
+
+### Scaling
+
+| Stage | Change |
+|---|---|
+| V1 | Stateless Node API + Postgres + a few storage nodes, 3x replication, single PUT + GET Range |
+| V2 -- our numbers | CDN, multipart, presigned, 3 AZs W=2, repair/scrubber/GC workers, lifecycle EC 8+4, Kafka events, optional Redis |
+| V3 -- bigger | Metadata range-sharded (or FoundationDB/TiKV-style KV), hot-prefix split + `SLOW_DOWN`, cross-region replication |
+
+### Consistency
+
+| Where | Level |
+|---|---|
+| PUT / DELETE / LIST vs later reads | **Strong** -- metadata commit = visibility; read from primary / sync standby |
+| Replicas at ack time | 2 of 3 durable; 3rd **eventual** (repair) |
+| Events (`storage.events`) | At-least-once via outbox; consumers dedupe |
+| CDN copies | Eventual (TTL / invalidation / versioned URLs) |
+
+### Failure Handling
+
+| Failure | Behaviour |
+|---|---|
+| Disk / node dies | Heartbeat miss > 10 min -> dead -> repair re-replicates from survivors |
+| Node dies mid-write | W=2 still met -> success + repair; < 2 -> 503, no commit |
+| AZ down | Other 2 AZs have copies -> reads continue; new writes W=2, repair later |
+| Bit rot | CRC on every read + scrubber (2 weeks) -> serve other copy, repair |
+| Client disconnects mid-upload | Nothing committed; orphans GC'd after 24 h |
+| Metadata primary down | Promote sync standby (no committed metadata lost) |
+| GC bug risk | Only unreferenced chunks older than 24 h; `gc_reclaimed_bytes_total` alerts on spikes |
+
+### Security
+
+- **SBX1-HMAC-SHA256** request signing (method, path, query, headers, payload hash, `x-sbx-date`, skew <= 15 min), `timingSafeEqual`.
+- **Presigned URLs** (max 7 days) -- browser direct upload/download, no API key leak.
+- **Encryption at rest** (envelope: per-object data key wrapped by a KMS master key) + **TLS** in transit.
+- Bucket ownership checks, per-key rate limits (Rate Limiter), private objects never on CDN.
+
+### Observability
+
+`storage_requests_total{op,status}`, `storage_request_duration_seconds{op}` (TTFB + total), `storage_bytes_in_total`, `storage_bytes_out_total`, **`chunks_under_replicated` (must trend to 0)**, `repair_queue_lag_seconds`, `scrubber_corrupt_chunks_total`, `node_disk_used_ratio{node}`, `placement_live_nodes{az}`, `metadata_query_duration_seconds`, `gc_reclaimed_bytes_total`, `multipart_incomplete_uploads`.
+
+### Top 5 Trade-offs
+
+| Decision | Chosen | Kyun | Kab badlega |
+|---|---|---|---|
+| Durability scheme | 3x replication hot, EC 8+4 cold | Hot = fast reads/repair; cold = 1.5x cost | Tiny system -> sirf replication; huge archive -> more EC |
+| Write quorum | W=2 of 3 | One dead/slow node PUT nahi rokta | Critical data -> W=3 (slower) |
+| Metadata sharding | Range on (bucket_id, key) | Prefix LIST 1-2 shards par | Hash if LIST rare -> even load, fan-out LIST |
+| Chunk size | 8 MB | Rows kam, retry sasta, parallel reads | Mostly-huge objects -> bigger chunks |
+| Build vs buy | Build (interview) | Cost at PB scale, control | Usually buy: S3 / GCS / MinIO |
+
+### Top 10 Follow-up Questions
+
+| # | Question | One-line answer |
+|---|---|---|
+| 1 | Files DB mein kyun nahi? | Bytes huge; DB metadata ke liye; bytes nodes par |
+| 2 | Upload beech mein node mara? | W=2 met -> success + repair; warna 503, no commit, GC |
+| 3 | 11 nines kaise? | 3 AZs, fast repair, CRC + scrubber, EC for cold |
+| 4 | W=3 kyun nahi? | Ek slow node har PUT slow kar deta; 2 AZs mein fsync kaafi + repair |
+| 5 | Same key par 2 PUTs? | Last metadata commit wins; har PUT ka apna version |
+| 6 | PUT ke turant baad GET stale? | Nahi -- commit = visibility, primary / sync standby se read |
+| 7 | Bit rot? | CRC32C har read par + scrubber har 2 weeks + repair |
+| 8 | 5 GB upload? | Multipart + presigned per part, ETag `-N` |
+| 9 | Billions of keys ka LIST? | Range-sharded metadata, B-tree prefix scan, cursor; hot prefix `SLOW_DOWN` |
+| 10 | Delete se space kab? | Metadata turant; GC + compaction (> 30% garbage) baad mein |
+
+### 30-second answer
+
+PART 27. Skeleton: **metadata vs data -> 8 MB chunks, 3 AZs, W=2 -> one Postgres commit = visible -> Range + CRC + replica fallback -> repair / scrubber / GC -> EC 8+4 for cold -> CDN.**
+
+### 5-minute answer (skeleton -- full text PART 28)
+
+1. **0:00** Requirements: S3 not Dropbox; PUT/GET Range/LIST/multipart/presigned/versioning/lifecycle; 11 nines.
+2. **0:45** Numbers: 1,000 PUT/s, 7K GET/s, 10 TB/day, 3.65 PB/yr, 548 vs 274 disks, 7.3B objects/yr.
+3. **1:30** "Initially main simple architecture rakhunga"; "Sabse important idea: metadata aur data alag"; placement.
+4. **2:30** Write (chunks, W=2 of 3 AZs) + "object tabhi visible hoga jab metadata commit ho" + read (Range, CRC, fallback).
+5. **3:30** "At scale, bottleneck metadata aur disks honge"; range sharding; "Isliye cold data ke liye erasure coding"; scrubber, repair, security.
+6. **4:15** "One trade-off here is..." W=2 vs W=3, EC vs replication; "deep dive kahan?"
+
+### MOST IMPORTANT RULE -- 5 sawaal, 3 key decisions par
+
+| Sawaal | Separate metadata and data | W=2 of 3 replication across AZs | Erasure coding for cold data |
+|---|---|---|---|
+| **Hum ye kyun kar rahe hain?** | Metadata chhota + transactional (Postgres), bytes huge + sequential (disks); dono alag scale | 11 nines + availability: har chunk 3 AZs, 2 fsynced acks par durable | 3.65 PB/yr par 3x = ~548 disks/yr; EC 8+4 = 1.5x, ~274 disks, 4 failures tak safe |
+| **Agar ye nahi kiya toh?** | Bytes DB mein -> DB bloat, backups/replication choke; sirf disk -> LIST, versions, atomic visibility nahi | 1 copy -> disk gaya = data gaya; W=3 -> ek slow node har PUT rokta; same AZ -> AZ outage = loss | Saara data 3x -> cost double; ya kam copies -> durability girti |
+| **Iska alternative kya hai?** | Files local disk / NFS par path DB mein; metadata disk par hi (xattrs) | W=1 + async; W=3 sync; 2 AZ; client-side mirroring | Sab kuch 3x; 2x replication; wider EC (e.g. 10+4, 17+3) |
+| **Alternative kab choose karenge?** | Chhota app, ek server -> local disk + DB path chal jaata hai (V0) | Cheap re-creatable data (thumbnails) -> W=1; super-critical -> W=3 | Hot data / small objects -> replication (EC reads slow, repair heavy); deep archive -> wider EC |
+| **Scale badhne par kya change hoga?** | Metadata range-sharded / distributed KV; data nodes add + rebalance | More AZs/regions, cross-region replication, faster repair (parallel) | Lifecycle aggressive, bigger stripes, EC across AZs |
+
+### Most Important Things To Remember
+
+1. **Metadata aur data alag** -- Postgres me "kya hai, kahan hai"; disks par bytes.
+2. **8 MB chunks, 3 copies, 3 AZs, W=2** -- 3rd async / repair.
+3. **Commit = visibility** -- metadata txn last; fail -> kuch nahi dikhta, orphans GC.
+4. **Last commit wins** for same key; har PUT naya `version_id`, `is_latest` flip.
+5. **Range GET** sirf overlapping chunks; **stream.pipeline**, never buffer.
+6. **CRC32C** har chunk, har read par; scrubber 2 weeks; mismatch -> next replica + repair.
+7. **EC 8+4** for COLD (> 30 days): 1.5x, survives 4 losses; hot = 3x.
+8. **Delete** = metadata first; GC (24 h grace) + compaction (> 30% garbage).
+9. **ETag** = MD5 (single) / `md5(part md5s)-N` (multipart); parts 5 MB-100 MB, max 10,000.
+10. **Numbers**: 1,000 PUT/s, 7K GET/s, 10 TB/day, 3.65 PB/yr, 7.3B objects/yr, 11 nines = 0.1 object/yr per 10B.
+
+---
+
+## Remember
+
+> **Coding round mein: clarify (chunk size? W? overwrite? delete?) -> logic bolo (data nodes alag, chunks + W=2 AZ-aware, commit last) -> code with fake nodes -> node down / bit rot / parallel PUT dikhao -> edge cases -> complexity. Design round mein: requirements (11 nines) -> numbers (PBs) -> metadata vs data -> write path W=2 -> commit = visibility -> read path CRC -> EC for cold.** File storage ka dil ek line hai: "Bytes ko chunks mein 3 AZs par rakho, aur object ko tabhi exist karne do jab metadata commit ho."
+
+## Quick Self-Test
+
+1. Output line **C** mein `az2-n1` down tha phir bhi PUT success kyun hua? `pickNodes` agar `up` check karta toh kya ye scenario realistic hota? (Hint: heartbeat timeout.)
+2. Line **F** mein PUT#1 pehle start hua phir bhi latest kyun bana? Agar `commit()` ke andar ek `await` aa jaaye toh kya toot sakta hai, aur production mein kaunsa index ise bachata hai?
+3. `gc()` ne line **G** mein 20 copies kyun hataayi -- 18 to inv-1001 ki, baaki 2 kaun si thi aur har ek garbage kyun bani?
+4. Range `bytes=6-9` ne 2 chunks padhe. 8 MB chunks ke saath `bytes=0-1048575` (1 MB) GET kitne chunks padhega, aur 1 GB object ke last 10 bytes?
+5. MOST IMPORTANT RULE table se: erasure coding **hot** data par kyun nahi? Aur W=2 mein ack ke waqt sirf 2 copies hain -- kaunsa metric batata hai ki risk window chhoti reh rahi hai?
+
+---
+
+**File Storage complete.** Next system: **News Feed**. "next" bolo.
+
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') return '<div class="mermaid">' + code + '</div>';
+    return '<pre><code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</code></pre>';
+  };
+  renderer.table = function(header, body) {
+    return '<div class="table-wrap"><table><thead>' + header + '</thead><tbody>' + body + '</tbody></table></div>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

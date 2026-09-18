@@ -167,6 +167,19 @@ interface StorageNodeClient { putChunk(nodeId: string, chunkId: string, data: Bu
 - Kafka topics: `storage.events` (object.created / object.deleted), `storage.repair`, `storage.gc`.
 - Metrics: `storage_requests_total{op,status}`, `storage_request_duration_seconds{op}` (time to first byte + total), `storage_bytes_in_total`, `storage_bytes_out_total`, `chunks_under_replicated` (gauge -- must trend to 0), `repair_queue_lag_seconds`, `scrubber_corrupt_chunks_total`, `node_disk_used_ratio{node}`, `placement_live_nodes{az}`, `metadata_query_duration_seconds`, `gc_reclaimed_bytes_total`, `multipart_incomplete_uploads`.
 
+## Decisions settled while writing (parts follow these)
+- GC safety: a chunk is garbage only if it has no `object_chunks` reference AND is not in `upload_parts.chunk_ids` of an `IN_PROGRESS` upload AND is older than 24 h; GC re-checks references on the primary before deleting (two-phase).
+- Concurrent PUT to the same key: update-then-insert inside one transaction; the loser hits unique violation `23505` on `ux_objects_latest` and retries (bounded). Create-only PUT (`If-None-Match: *`) returns 412 instead.
+- Unversioned bucket overwrite: the old version row is removed in the same transaction (Part 2 code) -- or equivalently flipped to `is_latest = false` and cleaned later (Parts 3/6 wording); either way its chunks go to GC via `storage.gc`.
+- An `outbox` table (Payment System pattern) backs the `storage.events` publish in write path step 5.
+- `putChunk` ack carries `{ crc32c, volumeId, offsetBytes }` (needed for `chunk_locations`). Extra indexes needed: `object_chunks (chunk_id)`, `chunk_locations (node_id)`.
+- Multipart complete stores `completed_version_id` on `multipart_uploads` so a retried complete returns the same version. Multipart chunks are cut per part (a 5 MB part = one 5 MB chunk), so Range math uses cumulative offsets, not `start / CHUNK_SIZE`.
+- W=2 is counted from per-replica fsync acks; the teaching code uses parallel fan-out, the text explains chain replication as the bandwidth-saving alternative.
+- Extra error codes: `503 INSUFFICIENT_REPLICAS` (fewer than 2 durable copies, nothing committed), `400 INVALID_PART` (wrong part ETag at complete).
+- LIST order = UTF-8 byte order -> `key TEXT COLLATE "C"`.
+- Metadata sharding: plan at 1x (7.3B rows/year), implement at 10x.
+- Encryption at rest needs a `wrapped_dek` column (envelope encryption).
+
 ## Style rules (every part)
 - Title: `# File Storage (S3-style) -- HLD + LLD (Part N: A -> B -> C)` (the reader uses the text inside `(Part N: ...)` as the chapter label).
 - Easy Hinglish, ASCII only (no em/en dashes, smart quotes, arrows, box-drawing, emojis), Node.js/TypeScript, `**Code Explanation:**` line-by-line after every code block, interview lines, `## Remember` + `## Quick Self-Test` (5 questions) at end, final `**Next (Part N+1):** ... "next" bolo.` line (Part 6 ends with `**File Storage complete.** Next system: **News Feed**. "next" bolo.`).

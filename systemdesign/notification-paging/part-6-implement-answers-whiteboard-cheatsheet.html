@@ -1,0 +1,1844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Notification / Paging System -- HLD + LLD (Part 6: Implement It - Interview Answers - Whiteboard - Cheat Sheet)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root { --bg:#fafafa; --fg:#1f2328; --muted:#57606a; --border:#d0d7de; --code-bg:#f6f8fa; --accent:#0969da; --callout-bg:#fff8c5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --border:#30363d; --code-bg:#161b22; --accent:#58a6ff; --callout-bg:#3b3410; }
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.65; max-width:900px; margin:0 auto; padding:40px 24px 100px; }
+  h1,h2,h3 { line-height:1.3; }
+  h1 { font-size:2rem; border-bottom:2px solid var(--border); padding-bottom:10px; }
+  h2 { font-size:1.45rem; margin-top:2.4em; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  h3 { font-size:1.1rem; color:var(--accent); margin-top:1.8em; }
+  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; font-size:0.9em; }
+  pre { background:var(--code-bg); padding:14px 16px; border-radius:8px; overflow-x:auto; border:1px solid var(--border); }
+  pre code { background:none; padding:0; }
+  blockquote { border-left:4px solid var(--accent); background:var(--callout-bg); margin:1.2em 0; padding:0.6em 1em; border-radius:0 6px 6px 0; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:1.2em 0; }
+  th,td { border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul,ol { padding-left:1.4em; }
+  li { margin:0.35em 0; }
+  .mermaid { background:white; border-radius:8px; padding:12px; margin:1.2em 0; }
+  a { color:var(--accent); }
+  hr { border:none; border-top:1px solid var(--border); margin:2.5em 0; }
+  @media (max-width:600px) { body { padding:24px 16px 80px; } h1 { font-size:1.5rem; } }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Notification / Paging System -- HLD + LLD (Part 6: Implement It -> Interview Answers -> Whiteboard -> Cheat Sheet)
+
+> Is file mein prompt ke **Parts 26-30** hain: coding round mein "Implement an alerting / paging service" kaise solve karein, 30-second answer, 5-minute answer, whiteboard par diagram kis order mein banayein, aur poore Notification / Paging System (Parts 1-5) ki final cheat sheet.
+> Part 5 recap: humne har bada decision trade-off ki language mein bola (Kafka vs RabbitMQ, Redis ZSET vs DB polling, at-least-once vs exactly-once), MVP -> Scalable -> Highly Scalable teen versions banaye, aur interviewer ke follow-ups + Node.js specific sawaal cover kiye.
+> Ye **last file** hai aur ye **revision file** hai -- Parts 1-5 padhne ke baad har baar sirf yahi kholna hai. Design samajh chuke ho; ab usko **bolna, likhna aur draw karna** seekhenge.
+
+---
+
+## PART 26 -- Code Design Question: "Implement an alerting / paging service"
+
+### Pehle samjho: ye 45-minute system design round nahi hai
+
+Ye ek **live coding / LLD round** hai. Interviewer ne bola:
+
+> "Ek chhota alerting service implement karo. Event aaye toh incident bane, duplicate events se naya incident na bane, on-call ko notify karo, aur agar 5 minute mein acknowledge na ho toh escalate karo."
+
+Yahan interviewer Kafka, Postgres partitions, Twilio short codes **nahi** dekhna chahta. Woh dekhna chahta hai:
+
+- Tum **scope clarify** karte ho ya seedha typing shuru?
+- **Dedup contract** sahi likha ya nahi (yahi is system ka dil hai)?
+- **State machine** clean hai, ya `if` ka jungle?
+- **Timers** ko tumne testable banaya (injected clock) ya `setTimeout` mein phansa diya?
+- **Cancellation** handle ki? (ack ke baad page jaana = product ki sabse badi shikayat)
+- **Retry** + **idempotency** ka concept aata hai?
+- Complexity bata sakte ho?
+
+Iska matlab: **ek file, in-memory Map, fake providers, fake clock. Koi Postgres, koi Kafka, koi Redis nahi.** Lekin tum har jagah bologe: "Production mein yahi jagah Postgres partial unique index / Redis ZSET / Kafka topic banti hai."
+
+> Connection: Rate Limiter ke Part 26 mein bhi yahi pattern tha -- in-memory class + injectable clock, phir "production mein storage badlega, interface nahi". Notification system mein ek extra cheez hai: **time khud ek feature hai** (ack timeout, notification delay, retry backoff). Isliye clock injection yahan optional nahi, **mandatory** hai.
+
+### Step 1 -- Clarify scope in 60 seconds (typing se pehle)
+
+> "Code likhne se pehle 60 second mein scope pin kar leta hoon, taaki main sahi cheez banaun."
+
+| Question | Mera assumption (agar interviewer bole "you decide") |
+|---|---|
+| Input kya hai? | `IncomingEvent` with `routingKey`, `eventAction` (`trigger`/`acknowledge`/`resolve`), `dedupKey`, `payload` |
+| Dedup ka rule? | Same `(serviceId, dedupKey)` ka trigger, jab tak incident `resolved` nahi -- **naya incident nahi**, sirf `occurrenceCount++` |
+| Escalation policy kya hai? | Levels ki list; har level ka `ackTimeoutMin` (default 5) aur target users; policy `repeatCount` (default 2) baar wrap karti hai |
+| Notification channels? | `push`, `sms`, `voice`, `email`, `slack` -- ek `NotificationProvider` interface, demo mein fake impl |
+| Per-user rules? | "0 min push, 1 min SMS, 5 min voice" -- high urgency; low urgency sirf email/push |
+| Ack ke baad kya hota hai? | Pending escalation timers **aur** pending notifications dono cancel |
+| Storage? | Interview mein in-memory; main dedup/timer ka **contract** likhunga taaki Postgres + Redis se swap ho jaaye |
+| Concurrency? | Single process, Node event loop. Multi-instance ke liye optimistic locking (`version`) aur atomic timer claim -- bolunga, aur code mein `version` rakhunga |
+| Real time ya fake clock? | **Fake clock inject karunga** -- warna test mein 5 minute wait karna padega |
+
+**Main ye banaunga (bolke batao):**
+
+1. `types.ts` -- spec wale exact types.
+2. `InMemoryIncidentStore` -- dedup contract ke saath (Postgres ka stand-in).
+3. `IncidentService.handleEvent()` -- trigger / acknowledge / resolve + state machine.
+4. `EscalationScheduler` -- **interface**, in-memory impl (interview) + Redis ZSET impl (production sketch).
+5. `NotificationDispatcher` -- per-user rules, cancelled-check, retry with full jitter, fake provider.
+6. `main()` -- ek poora scenario chalayega aur timeline print karega.
+
+**Main ye STUB karunga (ye bhi bolke batao, warna interviewer sochega tum bhool gaye):**
+
+| Stub | Production mein kya hai |
+|---|---|
+| `InMemoryIncidentStore` | Postgres `incidents` table + `incidents_open_dedup_uniq` partial unique index |
+| `InMemoryEscalationScheduler` | Redis ZSET `sched:escalations` + Lua claim + Postgres `escalation_timers` durable copy |
+| `FakeProvider` | Twilio SMS/Voice, FCM/APNs, SendGrid, Slack adapters + circuit breaker |
+| `dispatcher.tick()` | Kafka `notifications` topic + `notification-workers` consumer group |
+| `StaticRouting` | `routing.service.ts` + `oncall.service.ts` (escalation policy -> schedule layers -> rotation index -> overrides) |
+| Auth / rate limit / idempotency middleware | `middleware/auth.ts`, `rate-limit.ts`, `idempotency.ts` |
+
+### Step 2 -- Logic pehle bolo (code se pehle, Hinglish mein)
+
+> "Poora system ek line mein: **event -> dedup -> incident -> route -> notify -> timer -> escalate ya cancel.**
+>
+> Dedup ke liye main ek index rakhunga: `(serviceId, dedupKey) -> open incidentId`. Incident resolve hote hi ye index entry **hat** jaati hai -- isliye resolved incident ke baad wahi dedupKey naya incident bana sakta hai. Production mein ye index Postgres ka `WHERE status <> 'resolved'` wala **partial unique index** hai, kyunki uniqueness DB level par enforce honi chahiye, application logic par nahi.
+>
+> State machine teen states ki hai: `triggered -> acknowledged -> resolved`, aur `triggered -> resolved` bhi (monitoring auto-resolve karta hai). Har transition **optimistic lock** (`version`) ke saath, taaki do responder ek saath ack karein toh ek jeete aur doosre ko error na mile -- usko current state mile.
+>
+> Timer ke liye `setTimeout` **nahi** use karunga. Process crash hua toh saare timers gayab -- aur is product mein timer ka gayab hona matlab page hi nahi gaya. Isliye timer ek **data row** hai: `{ timerId, incidentId, level, dueAtMs }`, aur ek scheduler har tick par 'due' timers claim karta hai. Interview mein claim in-memory hai, production mein Redis ZSET ka atomic Lua.
+>
+> Notification ek **task** hai, function call nahi -- `taskId` iski idempotency key hai. Har task ka apna `dueAtMs` hai (user rule: 0 min push, 1 min sms, 5 min voice). Worker bhejne se **ek second pehle** check karta hai ki incident abhi bhi `triggered` hai ya nahi -- kyunki ack ke baad SMS jaana user ke liye bug hai.
+>
+> Retry **full jitter** se: `delay = random(0, min(30000, 1000 * 2^attempt))`. Jitter isliye ki alert storm mein 1000 workers ek saath retry karke provider ko dobara na maar dein.
+>
+> Aur clock inject karunga -- `now: () => number`. Isse 5-minute escalation ka test 5 millisecond mein chal jaata hai."
+
+Ab code.
+
+### Step 3 -- Types (spec wale exact types)
+
+```ts
+export type EventAction = 'trigger' | 'acknowledge' | 'resolve';
+export type Severity = 'critical' | 'error' | 'warning' | 'info';
+export type IncidentStatus = 'triggered' | 'acknowledged' | 'resolved';
+export type Channel = 'push' | 'sms' | 'voice' | 'email' | 'slack';
+export type NotificationStatus = 'queued' | 'sent' | 'delivered' | 'failed' | 'cancelled';
+
+export type Clock = () => number;                 // ms since epoch
+export type Rand = () => number;                  // [0, 1)
+export type Sleep = (ms: number) => Promise<void>;
+
+export interface IncomingEvent {
+  routingKey: string;
+  eventAction: EventAction;
+  dedupKey: string;                 // absent ho toh ingest API hash(summary + source) bhar deta hai
+  payload: {
+    summary: string;
+    source: string;
+    severity: Severity;
+    customDetails?: Record<string, unknown>;
+  };
+  receivedAt: string;               // ISO, ingest API stamps it
+  eventId: string;                  // uuid v4, ingest API stamps it
+}
+
+export interface Incident {
+  id: string;
+  serviceId: string;
+  dedupKey: string;
+  status: IncidentStatus;
+  severity: Severity;
+  summary: string;
+  source: string;
+  occurrenceCount: number;
+  escalationLevel: number;
+  escalationRound: number;
+  acknowledgedBy: string | null;
+  createdAt: Date;
+  lastSeenAt: Date;
+  resolvedAt: Date | null;
+  version: number;                  // optimistic lock
+}
+
+export interface NotificationTask {
+  taskId: string;                   // idempotency key for at-least-once delivery
+  incidentId: string;
+  userId: string;
+  channel: Channel;
+  contactMethodId: string;
+  attempt: number;
+  escalationLevel: number;
+  scheduledFor: string;             // ISO
+}
+
+export interface ProviderResult {
+  providerMessageId: string;
+  status: 'sent' | 'failed';
+  permanent?: boolean;              // true = 4xx, dobara mat bhejo
+}
+
+export interface NotificationProvider {
+  name: string;
+  channel: Channel;
+  send(task: NotificationTask, address: string, incident: Incident): Promise<ProviderResult>;
+}
+```
+
+**Code Explanation:**
+
+- `EventAction` / `Severity` / `IncidentStatus` / `Channel` / `NotificationStatus` -- ye **union types** hain, `string` nahi. Iska fayda: `status = 'ackd'` likhte hi compiler pakad lega. Postgres mein bhi yahi `CHECK (status IN (...))` constraint hai -- **do jagah same invariant**, isliye galat data DB tak pahunch hi nahi sakta.
+- `Clock = () => number` -- poore system ka time isi se aayega. Ek bhi jagah seedha `Date.now()` nahi. Yahi cheez 5-minute escalation ko unit-testable banati hai.
+- `Rand`, `Sleep` -- retry backoff ke liye. Test mein `rand = () => 0.5` dene se output deterministic ho jaata hai; `sleep` ko no-op bana dete hain, warna test 30 second chalega.
+- `IncomingEvent.dedupKey` ko maine `string` rakha (optional nahi), kyunki **ingest API** yahan default bhar deta hai -- service layer ko `undefined` handle karne ki zarurat hi na pade. Ye chhota design choice hai: "normalize at the edge, keep the core simple".
+- `Incident.occurrenceCount` -- dedup ka output. 95% events yahi field badhate hain aur koi page nahi jaata.
+- `escalationLevel` + `escalationRound` -- `level` = policy ke andar kaunsa step; `round` = poori policy kitni baar repeat hui (`repeatCount` tak).
+- `version` -- optimistic lock. Ack race (do responder ek saath) isi se safe hota hai.
+- `NotificationTask.taskId` -- **at-least-once delivery ki idempotency key.** Postgres mein `notifications_task_uniq` unique index isi par hai, aur Twilio ko bhi yahi key jaati hai -- taaki duplicate consume par do SMS na jaayein.
+- `ProviderResult.permanent` -- ye ek line poora retry budget bachati hai. Invalid phone number (Twilio 4xx) ko 5 baar retry karna paisa aur time dono ki barbaadi hai.
+- `NotificationProvider` -- ek hi interface, paanch implementations. Naya channel (WhatsApp) add karna = ek nayi file, core logic untouched.
+
+### Step 4 -- `InMemoryIncidentStore` (dedup contract)
+
+```ts
+export interface TriggerInput {
+  serviceId: string;
+  dedupKey: string;
+  severity: Severity;
+  summary: string;
+  source: string;
+}
+
+export interface UpsertResult {
+  incident: Incident;
+  created: boolean;                 // true = naya incident -> PAGE karo. false = dedup -> chup raho
+}
+
+export class InMemoryIncidentStore {
+  private readonly byId = new Map<string, Incident>();
+  private readonly openByDedup = new Map<string, string>();   // "serviceId|dedupKey" -> incidentId
+  private seq = 0;
+
+  constructor(private readonly now: Clock) {}
+
+  private openKey(serviceId: string, dedupKey: string): string {
+    return `${serviceId}|${dedupKey}`;
+  }
+
+  upsertOnTrigger(input: TriggerInput): UpsertResult {
+    const k = this.openKey(input.serviceId, input.dedupKey);
+    const openId = this.openByDedup.get(k);
+
+    if (openId !== undefined) {
+      const existing = this.byId.get(openId)!;
+      existing.occurrenceCount += 1;
+      existing.lastSeenAt = new Date(this.now());
+      return { incident: existing, created: false };
+    }
+
+    const incident: Incident = {
+      id: `inc_${++this.seq}`,
+      serviceId: input.serviceId,
+      dedupKey: input.dedupKey,
+      status: 'triggered',
+      severity: input.severity,
+      summary: input.summary,
+      source: input.source,
+      occurrenceCount: 1,
+      escalationLevel: 1,
+      escalationRound: 0,
+      acknowledgedBy: null,
+      createdAt: new Date(this.now()),
+      lastSeenAt: new Date(this.now()),
+      resolvedAt: null,
+      version: 0,
+    };
+    this.byId.set(incident.id, incident);
+    this.openByDedup.set(k, incident.id);
+    return { incident, created: true };
+  }
+
+  getById(id: string): Incident | null {
+    return this.byId.get(id) ?? null;
+  }
+
+  findOpenByDedup(serviceId: string, dedupKey: string): Incident | null {
+    const id = this.openByDedup.get(this.openKey(serviceId, dedupKey));
+    return id === undefined ? null : this.byId.get(id) ?? null;
+  }
+
+  // Optimistic lock: expectedVersion match kare tabhi update.
+  transition(id: string, expectedVersion: number, patch: Partial<Incident>): Incident | null {
+    const incident = this.byId.get(id);
+    if (!incident || incident.version !== expectedVersion) return null;
+    Object.assign(incident, patch);
+    incident.version += 1;
+    if (incident.status === 'resolved') {
+      this.openByDedup.delete(this.openKey(incident.serviceId, incident.dedupKey));
+    }
+    return incident;
+  }
+
+  get openCount(): number {
+    return this.openByDedup.size;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `byId` + `openByDedup` -- **do maps, do alag kaam.** `byId` = poora data (Postgres table). `openByDedup` = "open incident ka index" (Postgres ka partial unique index). Interview mein ye do-map structure bolna hi tumhara dedup design hai.
+- `openKey()` ek hi jagah hai jo key format jaanta hai. Agar kal key mein `accountId` bhi jodna pade, ek line badlegi.
+- `upsertOnTrigger` -- **ek hi method, do outcomes.** `created: true` matlab naya incident bana -> page karo. `created: false` matlab dedup -> sirf counter badha, **koi notification nahi**. Poore system ki sabse important boolean yahi hai.
+- Production mein yahi method ek SQL statement hai:
+
+```sql
+INSERT INTO incidents (id, service_id, dedup_key, status, severity, summary, source)
+VALUES ($1, $2, $3, 'triggered', $4, $5, $6)
+ON CONFLICT (service_id, dedup_key) WHERE status <> 'resolved'
+DO UPDATE SET occurrence_count = incidents.occurrence_count + 1,
+              last_seen_at = now()
+RETURNING id, (xmax = 0) AS inserted;
+```
+
+**Code Explanation:**
+
+- `ON CONFLICT (service_id, dedup_key) WHERE status <> 'resolved'` -- ye `incidents_open_dedup_uniq` **partial unique index** ko target karta hai. "Partial" isliye ki resolved incidents par uniqueness nahi chahiye (ek hi dedupKey saal bhar mein 500 baar resolve ho sakta hai).
+- `DO UPDATE SET occurrence_count = incidents.occurrence_count + 1` -- conflict par insert ki jagah counter badhao. Ek round trip, ek atomic statement, koi read-then-write race nahi.
+- `RETURNING (xmax = 0) AS inserted` -- Postgres ka trick: `xmax = 0` matlab row **naya insert** hua (`created: true`); non-zero matlab existing row update hui (`created: false`). Ye ek expression hamare `UpsertResult.created` ke barabar hai.
+- **Kyun Redis nahi?** Redis `SET NX` fast path ke liye theek hai (`dedup:<serviceId>:<dedupKey>`, TTL 6 h) taaki 95% duplicate events DB tak pahunche hi na. Lekin Redis eviction/failover par key gayab ho sakti hai -> duplicate incident. Isliye **source of truth Postgres ka index hai, Redis sirf speed hai.**
+- `transition(id, expectedVersion, patch)` -- optimistic locking. `version` match na kare toh `null` -- matlab koi aur pehle update kar gaya. Production SQL: `UPDATE incidents SET status='acknowledged', acknowledged_by=$1, version=version+1 WHERE id=$2 AND status='triggered' AND version=$3` -- 0 rows = race haar gaye.
+- `if (incident.status === 'resolved') this.openByDedup.delete(...)` -- **yahi ek line dedup ka lifecycle poora karti hai.** Resolve hote hi dedupKey free, aur wahi alert dobara aaye toh naya incident. Ye line bhool jaao toh system kabhi dobara page hi nahi karega -- outage ke andar outage.
+- Note: yahan main objects **by reference** return kar raha hoon (interview mein theek hai, chhota code). Production repository hamesha row ka copy deta hai, warna caller galti se in-memory state mutate kar dega.
+
+### Step 5 -- State machine: table + diagram
+
+| Current state | Event | Allowed? | New state | Side effects |
+|---|---|---|---|---|
+| (none) | `trigger` (new dedupKey) | [OK] | `triggered` | Incident create, timeline `triggered`, page level 1, escalation timer arm |
+| `triggered` | `trigger` (same dedupKey) | [OK] | `triggered` | `occurrenceCount++`, `lastSeenAt` update, **koi page nahi** |
+| `triggered` | escalation timer fires | [OK] | `triggered` | `escalationLevel++` (ya round wrap), page next level, naya timer |
+| `triggered` | `acknowledge` | [OK] | `acknowledged` | CAS on `version`; cancel timers + queued notifications; timeline `acknowledged` |
+| `triggered` | `resolve` | [OK] | `resolved` | Cancel sab kuch; `resolvedAt`; dedup index free |
+| `acknowledged` | `trigger` (same dedupKey) | [OK] | `acknowledged` | `occurrenceCount++` only -- **ack ke baad dobara page nahi** |
+| `acknowledged` | `acknowledge` (dobara) | [OK] | `acknowledged` | Idempotent `200` with current state, **error nahi** |
+| `acknowledged` | escalation timer fires | Ignore | `acknowledged` | Stale timer -- log + drop (zombie timer case) |
+| `acknowledged` | `resolve` | [OK] | `resolved` | Cancel sab; dedup index free |
+| `resolved` | `trigger` (same dedupKey) | [OK] | **naya** `triggered` | Naya incident id -- purana incident chhua bhi nahi jaata |
+| `resolved` | `acknowledge` / `resolve` | Ignore | `resolved` | Idempotent `200`, no-op |
+
+```mermaid
+stateDiagram-v2
+    [*] --> triggered: trigger (new dedupKey)
+    triggered --> triggered: duplicate trigger (occurrenceCount++)
+    triggered --> triggered: ack timeout (escalate to next level)
+    triggered --> acknowledged: acknowledge (CAS on version)
+    triggered --> resolved: resolve / auto-resolve
+    acknowledged --> acknowledged: duplicate ack (idempotent 200)
+    acknowledged --> resolved: resolve
+    resolved --> [*]: dedupKey freed, next trigger = NEW incident
+```
+
+> Interview line: "Ye state machine chhoti hai lekin **saare bugs iske kinaron par** hote hain: duplicate trigger, duplicate ack, ack ke baad aaya hua timer, aur resolve ke baad wahi dedupKey. Main in chaaron ko explicitly handle karta hoon, aur teeno mein se do -- duplicate ack aur late timer -- **error nahi, silent no-op** hain, kyunki responder ko error dikhana uski raat aur kharab karega."
+
+### Step 6 -- `EscalationScheduler`: ek interface, do implementations
+
+```ts
+export interface ScheduledTimer {
+  timerId: string;
+  incidentId: string;
+  level: number;
+  dueAtMs: number;
+}
+
+export interface EscalationScheduler {
+  schedule(timer: ScheduledTimer): void;
+  cancelForIncident(incidentId: string): number;
+  claimDue(nowMs: number, batch: number): Promise<ScheduledTimer[]>;
+}
+
+// --- Implementation 1: interview / single process ---
+export class InMemoryEscalationScheduler implements EscalationScheduler {
+  private readonly timers = new Map<string, ScheduledTimer>();
+
+  schedule(timer: ScheduledTimer): void {
+    this.timers.set(timer.timerId, timer);
+  }
+
+  cancelForIncident(incidentId: string): number {
+    let n = 0;
+    for (const [id, t] of this.timers) {
+      if (t.incidentId === incidentId) {
+        this.timers.delete(id);
+        n++;
+      }
+    }
+    return n;
+  }
+
+  async claimDue(nowMs: number, batch: number): Promise<ScheduledTimer[]> {
+    const due = [...this.timers.values()]
+      .filter((t) => t.dueAtMs <= nowMs)
+      .sort((a, b) => a.dueAtMs - b.dueAtMs)
+      .slice(0, batch);
+    for (const t of due) this.timers.delete(t.timerId);   // claim = remove (fire once)
+    return due;
+  }
+
+  get pending(): number {
+    return this.timers.size;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `ScheduledTimer` -- timer ek **data row** hai, `setTimeout` handle nahi. Ye ek line poora design decide kar deti hai: data row persist ho sakta hai, replicate ho sakta hai, recover ho sakta hai; `setTimeout` handle process ke saath mar jaata hai.
+- `EscalationScheduler` interface mein sirf **teen** methods: arm, cancel, claim. Itna hi chahiye. Interface chhota rakhna isliye zaruri hai ki production impl (Redis) usko poora kar sake.
+- `claimDue` `Promise` return karta hai even in-memory mein -- taaki Redis impl **same signature** rakhe aur `IncidentService` ko pata hi na chale ki neeche kya hai. (Dependency inversion: service interface par depend karta hai, impl par nahi.)
+- `claimDue` mein **filter + delete ek saath** -- yahi "claim" ka matlab hai. Claim karne ke baad timer map se gayab, isliye doosra tick usko dobara fire nahi karega.
+- `cancelForIncident` -- ack par saare timers hataao. In-memory mein `O(N)` scan hai (N = pending timers). Production mein `incident_timers` ka secondary index ya incident row par `timerId` rakhke `O(1)`.
+- `sort(...).slice(0, batch)` -- `batch` isliye ki storm mein 50,000 timers ek saath due ho sakte hain; ek tick mein sab fire karne se worker aur provider dono chhat jaayenge. Fairness ke liye **oldest first**.
+
+```ts
+// --- Implementation 2: production (Redis ZSET + durable Postgres copy) ---
+import type Redis from 'ioredis';
+import type { Pool } from 'pg';
+
+const CLAIM_LUA = `
+-- KEYS[1] = 'sched:escalations', ARGV[1] = now ms, ARGV[2] = batch size
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+if #due > 0 then redis.call('ZREM', KEYS[1], unpack(due)) end
+return due
+`;
+
+export class RedisZsetEscalationScheduler implements EscalationScheduler {
+  private static readonly KEY = 'sched:escalations';
+
+  constructor(private readonly redis: Redis, private readonly pg: Pool) {
+    this.redis.defineCommand('claimDueTimers', { numberOfKeys: 1, lua: CLAIM_LUA });
+  }
+
+  async scheduleDurable(timer: ScheduledTimer): Promise<void> {
+    // 1) durable copy pehle -- Redis wipe ho jaaye toh recovery job isi se rebuild karega
+    await this.pg.query(
+      `INSERT INTO escalation_timers (id, incident_id, level, due_at, state)
+       VALUES ($1, $2, $3, to_timestamp($4 / 1000.0), 'pending')
+       ON CONFLICT (id) DO NOTHING`,
+      [timer.timerId, timer.incidentId, timer.level, timer.dueAtMs],
+    );
+    // 2) phir fast path
+    await this.redis.zadd(RedisZsetEscalationScheduler.KEY, timer.dueAtMs, timer.timerId);
+  }
+
+  schedule(timer: ScheduledTimer): void {
+    void this.scheduleDurable(timer);
+  }
+
+  async cancelDurable(incidentId: string): Promise<number> {
+    const { rows } = await this.pg.query<{ id: string }>(
+      `UPDATE escalation_timers SET state = 'cancelled'
+       WHERE incident_id = $1 AND state = 'pending' RETURNING id`,
+      [incidentId],
+    );
+    if (rows.length > 0) {
+      await this.redis.zrem(RedisZsetEscalationScheduler.KEY, ...rows.map((r) => r.id));
+    }
+    return rows.length;
+  }
+
+  cancelForIncident(incidentId: string): number {
+    void this.cancelDurable(incidentId);
+    return 0; // real signature Promise<number> hoti; interview mein bol do
+  }
+
+  async claimDue(nowMs: number, batch: number): Promise<ScheduledTimer[]> {
+    const ids: string[] = await (this.redis as any).claimDueTimers(
+      RedisZsetEscalationScheduler.KEY, String(nowMs), String(batch),
+    );
+    if (ids.length === 0) return [];
+    const { rows } = await this.pg.query(
+      `UPDATE escalation_timers SET state = 'fired'
+       WHERE id = ANY($1::uuid[]) AND state = 'pending'
+       RETURNING id, incident_id, level, extract(epoch from due_at) * 1000 AS due_at_ms`,
+      [ids],
+    );
+    return rows.map((r) => ({
+      timerId: r.id, incidentId: r.incident_id, level: r.level, dueAtMs: Number(r.due_at_ms),
+    }));
+  }
+}
+```
+
+**Code Explanation:**
+
+- `CLAIM_LUA` -- spec wala exact script. `ZRANGEBYSCORE ... LIMIT 0, batch` due timers nikalta hai, phir usi script mein `ZREM` unhe hata deta hai. **Read aur remove ek atomic step** -- isliye do scheduler instances same timer do baar fire nahi kar sakte. Agar ye do alag commands hote, dono instances same batch padh lete aur user ko do page jaate.
+- `unpack(due)` -- Lua mein array ko arguments mein spread karna (JS ka `...`).
+- `defineCommand('claimDueTimers', ...)` -- ioredis script ko `EVALSHA` se chalata hai: script ek baar upload, phir har call par sirf SHA jaata hai.
+- `scheduleDurable` mein **order important hai**: pehle Postgres, phir Redis. Ulta karte aur beech mein crash hota, toh Redis mein timer hota par DB mein nahi -- recovery job usko dobara nahi la pata. Is order mein worst case ye hai ki DB mein timer hai par Redis mein nahi, aur **recovery job 60 second mein usko wapas ZSET mein daal dega**. Yaani worst case = thodi der ka lag, page ka miss nahi. **"Duplicate page is OK, missed page is NOT"** -- yahi principle is ek line ke order mein zinda hai.
+- `ON CONFLICT (id) DO NOTHING` -- Kafka consumer retry par same timer dobara insert na ho.
+- `cancelDurable` -- pehle DB mein `cancelled` mark (source of truth), phir `ZREM`. `ZREM` fail bhi ho jaaye toh timer fire hoga, lekin `IncidentService` dekhega ki incident `acknowledged` hai aur **drop kar dega**. Do-layer safety.
+- `claimDue` Redis se ids leta hai aur Postgres mein `state='fired'` karta hai -- `AND state='pending'` ke saath, taaki cancel ho chuka timer galti se fire na ho.
+- **Recovery job** (har 60 s, code yahan nahi): `SELECT id, due_at FROM escalation_timers WHERE state='pending' AND due_at < now() + interval '5 minutes'` -> `ZADD NX`. `NX` isliye ki already-present timer ka score na badle. **Timers ko sirf Redis mein rakhna is system ki sabse badi galti hogi** -- ek Redis failover = us window ke saare escalations gayab.
+
+| Timer strategy | Kaise | Kyun humne nahi liya |
+|---|---|---|
+| `setTimeout` in process | Simple, exact | Process crash / deploy = **timer gaya**. Paging mein unacceptable |
+| DB polling `FOR UPDATE SKIP LOCKED` | Durable, simple, no Redis | Har second full-table scan-ish load; 50K active timers par DB par avoidable pressure. **Chhote scale par ye bilkul sahi choice hai** |
+| Kafka delayed topics | Fixed delay tiers (30 s, 5 min, 30 min) | Arbitrary delay nahi; 7 min ka timeout fit nahi hota |
+| SQS delay queue | Managed | Max delay **15 min** -- hamara 60 min escalation fit nahi hota |
+| Cron (1 min) | Trivial | 1 min granularity + thundering herd; hamara SLO 10 s lag ka hai |
+| **Redis ZSET + Lua claim + Postgres copy** | O(log N) insert, O(log N + k) claim, atomic, HA | **Chosen.** Do systems chahiye -- wahi iski keemat hai |
+
+### Step 7 -- `NotificationDispatcher` (rules, cancel-check, retry with full jitter)
+
+```ts
+export interface ContactMethod {
+  id: string;
+  channel: Channel;
+  address: string;                  // production mein address_enc, KMS envelope encryption
+  verified: boolean;
+}
+
+export interface UserProfile {
+  userId: string;
+  name: string;
+  contactMethods: ContactMethod[];
+  rules: { urgency: 'high' | 'low'; delayMin: number; contactMethodId: string }[];
+}
+
+interface PendingTask {
+  task: NotificationTask;
+  dueAtMs: number;
+  address: string;
+  status: NotificationStatus;
+  settled: boolean;
+}
+
+const MAX_ATTEMPTS = 5;
+
+export class NotificationDispatcher {
+  private readonly pending: PendingTask[] = [];
+  private seq = 0;
+
+  constructor(
+    private readonly store: InMemoryIncidentStore,
+    private readonly users: Map<string, UserProfile>,
+    private readonly providers: Map<Channel, NotificationProvider>,
+    private readonly now: Clock,
+    private readonly rand: Rand,
+    private readonly sleep: Sleep,
+  ) {}
+
+  private urgencyOf(sev: Severity): 'high' | 'low' {
+    return sev === 'critical' || sev === 'error' ? 'high' : 'low';
+  }
+
+  pageUser(incident: Incident, userId: string, level: number): number {
+    const user = this.users.get(userId);
+    if (!user) { log(`    [X] no user ${userId}`); return 0; }
+
+    const urgency = this.urgencyOf(incident.severity);
+    const rules = user.rules.filter((r) => r.urgency === urgency);
+    let queued = 0;
+
+    for (const rule of rules) {
+      const cm = user.contactMethods.find((c) => c.id === rule.contactMethodId);
+      if (!cm || !cm.verified) {
+        log(`    [X] ${user.name}: contact method ${rule.contactMethodId} missing/unverified -- skipped`);
+        continue;
+      }
+      this.pending.push({
+        task: {
+          taskId: `task_${++this.seq}`,
+          incidentId: incident.id,
+          userId,
+          channel: cm.channel,
+          contactMethodId: cm.id,
+          attempt: 0,
+          escalationLevel: level,
+          scheduledFor: new Date(this.now() + rule.delayMin * 60_000).toISOString(),
+        },
+        dueAtMs: this.now() + rule.delayMin * 60_000,
+        address: cm.address,
+        status: 'queued',
+        settled: false,
+      });
+      queued++;
+    }
+
+    if (queued === 0) log(`    [X] ${user.name}: no deliverable contact method for urgency=${urgency}`);
+    else log(`    queued ${queued} notification(s) for ${user.name} (urgency=${urgency}, level ${level})`);
+    return queued;
+  }
+
+  cancelForIncident(incidentId: string): number {
+    let n = 0;
+    for (const p of this.pending) {
+      if (p.task.incidentId === incidentId && p.status === 'queued') {
+        p.status = 'cancelled';
+        // Future task abhi queue mein gaya hi nahi -> koi use padhega hi nahi.
+        // Already-due task in flight hai -> worker ko last-moment check karna hoga.
+        if (p.dueAtMs > this.now()) p.settled = true;
+        n++;
+      }
+    }
+    return n;
+  }
+
+  async tick(nowMs: number): Promise<void> {
+    const due = this.pending
+      .filter((p) => !p.settled && p.dueAtMs <= nowMs)
+      .sort((a, b) => a.dueAtMs - b.dueAtMs);
+    for (const p of due) await this.deliver(p);
+  }
+
+  private async deliver(p: PendingTask): Promise<void> {
+    p.settled = true;
+
+    if (p.status === 'cancelled') {
+      log(`    [X] ${p.task.channel} NOT sent -- task was cancelled by ack/resolve (worker checks before send)`);
+      return;
+    }
+
+    // last-moment check: incident abhi bhi page-worthy hai?
+    const incident = this.store.getById(p.task.incidentId);
+    if (!incident || incident.status !== 'triggered') {
+      p.status = 'cancelled';
+      log(`    [X] ${p.task.channel} skipped -- incident ${p.task.incidentId} is ${incident ? incident.status : 'gone'} (last-moment check)`);
+      return;
+    }
+
+    const provider = this.providers.get(p.task.channel)!;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      p.task.attempt = attempt;
+      const res = await provider.send(p.task, p.address, incident);
+      if (res.status === 'sent') { p.status = 'sent'; return; }
+      if (res.permanent) {
+        p.status = 'failed';
+        log(`    [X] ${p.task.channel} permanent failure -- no retry, next channel`);
+        return;
+      }
+      const cap = Math.min(30_000, 1000 * 2 ** attempt);
+      const delay = Math.floor(this.rand() * cap);              // FULL JITTER
+      log(`    retry ${p.task.channel} in ${delay} ms (full jitter, cap ${cap} ms)`);
+      await this.sleep(delay);
+    }
+    p.status = 'failed';
+    log(`    [X] ${p.task.channel} exhausted ${MAX_ATTEMPTS} attempts -> notifications-dlq`);
+  }
+}
+```
+
+**Code Explanation:**
+
+- `urgencyOf(severity)` -- spec ka default mapping: `critical|error` = high (full paging), `warning|info` = low (email/digest, **raat ko phone nahi bajta**). Ye ek function hai, `if` bikhra hua nahi -- kyunki production mein ye per-service configurable hota hai aur tab sirf yahi function badlega.
+- `rules.filter(r => r.urgency === urgency)` -- user ke notification rules urgency ke hisaab se. Priya ke high rules: `0 min push`, `1 min sms`, `5 min voice`. Low urgency mein sirf push/email.
+- `if (!cm || !cm.verified) continue` -- **unverified contact method par kabhi mat bhejo.** Reasons: (a) galat number par SMS = doosre insaan ko aadhi raat ko alert, (b) compliance, (c) paisa. Aur skip ko **log** karna zaruri hai -- warna on-call ko lagega system ne page kiya tha.
+- `if (queued === 0)` -- ek user jiska koi deliverable contact method nahi. Production mein ye ek **alert-worthy event** hai (`notification_no_contact_total`), kyunki iska matlab ek on-call insaan effectively invisible hai.
+- `dueAtMs = now + delayMin * 60_000` -- per-user rule ka delay. Ye **staircase** hai: push abhi (muft, instant), SMS 1 min baad (sasta), voice 5 min baad (mehnga par jagata hai). Cost bhi design constraint hai, sirf latency nahi.
+- `taskId` -- har task ka apna id. Production mein `notifications.task_id` unique index isi par, taaki Kafka ka duplicate consume do SMS na bheje.
+- `cancelForIncident` mein do cases:
+  - `dueAtMs > now` -> task abhi queue mein gaya hi nahi (Kafka mein produce hi nahi hua) -> `settled = true`, chup-chaap khatam.
+  - `dueAtMs <= now` -> task in flight hai -> sirf `status = 'cancelled'` mark; worker `deliver()` mein khud check karega. **Ye do-layer cancellation hi ack ke baad aane wale phantom SMS rokti hai.**
+- `deliver()` mein **do checks, ek ke baad ek**: (1) task cancelled hai kya, (2) incident abhi bhi `triggered` hai kya. Doosra check isliye alag hai ki ack kisi doosre pod par ho sakta hai aur Redis/DB cancel flag time par na pahunche. **Source of truth hamesha incident ka status hai.**
+- Retry loop: `MAX_ATTEMPTS = 5` per channel. `res.permanent` par **turant stop** -- Twilio 4xx (invalid number) 5 baar bhejne se sahi nahi ho jaayega.
+- `cap = Math.min(30_000, 1000 * 2 ** attempt)` -> 1s, 2s, 4s, 8s, 16s (30s par capped). `delay = rand() * cap` -- **full jitter**. Sirf exponential backoff karte toh 1,000 failed workers exactly 2 second baad ek saath wapas aate aur provider ko dobara gira dete (thundering herd). Jitter unko 0-2000 ms mein phaila deta hai.
+- Exhausted -> `notifications-dlq`. DLQ par alert hota hai; DLQ worker manually ya failover provider se replay karta hai. **Aur ye ek page ka "silent death" nahi hai** -- incident abhi bhi `triggered` hai, toh escalation timer agle level par page kar dega. Do independent safety nets.
+- Production mein ye loop `notification.worker.ts` ke andar hai: `notifications` Kafka topic (48 partitions, key = `incidentId`), `enable.auto.commit=false`, DB write ke baad manual commit, per-provider concurrency cap (Twilio long code ~1 SMS/sec) aur per-provider circuit breaker (`cb:<provider>`, 30 s window, >50% fail in >=20 req -> open 30 s).
+
+### Step 8 -- Fake provider + routing + the service that glues it
+
+```ts
+export class FakeProvider implements NotificationProvider {
+  private calls = 0;
+  constructor(
+    public readonly name: string,
+    public readonly channel: Channel,
+    private readonly script: Array<'ok' | 'soft' | 'hard'> = [],
+  ) {}
+
+  async send(task: NotificationTask, address: string, incident: Incident): Promise<ProviderResult> {
+    const outcome = this.script[this.calls++] ?? 'ok';
+    if (outcome === 'ok') {
+      log(`    ${this.name} -> ${mask(address)} : SENT   "${incident.summary}" (attempt ${task.attempt})`);
+      return { providerMessageId: `${this.name}_${this.calls}`, status: 'sent' };
+    }
+    if (outcome === 'hard') {
+      log(`    ${this.name} -> ${mask(address)} : FAILED permanent (invalid address)`);
+      return { providerMessageId: '', status: 'failed', permanent: true };
+    }
+    log(`    ${this.name} -> ${mask(address)} : FAILED transient (attempt ${task.attempt})`);
+    return { providerMessageId: '', status: 'failed' };
+  }
+}
+
+function mask(a: string): string {
+  return a.startsWith('+') ? `${a.slice(0, 3)}XXXXXX${a.slice(-4)}` : a;
+}
+
+export interface RoutingPlan { level: number; ackTimeoutMin: number; userIds: string[] }
+
+export interface RoutingService {
+  planFor(serviceId: string, level: number, atMs: number): RoutingPlan | null;
+  repeatCount(serviceId: string): number;
+}
+
+export class StaticRouting implements RoutingService {
+  constructor(
+    private readonly policies: Map<string, {
+      repeatCount: number;
+      levels: { level: number; ackTimeoutMin: number; userIds: string[] }[];
+    }>,
+  ) {}
+
+  planFor(serviceId: string, level: number, _atMs: number): RoutingPlan | null {
+    const rule = this.policies.get(serviceId)?.levels.find((l) => l.level === level);
+    return rule ? { level, ackTimeoutMin: rule.ackTimeoutMin, userIds: rule.userIds } : null;
+  }
+
+  repeatCount(serviceId: string): number {
+    return this.policies.get(serviceId)!.repeatCount;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `FakeProvider` ek **script** leta hai: `['soft', 'ok']` matlab pehla call transient fail, doosra success. Isse retry + jitter ka path bina real network ke test ho jaata hai. `'hard'` = permanent 4xx.
+- `mask(address)` -- logs mein phone kabhi plain nahi. `+919876543210` -> `+91XXXXXX3210`. Ye ek line PII leak ka poora class of bug band karti hai (logs Datadog/Loki/S3 sab jagah jaate hain).
+- `RoutingService.planFor(serviceId, level, atMs)` mein `atMs` **dikhne mein bekaar** hai (static impl use nahi karta), lekin signature mein hai kyunki production `oncall.service.ts` ko time chahiye: rotation index = `floor((at - handoffAt) / rotationLengthMs) % memberIds.length`, phir `schedule_overrides` apply. Interview mein ye bolna: "main signature production ke hisaab se rakh raha hoon, impl abhi static hai."
+- `planFor` `null` return karta hai jab us level ka rule nahi hai -- yahi "escalation ke levels khatam" ka signal hai, aur `IncidentService` usko round-wrap ya exhausted mein badalta hai.
+- `repeatCount` -- policy kitni baar poori wrap karegi (default 2). Uske baad `escalation exhausted` timeline entry aur bas -- infinite paging nahi.
+- **DST ka note** (interviewer ko bolo, code mein mat likho): rotation ka hisaab hamesha **UTC instants** par karo aur display ke liye IANA timezone (Luxon `DateTime.fromMillis(ms, { zone: 'Asia/Kolkata' })`). `new Date(y, m, d, 2, 0)` kabhi mat likho -- spring-forward wale din 2 AM exist hi nahi karta aur handoff silently khisak jaata hai.
+
+```ts
+export type HandleOutcome =
+  | { kind: 'created'; incident: Incident }
+  | { kind: 'deduped'; incident: Incident }
+  | { kind: 'acknowledged'; incident: Incident }
+  | { kind: 'resolved'; incident: Incident }
+  | { kind: 'ignored'; reason: string };
+
+export class IncidentService {
+  private timerSeq = 0;
+
+  constructor(
+    private readonly store: InMemoryIncidentStore,
+    private readonly routing: RoutingService,
+    private readonly scheduler: EscalationScheduler,
+    private readonly dispatcher: NotificationDispatcher,
+    private readonly now: Clock,
+  ) {}
+
+  handleEvent(evt: IncomingEvent, serviceId: string): HandleOutcome {
+    switch (evt.eventAction) {
+      case 'trigger':
+        return this.onTrigger(evt, serviceId);
+      case 'acknowledge': {
+        const inc = this.store.findOpenByDedup(serviceId, evt.dedupKey);
+        return inc ? this.acknowledge(inc.id, 'monitoring') : { kind: 'ignored', reason: 'no open incident' };
+      }
+      case 'resolve': {
+        const inc = this.store.findOpenByDedup(serviceId, evt.dedupKey);
+        return inc ? this.resolve(inc.id, 'monitoring') : { kind: 'ignored', reason: 'already resolved' };
+      }
+    }
+  }
+
+  private onTrigger(evt: IncomingEvent, serviceId: string): HandleOutcome {
+    const { incident, created } = this.store.upsertOnTrigger({
+      serviceId,
+      dedupKey: evt.dedupKey,
+      severity: evt.payload.severity,
+      summary: evt.payload.summary,
+      source: evt.payload.source,
+    });
+
+    if (!created) {
+      log(`DEDUP  ${incident.id} occurrenceCount=${incident.occurrenceCount} (no page)`);
+      return { kind: 'deduped', incident };
+    }
+
+    log(`TRIGGER ${incident.id} "${incident.summary}" severity=${incident.severity} dedupKey=${incident.dedupKey}`);
+    this.page(incident, 1, 'notified');
+    return { kind: 'created', incident };
+  }
+
+  private page(incident: Incident, level: number, timelineType: string): boolean {
+    const plan = this.routing.planFor(incident.serviceId, level, this.now());
+    if (!plan) return false;
+
+    log(`  ${timelineType.toUpperCase()} level ${level} -> [${plan.userIds.join(', ')}] ackTimeout=${plan.ackTimeoutMin}min`);
+    for (const userId of plan.userIds) this.dispatcher.pageUser(incident, userId, level);
+
+    const timer: ScheduledTimer = {
+      timerId: `tmr_${++this.timerSeq}`,
+      incidentId: incident.id,
+      level,
+      dueAtMs: this.now() + plan.ackTimeoutMin * 60_000,
+    };
+    this.scheduler.schedule(timer);
+    log(`  timer ${timer.timerId} armed, dueAt t=${Math.round(timer.dueAtMs / 1000)}s`);
+    return true;
+  }
+
+  onEscalationTimer(timer: ScheduledTimer): void {
+    const incident = this.store.getById(timer.incidentId);
+    if (!incident) return;
+
+    if (incident.status !== 'triggered') {
+      log(`  timer ${timer.timerId} fired but ${incident.id} is ${incident.status} -- ignored (stale)`);
+      return;
+    }
+
+    const nextLevel = timer.level + 1;
+    if (this.routing.planFor(incident.serviceId, nextLevel, this.now())) {
+      this.store.transition(incident.id, incident.version, { escalationLevel: nextLevel });
+      log(`ESCALATE ${incident.id} no ack in time -> level ${nextLevel}`);
+      this.page(incident, nextLevel, 'escalated');
+      return;
+    }
+
+    const round = incident.escalationRound + 1;
+    this.store.transition(incident.id, incident.version, { escalationRound: round, escalationLevel: 1 });
+    if (round >= this.routing.repeatCount(incident.serviceId)) {
+      log(`EXHAUSTED ${incident.id} escalation exhausted after ${round} round(s) -- timeline entry, no more pages`);
+      return;
+    }
+    log(`REPEAT ${incident.id} round ${round} -- policy wraps back to level 1`);
+    this.page(incident, 1, 'escalated');
+  }
+
+  acknowledge(incidentId: string, userId: string): HandleOutcome {
+    const incident = this.store.getById(incidentId);
+    if (!incident) return { kind: 'ignored', reason: 'unknown incident' };
+
+    if (incident.status !== 'triggered') {
+      log(`ACK    ${incident.id} already ${incident.status} (by ${incident.acknowledgedBy ?? '-'}) -- idempotent 200`);
+      return { kind: 'acknowledged', incident };
+    }
+
+    const updated = this.store.transition(incident.id, incident.version, {
+      status: 'acknowledged', acknowledgedBy: userId,
+    });
+    if (!updated) {
+      log(`ACK    ${incident.id} lost the CAS race -- returning current state, no error`);
+      return { kind: 'acknowledged', incident: this.store.getById(incidentId)! };
+    }
+
+    const t = this.scheduler.cancelForIncident(incident.id);
+    const n = this.dispatcher.cancelForIncident(incident.id);
+    log(`ACK    ${incident.id} by ${userId} -- cancelled ${t} timer(s), ${n} queued notification(s)`);
+    return { kind: 'acknowledged', incident: updated };
+  }
+
+  resolve(incidentId: string, userId: string): HandleOutcome {
+    const incident = this.store.getById(incidentId);
+    if (!incident) return { kind: 'ignored', reason: 'unknown incident' };
+
+    if (incident.status === 'resolved') {
+      log(`RESOLVE ${incident.id} already resolved -- idempotent 200`);
+      return { kind: 'resolved', incident };
+    }
+
+    const updated = this.store.transition(incident.id, incident.version, {
+      status: 'resolved', resolvedAt: new Date(this.now()),
+    });
+    if (!updated) return { kind: 'resolved', incident: this.store.getById(incidentId)! };
+
+    const t = this.scheduler.cancelForIncident(incident.id);
+    const n = this.dispatcher.cancelForIncident(incident.id);
+    log(`RESOLVE ${incident.id} by ${userId} -- cancelled ${t} timer(s), ${n} notification(s); dedupKey free again`);
+    return { kind: 'resolved', incident: updated };
+  }
+}
+```
+
+**Code Explanation:**
+
+- `HandleOutcome` ek **discriminated union** hai. Caller (`events.controller.ts`) `switch (outcome.kind)` karke response banata hai, aur TypeScript har case check karta hai. `boolean` return karne se kaafi behtar -- "created" aur "deduped" dono `true` hote aur metric galat nikalta.
+- `handleEvent` ek **thin router** hai: action ke hisaab se teen methods. Business logic methods mein hai, `switch` mein nahi.
+- `acknowledge` / `resolve` **do entry points** se aate hain: monitoring ka event (`eventAction: 'acknowledge'`) aur responder ka API call (`POST /api/v1/incidents/:id/acknowledge`). Dono ek hi method par milte hain -- isliye SMS reply "4", voice DTMF "4", mobile app aur email link, sab exactly same behaviour dete hain.
+- `onTrigger` mein sabse important line: `if (!created) { ... return }` -- **95% events yahin ruk jaate hain.** Metric `dedup_hits_total` yahin badhta hai. Agar ye line galat hui toh monitoring ka har 30-second repeat ek naya page ban jaayega.
+- `page()` **do kaam ek saath** karta hai: notify + timer arm. Ye pair kabhi alag nahi hona chahiye -- notify bina timer = koi escalate nahi karega; timer bina notify = koi page hi nahi gaya. Production mein ye dono **ek Postgres transaction** mein likhe jaate hain (incident + timeline + timer row), phir Kafka par task produce hota hai.
+- `page()` ke `plan` mein `plan.userIds` ek **array** hai -- ek level par multiple on-call ho sakte hain (primary + secondary layer).
+- `onEscalationTimer` ki pehli guard: `incident.status !== 'triggered'` -> **ignore**. Yahi "timer fired after ack" ka jawab hai. Timer cancel karna best-effort hai; ye check **guarantee** hai.
+- `nextLevel` exist karta hai -> escalate. Nahi karta -> round wrap. `round >= repeatCount` -> `EXHAUSTED`. Note: exhausted par hum incident `resolved` **nahi** karte -- woh abhi bhi open hai aur dashboard par red hai. Machine ne koshish chhod di, insaan ne nahi.
+- `acknowledge` mein `if (incident.status !== 'triggered')` -> **idempotent 200, error nahi.** Interview mein ye bolna: "Responder aadhi raat ko app aur SMS dono se ack kar sakta hai. Doosre ko `409` dena technically sahi aur product ke hisaab se galat hai."
+- `transition(...)` `null` de toh **CAS race haar gaye** -> current state return karo. Kabhi retry loop mat lagao: koi aur already ack kar chuka hai, kaam ho gaya.
+- `cancelForIncident` **dono** par -- scheduler aur dispatcher. Teesri layer `deliver()` ka last-moment check hai. Teen layers isliye ki "ack ke baad page" is product ki #1 complaint hai.
+- `resolve` `triggered` **aur** `acknowledged` dono se allowed hai, aur `resolvedAt` set karke dedup index free karta hai.
+
+### Step 9 -- `main()`: poora scenario chalao
+
+```ts
+let fakeNow = 0;
+const clock: Clock = () => fakeNow;
+const rand: Rand = () => 0.5;           // deterministic jitter
+const sleep: Sleep = async () => {};    // test mein wait nahi karna
+
+function log(msg: string): void {
+  console.log(`[t=${String(Math.round(fakeNow / 1000)).padStart(4)}s] ${msg}`);
+}
+
+const store = new InMemoryIncidentStore(clock);
+const scheduler = new InMemoryEscalationScheduler();
+
+const users = new Map<string, UserProfile>([
+  ['u_priya', {
+    userId: 'u_priya', name: 'Priya',
+    contactMethods: [
+      { id: 'cm_p_push', channel: 'push', address: 'fcm:priya-pixel', verified: true },
+      { id: 'cm_p_sms', channel: 'sms', address: '+919876543210', verified: true },
+      { id: 'cm_p_voice', channel: 'voice', address: '+919876543210', verified: true },
+    ],
+    rules: [
+      { urgency: 'high', delayMin: 0, contactMethodId: 'cm_p_push' },
+      { urgency: 'high', delayMin: 1, contactMethodId: 'cm_p_sms' },
+      { urgency: 'high', delayMin: 5, contactMethodId: 'cm_p_voice' },
+      { urgency: 'low', delayMin: 0, contactMethodId: 'cm_p_push' },
+    ],
+  }],
+  ['u_rahul', {
+    userId: 'u_rahul', name: 'Rahul',
+    contactMethods: [
+      { id: 'cm_r_push', channel: 'push', address: 'fcm:rahul-oneplus', verified: true },
+      { id: 'cm_r_sms', channel: 'sms', address: '+919000011111', verified: true },
+    ],
+    rules: [
+      { urgency: 'high', delayMin: 0, contactMethodId: 'cm_r_push' },
+      { urgency: 'high', delayMin: 1, contactMethodId: 'cm_r_sms' },
+    ],
+  }],
+  ['u_sam', {
+    userId: 'u_sam', name: 'Sam',
+    contactMethods: [{ id: 'cm_s_sms', channel: 'sms', address: '+14155550000', verified: false }],
+    rules: [{ urgency: 'high', delayMin: 0, contactMethodId: 'cm_s_sms' }],
+  }],
+]);
+
+const providers = new Map<Channel, NotificationProvider>([
+  ['push', new FakeProvider('fcm', 'push')],
+  ['sms', new FakeProvider('twilio-sms', 'sms', ['soft', 'ok'])],   // pehla SMS transient fail
+  ['voice', new FakeProvider('twilio-voice', 'voice')],
+]);
+
+const routing = new StaticRouting(new Map([
+  ['svc_checkout', {
+    repeatCount: 2,
+    levels: [
+      { level: 1, ackTimeoutMin: 5, userIds: ['u_priya'] },
+      { level: 2, ackTimeoutMin: 5, userIds: ['u_rahul', 'u_sam'] },
+    ],
+  }],
+  ['svc_cron', { repeatCount: 1, levels: [{ level: 1, ackTimeoutMin: 5, userIds: ['u_priya'] }] }],
+]));
+
+const dispatcher = new NotificationDispatcher(store, users, providers, clock, rand, sleep);
+const incidents = new IncidentService(store, routing, scheduler, dispatcher, clock);
+
+function ev(action: EventAction, dedupKey: string, summary: string,
+            severity: Severity = 'critical'): IncomingEvent {
+  return {
+    routingKey: 'R0UT1NGK3Y',
+    eventAction: action,
+    dedupKey,
+    payload: { summary, source: 'web-3', severity },
+    receivedAt: new Date(fakeNow).toISOString(),
+    eventId: `evt_${Math.round(fakeNow)}`,
+  };
+}
+
+// ek "tick": clock set karo, action chalao, due timers claim karo, due notifications bhejo
+async function at(tMs: number, fn?: () => void): Promise<void> {
+  fakeNow = tMs;
+  if (fn) fn();
+  for (const timer of await scheduler.claimDue(tMs, 100)) incidents.onEscalationTimer(timer);
+  await dispatcher.tick(tMs);
+}
+
+async function main(): Promise<void> {
+  console.log('=== Scenario A: trigger -> push -> no ack -> escalate -> ack -> cancel -> resolve ===');
+  await at(0, () => incidents.handleEvent(ev('trigger', 'cpu-high-web-3', 'CPU 97% on web-3'), 'svc_checkout'));
+  await at(1_000, () => incidents.handleEvent(ev('trigger', 'cpu-high-web-3', 'CPU 97% on web-3'), 'svc_checkout'));
+  await at(60_000);
+  await at(300_000);
+  await at(330_000, () => incidents.acknowledge('inc_1', 'u_rahul'));
+  await at(331_000, () => incidents.acknowledge('inc_1', 'u_priya'));       // ack race
+  await at(400_000, () => incidents.handleEvent(ev('resolve', 'cpu-high-web-3', 'CPU back to normal'), 'svc_checkout'));
+  await at(401_000, () => incidents.handleEvent(ev('trigger', 'cpu-high-web-3', 'CPU 97% on web-3'), 'svc_checkout'));
+  await at(401_500, () => incidents.resolve('inc_2', 'u_priya'));
+
+  console.log('\n=== Scenario B: ack before the first notification is even sent ===');
+  await at(500_000, () => {
+    incidents.handleEvent(ev('trigger', 'disk-full-db-1', 'Disk 95% on db-1'), 'svc_checkout');
+    incidents.acknowledge('inc_3', 'u_priya');
+  });
+  await at(501_000);
+
+  console.log('\n=== Scenario C: a timer that survived the ack (Redis failover re-added it) ===');
+  scheduler.schedule({ timerId: 'tmr_zombie', incidentId: 'inc_3', level: 1, dueAtMs: 502_000 });
+  await at(502_000);
+  await at(503_000, () => incidents.resolve('inc_3', 'u_priya'));
+
+  console.log('\n=== Scenario D: nobody acks -> escalation exhausted (repeatCount 1, single level) ===');
+  await at(600_000, () => incidents.handleEvent(ev('trigger', 'cron-missed', 'nightly-billing cron did not run'), 'svc_cron'));
+  await at(660_000);
+  await at(900_000);
+  console.log(`\nopen incidents = ${store.openCount}, pending timers = ${scheduler.pending}`);
+}
+
+void main();
+```
+
+**Actual output:**
+
+```
+=== Scenario A: trigger -> push -> no ack -> escalate -> ack -> cancel -> resolve ===
+[t=   0s] TRIGGER inc_1 "CPU 97% on web-3" severity=critical dedupKey=cpu-high-web-3
+[t=   0s]   NOTIFIED level 1 -> [u_priya] ackTimeout=5min
+[t=   0s]     queued 3 notification(s) for Priya (urgency=high, level 1)
+[t=   0s]   timer tmr_1 armed, dueAt t=300s
+[t=   0s]     fcm -> fcm:priya-pixel : SENT   "CPU 97% on web-3" (attempt 0)
+[t=   1s] DEDUP  inc_1 occurrenceCount=2 (no page)
+[t=  60s]     twilio-sms -> +91XXXXXX3210 : FAILED transient (attempt 0)
+[t=  60s]     retry sms in 500 ms (full jitter, cap 1000 ms)
+[t=  60s]     twilio-sms -> +91XXXXXX3210 : SENT   "CPU 97% on web-3" (attempt 1)
+[t= 300s] ESCALATE inc_1 no ack in time -> level 2
+[t= 300s]   ESCALATED level 2 -> [u_rahul, u_sam] ackTimeout=5min
+[t= 300s]     queued 2 notification(s) for Rahul (urgency=high, level 2)
+[t= 300s]     [X] Sam: contact method cm_s_sms missing/unverified -- skipped
+[t= 300s]     [X] Sam: no deliverable contact method for urgency=high
+[t= 300s]   timer tmr_2 armed, dueAt t=600s
+[t= 300s]     twilio-voice -> +91XXXXXX3210 : SENT   "CPU 97% on web-3" (attempt 0)
+[t= 300s]     fcm -> fcm:rahul-oneplus : SENT   "CPU 97% on web-3" (attempt 0)
+[t= 330s] ACK    inc_1 by u_rahul -- cancelled 1 timer(s), 1 queued notification(s)
+[t= 331s] ACK    inc_1 already acknowledged (by u_rahul) -- idempotent 200
+[t= 400s] RESOLVE inc_1 by monitoring -- cancelled 0 timer(s), 0 notification(s); dedupKey free again
+[t= 401s] TRIGGER inc_2 "CPU 97% on web-3" severity=critical dedupKey=cpu-high-web-3
+[t= 401s]   NOTIFIED level 1 -> [u_priya] ackTimeout=5min
+[t= 401s]     queued 3 notification(s) for Priya (urgency=high, level 1)
+[t= 401s]   timer tmr_3 armed, dueAt t=701s
+[t= 401s]     fcm -> fcm:priya-pixel : SENT   "CPU 97% on web-3" (attempt 0)
+[t= 402s] RESOLVE inc_2 by u_priya -- cancelled 1 timer(s), 2 notification(s); dedupKey free again
+
+=== Scenario B: ack before the first notification is even sent ===
+[t= 500s] TRIGGER inc_3 "Disk 95% on db-1" severity=critical dedupKey=disk-full-db-1
+[t= 500s]   NOTIFIED level 1 -> [u_priya] ackTimeout=5min
+[t= 500s]     queued 3 notification(s) for Priya (urgency=high, level 1)
+[t= 500s]   timer tmr_4 armed, dueAt t=800s
+[t= 500s] ACK    inc_3 by u_priya -- cancelled 1 timer(s), 3 queued notification(s)
+[t= 500s]     [X] push NOT sent -- task was cancelled by ack/resolve (worker checks before send)
+
+=== Scenario C: a timer that survived the ack (Redis failover re-added it) ===
+[t= 502s]   timer tmr_zombie fired but inc_3 is acknowledged -- ignored (stale)
+[t= 503s] RESOLVE inc_3 by u_priya -- cancelled 0 timer(s), 0 notification(s); dedupKey free again
+
+=== Scenario D: nobody acks -> escalation exhausted (repeatCount 1, single level) ===
+[t= 600s] TRIGGER inc_4 "nightly-billing cron did not run" severity=critical dedupKey=cron-missed
+[t= 600s]   NOTIFIED level 1 -> [u_priya] ackTimeout=5min
+[t= 600s]     queued 3 notification(s) for Priya (urgency=high, level 1)
+[t= 600s]   timer tmr_5 armed, dueAt t=900s
+[t= 600s]     fcm -> fcm:priya-pixel : SENT   "nightly-billing cron did not run" (attempt 0)
+[t= 660s]     twilio-sms -> +91XXXXXX3210 : SENT   "nightly-billing cron did not run" (attempt 0)
+[t= 900s] EXHAUSTED inc_4 escalation exhausted after 1 round(s) -- timeline entry, no more pages
+[t= 900s]     twilio-voice -> +91XXXXXX3210 : SENT   "nightly-billing cron did not run" (attempt 0)
+
+open incidents = 1, pending timers = 0
+```
+
+**Code Explanation -- output kya prove karta hai:**
+
+- **t=0** -- naya incident `inc_1`, level 1 par Priya, 3 notifications queue (push@0, sms@60s, voice@300s), timer `tmr_1` 5 minute baad ke liye armed, aur push turant chala gaya. **Yahi hamara p95 < 5 s wala path hai.**
+- **t=1s** -- wahi alert dobara: `DEDUP ... occurrenceCount=2 (no page)`. Monitoring har 30 s repeat bhejta hai; agar ye line na hoti toh Priya ka phone poori raat bajta rehta.
+- **t=60s** -- SMS pehli koshish mein transient fail, `retry sms in 500 ms (full jitter, cap 1000 ms)`, doosri koshish success. `rand = () => 0.5` aur `cap = min(30000, 1000 * 2^0) = 1000` -> `500`. Real system mein `rand()` random hota, isliye 1,000 workers 0-1000 ms mein phail jaate.
+- **t=300s** -- koi ack nahi aaya -> timer fire -> `ESCALATE ... level 2`. Level 2 par Rahul **aur** Sam. Sam ka SMS unverified hai -> **do log lines** (`skipped` + `no deliverable contact method`). Interviewer ko yahin bolo: "ye metric par alert hona chahiye, kyunki ek on-call effectively reachable nahi hai."
+- **t=300s** -- Priya ka `voice` (5 min delay) bhi ab due tha, woh bhi gaya. Yaani escalation ke waqt purane level ki queued notifications **automatically** cancel nahi hotin -- ack karti hai, escalation nahi.
+- **t=330s** -- Rahul ne ack kiya: `cancelled 1 timer(s), 1 queued notification(s)`. Timer `tmr_2` gaya aur Rahul ka pending SMS (360s wala) gaya. **Ab is incident par ek bhi aur page nahi jaayega.**
+- **t=331s** -- Priya ne bhi ack kiya (race): `already acknowledged (by u_rahul) -- idempotent 200`. Koi error nahi, koi state change nahi.
+- **t=400s** -- monitoring ne `resolve` bheja: `RESOLVE inc_1 by monitoring ... dedupKey free again`.
+- **t=401s** -- **wahi dedupKey** dobara -> `TRIGGER inc_2` (naya incident). Ye dedup contract ka doosra aadha hissa hai: dedup **sirf open incidents par** lagta hai. Agar hum resolve par index free na karte, CPU dobara 97% hone par kisi ko page hi nahi jaata.
+- **Scenario B (t=500s)** -- trigger aur ack **ek hi tick** mein. Timer + teeno notifications cancel; push (delay 0, yaani already due) `NOT sent -- worker checks before send`. Ye woh case hai jo `setTimeout`-based design mein miss ho jaata: task queue mein ja chuka hota hai, isliye **bhejne se pehle check** hi bachata hai.
+- **Scenario C (t=502s)** -- maine jaan-boojh kar ek **zombie timer** daala (jaise Redis failover ke baad recovery job ne Postgres se rebuild kiya ho). Timer fire hua, par `inc_3` `acknowledged` hai -> `ignored (stale)`. **Cancellation best-effort hai; status check guarantee hai.**
+- **Scenario D** -- `svc_cron` ki policy mein sirf level 1 aur `repeatCount 1`. t=600s page, t=660s SMS, t=900s par timer fire hua par agla level nahi hai -> round 1 = repeatCount -> `EXHAUSTED`. Note karo: **incident resolve nahi hua**, `open incidents = 1`. Machine ne paging band ki, incident abhi bhi dashboard par red hai.
+- **`pending timers = 0`** -- end mein koi timer leak nahi. Ye chhota assertion hi tumhare cancellation logic ka proof hai.
+
+### Step 10 -- Edge cases (interviewer zaroor poochega)
+
+| Edge case | Humara code kya karta hai | Production mein |
+|---|---|---|
+| **Duplicate trigger event** | `openByDedup` hit -> `occurrenceCount++`, `created: false`, koi page nahi | Postgres `ON CONFLICT ... WHERE status <> 'resolved'` + `xmax = 0`; Redis `dedup:<serviceId>:<dedupKey>` sirf fast path |
+| **Ack aaya pehli notification bhejne se bhi pehle** | Task `cancelled` mark; worker `deliver()` mein pehla check hi usko rok deta hai (Scenario B) | Kafka message already produced ho sakta hai -> worker DB se `notifications.status` + incident status padhta hai |
+| **Resolve jab escalation chal rahi ho** | `resolve` kisi bhi non-resolved state se allowed; timers + tasks cancel; dedup index free | Ek transaction: incident update + `escalation_timers.state='cancelled'` + `notifications.status='cancelled'`, phir `ZREM` |
+| **Timer ack ke baad fire hua (zombie)** | `onEscalationTimer` guard: `status !== 'triggered'` -> log + drop (Scenario C) | Wahi guard. Recovery job `ZADD NX` karta hai isliye ye case **normal** hai, exception nahi |
+| **Do responder ek hi second mein ack** | `transition(id, expectedVersion, ...)` -> ek jeeta, doosre ko current state, **error nahi** | `UPDATE ... WHERE status='triggered' AND version=$3`; 0 rows -> `200` with current state |
+| **Empty on-call schedule (koi rotation member nahi)** | `planFor` `null` -> `page()` `false`, escalation agle level par ya exhausted | `oncall.service.ts` empty result par: **account admin ko page karo** (fallback target) + `oncall_empty_total` alert. Silent drop kabhi nahi |
+| **User ke paas koi verified contact method nahi** | Log `no deliverable contact method`, task queue hi nahi hota | `notification_no_contact_total` metric + alert; onboarding mein verification mandatory |
+| **Escalation exhausted** | `round >= repeatCount` -> timeline entry, paging band, incident **open rehta hai** | Timeline `escalation_exhausted` + account-level alert + dashboard badge |
+| **Provider permanent 4xx (invalid number)** | `res.permanent` -> koi retry nahi, agla channel | Contact method `verified = false` mark karo + user ko email |
+| **Provider 5xx / timeout / 429** | Full jitter retry, 5 attempts, phir DLQ | + per-provider circuit breaker (`cb:<provider>`), failover (Twilio -> MessageBird), channel downgrade |
+| **Alert storm (1 min mein 100 incidents)** | Is code mein nahi | Redis `grp:<serviceId>:<minute>` INCR; >10 -> grouped notification per 5 min ("checkout: 63 new incidents"); incidents phir bhi bante hain (audit) |
+| **Kafka down (ingest)** | Is code mein nahi | Local disk spool ~60 s, phir `503 INGEST_UNAVAILABLE`. **Fail closed** -- jo page deliver nahi kar sakte usko accept karna, reject karne se bura hai |
+| **Clock peeche gaya (NTP)** | Timer `dueAtMs` absolute hai, relative nahi -> peeche jaana sirf fire late karta hai, galat nahi | Scheduler Redis `TIME` ya DB `now()` se; `timer_lag_seconds` metric alert > 10 s |
+| **Duplicate Kafka consume (at-least-once)** | `taskId` per task unique | `notifications_task_uniq` unique index + provider-side idempotency key -> mostly ek hi SMS. **100% exactly-once nahi, aur ye acceptable hai** |
+
+### Step 11 -- Unit tests (fake clock hi asli trick hai)
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest';
+
+describe('IncidentService', () => {
+  let t: number;
+  let store: InMemoryIncidentStore;
+  let scheduler: InMemoryEscalationScheduler;
+  let service: IncidentService;
+
+  beforeEach(() => {
+    t = 0;
+    const clock: Clock = () => t;
+    store = new InMemoryIncidentStore(clock);
+    scheduler = new InMemoryEscalationScheduler();
+    service = new IncidentService(store, routing, scheduler, dispatcher, clock);
+  });
+
+  it('same dedupKey ka doosra trigger naya incident nahi banata', () => {
+    const a = service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    const b = service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    expect(a.kind).toBe('created');
+    expect(b.kind).toBe('deduped');
+    expect((b as { incident: Incident }).incident.occurrenceCount).toBe(2);
+    expect(store.openCount).toBe(1);
+  });
+
+  it('resolve ke baad wahi dedupKey naya incident banata hai', () => {
+    service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    service.resolve('inc_1', 'u_priya');
+    const again = service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    expect(again.kind).toBe('created');
+  });
+
+  it('5 minute tak ack na ho toh level 2 par escalate hota hai', async () => {
+    service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    t = 4 * 60_000;
+    expect(await scheduler.claimDue(t, 10)).toHaveLength(0);   // abhi nahi
+    t = 5 * 60_000;
+    const due = await scheduler.claimDue(t, 10);
+    expect(due).toHaveLength(1);
+    service.onEscalationTimer(due[0]);
+    expect(store.getById('inc_1')!.escalationLevel).toBe(2);
+  });
+
+  it('ack saare pending timers cancel kar deta hai', async () => {
+    service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    service.acknowledge('inc_1', 'u_priya');
+    t = 10 * 60_000;
+    expect(await scheduler.claimDue(t, 10)).toHaveLength(0);
+    expect(scheduler.pending).toBe(0);
+  });
+
+  it('ack ke baad aaya hua timer ignore hota hai (zombie timer)', () => {
+    service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    service.acknowledge('inc_1', 'u_priya');
+    service.onEscalationTimer({ timerId: 'zombie', incidentId: 'inc_1', level: 1, dueAtMs: t });
+    const inc = store.getById('inc_1')!;
+    expect(inc.status).toBe('acknowledged');
+    expect(inc.escalationLevel).toBe(1);
+  });
+
+  it('doosra ack error nahi deta (idempotent)', () => {
+    service.handleEvent(ev('trigger', 'k1', 'CPU high'), 'svc_checkout');
+    service.acknowledge('inc_1', 'u_rahul');
+    const second = service.acknowledge('inc_1', 'u_priya');
+    expect(second.kind).toBe('acknowledged');
+    expect(store.getById('inc_1')!.acknowledgedBy).toBe('u_rahul');   // pehla jeeta
+  });
+});
+```
+
+**Code Explanation:**
+
+- `let t = 0; const clock = () => t;` -- **poore test suite ka dil.** `t = 5 * 60_000` likhkar hum "5 minute beet gaye" simulate karte hain. Agar code ke andar `Date.now()` hota, ya `setTimeout` hota, toh is ek test ke liye asli 5 minute lagte -- aur 6 tests = 30 minute. **CI mein koi aisa test suite nahi rakhega, isliye woh test likha hi nahi jaayega, isliye escalation bug production mein milega.** Clock injection ek testing trick nahi, ek **reliability decision** hai.
+- `beforeEach` har test ke liye fresh store + scheduler -- tests ek doosre ka state na dekhein.
+- Test 1 (dedup) aur test 2 (resolve ke baad naya) -- **dedup contract ke dono aadhe hisse.** Ek ke bina doosra adhoora hai; dono hamesha saath likho.
+- Test 3 (escalate) mein `t = 4 * 60_000` par `claimDue` **khaali** -- ye assertion utna hi important hai jitna t=5min wala. "Jaldi fire nahi hona chahiye" bhi ek requirement hai.
+- Test 4 (cancel) -- ack ke baad `t` ko 10 minute aage le jaake bhi kuch due nahi. Ye "ack ke baad page nahi" ka direct proof hai.
+- Test 5 (zombie) -- scheduler ko bypass karke seedha `onEscalationTimer` call kiya. **Guard ko unit test karna** hai, cancel path ko nahi.
+- Test 6 (idempotent ack) -- `acknowledgedBy` pehle wale par rehta hai. CAS ka behaviour.
+- Kya aur test karna: `resolve` while escalating, full jitter `rand` inject karke exact backoff sequence (`rand = () => 0` -> 0 ms, `rand = () => 0.999` -> ~cap), unverified contact method skip, aur grouping threshold.
+
+### Step 12 -- Complexity
+
+Pehle symbols fix karo:
+
+- **I** = active (non-resolved) incidents
+- **N** = pending escalation timers
+- **k** = ek tick mein due timers
+- **L** = escalation policy ke levels
+- **O** = us schedule ke overlapping overrides
+- **R** = ek user ke notification rules (typically 2-3)
+
+| Operation | Time | Space | Kyun |
+|---|---|---|---|
+| `handleEvent` -> `upsertOnTrigger` | **O(1)** | O(1) | Do `Map` lookups (`openByDedup`, `byId`). Production mein ek indexed `INSERT ... ON CONFLICT` -- B-tree lookup, effectively O(log I) |
+| `handleEvent` -> `acknowledge` / `resolve` | **O(1)** + cancel cost | O(1) | Ek `Map` get + CAS. Cancel neeche |
+| `page()` (notify + arm timer) | **O(R)** | O(R) | Har user rule ke liye ek task. `R` chhota aur bounded (per-user rules 2-3) |
+| `resolveOnCall(scheduleId, at)` | **O(L + O)** | O(1) | Layers par ek pass (rotation index ek modulo hai, loop nahi) + overlapping overrides. Production mein `schedule_overrides (schedule_id, starts_at, ends_at)` index se `O` chhota rehta hai |
+| Scheduler tick -- **Redis ZSET** | **O(log N + k)** | O(N) | `ZRANGEBYSCORE ... LIMIT 0, k` = `O(log N + k)`, `ZREM` per member `O(log N)`. Yahi reason hai ki ZSET chuna gaya |
+| Scheduler tick -- in-memory demo impl | **O(N log N)** | O(N) | `filter` + `sort` har tick par. Interview mein theek, production mein nahi -- aur yahi bolna ki "isliye ZSET" |
+| `cancelForIncident` (in-memory) | **O(N)** / **O(P)** | O(1) | Poora scan. Production: `escalation_timers (incident_id)` index -> `O(log N + cancelled)` |
+| `deliver()` ek task | **O(attempts)** = O(5) | O(1) | Bounded retries; backoff `sleep` mein time jaata hai, CPU nahi |
+| Memory -- active incidents | -- | **O(I)** | Spec: ~3,500 typical, storm mein ~50,000. 50K x ~100 B ZSET member = **~5 MB** -- trivial |
+
+> Interview line: "`handleEvent` O(1) hai kyunki dedup ek index lookup hai, scan nahi. Scheduler O(log N + k) hai kyunki ZSET sorted hai aur hum sirf due prefix uthate hain. Memory O(active incidents) hai -- hamare numbers par 50,000 timers ka matlab ~5 MB, yaani **timers memory problem nahi hain.** Asli problem poll fairness aur duplicate fire hai, aur woh atomic Lua claim se solve hoti hai, badi machine se nahi."
+
+---
+
+## PART 27 -- 30-Second Answer
+
+> "At a high level, monitoring tools hamari Events API par `POST /v2/enqueue` karte hain. Ingest API routing key validate karke, per-key rate limit lagakar, event ko Kafka `incident-events` par `acks=all` ke saath likhti hai aur **202 Accepted** deti hai -- yahan hum **fail closed** hain, kyunki jo page deliver nahi kar sakte usko accept karna galat hai. Incident Service consume karke dedup karti hai -- `(serviceId, dedupKey)` par Postgres ka **partial unique index** jo sirf non-resolved rows par lagta hai, isliye 50 million events se sirf 2.5 million incidents bante hain. Naya incident bane toh escalation policy plus on-call schedule se sahi insaan nikalta hai, notification tasks Kafka `notifications` par jaate hain -- per-user rules ke hisaab se 0 min push, 1 min SMS, 5 min voice -- aur ek escalation timer **Redis ZSET** mein armed hota hai jiski durable copy Postgres mein hai. Scheduler har second atomic Lua claim se due timers uthata hai; ack na ho toh agle level par page, ack ho jaaye toh timers aur pending notifications dono cancel. Guiding principle: **duplicate page is OK, missed page is NOT** -- isliye poora system at-least-once hai."
+
+(Bolne mein ~45 seconds. Ingest decision, dedup mechanism, timer mechanism, ek principle -- bas.)
+
+---
+
+## PART 28 -- 5-Minute Interview Answer (natural Hinglish)
+
+> Ise ratna nahi hai. Har minute ka **goal** yaad rakho; words apne aap aayenge. Beech-beech mein check-in: "Is this direction okay?"
+
+### Minute 1 -- requirements clarify
+
+"Main pehle requirements clarify karunga. Hum PagerDuty jaisa on-call alerting bana rahe hain: monitoring tools event bhejte hain, hum incident banate hain, sahi on-call insaan ko dhoondhte hain, aur usko phone par page karte hain jab tak woh acknowledge na kare.
+
+Functional side par paanch cheezein: ek **Events API** with `trigger`, `acknowledge`, `resolve`; **dedup** taaki har 30-second repeat naya incident na bane; **escalation policy** with levels aur ack timeout; **multi-channel delivery** -- push, SMS, voice, email, Slack; aur **acknowledge** jo saara pending kaam cancel kar de.
+
+Non-functional mein mere liye sabse upar **reliability** hai. Ek page ka miss hona matlab production down hai aur kisi ko pata hi nahi chala. Isliye mera guiding principle hai: **duplicate page is OK, missed page is NOT.** Iska seedha matlab hai ki poora system at-least-once hoga, exactly-once ke peeche main nahi bhagunga.
+
+Doosra, **latency**: event accept se pehli notification provider ko handover tak p95 5 second se kam, p99 10 second. Paging hi product hai -- 2 minute late page bekaar hai. Teesra, ingest par **99.99% availability**, kyunki customer ka monitoring tab bolta hai jab uska system already jal raha ho."
+
+### Minute 2 -- scale estimate
+
+"Numbers maan lete hain: 20,000 accounts, 500,000 responder users, 100,000 services.
+
+**50 million events per day** -- 50 million by 86,400 = roughly **580 events per second average**. Lekin alert storm normal hai -- ek data center gira toh sab kuch ek saath bolta hai -- toh peak main 10x maanunga, **~6,000 events per second**.
+
+Ab ek important insight: **dedup ratio ~95% hai**, kyunki monitoring har 30-60 second wahi alert repeat karta hai jab tak problem zinda hai. Toh 50 million events se sirf **2.5 million incidents** -- yaani ~29 incidents per second average, peak ~300. Matlab **ingest bahut heavy hai, par asli kaam bahut kam hai** -- yahi is system ka main leverage point hai.
+
+Notifications: average 3 per incident -- push, SMS, phir ek escalation -- toh **7.5 million per day**, ~87 per second average, peak ~1,000.
+
+Aur ek number jo interviewer ko pasand aata hai: SMS $0.0075 par, 2.25 million SMS = **~$17,000 per day**. Voice ~$5,000 per day. Isliye channel order push -> SMS -> voice hai: **cost bhi ek design constraint hai, sirf latency nahi.**
+
+Active incidents kisi bhi moment par ~3,500 typical, storm mein ~50,000. 50,000 timers Redis ZSET mein ~5 MB hain -- **timers memory problem nahi hain, poll fairness aur duplicate-fire problem hain.**"
+
+### Minute 3 -- architecture aur request flow
+
+"Initially main simple rakhunga -- ek **modular monolith**, microservices nahi. Ek codebase mein ingest, incident aur notify modules, alag deploys optional.
+
+Flow aisa hai: client `POST /v2/enqueue` karta hai. Load balancer se stateless Node.js ingest instances par jaata hai. Ingest teen kaam karta hai -- routing key se serviceId lookup, jo Redis mein 300 second cache hai; per-routing-key **token bucket rate limit**, taaki ek customer ka alert storm baaki sabko na maare; aur validate karke event ko **Kafka `incident-events`** par `acks=all` se likhna. Commit hone ke baad hi **202 Accepted** with dedupKey.
+
+201 nahi, **202**, kyunki processing async hai aur incident abhi bana hi nahi -- main incidentId de hi nahi sakta. Trade-off ye hai ki client ko turant incident id nahi milta; fayda ye hai ki storm mein ingest ka path DB se decoupled hai.
+
+Kafka 24 partitions, key = `serviceId` -- toh ek service ke events ordered rehte hain. Incident Service consumer group padhti hai, dedup karti hai, routing karti hai, notification tasks `notifications` topic par daalti hai (48 partitions, key = incidentId), aur escalation timer arm karti hai. Notification workers provider adapters chalate hain. Providers delivery status webhook se wapas bolte hain.
+
+Postgres primary plus do read replicas -- dashboard queries replicas se. Redis routing key cache, dedup fast path, timers, locks aur grouping counters ke liye.
+
+Ek cheez main **jaan-boojh kar nahi** le raha: CDN. Yahan kuch cache hota hi nahi, sab write path hai. Aur Elasticsearch v1 mein nahi -- incident search Postgres se chal jaati hai."
+
+### Minute 4 -- deep dive: dedup aur timers
+
+"Do mechanisms par main deep dive karna chahunga, kyunki poora system inhi par khada hai.
+
+**Pehla, dedup.** Main Postgres par ek **partial unique index** rakhta hoon: `(service_id, dedup_key)` par, `WHERE status <> 'resolved'`. Phir `INSERT ... ON CONFLICT ... DO UPDATE SET occurrence_count = occurrence_count + 1 RETURNING (xmax = 0) AS inserted`. `xmax = 0` batata hai ki row naya insert hua -- agar haan toh page karo, warna sirf counter badha aur chup raho. Redis mein bhi ek fast path key hai 6 ghante TTL ke saath, lekin **source of truth Postgres ka index hai**, kyunki Redis eviction ya failover par duplicate incident ban sakta hai. Aur partial isliye ki incident resolve hote hi wahi dedupKey free ho jaaye -- warna problem dobara aane par kabhi page hi nahi jaayega.
+
+**Doosra, timers.** `setTimeout` bilkul nahi -- process crash ya deploy matlab timer gaya, matlab page gaya. Main timer ko ek row banata hoon: Redis **ZSET `sched:escalations`**, member = timerId, score = dueAt milliseconds. Scheduler har second ek **atomic Lua script** chalata hai jo `ZRANGEBYSCORE` se due nikalta hai aur usi script mein `ZREM` kar deta hai -- claim aur remove ek step mein, isliye do scheduler instances same timer do baar fire nahi kar sakte. Leader election ki zarurat hi nahi, aur do instances chal sakte hain.
+
+Aur **durable copy Postgres `escalation_timers` mein hai.** Timers ko sirf Redis mein rakhna is system ki sabse badi galti hoti -- ek failover matlab us window ke saare escalations gayab. Har 60 second ek recovery job DB se pending timers padhkar `ZADD NX` karta hai.
+
+Ack aane par teen cheezein hoti hain: timer row `cancelled`, Redis se `ZREM`, aur queued notifications `cancelled`. Plus worker bhejne se **theek pehle** dobara check karta hai ki incident abhi bhi triggered hai -- kyunki task already queue mein ho sakta hai. Cancellation best-effort hai, ye last-moment check guarantee hai."
+
+### Minute 5 -- trade-offs aur failure
+
+"At scale yahan **bottleneck notification providers ho sakte hain**, hamara apna code nahi. Twilio ka ek long code ~1 SMS per second deta hai, aur peak par hamein ~1,000 notifications per second chahiye. Iska matlab multiple sender numbers, provider-side queue, aur workers par **per-provider concurrency cap** -- jo basically wahi rate limiter hai jo humne pichhle system mein banaya tha. Doosra bottleneck storm mein Postgres write throughput hai; uska jawab `serviceId` par partition, monthly table partitions, aur 90 din se purana data S3 Parquet mein.
+
+Failures: **Redis gir gaya** toh timers ZSET se gayab -- recovery job Postgres se rebuild karta hai, escalations kuch second late hoti hain par khoti nahi. **Kafka down** toh ingest local disk par ~60 second spool karta hai aur uske baad **503 INGEST_UNAVAILABLE**. Ye important hai -- **hum ingest par fail closed hain.** Rate limiter mein hum fail **open** the, wahan limiter ki failure se API nahi girni chahiye thi. Yahan ulta hai: **accepting a page you cannot deliver is worse than rejecting it loudly**, kyunki customer ka monitoring 503 dekhkar retry karega ya apne fallback par jaayega, jabki jhootha 202 uska alert chup-chaap kha jaata. **Ek provider down** toh per-provider circuit breaker 30 second ke liye open, failover provider ya channel downgrade.
+
+However, Redis source of truth nahi hai -- na dedup ke liye, na timers ke liye. Woh sirf speed layer hai, aur dono jagah Postgres peeche khada hai.
+
+One trade-off here is **at-least-once vs exactly-once**. Kafka consumers manual commit karte hain DB write ke baad, toh crash par message dobara aa sakta hai. Duplicate SMS `notifications.task_id` unique index aur provider-side idempotency key se mostly ruk jaata hai, par 100% guarantee nahi -- aur main ye accept karta hoon, kyunki exactly-once ki keemat latency aur complexity hai, aur hamara principle kehta hai duplicate page chalega, missed page nahi.
+
+Doosra trade-off: **202 async ingest vs synchronous incident creation.** Sync banate toh client ko turant incidentId milta, lekin ingest DB se coupled ho jaata aur storm mein sabse pehle wahi girta -- theek us waqt jab system ki sabse zyada zarurat hai.
+
+Summary: fail-closed ingest par 202, Kafka se durable event log, Postgres partial unique index se dedup, Redis ZSET plus durable copy se timers, at-least-once delivery with per-task idempotency, aur ack par teen-layer cancellation. Kisi part mein deep dive karein?"
+
+---
+
+## PART 29 -- Whiteboard Drawing Order
+
+**Rule:** diagram ek saath mat banao. Har box tab draw karo jab uska **reason** bol rahe ho. Is system mein ek extra rule: board par **left se right ek hi line** rakho -- event andar, page bahar -- aur ack ka loop sabse aakhir mein neeche se wapas laao. Woh loop hi is system ki kahani ka end hai.
+
+### Step 1 -- Client / monitoring tools
+
+```
+[Prometheus Alertmanager | Datadog | Sentry | cron jobs | custom scripts]
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Input insaan nahi, **machines** hain. Ye har 30-60 second wahi alert repeat karti hain jab tak problem zinda hai -- isliye 95% traffic duplicate hai aur dedup pehla design decision ban jaata hai."
+
+**Ye box kaunsa sawaal invite karta hai:** "Dedup kaise karoge?" -- perfect, tumhara sabse strong answer.
+
+### Step 2 -- Load Balancer
+
+```
+[Monitoring tools] --POST /v2/enqueue--> [Load Balancer]   TLS, routingKey = secret
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Stateless ingest instances ke aage LB. `routingKey` yahan ek API key ki tarah treat hoti hai -- secret, per-service, revocable. Availability target 99.99% isi path par hai, kyunki customer tab bolta hai jab uska system already jal raha ho."
+
+**Invite:** "99.99% kaise? Multi-AZ?" -- ready rakho: N instances across AZs, health checks, no sticky state.
+
+### Step 3 -- Ingest API
+
+```
+[Load Balancer]
+      |
+      v
+[Ingest API -- N stateless Node.js (Express 5)]
+   |-- routingKey -> serviceId (Redis svc:<routingKey>, TTL 300s; Postgres fallback)
+   |-- rate limit per routingKey (token bucket)
+   |-- validate + Idempotency-Key
+   |-- produce to Kafka (acks=all)  ==>  202 Accepted { dedupKey }
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Ingest sirf teen kaam karta hai: pehchaano, throttle karo, durable likho. Kuch bhi bhaari nahi. **202, 201 nahi** -- incident abhi bana hi nahi, main incidentId de hi nahi sakta. Aur Kafka down ho toh ~60 second disk spool, phir **503 -- fail closed.** Jo page deliver nahi kar sakte usko accept karna, reject karne se bura hai."
+
+**Invite:** "202 kyun, client ko id kyun nahi dete?" aur "fail open kyun nahi?" -- dono ke jawab upar hain.
+
+**Board abhi aisa dikhta hai (stage 1):**
+
+```
+[Monitoring tools: Prometheus | Datadog | Sentry | cron]
+                    |
+              POST /v2/enqueue
+                    v
+            [Load Balancer]
+                    v
+        [Ingest API -- N stateless Node]
+          routingKey -> serviceId (Redis)
+          rate limit per routingKey
+          validate -> produce -> 202 Accepted
+                    |
+             (Kafka down? spool 60s -> 503, FAIL CLOSED)
+```
+
+### Step 4 -- Kafka `incident-events`
+
+```
+[Ingest API] --> [Kafka: incident-events]  24 partitions, key = serviceId, retention 7d
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Kafka isliye, RabbitMQ nahi: **replay** chahiye -- bug fix karke 7 din ke events dobara process kar sakein; **ordering per service** chahiye, isliye key = serviceId; aur **multiple independent consumer groups** chahiye -- incident service, analytics, audit. 24 partitions = peak 6,000 events per second, ~250 per partition ka safe budget."
+
+**Invite:** "Partitions kaise nikale?" -- peak / per-partition budget. Aur "RabbitMQ kyun nahi?" -- replay + multi-consumer.
+
+### Step 5 -- Incident Service
+
+```
+[Kafka incident-events] --> [Incident Service -- consumer group 'incident-service']
+                               |-- dedup + state machine
+                               |-- routing: policy -> level -> schedule -> on-call user
+                               |-- produce notification tasks
+                               |-- arm escalation timer
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Yahan asli dimaag hai. Dedup se 50 million events **2.5 million incidents** ban jaate hain. State machine `triggered -> acknowledged -> resolved` hai, aur routing escalation policy se level, level se schedule, schedule se rotation index nikalti hai. Consumer `enable.auto.commit=false` hai -- DB write ke **baad** commit, isliye at-least-once."
+
+**Invite:** "Duplicate processing?" -> `taskId` unique index. "Rotation math?" -> `floor((at - handoffAt) / rotationLengthMs) % members.length`, aur **DST** ka jawab taiyaar rakho: UTC instants store karo, IANA timezone se compute karo.
+
+### Step 6 -- Postgres
+
+```
+[Incident Service] --> [Postgres primary + 2 read replicas]
+    incidents (monthly partitions)
+      UNIQUE (service_id, dedup_key) WHERE status <> 'resolved'   <-- THE index
+    incident_events (timeline), notifications, notification_attempts,
+    escalation_timers (durable copy), services, escalation_policies/rules,
+    schedules/layers/overrides, users, contact_methods, notification_rules, idempotency_keys
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Postgres isliye: data relational hai -- service se policy se schedule se user; incident, timeline aur timer **ek transaction** mein chahiye; aur dedup ke liye **partial unique index** chahiye jo sirf non-resolved rows par lage. `ON CONFLICT ... RETURNING (xmax = 0)` batata hai ki page karna hai ya nahi. Monthly partitions se 90-din retention aur S3 archive easy. MongoDB isliye nahi ki yahan multi-entity transactional correctness core hai."
+
+Board par is index ko **box karke highlight** karo. Agar interviewer ek hi cheez yaad rakhe, ye rakhe.
+
+**Board abhi aisa dikhta hai (stage 2):**
+
+```
+[Monitoring tools]
+      |
+      v
+[LB] -> [Ingest API] --202--> client
+              |
+              v
+      [Kafka incident-events]  24p, key=serviceId
+              |
+              v
+      [Incident Service]  dedup -> state machine -> routing
+        |            |
+        |            v
+        |      [Postgres]  incidents + timeline + timers
+        |        UNIQUE (service_id, dedup_key) WHERE status <> 'resolved'
+        v
+   (notification tasks + escalation timer -- next)
+```
+
+### Step 7 -- Redis ZSET + Scheduler
+
+```
+[Incident Service] --ZADD--> [Redis ZSET sched:escalations]  member=timerId, score=dueAtMs
+                                        ^         |
+                    ZADD NX, every 60s  |         | every 1s: atomic Lua
+                          [Postgres escalation_timers]      ZRANGEBYSCORE + ZREM
+                                                  v
+                                         [Scheduler Service x2]
+                                                  |
+                                                  v
+                                         [Kafka escalations]
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "`setTimeout` nahi -- crash matlab timer gaya matlab page gaya. Timer ek **row** hai. Redis ZSET mein score = dueAt, aur scheduler har second ek **atomic Lua** chalata hai jo due nikalta aur usi step mein `ZREM` kar deta hai. Isliye do scheduler instances safe hain, leader election ki zarurat nahi. Aur durable copy Postgres mein hai -- Redis wipe hone par recovery job `ZADD NX` se rebuild karta hai. **Timers sirf Redis mein rakhna is system ki sabse badi galti hogi.**"
+
+**Invite:** "DB polling se kyun nahi?" -> `FOR UPDATE SKIP LOCKED` chhote scale par bilkul sahi hai; 50K active timers aur 1-second granularity par ZSET sasta padta hai. "SQS delay?" -> max 15 minute, hamara 60 minute escalation fit nahi hota.
+
+### Step 8 -- Notification Workers
+
+```
+[Kafka notifications] 48p, key=incidentId --> [Notification Workers -- 'notification-workers']
+    |-- per-user rules (0 min push, 1 min sms, 5 min voice) + quiet hours + grouping
+    |-- CANCELLED check right before send
+    |-- retry: full jitter, 5 attempts -> [Kafka notifications-dlq]
+    |-- circuit breaker per provider (cb:<provider>)
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Workers per-user rules apply karte hain -- push pehle kyunki woh free aur instant hai, SMS 1 minute baad, voice 5 minute baad kyunki mehnga hai par jagata hai. Bhejne se **theek pehle** cancelled-check, warna ack ke baad SMS jaata hai -- ye product ki number one complaint hai. Retry full jitter se, warna 1,000 workers ek saath wapas aake provider ko dobara gira denge. Aur per-provider concurrency cap -- Twilio long code ~1 SMS per second deta hai."
+
+**Invite:** "Alert storm?" -> Redis `grp:<serviceId>:<minute>` counter, >10 par grouped page ("checkout: 63 new incidents"), incidents phir bhi bante hain.
+
+### Step 9 -- Providers + delivery webhooks
+
+```
+[Notification Workers] --> [FCM/APNs | Twilio SMS | Twilio Voice | SendGrid | Slack]
+                                        |
+                          delivery status webhook (signature verified)
+                                        v
+                               [Webhook API] --> [Postgres] + metrics
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Providers hamare control mein nahi hain, isliye teen cheezein: **circuit breaker** (30 s window, >50% fail in >=20 requests -> open 30 s -> half-open 5 probes), **failover** (Twilio -> MessageBird) ya channel downgrade, aur **delivery webhooks** -- 'sent' aur 'delivered' alag cheezein hain, aur hum dono track karte hain. Webhook ki signature verify karna mandatory hai, warna koi bhi jhoothi delivery report bhej sakta hai."
+
+### Step 10 -- Responder ack loop (yahi kahani ka end hai)
+
+```
+[Responder: mobile app | web | email link | SMS reply "4" | voice DTMF "4"]
+        |
+        v  POST /api/v1/incidents/:id/acknowledge
+[Incidents API] --> [Incident Service]
+        |-- CAS: UPDATE ... WHERE status='triggered' AND version=$n
+        |-- escalation_timers -> 'cancelled', ZREM from Redis
+        |-- queued notifications -> 'cancelled'
+        '-- timeline: acknowledged
+```
+
+**Ab interviewer ko kya bolna hai?**
+
+> "Ack char raaston se aa sakta hai -- app, web, email link, SMS reply '4' aur voice DTMF '4' -- lekin sab ek hi service method par milte hain, isliye behaviour identical hai. Do responder ek saath ack karein toh optimistic lock se ek jeetta hai aur doosre ko **error nahi, current state** milti hai. Aur ack teen cheezein cancel karta hai: timer row, Redis ZSET entry, aur queued notifications -- plus worker ka last-moment check chautha safety net hai."
+
+**Yahi woh box hai jahan poora loop band hota hai.** Board par is arrow ko workers se wapas Incident Service tak khincho, taaki cycle dikhe.
+
+### Final board
+
+```
+   [Monitoring tools: Prometheus | Datadog | Sentry | cron]
+                       |  POST /v2/enqueue
+                       v
+                 [Load Balancer]
+                       v
+         [Ingest API -- N stateless Node.js]  ---> 202 Accepted { dedupKey }
+           routingKey -> serviceId (Redis 300s)     (Kafka down: spool 60s -> 503 FAIL CLOSED)
+           token bucket per routingKey
+                       |
+                       v
+         [Kafka incident-events]  24p, key = serviceId, 7d
+                       |
+                       v
+         [Incident Service]  dedup -> state machine -> routing -> tasks + timer
+              |                    |                          |
+              |                    v                          v
+              |        [Postgres primary + 2 replicas]   [Redis ZSET sched:escalations]
+              |          incidents (monthly partitions)        ^        |  1s atomic Lua
+              |          UNIQUE(service_id, dedup_key)         |        |  ZRANGEBYSCORE+ZREM
+              |            WHERE status <> 'resolved'  <--- THE INDEX   v
+              |          incident_events, notifications,  |     [Scheduler x2] -> [Kafka escalations]
+              |          escalation_timers (durable) -----'              |
+              |                                                         |
+              v                                                         |
+     [Kafka notifications] 48p, key = incidentId  <----------------------'
+              |
+              v
+     [Notification Workers]  rules (0 push / 1 sms / 5 voice), quiet hours,
+              |              grouping, CANCELLED check, full-jitter retry -> [notifications-dlq]
+              v
+     [FCM/APNs | Twilio SMS | Twilio Voice | SendGrid | Slack]
+              |  delivery webhook (signature verified)
+              v
+     [Webhook API] -> [Postgres] + metrics
+              
+     [Responder: app | web | email | SMS "4" | DTMF "4"]
+              |  POST /incidents/:id/acknowledge  (CAS on version)
+              '--> [Incident Service]: cancel timers + ZREM + cancel queued notifications
+```
+
+### Kya sirf poochne par draw karna
+
+| Cheez | Kab draw karo | Ek line |
+|---|---|---|
+| **S3 archive** | "90 din se purana data?" | Postgres monthly partitions -> S3 Parquet, incidents 90 din hot, raw events 7 din Kafka |
+| **Analytics / MTTA-MTTR dashboards** | "Reporting?" | Alag consumer group `incident-events` par -> warehouse; read replicas se dashboards |
+| **Multi-region** | "Region gir gaya?" | Active-passive: ingest anycast, Kafka MirrorMaker, Postgres async replica; RPO seconds, RTO minutes |
+| **Elasticsearch** | "Incident text search?" | v1 mein nahi, Postgres kaafi; v3 mein -- aur woh agla system hai |
+| **SSE / WebSocket** | "Web dashboard live updates?" | v2 mein SSE; mobile ke liye push kaafi hai |
+| **Short links** | "SMS 160 chars mein link?" | `sho.rt/i/abc` -- URL Shortener lesson wapas |
+
+**Bilkul mat draw karo jab tak pooche nahi:** CDN (kuch cache hi nahi hota, sab write path hai), har module ke liye alag microservice (v1 modular monolith hai), service mesh, aur Cassandra (relational + transactional needs).
+
+---
+
+## PART 30 -- Final Cheat Sheet (5 minute revision)
+
+### Problem
+
+On-call incident alerting product (PagerDuty / Opsgenie jaisa) + uske andar multi-channel notification delivery engine. Monitoring tools event bhejte hain -> dedup karke incident banta hai -> escalation policy + on-call schedule se sahi insaan nikalta hai -> push / SMS / voice / email / Slack se page -> `ackTimeoutMin` mein ack na ho toh escalate. Ek line: **"Ek machine ka alert, sote hue insaan ke phone tak, guaranteed, minutes mein."**
+
+### Requirements
+
+| Type | Points |
+|---|---|
+| Functional | `POST /v2/enqueue` (`trigger`/`acknowledge`/`resolve`) -- dedup per `(serviceId, dedupKey)` jab tak resolved na ho -- state machine `triggered -> acknowledged -> resolved` with timeline audit -- routing service -> policy -> level -> schedule -> on-call user -> contact methods -- multi-channel delivery -- escalation with `ackTimeoutMin` (5) + `repeatCount` (2) -- ack/resolve app/web/email/SMS "4"/DTMF "4", ack par sab cancel -- quiet hours (low urgency = email only) -- alert grouping (10+ per min -> grouped page) |
+| NFR | **Reliability sabse upar**: "duplicate page is OK, missed page is NOT" -- **p95 < 5 s, p99 < 10 s** (accept -> first provider handover) -- **99.99%** ingest availability -- durability (202 se pehle Kafka committed) -- idempotency -- security (routingKey secret, PII encrypted, webhook signatures) -- storms 10x-50x |
+| Clarify first | Dedup kis par? Escalation levels aur timeout? Kaunse channels? Ack ke baad kya cancel? Low urgency ka behaviour? At-least-once acceptable? |
+
+### Key numbers (yaad rakho)
+
+| Metric | Value | Isse kya decide hua |
+|---|---|---|
+| Accounts / users / services | 20,000 / 500,000 / ~100,000 | Ek `routingKey` per service |
+| Events | **50M/day = 579/sec avg**, storm 10x = **~6,000/sec peak** | Kafka `incident-events` **24 partitions** (~250 eps/partition budget) |
+| Dedup ratio | **~95%** | **2.5M incidents/day = ~29/sec avg, ~300/sec peak** |
+| Notifications | avg 3/incident -> **7.5M/day = ~87/sec avg, ~1,000/sec peak** | `notifications` **48 partitions**, key = `incidentId` |
+| Channel split | push 50% (3.75M), SMS 30% (2.25M), email 15% (1.1M), voice 5% (0.4M) | Push pehle, voice last |
+| Cost | SMS 2.25M x $0.0075 = **~$17K/day**; voice 0.4M x $0.013 = **~$5K/day** | **Cost bhi design constraint hai** |
+| Raw events storage | 50 GB/day, 7d retention = **350 GB** (RF 3 -> ~1 TB) | Kafka disk |
+| Incidents storage | 2.5M x 2 KB = 5 GB/day, 90d hot = **~450 GB** | Postgres monthly partitions -> S3 Parquet |
+| Notifications storage | ~4 GB/day, 30d = **~120 GB** | Retention job |
+| Active incidents | ack p50 ~2 min, p95 ~10 min -> **~3,500 typical, ~50,000 storm** | 50K x ~100 B = **5 MB ZSET** -- memory nahi, **fairness + duplicate-fire** problem |
+| Twilio throughput | ~**1 SMS/sec per long code**, short code ~100/sec | Multiple sender numbers + per-provider concurrency cap |
+| Timer granularity | tick **1 s**, lag budget **10 s** | Alert on `timer_lag_seconds > 10` |
+
+### APIs
+
+| API | Kya |
+|---|---|
+| `POST /v2/enqueue` | Events API (PagerDuty-compatible). `202 { "status": "accepted", "dedupKey": "cpu-high-web-3" }` |
+| `GET /api/v1/incidents?status=triggered&serviceId=&cursor=` | Keyset pagination (`created_at, id`), offset nahi |
+| `GET /api/v1/incidents/:id` | Incident + timeline |
+| `POST /api/v1/incidents/:id/acknowledge` | `{ userId }` -> `200` current state (**idempotent**) |
+| `POST /api/v1/incidents/:id/resolve` | `{ userId, note }` |
+| `POST /api/v1/incidents/:id/notes` | Timeline note |
+| `GET /api/v1/oncall?scheduleId=&at=` | `[{ userId, name, until }]` |
+| `POST /webhooks/twilio/status` | Delivery status (signature verified) |
+| `POST /webhooks/twilio/inbound` | SMS reply "4" = acknowledge |
+| `GET /health`, `GET /ready` | Probes |
+| Errors | `400 VALIDATION_ERROR`, `401 INVALID_ROUTING_KEY`, `409 IDEMPOTENCY_KEY_REUSED`, `429 RATE_LIMITED`, `503 INGEST_UNAVAILABLE` |
+
+### HLD one-liner
+
+```
+Monitoring -> LB -> Ingest API (routingKey->serviceId cache, token bucket, 202 after Kafka acks=all)
+  -> Kafka incident-events (24p, key=serviceId)
+  -> Incident Service (dedup -> state machine -> routing -> tasks + timer)
+       |-> Postgres (incidents, timeline, timers, config)   |-> Redis ZSET + Scheduler x2
+  -> Kafka notifications (48p, key=incidentId) -> Notification Workers (rules, cancel-check, retry)
+  -> Providers (FCM/APNs, Twilio SMS/Voice, SendGrid, Slack) -> delivery webhooks
+  <- Responder ack (app/web/email/SMS "4"/DTMF "4") cancels timers + queued notifications
+```
+
+No CDN, no Elasticsearch (v1), no microservice-per-thing (modular monolith), no WebSocket (push kaafi).
+
+### LLD folders
+
+```
+src/
+  routes/           events.routes.ts, incidents.routes.ts, webhooks.routes.ts
+  controllers/      events.controller.ts, incidents.controller.ts, provider-webhook.controller.ts
+  services/         incident.service.ts, routing.service.ts, oncall.service.ts,
+                    notification.service.ts, escalation.service.ts, grouping.service.ts
+  repositories/     incident.repository.ts, service.repository.ts, policy.repository.ts,
+                    schedule.repository.ts, notification.repository.ts, timer.repository.ts
+  providers/        provider.interface.ts, twilio-sms.provider.ts, twilio-voice.provider.ts,
+                    fcm.provider.ts, sendgrid.provider.ts, slack.provider.ts, provider-registry.ts
+  workers/          incident.consumer.ts, notification.worker.ts, scheduler.ts, dlq.worker.ts
+  middleware/       auth.ts, rate-limit.ts, idempotency.ts, validate.ts
+  infra/            kafka.ts, redis.ts, postgres.ts, logger.ts, metrics.ts, tracing.ts
+  utils/            dedup-key.ts, backoff.ts, circuit-breaker.ts, time.ts
+  app.ts  server.ts
+```
+
+### Database tables + the one index that matters
+
+| Table | Kya rakhta hai |
+|---|---|
+| `services` | `routing_key` UNIQUE (secret), `policy_id`, `auto_resolve_min` |
+| `escalation_policies` / `escalation_rules` | `repeat_count` (2) / per level `ack_timeout_min` (5), `target_type` (`schedule`/`user`), `target_id` |
+| `schedules` / `schedule_layers` / `schedule_overrides` | IANA `timezone`; `rotation_type`, `rotation_length_sec`, `handoff_at` (UTC anchor), `member_ids[]`, `restriction` JSONB |
+| `users` / `contact_methods` / `notification_rules` | `address_enc` BYTEA (KMS envelope), `verified`; per-user "0 min push, 1 min sms, 5 min voice" |
+| **`incidents`** | Monthly partitions by `created_at`; `status`, `occurrence_count`, `escalation_level`, `escalation_round`, `version` |
+| `incident_events` | Immutable timeline: `triggered`, `notified`, `escalated`, `acknowledged`, `resolved`, `note` |
+| `notifications` / `notification_attempts` | `task_id` UNIQUE (at-least-once dedup), provider + `provider_message_id`, per-attempt result/latency |
+| `escalation_timers` | Redis ZSET ki **durable copy**; `state` = pending/fired/cancelled |
+| `idempotency_keys` | `(account_id, key)` PK, `request_hash`, `response_json`, 24 h TTL |
+
+**The one index:**
+
+```sql
+CREATE UNIQUE INDEX incidents_open_dedup_uniq
+  ON incidents (service_id, dedup_key)
+  WHERE status <> 'resolved';
+```
+
+Iske saath ek aur kaam ka: `CREATE INDEX incidents_open_by_service ON incidents (service_id, created_at DESC) WHERE status <> 'resolved';` (dashboard ka main query), aur `CREATE INDEX escalation_timers_due ON escalation_timers (due_at) WHERE state = 'pending';` (recovery job).
+
+### Redis usage
+
+| Key | Type | TTL | Kaam | Kho jaaye toh? |
+|---|---|---|---|---|
+| `svc:<routingKey>` | string | 300 s | routingKey -> serviceId cache | Postgres fallback, thodi latency |
+| `dedup:<serviceId>:<dedupKey>` | string | 6 h | Dedup **fast path** | Postgres partial unique index bacha leta hai (source of truth) |
+| `sched:escalations` | **ZSET** | -- | Escalation timers (member = timerId, score = dueAtMs) | Recovery job Postgres se `ZADD NX` |
+| `grp:<serviceId>:<minute>` | counter | ~10 min | Storm grouping (>10 -> grouped page) | Grouping off, individual pages -- noisy par safe |
+| `cb:<provider>` | hash | -- | Circuit breaker state | Breaker reset, thode extra failed attempts |
+| `rl:events:<routingKey>` | hash | computed | Token bucket (Rate Limiter format) | Fail open per Rate Limiter lesson |
+
+**Redis kahin bhi source of truth nahi hai.** Har entry ke peeche Postgres khada hai.
+
+### Kafka topics
+
+| Topic | Partitions | Key | Consumer group | Kyun |
+|---|---|---|---|---|
+| `incident-events` | **24** | `serviceId` | `incident-service` | Peak 6K eps / ~250 per partition; ordering per service; 7d replay |
+| `notifications` | **48** | `incidentId` | `notification-workers` | Peak ~1K/sec x retries; ek incident ki notifications ordered |
+| `escalations` | -- | `incidentId` | `escalation-consumer` | Scheduler ke claimed timers |
+| `notifications-dlq` | -- | -- | `dlq.worker` | 5 attempts ke baad; `dlq_depth` par alert |
+
+Kafka kyun, RabbitMQ nahi: **replay**, **ordering per key**, **multiple independent consumer groups**, high throughput. RabbitMQ ka per-message ack/retry/delay pattern notification **retry** level par behtar hai -- woh alag layer hai.
+
+### Main algorithms
+
+**1. Dedup**
+
+```
+INSERT ... ON CONFLICT (service_id, dedup_key) WHERE status <> 'resolved'
+DO UPDATE SET occurrence_count = occurrence_count + 1, last_seen_at = now()
+RETURNING (xmax = 0) AS inserted;
+```
+`xmax = 0` -> naya incident -> **page karo**. Warna sirf counter -> **chup raho**. Resolve par index entry free -> wahi dedupKey naya incident bana sakta hai.
+
+**2. Timer claim (atomic)**
+
+```lua
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+if #due > 0 then redis.call('ZREM', KEYS[1], unpack(due)) end
+return due
+```
+Read + remove ek atomic step -> 2+ scheduler instances safe, leader election ki zarurat nahi. Durable copy `escalation_timers`; recovery job har 60 s `ZADD NX`.
+
+**3. Retry backoff (full jitter)**
+
+```
+delay = random(0, min(30000, 1000 * 2^attempt))   // max 5 attempts per channel
+4xx = permanent, no retry.  5xx / timeout / 429 = retry.
+```
+Circuit breaker per provider: 30 s window, >50% fail in >=20 req -> `open` 30 s -> `half-open` 5 probes -> failover / channel downgrade.
+
+**4. On-call rotation**
+
+```
+index = floor((at - handoffAt) / rotationLengthMs) % memberIds.length
+then apply schedule_overrides (specific window -> someone else)
+```
+**DST:** UTC instants store karo, IANA timezone se compute (Luxon). `new Date(y, m, d, 2, 0)` kabhi nahi -- spring-forward par 2 AM exist hi nahi karta.
+
+**5. Ack race (optimistic lock)**
+
+```sql
+UPDATE incidents SET status='acknowledged', acknowledged_by=$1, version=version+1
+WHERE id=$2 AND status='triggered' AND version=$3;
+```
+0 rows -> koi pehle kar gaya -> `200` with current state, **error nahi**.
+
+**6. Storm grouping**
+
+`INCR grp:<serviceId>:<minute>`; count > 10 -> individual notifications rok kar ek grouped page per 5 min ("checkout: 63 new incidents"). Incidents phir bhi bante hain (audit).
+
+### Scaling ladder
+
+| Stage | Change |
+|---|---|
+| V1 (MVP) | Ek Node process: Express + Postgres + `SELECT ... FOR UPDATE SKIP LOCKED` polling timers. Kafka nahi, Redis nahi. **Chhote scale par ye bilkul sahi hai** |
+| V2 | Kafka `incident-events` (durability + spike absorb), Incident Service consumer group, Redis ZSET timers + durable copy, notification workers alag |
+| V3 -- hamare numbers (6K eps, 1K notif/sec) | 24 + 48 partitions, Postgres monthly partitions + 2 read replicas, scheduler x2, per-provider concurrency caps + circuit breakers, grouping |
+| V4 -- aage | Postgres shard by `account_id`, incidents 90d ke baad S3 Parquet, multi-region active-passive (MirrorMaker + async replica), notification service alag deploy, Elasticsearch for incident search |
+
+### Consistency
+
+| Where | Level | Why OK |
+|---|---|---|
+| Dedup | **Strong** (Postgres unique index) | Duplicate incident = duplicate page storm. Yahan compromise nahi |
+| Incident state transitions | **Strong** + optimistic lock (`version`) | Ack race ka deterministic winner |
+| Redis dedup fast path | **Eventual / best-effort** | Miss hua toh DB index pakad lega |
+| Timers (Redis vs Postgres) | **Eventual** (60 s recovery job) | Worst case: escalation kuch second late, **kabhi khoyi nahi** |
+| Notification delivery | **At-least-once** | `task_id` unique + provider idempotency key se mostly single; duplicate page acceptable hai |
+| Dashboards (read replicas) | **Eventual** (replica lag) | Incident **detail** page primary se padho; list replica se chalegi |
+| Ingest -> incident visible | **Async** (202) | Client ko `dedupKey` milta hai, `incidentId` nahi |
+
+### Failure handling
+
+| Failure | Behaviour |
+|---|---|
+| **Kafka down** | Ingest ~60 s local disk spool -> phir **503 INGEST_UNAVAILABLE**. **FAIL CLOSED** -- "accepting a page you cannot deliver is worse than rejecting it loudly" |
+| **Redis down** | Dedup Postgres index par gir jaata hai (slow par correct); timers recovery job se Postgres se rebuild; rate limit fail open |
+| **Postgres primary down** | Failover to replica; ingest Kafka par likhta rehta hai (buffer), incident service lag karti hai aur recover hoti hai. **Kuch nahi khota, sab late hota hai** |
+| **Scheduler instance crash** | Doosra instance chalta rehta hai (claim atomic hai). Dono gire toh `timer_lag_seconds` alert + recovery job |
+| **Ek provider down (Twilio)** | Circuit breaker open 30 s -> failover provider (MessageBird) ya channel downgrade (SMS -> voice); attempts DLQ mein |
+| **Notification worker crash mid-send** | At-least-once: message dobara aayega; `task_id` unique index + provider idempotency key duplicate rokte hain (100% nahi) |
+| **Ack ke baad notification queue mein pada tha** | Worker ka **last-moment cancelled-check** + incident status check |
+| **Timer ack ke baad fire hua** | `status !== 'triggered'` guard -> drop |
+| **On-call schedule empty** | Account admin ko fallback page + `oncall_empty_total` alert. **Silent drop kabhi nahi** |
+| **Escalation exhausted** | Timeline entry + account alert; incident **open rehta hai** (dashboard par red) |
+| **Alert storm 50x** | Per-routingKey token bucket + grouping; incidents bante rahenge, pages collapse ho jaayenge |
+
+### Security
+
+- `routing_key` = **secret, API key ki tarah**: UNIQUE, revocable, per-service, logs mein kabhi nahi. Galat key -> `401 INVALID_ROUTING_KEY`.
+- **PII encrypted at rest**: `contact_methods.address_enc` BYTEA, KMS envelope encryption. Logs mein masked (`+91XXXXXX3210`).
+- **Provider webhook signature verification** mandatory -- warna koi bhi jhoothi delivery report ya jhootha inbound "4" (= fake acknowledge!) bhej sakta hai.
+- **Per-account isolation**: har query par `account_id` filter; incident id guess karke doosre account ka incident ack na kar sake.
+- **Rate limit per routingKey** -- ek customer ka storm doosre ko na maare.
+- **Ack authorization**: sirf wahi users jo us incident ke escalation path/account mein hain.
+- Audit: `incident_events` immutable timeline -- kisne kab kya kiya, compliance ke liye.
+
+### Top 5 trade-offs
+
+| Decision | Chosen | Kyun | Kab badlega |
+|---|---|---|---|
+| Ingest failure policy | **Fail closed** (spool 60 s -> 503) | Jhootha 202 = alert chup-chaap kha gaya. Loud reject se customer retry/fallback kar sakta hai | Agar downstream truly independent hota (best-effort marketing notifications) toh fail open |
+| Delivery guarantee | **At-least-once** | "Duplicate page is OK, missed page is NOT". Exactly-once ki keemat latency + complexity | Billing-grade messaging (paid SMS campaigns) -> exactly-once effort worth it |
+| Ingest response | **202 async** (dedupKey, incidentId nahi) | Ingest DB se decoupled; storm mein girta nahi | Chhota scale / client ko turant id chahiye -> sync 201 |
+| Timers | **Redis ZSET + Postgres durable copy** | O(log N + k) claim, atomic Lua, 1 s granularity, HA without leader | Chhote scale -> Postgres `FOR UPDATE SKIP LOCKED` polling (ek kam system) |
+| Dedup source of truth | **Postgres partial unique index** (Redis sirf fast path) | Redis eviction/failover par duplicate incident ban jaata | Kabhi nahi -- ye correctness hai, performance nahi |
+
+### Top 10 follow-up questions (one-line answers)
+
+| # | Question | One-line answer |
+|---|---|---|
+| 1 | Same alert har 30 second aa raha hai, naya incident kyun nahi banta? | `(service_id, dedup_key)` par partial unique index `WHERE status <> 'resolved'`; `ON CONFLICT` sirf `occurrence_count` badhata hai, `xmax = 0` batata hai ki page karna hai ya nahi |
+| 2 | Escalation timers `setTimeout` se kyun nahi? | Process crash ya deploy = timer gaya = page gaya; timer ek **row** hai -- Redis ZSET + Postgres durable copy + 60 s recovery job |
+| 3 | Do scheduler instances same timer do baar fire nahi karenge? | `ZRANGEBYSCORE` + `ZREM` ek **atomic Lua** mein -- claim aur remove ek step, isliye leader election bhi nahi chahiye |
+| 4 | Redis poora wipe ho gaya toh? | `escalation_timers` Postgres mein pending hain; recovery job har 60 s `ZADD NX` se ZSET rebuild karta hai -- escalations late, khoyi nahi |
+| 5 | Ack ke baad bhi SMS aa gaya, kyun? | At-least-once system mein task already queue mein tha; isliye teen layers -- timer cancel, task `cancelled`, aur worker ka **last-moment status check** |
+| 6 | Do responder ek saath ack karein? | `UPDATE ... WHERE status='triggered' AND version=$n` (optimistic lock); haarne wale ko `200` current state, error nahi |
+| 7 | Kafka down ho gaya toh ingest kya kare? | ~60 s local disk spool, phir **503 -- fail closed**. Jo deliver nahi kar sakte usko accept karna galat hai (Rate Limiter ke fail-open se ulta) |
+| 8 | Twilio down ho gaya? | Per-provider circuit breaker (30 s, >50% fail in >=20) -> open -> failover provider ya channel downgrade; 5 full-jitter attempts ke baad DLQ, aur escalation timer waise bhi agle level par page karega |
+| 9 | Alert storm mein 500 incidents ek minute mein? | Incidents bante rahenge (audit), par `grp:<serviceId>:<minute>` counter >10 par notifications ek grouped page mein collapse -- "checkout: 63 new incidents" |
+| 10 | On-call rotation DST par kaise handle karoge? | UTC instants store karo, rotation index `floor((at - handoffAt) / rotationLengthMs) % members.length`, display IANA timezone se (Luxon); `new Date(y, m, d, 2, 0)` kabhi nahi |
+
+### 30-second answer
+
+PART 27 dekho. Skeleton: **202 fail-closed ingest -> Kafka `incident-events` -> dedup via Postgres partial unique index (`xmax = 0`) -> routing (policy -> schedule -> on-call) -> notification tasks with per-user rules -> Redis ZSET timers with Postgres durable copy + atomic Lua claim -> escalate ya ack-cancel -> at-least-once, kyunki duplicate page OK hai, missed page nahi.**
+
+### 5-minute skeleton (full text PART 28 mein)
+
+1. **Minute 1** -- Requirements: events API, dedup, escalation, multi-channel, ack cancels. Principle: **duplicate page OK, missed page NOT**. SLO p95 < 5 s, 99.99% ingest.
+2. **Minute 2** -- Numbers: 50M events/day = 580/s avg, 6K peak; **95% dedup** -> 2.5M incidents; 7.5M notifications; SMS ~$17K/day; 50K active timers = 5 MB.
+3. **Minute 3** -- Architecture: LB -> ingest (202 after Kafka acks=all) -> Kafka 24p key=serviceId -> incident service -> Postgres + Redis -> notification workers -> providers. Modular monolith, no CDN.
+4. **Minute 4** -- Deep dive: partial unique index + `xmax = 0`; timers as rows, ZSET + atomic Lua claim + Postgres durable copy + recovery job; ack cancels 3 things + last-moment check.
+5. **Minute 5** -- Bottleneck = **providers**, not our code (Twilio 1 SMS/sec per long code); failures (Redis, Kafka -> **fail closed**, provider circuit breaker); trade-offs (at-least-once, 202 async); "deep dive kahan?"
+
+### Most Important Things To Remember
+
+1. **"Duplicate page is OK, missed page is NOT."** Ye ek line poore system ke har decision ko explain karti hai -- at-least-once, durable timers, fail-closed ingest, teen-layer cancellation.
+2. **Dedup hi is system ka leverage hai:** 50M events -> 2.5M incidents (95% drop). Source of truth Postgres ka **partial unique index** `WHERE status <> 'resolved'`, Redis sirf fast path. Resolve par index free hona utna hi zaruri hai jitna conflict par counter badhna.
+3. **Timer ek data row hai, `setTimeout` nahi.** Redis ZSET + **atomic Lua claim** (do instances safe, leader election nahi) + **Postgres durable copy** + 60 s recovery job. Timers sirf Redis mein rakhna is system ki sabse badi galti hogi.
+4. **Ingest par FAIL CLOSED** -- Rate Limiter ke fail-open se **ulta**, aur yahi contrast yaad rakhne layak hai: "accepting a page you cannot deliver is worse than rejecting it loudly."
+5. **Ack teen cheezein cancel karta hai** (timer row, ZSET entry, queued notifications) aur worker ka **last-moment status check** chautha net hai. Cancellation best-effort, status check guarantee.
+6. **Channel order = cost + wake-up power:** 0 min push (free, instant), 1 min SMS (sasta), 5 min voice (mehnga, par jagata hai). SMS ~$17K/day -- **cost bhi design constraint hai.**
+7. **Bottleneck providers hain, hamara code nahi** -- Twilio long code ~1 SMS/sec. Per-provider concurrency cap + circuit breaker + failover. (Rate Limiter lesson yahan wapas aata hai.)
+8. **Har state transition optimistic lock (`version`) se**, aur duplicate ack / late timer / resolve-while-escalating sab **silent no-op**, error nahi. Aadhi raat ko responder ko `409` dena product bug hai.
+9. **Clock inject karo.** 5-minute escalation ka test 5 millisecond mein chalna chahiye, warna test likha hi nahi jaayega aur bug production mein milega.
+10. Numbers bolo: **50M events/day, 579/s avg, 6K peak, 95% dedup, 2.5M incidents, 7.5M notifications, 24 + 48 partitions, p95 < 5 s, ack timeout 5 min, repeatCount 2, 50K active timers = 5 MB.**
+
+---
+
+## Remember
+
+> **Coding round mein: scope clarify (dedup kis par? escalation levels? ack ke baad kya cancel?) -> logic bolo (dedup index + timer as a row) -> clean code with injected clock -> edge cases (duplicate trigger, early ack, zombie timer, ack race, empty on-call) -> complexity. Design round mein: requirements -> numbers ("95% dedup") -> simple diagram -> deep dive (partial unique index + ZSET claim) -> failure policy (fail closed).** Poore system ka dil ek line hai: **"Duplicate page is OK, missed page is NOT -- isliye har timer durable hai, har delivery at-least-once hai, aur ingest jhooth bolne se pehle 503 de deta hai."**
+
+## Quick Self-Test
+
+1. Dedup index par `WHERE status <> 'resolved'` na hota toh do alag-alag bugs aate -- kaunse? Ek bug "page hi nahi jaayega" wala hai aur doosra "uniqueness violation" wala -- dono explain karo.
+2. `RedisZsetEscalationScheduler.scheduleDurable` mein Postgres pehle aur Redis baad mein kyun? Ulta order karke beech mein crash hone par exactly kya hota, aur hamara principle usko kyun reject karta hai?
+3. Scenario B ke output mein push `NOT sent` hua par Scenario A mein Rahul ka SMS cancel hone ki koi line nahi aayi -- `cancelForIncident` ke andar `if (p.dueAtMs > this.now()) p.settled = true` wali line iska kya karan banti hai, aur production mein ye do cases Kafka ke hisaab se kaise map hote hain?
+4. Interviewer bola: "Timers ke liye Redis hata do, sirf Postgres polling rakho." Kaunse scale par ye sahi answer hai, kaunse par galat, aur tum kaunsa number quote karke decide karoge?
+5. Rate Limiter mein hum **fail open** the aur yahan ingest par **fail closed** -- dono systems ka kaunsa fark ye ulta decision justify karta hai? Aur is system mein aisi kaunsi jagah hai jahan hum phir bhi fail open karte hain?
+
+---
+
+**Notification / Paging System complete.** Next system: **Search System**. "next" bolo.
+
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') return '<div class="mermaid">' + code + '</div>';
+    return '<pre><code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</code></pre>';
+  };
+  renderer.table = function(header, body) {
+    return '<div class="table-wrap"><table><thead>' + header + '</thead><tbody>' + body + '</tbody></table></div>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

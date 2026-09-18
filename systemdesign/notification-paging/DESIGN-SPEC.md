@@ -247,6 +247,15 @@ CREATE TABLE incidents (
 ) PARTITION BY RANGE (created_at);            -- monthly partitions
 CREATE UNIQUE INDEX incidents_open_dedup_uniq ON incidents (service_id, dedup_key) WHERE status <> 'resolved';
 CREATE INDEX incidents_open_by_service ON incidents (service_id, created_at DESC) WHERE status <> 'resolved';
+-- GOTCHA (parts must teach this, not hide it): a partitioned table's unique index must
+-- include the partition key. `(service_id, dedup_key)` does not include `created_at`, so
+-- Postgres makes it unique PER PARTITION, not globally. Practical effect: across a month
+-- boundary two open incidents with the same (service_id, dedup_key) are possible.
+-- Three honest remedies: (a) accept it (once a month, one extra incident -- "duplicate page
+-- is OK"), (b) keep `incidents` un-partitioned and move old rows to `incidents_archive`,
+-- (c) keep a small un-partitioned `open_incidents (service_id, dedup_key, incident_id)`
+-- table that holds the real unique constraint. Raising this yourself in an interview is a
+-- strong signal.
 
 CREATE TABLE incident_events (              -- immutable timeline / audit
   id BIGSERIAL, incident_id UUID NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -264,6 +273,7 @@ CREATE TABLE notifications (
 );
 CREATE INDEX ON notifications (incident_id);
 CREATE UNIQUE INDEX notifications_task_uniq ON notifications (task_id);  -- at-least-once dedup
+CREATE INDEX notifications_provider_msg ON notifications (provider_message_id);  -- status webhook looks up by this
 
 CREATE TABLE notification_attempts (
   id BIGSERIAL, notification_id UUID NOT NULL, attempt INT NOT NULL,

@@ -27,7 +27,13 @@ Rebuild HTML after editing any .md: `node systemdesign/build.mjs` (also rebuilds
    - [x] Part 4 -- Scaling, Failures (PSP timeout = unknown), Consistency, Security (PCI, webhook HMAC), Observability (16-20)
    - [x] Part 5 -- Trade-offs, V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js Qs (21-25)
    - [x] Part 6 -- Implement idempotent payment API, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
-4. [ ] File Storage (S3-style)
+4. File Storage (S3-style) -- **read all parts in one place: [file-storage/index.html](file-storage/index.html)** (shared design decisions: [DESIGN-SPEC.md](file-storage/DESIGN-SPEC.md))
+   - [x] Part 1 -- Basics (local disk / NFS break), file vs block vs object, Requirements (11 nines), Capacity (PB/year), HLD, Component WHY (1-6)
+   - [x] Part 2 -- PUT / Range GET / multipart / presigned flows, APIs + HMAC signing, metadata schema, LLD, Node.js streaming code (7-12)
+   - [x] Part 3 -- Chunking, consistent hashing + AZ placement, W=2 quorum, erasure coding (XOR -> 8+4), durability math, CRC/ETag, volumes + GC, concurrency, CDN + caching (13-15)
+   - [x] Part 4 -- Scaling (bytes vs objects vs RPS), Failures (disk/node/AZ, bit rot, GC bug), Consistency, Security, Observability (16-20)
+   - [x] Part 5 -- Trade-offs (replication vs EC, build vs buy), V1 -> V2 -> V3, Follow-ups, What-ifs, Node.js streams Qs (21-25)
+   - [x] Part 6 -- Implement a mini object store, 30-sec / 5-min answers, Whiteboard order, Cheat sheet (26-30)
 5. [ ] News Feed
 6. [ ] Chat System
 7. Search System -- **read all parts in one place: [search-system/index.html](search-system/index.html)** (shared design decisions: [DESIGN-SPEC.md](search-system/DESIGN-SPEC.md))
