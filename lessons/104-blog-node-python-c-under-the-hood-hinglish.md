@@ -1,0 +1,108 @@
+# Blog: Node.js Aur Python Andar Se C/C++ Par Kyun Chalte Hain? (Hinglish)
+
+> **Blog post** - interview ka jawab nahi, par "Node single-threaded hai?" type sawaalon ki jad yahi hai. Related: [[01-concurrency-vs-parallelism]], [[22-nodejs-memory-leak-debugging]], [[56-password-hashing-not-sha256]].
+
+## 1. Ek Seedha Sawaal
+
+Aapne `node server.js` chalaya. JavaScript to browser ki language thi - phir ye aapki hard disk se file kaise padh leti hai? Socket kaise kholti hai? Kyunki JavaScript **khud** ye kar hi nahi sakti. JS spec mein `readFile` naam ki koi cheez hai hi nahi.
+
+Jo cheez actually file kholti hai wo hai OS ka **syscall** (`open`, `read`, `epoll_wait`). Aur syscalls ka darwaza C ki language mein likha hai. Isliye har "high-level" language ke neeche ek C/C++ ka engine baitha hota hai jo uske liye ye gandi mehnat karta hai.
+
+## 2. Node.js Ke Do Pillar: V8 Aur libuv
+
+| Layer | Kis language mein | Kaam |
+|---|---|---|
+| Aapka code | JavaScript | business logic |
+| **V8** | C++ | JS ko parse karke **machine code** banata hai, memory/GC sambhalta hai |
+| **libuv** | C | event loop, epoll/kqueue/IOCP, thread pool, timers |
+| **OS** | C | syscalls, scheduler, disk, network |
+
+**V8 (C++)**: aapka JS interpret nahi hota rehta - V8 pehle bytecode banata hai (Ignition), aur jo function baar-baar chalta hai use **JIT** optimizing compiler (TurboFan) asli x86/ARM machine code mein compile kar deta hai. Isi JIT ki wajah se JS "scripting language hone ke bawajood" kaafi tez hai. Heap, garbage collector, `--max-old-space-size` - ye sab V8 ke C++ code ke andar ka maamla hai ([[22-nodejs-memory-leak-debugging]] mein jo heap snapshots dekhe the, wo V8 hi de raha tha).
+
+**libuv (C)**: ye Node ka asli dil hai. Do alag mechanism deta hai, aur yahi sabse zyada confusion paida karta hai:
+
+1. **Network I/O -> OS ko poocho, wait mat karo.** Linux par `epoll`, macOS/BSD par `kqueue`, Windows par `IOCP`. Thousands of sockets, zero extra threads. OS batata hai "is socket par data aa gaya", tab callback chalta hai.
+2. **Jo cheezein OS async nahi deta -> thread pool.** File system, `dns.lookup`, `crypto` ke kuch functions, `zlib`. libuv chupke se **default 4 threads** rakhta hai aur ye kaam unhe de deta hai.
+
+> To "Node single-threaded hai" ka matlab: **aapka JavaScript** ek hi thread par chalta hai. Node process ke andar threads kai hain - bas wo C mein hain, JS mein nahi.
+
+## 3. Python Ki Kahani Bhi Wahi Hai
+
+Jise hum "Python" kehte hain wo asal mein **CPython** hai - ek C program. Aapki `.py` file bytecode banti hai aur ek C loop use evaluate karta hai. `open()`, `socket`, `list` - sab C structs aur C functions hain.
+
+Aur jo libraries "Python fast hai" ka bharam dete hain, wo aksar Python hain hi nahi:
+
+- **NumPy** - arrays aur math C (aur BLAS/Fortran) mein. `arr.sum()` par Python loop chalta hi nahi, ek C loop chalta hai.
+- **lxml** - andar `libxml2`/`libxslt` (C).
+- `json`, `re`, `hashlib` - sabke C accelerators.
+
+**GIL ek line mein**: CPython mein ek waqt par sirf ek thread Python bytecode chala sakta hai - isliye CPU-heavy Python threads se parallel nahi hota (3.13+ mein optional free-threaded build aa raha hai, par abhi default nahi).
+
+Mazedaar baat: NumPy jaisi C libraries kaam karte waqt GIL **chhod** deti hain - isliye numeric code threads se parallel ho jaata hai, aur pure Python loop nahi hota.
+
+## 4. C/C++ Hi Kyun?
+
+- **Syscalls tak seedhi pahunch** - OS ka interface C mein hi expose hota hai.
+- **Memory par control** - buffers, pointers, alignment. GC ko khud likhne ke liye ye chahiye.
+- **Speed** - koi interpreter layer nahi, seedha machine code.
+- **30 saal ki ready libraries** - OpenSSL, zlib, libxml2, SQLite, FFmpeg. Inhe dobara likhne ka koi matlab nahi; unhe **wrap** karna sasta hai.
+
+## 5. Isse Practically Kya Samajh Aata Hai
+
+**(a) `fs.readFile` async hai par `crypto.pbkdf2Sync` block karta hai.** Dono disk/CPU ka kaam hain - farak ye hai ki async version kaam thread pool ko deta hai, `Sync` version aapke JS thread par hi karta hai. Password hashing ([[56-password-hashing-not-sha256]]) **jaan-boojh kar** slow hoti hai, isliye Sync version production request path mein zeher hai.
+
+```javascript
+const crypto = require('crypto');
+const t = setInterval(() => console.log('event loop zinda hai', Date.now() % 10000), 50);
+
+crypto.pbkdf2Sync('pass', 'salt', 600000, 32, 'sha256');   // JS thread BLOCKED - interval ruk jaayega
+crypto.pbkdf2('pass', 'salt', 600000, 32, 'sha256', () => {
+  console.log('async ho gaya');                            // thread pool mein hua - interval chalta raha
+  clearInterval(t);
+});
+```
+
+**(b) Thread pool sirf 4 ka hai - aur dikh bhi jaata hai.**
+
+```javascript
+// node app.js  -> 4 hashes ek batch, phir agle 4
+// UV_THREADPOOL_SIZE=8 node app.js  -> aath saath (agar 8 core hain)
+const crypto = require('crypto');
+const start = Date.now();
+for (let i = 0; i < 8; i++) {
+  crypto.pbkdf2('pass', 'salt', 300000, 32, 'sha256', () => {
+    console.log(`hash ${i} done @ ${Date.now() - start} ms`);
+  });
+}
+```
+
+`UV_THREADPOOL_SIZE` **process start se pehle** set karna padta hai (pool pehle use par ban jaata hai), aur ise cores se bahut zyada karna ulta pada - CPU to utne hi hain.
+
+**(c) CPU-heavy JS event loop ko maar deta hai.** Ye thread pool mein nahi jaata - aapka loop V8 ke andar aapke hi thread par chalta hai:
+
+```javascript
+let s = 0;
+for (let i = 0; i < 5e9; i++) s += i;   // is poore time mein ek bhi request serve nahi hogi
+```
+
+Iska ilaaj `worker_threads` (asli alag V8 isolate) ya kaam ko queue par bhejna hai - `async` lagane se kuch nahi hota ([[01-concurrency-vs-parallelism]] wala farak yahin dikhta hai: async = concurrency, worker = parallelism).
+
+**(d) `npm install` kabhi-kabhi compile kyun karta hai.** `bcrypt`, `sharp`, `better-sqlite3` jaise packages **native addons** hain - C/C++ code jo **N-API** ke through JS se baat karta hai. Aksar prebuilt binary download ho jaati hai; na mile to `node-gyp` aapke machine par compile karta hai - isliye Docker build mein `python3`/`make`/`g++` maangta hai aur macOS par bana `node_modules` Linux par chalta nahi.
+
+## 6. Ek Mental Model
+
+```
+Aapka JS  ->  V8 (C++: JIT + GC)  ->  libuv (C: event loop + 4 threads)  ->  OS syscalls (C)  ->  hardware
+```
+
+JavaScript aur Python **orchestration** ki languages hain: wo decide karti hain kya karna hai. Asli I/O aur number-crunching neeche C mein hota hai. Performance ke sawaal isi seedhi par neeche utar kar solve hote hain - "mera code slow hai" ka jawab aksar ye hai ki aapne kaam C layer ko dene ke bajaye apne single JS thread par rakh liya.
+
+## 🧠 Remember
+
+> JavaScript aur Python khud file ya socket ko haath nahi lagate - V8, libuv aur CPython (sab C/C++) unke liye OS se baat karte hain. Isliye "single-threaded" ka matlab hai *aapka code* single-threaded, process nahi.
+
+## Quick Self-Test
+
+1. `fs.readFile` aur network socket read - dono async hain, par libuv inhe alag-alag tarike se handle karta hai. Kaise aur kyun?
+2. `UV_THREADPOOL_SIZE=64` karne se 64 CPU-heavy hashes 64x fast kyun nahi honge?
+3. NumPy ka code Python threads se parallel chal jaata hai par pure Python loop nahi - GIL ke hisaab se kyun?
