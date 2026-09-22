@@ -612,3 +612,146 @@ flowchart TD
 **My Answer:** "Main `messageId` (client UUID) se chalta hoon, kyunki wahi har hop par same rehta hai -- structured logs mein `messageId`, `conversationId`, `senderId`, `seq`, `nodeId` hone chahiye. Sawal ek-ek karke: (1) Kya server ne accept kiya? `messages` mein row hai? Nahi toh client ne bheja hi nahi ya gateway ne reject kiya (`error` frame, rate limit, `NOT_A_MEMBER`, 4 KB limit). (2) Kya Kafka par gaya? `chat-events` mein us partition ka record aur `kafka_consumer_lag{group=delivery}` dekho -- lag bada hai toh message 'kho' nahi gaya, bas **late** hai. (3) Kya delivery worker ko session mili? `deliveries_total{result="no_session"}` aur us waqt ka `conn:` lookup -- agar nahi mili toh push notification ka path check karo. (4) Kya gateway ne socket par likha? `message_delivery_latency_seconds` ka trace + `slow_client_drops_total` -- ho sakta hai recipient slow client tha aur hum ne use drop kiya. (5) Kya client ne render kiya? Client-side telemetry aur uska `lastSeq` -- gap hai toh sync bug hai. Trade-off: itna trace rakhna logging cost badhata hai, isliye main **sampling** karta hoon (1%) plus ek targeted 'debug mode' jo ek user ke liye full trace on kar deta hai."
 
 ---
+
+## PART 24 -- Requirement Change ("What if...") Questions
+
+> Format: **Current Design -> New Problem -> Change -> Trade-off.**
+
+### 1. What if concurrent connections become 10x (100M)?
+
+- **Current Design:** 250 gateway nodes x 50,000 connections = 10M; Redis Cluster session registry; Kafka 64 partitions; 460K deliveries/sec peak.
+- **New Problem:** 100M connections = **2,500 gateway nodes** raw `ws` par. Session registry mein 100M+ keys (x devices) aur har delivery par lookup -> Redis ops crore mein. Deliveries ~4.6M/sec peak. Aur sabse bura: ek deploy mein 2,500 nodes drain karna matlab **ghanton ka reconnect churn**.
+- **Change:**
+  - **uWebSockets.js** par gateway shift karo -- per-connection memory kai guna kam, ek node par 150-250K connections realistic -> nodes ~500-700, 2,500 nahi.
+  - **Session registry ko shard karo** aur lookup batch karo: ek group message ke 30 members ke liye 30 alag `GET` nahi, ek `MGET`/pipeline.
+  - **Delivery worker ko gateway ke paas le jao** -- worker sirf `nodeId` par group karke ek frame mein multiple recipients bheje (per-node batching), taaki pub/sub messages deliveries se kam hon.
+  - Kafka partitions 64 -> 512+ (rebalance planning ke saath), aur delivery consumer group ko partition count ke barabar scale karo.
+  - Regions badhao -- ek region mein 100M sockets rakhna operational suicide hai.
+- **Trade-off:** uWebSockets.js par ecosystem chhota hai aur API alag hai (migration cost); per-node batching latency thodi badhati hai (batch window); zyada partitions = zyada rebalance dard. Honest baat: 100M par **blast radius** hi asli design problem ban jaata hai, throughput nahi.
+
+### 2. What if groups can have 100,000 members (broadcast channels)?
+
+- **Current Design:** group max 256; message ek baar store; delivery har member ke har device tak push.
+- **New Problem:** ek message = **100,000 deliveries**. 10 aise channels ek saath post karein toh 1M deliveries ek second mein, ek hi conversation par -- aur Kafka mein woh sab **ek partition** mein hai (key `conversationId`), toh ek partition hot ho jaata hai. Receipts ('read by 98,231') ka matrix bhi assambhav.
+- **Change:** ise **alag product** maano, group nahi:
+  - **Push se pull par shift:** message store karo, par sabko push mat karo. Members ko ek halka "new content" signal jaaye (ya kuch bhi na jaaye) aur client app khulne par `afterSeq` se fetch kare. Ye News Feed ka model hai.
+  - **Sirf admins likh sakte hain** -- write rate ko naturally bound karo.
+  - **Receipts aur typing off**, unread ko approximate count se dikhao.
+  - Fan-out ko **tiered** karo: jo members abhi online hain unhe push (woh 5-10% hain), baaki ke liye kuch nahi.
+  - Cassandra mein `month_bucket` toh pehle se hai -- ek bahut active channel ke liye chhota bucket (day) chuno.
+- **Trade-off:** ab do delivery models maintain karne padenge (chat ke liye push, channel ke liye pull), aur channel ke messages "instant" feel nahi karenge. Lekin yahi sahi hai -- 100K logon ko sub-second delivery ka product matlab hi nahi banta.
+
+### 3. What if end-to-end encryption becomes mandatory?
+
+- **Current Design:** server plaintext dekhta hai; server-side search index; server group fan-out; multi-device history server se.
+- **New Problem:** server ke paas sirf ciphertext hoga. Search index bekaar, group fan-out of content assambhav (server encrypt nahi kar sakta), naye device ko purana history nahi de sakte, moderation blind ho jaayegi, link previews aur server-side backup khatam.
+- **Change:**
+  - **Key management** sabse pehle: har device ki identity key + prekeys server par (public keys, ek "key directory"), session establishment client-to-client (Signal-style double ratchet).
+  - **Sender-side fan-out of ciphertext:** sender har recipient **device** ke liye alag encrypt karke ek envelope bhejta hai. 256 members x 3 devices = 768 encryptions. Isliye "sender keys" (group key jo ek baar har device ko bheji jaati hai, phir message ek baar encrypt) use hoti hain -- warna mobile battery khatam.
+  - **Server ka role badalta hai, marta nahi:** routing, session registry, seq, ordering, receipts, presence -- sab waise hi chalte hain, kyunki woh metadata par hain.
+  - **Search client-side** -- device par local index; naye device par purana history searchable nahi.
+  - **Backup** user ke password/recovery key se encrypted, server par sirf blob.
+- **Trade-off:** product features jaate hain (search, moderation, previews, easy multi-device), support "mera message nahi dikh raha" debug nahi kar sakta, aur **metadata phir bhi server ke paas hai** -- toh privacy claim honest rakhna padega. Migration bhi bada hai: purana plaintext history convert nahi hota, ek cut-off date rakhni padti hai.
+
+### 4. What if message search is required?
+
+- **Current Design:** Cassandra `PRIMARY KEY ((conversation_id, month_bucket), seq)` -- sirf conversation + seq se access.
+- **New Problem:** "sab chats mein 'invoice' dhoondo" -- Cassandra mein ye query hai hi nahi; full scan 219 TB par joke hai.
+- **Change:** `chat-events` par ek **search indexer** consumer group -> Elasticsearch/OpenSearch. Document mein `conversationId`, `senderId`, `seq`, `createdAt`, `body`. Query par **hamesha** user ki membership list se filter (`conversationId IN (...)`), warna ye system ka sabse bada privacy bug ban jaayega. Index sirf last 90 din (cost), purana on-demand restore. Media ke liye filename/caption index karo, content nahi.
+- **Trade-off:** ek aur bada stateful system (index size ~messages ke barabar ya zyada), eventual consistency (naya message search mein kuch second baad), aur delete/edit par index update karna padega warna deleted message search se dikh jaayega. Aur E2EE ke saath ye poora feature server par assambhav hai.
+
+### 5. What if we must support voice/video calls?
+
+- **Current Design:** WebSocket par JSON frames, message persistence, presence, delivery receipts.
+- **New Problem:** call ka **media** (audio/video) TCP par nahi jaa sakta -- ek packet ka retransmit wait poore call ko lag kar deta hai. Media ko UDP chahiye, aur peer-to-peer ya media server ke through.
+- **Change:** **Hamara chat system media nahi bhejta -- woh WebRTC ka signalling channel banta hai**, aur ye distinction hi answer hai:
+  - **Jo hum dete hain:** ek reliable, authenticated, low-latency, bidirectional channel jispar do clients `offer` / `answer` (SDP) aur `ice-candidate` frames exchange kar sakte hain; presence (banda online hai ya nahi); multi-device routing (kis device par ring karein); offline par push notification (incoming call alert); aur call ka **record** (missed call, duration) ek system message ki tarah.
+  - **Jo hum NAHI dete:** audio/video packets. Unke liye chahiye **STUN** (apna public IP pata karna), **TURN** (jab NAT ki wajah se direct connection na bane -- ye media relay karta hai aur **bandwidth-mehenga** hai), aur group calls ke liye **SFU** (Selective Forwarding Unit -- ek media server jo har participant ka stream baaki sabko forward karta hai, taaki har client ko N-1 uploads na karne padein).
+  - Naye frame types: `call_offer`, `call_answer`, `ice_candidate`, `call_end` -- inka `type` wahi frame router handle karega, par inhe **persist nahi** karna (typing jaisa ephemeral), sirf call summary persist hoti hai.
+- **Trade-off:** signalling sasta hai, media mehenga -- TURN relay ka bandwidth bill aur SFU ka CPU bill chat se bada ho sakta hai. Aur call ka latency budget 150 ms hai, chat ka 500 ms -- toh media path ke liye alag regional infra chahiye. Isliye main saaf bolunga: "chat system signalling deta hai; calls ek alag system hai jo iske upar baithta hai."
+
+### 6. What if messages must disappear after 24 hours?
+
+- **Current Design:** messages hot store mein 1 saal, phir S3 archive; delete = tombstone.
+- **New Problem:** 24 ghante baad message sach mein har jagah se jaana chahiye -- server, sab devices, backups, search index, push notification history.
+- **Change:**
+  - Server side sabse aasaan: Cassandra mein **per-row TTL** (`USING TTL 86400`) -- row apne aap tombstone hokar compaction mein nikal jaati hai. Postgres mein ek partitioned table + `DROP PARTITION` (row-by-row `DELETE` 2B rows/day par kaam nahi karega).
+  - `archiver` consumer ko in messages ko **skip** karna hoga, warna S3 par permanent copy bach jaayegi. Search indexer ko bhi TTL ke saath index karna hoga.
+  - Client side par expiry client ka kaam hai (local DB se hataana) -- aur yahi kamzor kadi hai.
+  - `seq` phir bhi aage badhta hai; purane seq gayab honge, toh client ka gap-fill logic "ye message expire ho gaya" ko gap se alag samajhna chahiye.
+- **Trade-off:** ye **soft guarantee** hai, cryptographic nahi -- screenshot, notification preview, aur ek modified client sab bach sakte hain. Cassandra mein bahut zyada TTL rows compaction pressure aur tombstone problem banati hain. Product ko honestly batana chahiye: "disappearing" matlab "hamare server aur normal clients se gayab", "duniya se gayab" nahi.
+
+### 7. What if we need message editing and delete-for-everyone?
+
+- **Current Design:** `messages` append-only, `deleted_at` column already hai, clients `seq` se sorted list rakhte hain.
+- **New Problem:** ek purana message badalna matlab **har device par** badalna, un devices par bhi jo abhi offline hain, aur un par bhi jinhone use notification mein dekh liya hai. Aur sync protocol `afterSeq` par bana hai -- purane seq ka update `afterSeq` query mein aayega hi nahi!
+- **Change:**
+  - Edit/delete ko **naya event** banao, purani row ka silent update nahi: ek `message_edited` / `message_deleted` event jiska apna **naya `seq`** hai aur jo `targetSeq` point karta hai. Isse delta sync automatically kaam karta hai -- offline client `afterSeq` se sync karega aur use edit event mil jaayega.
+  - Storage mein: `messages` row ka `body` update + `edited_at`, aur delete par `deleted_at` + body/media clear (tombstone, row delete nahi -- warna permanent gap).
+  - Edit window limit (e.g. 15 min) aur edit history rakhna hai ya nahi -- product decision (compliance ke liye rakhna padta hai).
+  - Search index aur `last_message` preview dono ko update karna mat bhoolo.
+- **Trade-off:** "message list" ab pure append-only nahi rahi -- client ko mutation apply karni padti hai, jo local DB logic ko kaafi complex banata hai. Aur jaisa #17 mein bola: jo device message pehle dekh chuka hai uspar hamara koi control nahi.
+
+### 8. What if users are spread across 3 continents?
+
+- **Current Design:** ek region: gateways, Redis, Kafka, Cassandra sab ek jagah.
+- **New Problem:** Mumbai se us-east tak RTT ~200 ms. Ek message ka raasta (client -> server -> worker -> gateway -> client) do baar samundar paar karega -> p95 500 ms ka budget aaram se toot jaayega. Aur TLS handshake bhi 2-3 RTT hai, toh har reconnect painful.
+- **Change:** GeoDNS/Anycast se nearest region par connect; har region ke apne gateways aur **region-local session registry**; **conversation ka home region** (jahan seq assign hota hai aur write jaata hai) taaki ordering ek jagah decide ho; Kafka cross-region mirroring; Cassandra multi-DC replication (`LOCAL_QUORUM` reads). Sabse common case -- dono users ek hi region mein -- poori tarah local rehta hai.
+- **Trade-off:** cross-region conversations ko ~80-150 ms extra milta hai (acceptable, kyunki budget 500 ms hai), aur home region gira toh us conversation ke writes tab tak nahi honge jab tak home region failover na ho. Active-active writes (dono regions seq de rahe hain) ordering tod dete hain -- woh complexity tabhi loon jab product maange.
+
+### 9. What if delivery latency must be under 100 ms (p95), not 500 ms?
+
+- **Current Design:** client -> gateway -> chat service -> Redis INCR -> persist -> Kafka -> delivery worker -> Redis lookup + publish -> gateway -> client. Har hop 2-15 ms, plus network.
+- **New Problem:** 100 ms mein Kafka ka round trip (produce + consume, batching ke saath ~10-30 ms), Cassandra write (~5-15 ms), aur do Redis hops fit karna mushkil hai -- aur internet ka RTT toh aapke haath mein hai hi nahi (Delhi-Mumbai ~30 ms, cross-continent ~200 ms, matlab **cross-continent 100 ms possible hi nahi**).
+- **Change:**
+  - Pehla sawaal: **"100 ms kiske beech?"** Server accept se recipient socket write tak? Toh possible hai. Sender ke keypress se recipient screen tak, cross-continent? Nahi.
+  - **Fast path bypass:** agar recipient ka session **usi gateway node** par hai (1:1 chat mein ye common hai), toh message ko persist ke saath saath seedha uske socket par likh do -- Kafka ka intezaar mat karo. Kafka par event phir bhi jaayega (unread, push, archive ke liye).
+  - **Delivery ko Kafka se nikaal ke direct path par lao** (delivery worker gateway ke andar, ya direct gRPC node-to-node) -- Kafka sirf side consumers ke liye rahe.
+  - Persist aur deliver ko **parallel** karo, aur sender ko `ack` persist ke baad do (durability requirement nahi todni).
+  - Regional deployment, TLS session resumption (0-RTT), connection pehle se warm.
+- **Trade-off:** fast path delivery ko Kafka ki ordering guarantee se bahar le jaata hai -- agar dono raaste chalein toh client ko dedup (`messageId`) aur seq-sorting par aur bharosa karna padega. Aur "persist se pehle deliver" ka shortcut main **nahi** lunga: durability requirement uske liye nahi hai.
+
+### 10. What if compliance requires 7-year retention and export?
+
+- **Current Design:** hot store 1 saal, S3 archive, watermark receipts, delete = tombstone.
+- **New Problem:** 7 saal x 219 TB/saal = **~1.5 PB** (replication ke bina). Aur "delete for everyone" ab legal hold ke saath takraata hai. Plus regulator kehta hai "is user ka poora data 30 din mein export karo".
+- **Change:**
+  - **Tiering:** hot (Cassandra, 1 saal) -> warm (S3 Standard-IA) -> cold (Glacier, 6 saal). Format: compressed Parquet, conversation + month se partitioned.
+  - **Immutable archive:** S3 Object Lock / WORM, taaki koi (hum bhi) badal na sake -- yahi compliance ka asli matlab hai.
+  - **Export pipeline:** ek async job (`202 Accepted` + job id) jo user/conversation ke saare messages Glacier se restore karke ek signed zip banata hai. Ye ghanton ka kaam hai, real-time API nahi.
+  - **Legal hold** flag: jis conversation par hold hai wahan delete/TTL apply nahi hoti (tombstone dikhao par archive mein data raho) -- ye product aur legal ka faisla hai, engineering ka nahi.
+  - Receipts par bhi asar: agar compliance "kisne kab padha" maangti hai toh watermark kaafi nahi, per-message rows chahiye -- tab 660 GB/day ka bill lena padega, kam se kam enterprise plan par.
+- **Trade-off:** privacy vs compliance ka seedha takraav -- "right to be forgotten" aur "7-year retention" dono ek hi system mein lagana product/legal ka kaam hai. Aur Glacier restore ghanton ka hai, toh SLA mein ye likhna padega.
+
+### 11. What if the client is a browser tab that goes to sleep?
+
+- **Current Design:** 30 s server ping, 2 miss (60 s) par connection close + session registry se entry hataao.
+- **New Problem:** browser background tab ko throttle karta hai (timers 1/min tak dhime, aur mobile par tab pura freeze ho sakta hai); laptop sleep mein jaata hai; tab kabhi kabhi bina `close` frame ke gayab ho jaata hai (half-open TCP -- server ko lagta hai connection zinda hai). Result: registry mein zombie sessions aur "message deliver ho gaya" ka jhoot.
+- **Change:**
+  - Server-driven `ping` par bharosa karo, client ke `setInterval` par nahi -- browser server ke WebSocket `ping` ka `pong` **automatically** bhejta hai, throttled JS ke bina bhi. (Client-side heartbeat timer background tab mein dhima ho jaayega.)
+  - 2 missed pongs par `terminate()` -- `close()` nahi, kyunki dead peer close handshake ka jawab kabhi nahi dega.
+  - Browser ke `visibilitychange` par: tab hidden -> presence ko "away" maano aur typing/presence subscriptions band karo; tab visible -> turant `resume` bhejo (`lastSeqByConversation`) aur missed messages sync karo.
+  - Web ke liye **Service Worker + Web Push** rakho taaki tab band hone par bhi notification pahunche.
+  - `ws_disconnect_total{reason="heartbeat_timeout"}` ko alag metric rakho -- ye number achanak badhna network ya client bug ka sabse pehla signal hai.
+- **Trade-off:** timeout chhota (60 s) rakhoge toh laptop lid band karne par bhi user "offline" dikhega aur reconnect churn badhega; bada rakhoge toh zombie sessions mein messages drop honge (aur unhe sync se recover karna padega). 60-90 s ek practical beech ka raasta hai.
+
+### 12. What if bots and webhooks must post into conversations?
+
+- **Current Design:** har `send` ek authenticated user ke socket se aata hai, rate limits per user, membership check per send.
+- **New Problem:** bot ke paas socket nahi hota -- woh HTTP se post karega. Aur ek CI bot ek second mein 500 messages bhej sakta hai (deploy failures), jo ek conversation ke sab members ko 500 notifications de dega.
+- **Change:**
+  - **REST ingress:** `POST /api/v1/conversations/:id/messages` with a **bot token** (scoped: kaunse conversations, read ya write). Bot bhi `conversation_members` mein ek row hai -- toh authorization ka code wahi rehta hai, naya code nahi.
+  - **Idempotency:** bot ko bhi `messageId` (UUID) bhejna padega -- webhook retries (at-least-once) is system mein duplicate na banayein. Yahi `ON CONFLICT` path reuse hota hai.
+  - **Alag rate limits** (per bot, per conversation) aur **coalescing**: 500 messages ki jagah ek updated message (edit) ya digest. Bade bots ke liye `silent: true` flag (message dikhe par push na jaaye).
+  - **Outgoing webhooks:** ek alag `webhook-dispatcher` consumer group jo `chat-events` se subscribe karke bot ke URL par POST kare -- retries with backoff, HMAC signature, aur circuit breaker (bot ka server down ho toh hamara worker na atke).
+  - Bot messages ka `type: 'system'` ya sender par ek `isBot` flag -- taaki UI aur unread logic inhe alag treat kar sake.
+- **Trade-off:** ab ek non-socket write path hai, matlab authorization aur rate limiting **do jagah** maintain karni hai (socket handler aur REST route) -- isliye dono ko ek hi `ChatService.send()` call karna chahiye, logic duplicate nahi. Aur outgoing webhooks ek naya reliability domain khol dete hain (kisi ka slow server tumhare consumer lag ka kaaran ban sakta hai).
+
+### 13. What if a single celebrity user is in 5,000 conversations and is always typing?
+
+- **Current Design:** typing 3 s throttle, sirf connected members ko, `typing:<conversationId>` TTL 5 s.
+- **New Problem:** presence aur typing dono is user par multiply hote hain: uske online/offline flip ko 5,000 conversations ke members tak pahunchana, aur uska har typing burst hazaaron deliveries. Ye "hot user" problem hai -- News Feed ka celebrity problem, chat version.
+- **Change:** presence ko **pull-on-demand** rakho (jo uski chat khol ke baitha hai wahi poochhega, hum broadcast nahi karenge); typing ko sirf **us conversation** tak seemit rakho jisme woh sach mein type kar raha hai; aur is user ke liye per-user outbound rate limit. Agar ye ek support/business account hai toh use alag product surface do (inbox/queue model, jahan 5,000 conversations ek agent pool mein bat-te hain).
+- **Trade-off:** pull model se presence thodi stale dikhegi, aur business inbox banana ek naya product hai -- par alternative (broadcast) ka math kaam hi nahi karta.
+
+---

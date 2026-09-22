@@ -148,9 +148,6 @@ This is the same rule that makes **horizontal scaling** and **zero-downtime depl
 - **Rotating the secret on purpose:** if you must rotate a JWT secret, support **two keys** for a while (verify with old or new, sign with new) - or everyone is logged out at the rotation.
 - **Cookie settings changed in the deploy:** a new cookie name, domain or `SameSite` value also makes old cookies useless.
 
-## 7. Real Example (ThePipingMart)
-
-ThePipingMart stores the session **in Redis** (the token is the Redis key), so a Node restart doesn't log anyone out - good. The remaining risk: cache keys share the same Redis and some have **no TTL**, so if memory fills up and Redis evicts keys, sessions can disappear, which looks like "random logouts". In an AWS lab with two containers each running their own Redis, logins broke across containers until Redis was shared - the same lesson at small scale.
 
 ## 🧠 Remember
 

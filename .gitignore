@@ -1,16 +1,16 @@
 CLAUDE.MD
+
+# Question lists (private working notes)
 quastion.md
+quastioncompleted.md
+questionnew.md
+preparation.md
 
 # Private notes: only the encrypted copy (prep/index.html) is ever published.
 interview-prep/
 
-# System design: publish the study material, not the AI prompt
-systemdesign/prompt.md
-preparation.md
-
-
 # Company codebase knowledge (infra IPs, security findings): only inside the encrypted prep page
 codebaseknowledge/
 
-# Private: current-work codebase notes -- only go into the encrypted prep page
-codebaseknowledge/
+# System design: publish the study material, not the AI prompt
+systemdesign/prompt.md

@@ -1426,3 +1426,310 @@ export class ConnectionManager {
   - `if (ws.readyState !== ws.OPEN) continue;` -- socket band ho raha hai. `CLOSING` state par `send()` throw karta hai.
   - `if (!canWrite(ws)) { dropSlowClient(ws); ... }` -- **backpressure**, agla section.
   - `ws.send(text)` -- **yahi woh ek line hai jahan message asal mein user tak pahunchta hai.** Poora system -- Kafka, workers, Redis, registry -- sirf is line tak pahunchne ke liye hai.
+
+### 3. `gateway/backpressure.ts` -- slow client ko drop karna
+
+```ts
+import type { WebSocket } from 'ws';
+import { wsBufferedAmountBytes, slowClientDropsTotal } from '../infra/metrics';
+
+export const MAX_BUFFERED_BYTES = 1024 * 1024;        // 1 MB (spec)
+const GRACE_MS = 5_000;
+
+export function canWrite(ws: WebSocket): boolean {
+  const buffered = ws.bufferedAmount;
+  wsBufferedAmountBytes.observe(buffered);
+  return buffered <= MAX_BUFFERED_BYTES;
+}
+
+export function dropSlowClient(ws: WebSocket): void {
+  slowClientDropsTotal.inc();
+  try {
+    ws.close(1013, 'slow client');                     // 'try again later'
+  } catch {
+    // already closing -- ignore
+  }
+  setTimeout(() => {
+    if (ws.readyState !== ws.CLOSED) ws.terminate();   // close frame bhi nahi ja paa raha
+  }, GRACE_MS).unref();
+}
+```
+
+**Code Explanation:**
+
+- `ws.bufferedAmount` -- **ye number samajhna hi is section ka asli sabak hai.** Jab aap `ws.send(data)` likhte ho, data seedha network par nahi jaata. Woh **kernel ke socket send buffer** mein jaata hai; kernel usko TCP ki raftaar se bhejta hai. Agar client slow hai (2G, tunnel mein, ya app suspend ho gaya) toh TCP ka receive window chhota ho jaata hai aur kernel buffer bharne lagta hai. Jab kernel buffer bhar jaata hai, `ws` library **Node ke process memory mein** aage ka data jama karne lagti hai. `bufferedAmount` = "kitne bytes abhi tak socket par nikle hi nahi."
+- **Ye gateway OOM ka asli karan kyun hai?** Ye arithmetic dekho:
+
+```
+Ek slow client jo 1 minute se data nahi le raha,
+ek busy group mein hai jahan 20 msg/min aate hain:
+     20 x 300 B = 6 KB    -- theek hai, koi baat nahi
+
+Par asli khatra fan-out ka hai. Socho ek user 50 active groups mein hai:
+     50 groups x 20 msg/min x 300 B = 300 KB/min per slow client
+
+Aur asli disaster: kisi ne 200 messages ka backlog bheja
+(ya ek buggy client ne resume loop chala diya):
+     Ab har slow client 1-10 MB hold kar sakta hai.
+
+Node ka heap default ~1.5-4 GB hai. Node par 8 GB RAM hai jisme se
+~1 GB connections ke liye already gaya hua hai.
+
+     500 slow clients x 5 MB = 2.5 GB    -> heap exhausted -> OOM kill
+     -> NODE MAR GAYA
+     -> USKE 50,000 CONNECTIONS TOOT GAYE (49,500 healthy clients bhi)
+     -> woh sab reconnect karenge -> THUNDERING HERD -> agla node bhi khatre mein
+```
+
+  **Yaani: 500 kharab clients 50,000 achhe clients ko maar dete hain.** Isliye slow client ko drop karna nirdayi nahi, **zaruri** hai -- ye ek bulkhead hai.
+- `MAX_BUFFERED_BYTES = 1 MB` -- threshold. Kyun 1 MB? Normal healthy client ka `bufferedAmount` hamesha ~0 rehta hai (message jaate hi nikal jaata hai). Chhoti spikes (burst) mein kuch KB ho sakta hai. 1 MB par pahunchna ka matlab hai: **~3,500 messages backlog** -- ye temporary slowness nahi, ye client sach mein data le hi nahi raha. Bahut kam threshold (jaise 64 KB) rakhoge toh achhe clients bhi burst par drop honge; bahut zyada (100 MB) rakhoge toh protection hi nahi bachegi.
+- `wsBufferedAmountBytes.observe(buffered)` -- **histogram**, gauge nahi. Isse dashboard par `bufferedAmount` ka p50/p95/p99 dikhta hai. Healthy fleet mein p99 bhi ~0 hona chahiye. p99 badhna shuru ho = network problem aa rahi hai, drops shuru hone se **pehle** alert.
+- `canWrite()` har `send` se pehle call hota hai -- `deliverLocal()` mein bhi aur heartbeat sweeper mein bhi.
+- `ws.close(1013, 'slow client')` -- `1013` = "Try again later". Ye code client ko saaf batata hai: "tum galat nahi ho, server bhi theek hai, bas abhi nahi ho paa raha." Achha client iske baad **lamba** backoff leta hai (turant reconnect karega toh wahi hoga, kyunki uska network abhi bhi slow hai) aur phir `resume` se saara backlog `seq` se le leta hai. **Ek bhi message nahi khota** -- sab kuch DB mein `seq` ke saath baitha hai. Yahi wajah hai ki drop karna safe hai.
+- `try { ws.close(...) } catch {}` -- socket already `CLOSING`/`CLOSED` ho sakta hai; `close()` tab throw kar sakta hai. Ek slow client ki wajah se gateway crash na ho.
+- **`setTimeout(... ws.terminate(), 5000)`** -- `close()` bhi ek **frame bhejta hai**, aur us frame ko bhi buffer se guzarna padta hai. Slow client ka buffer already bhara hua hai, toh close frame kabhi nikal hi nahi paayega aur socket hamesha ke liye `CLOSING` mein latak jaayega -- memory abhi bhi hold hai, problem hal nahi hui. 5 second ke baad `terminate()` = TCP ko forcefully band karo, buffer turant free. **`close()` tameez hai, `terminate()` guarantee hai. Dono chahiye.**
+- `.unref()` -- ye timer shutdown ko block na kare.
+
+> **Interview line:** "WebSocket gateway ka sabse common production failure OOM hota hai, aur uski wajah hamesha slow clients hoti hai. `send()` async hai -- data application memory mein queue hota hai jab tak client use nahi leta. Main har write se pehle `bufferedAmount` check karunga, 1 MB par client ko close code `1013` ke saath drop karunga, aur 5 second baad `terminate()` karunga kyunki close frame bhi usi bhare hue buffer se jaata hai. Client reconnect karke `resume` se sab kuch `seq` se le lega, isliye koi message nahi khota."
+
+### 4. `services/chat.service.ts` -- authorize, seq, persist, ack, produce
+
+```ts
+import type { Redis } from 'ioredis';
+import type { Producer } from 'kafkajs';
+import type { MessageRepository } from '../repositories/message.repository';
+import type { ConversationService } from './conversation.service';
+import type { ChatMessage } from '../types/frames';
+import { AppError } from '../infra/errors';
+import { messageSendDuration } from '../infra/metrics';
+import { logger } from '../infra/logger';
+
+const MAX_BODY_BYTES = 4096;                          // spec: text message max 4 KB
+
+export interface SendInput {
+  messageId: string;
+  conversationId: string;
+  body?: string;
+  mediaKey?: string;
+}
+
+export class ChatService {
+  constructor(
+    private readonly conversations: ConversationService,
+    private readonly redis: Redis,
+    private readonly messages: MessageRepository,
+    private readonly producer: Producer,
+  ) {}
+
+  async sendMessage(
+    senderId: string,
+    input: SendInput,
+    ackSender: (m: ChatMessage) => void,          // gateway ka callback -- service ws nahi jaanti
+  ): Promise<ChatMessage> {
+    const done = messageSendDuration.startTimer();
+    try {
+      // --- 1. VALIDATE (sasta kaam pehle) ---
+      if (!isUuid(input.messageId) || !isUuid(input.conversationId)) {
+        throw new AppError('BAD_FRAME', 400, 'messageId and conversationId must be UUIDs');
+      }
+      const bytes = Buffer.byteLength(input.body ?? '', 'utf8');
+      if (bytes > MAX_BODY_BYTES) {
+        throw new AppError('MESSAGE_TOO_LARGE', 413, 'Message body exceeds 4096 bytes');
+      }
+      if (!input.body && !input.mediaKey) {
+        throw new AppError('BAD_FRAME', 400, 'body or mediaKey required');
+      }
+
+      // --- 2. AUTHORIZE (Redis-cached membership) ---
+      const isMember = await this.conversations.isMember(input.conversationId, senderId);
+      if (!isMember) {
+        throw new AppError('NOT_A_MEMBER', 403, 'You are not a member of this conversation');
+      }
+
+      // --- 3. SEQ (atomic, per conversation) ---
+      const seq = await this.redis.incr('seq:' + input.conversationId);
+
+      // --- 4. PERSIST (idempotent) ---
+      const { message, duplicate } = await this.messages.insert({
+        conversationId: input.conversationId,
+        seq,
+        messageId: input.messageId,
+        senderId,
+        type: input.mediaKey ? 'media' : 'text',
+        body: input.body ?? '',
+        mediaKey: input.mediaKey,
+      });
+
+      // --- 5. ACK (persist ke BAAD, Kafka se PEHLE) ---
+      ackSender(message);
+
+      // --- 6. FAN-OUT (async) ---
+      if (!duplicate) {
+        await this.producer.send({
+          topic: 'chat-events',
+          messages: [{
+            key: message.conversationId,                 // per-conversation ordering
+            value: JSON.stringify({ type: 'message', message }),
+          }],
+        });
+      } else {
+        logger.info({ messageId: input.messageId, seq: message.seq }, 'duplicate send ignored');
+      }
+
+      return message;
+    } finally {
+      done();
+    }
+  }
+}
+```
+
+**Code Explanation:**
+
+- `constructor(conversations, redis, messages, producer)` -- **dependency injection.** Service ke andar `new Redis()` kabhi nahi. Test mein chaaron ko fake se badal do aur poora business logic bina kisi infra ke test ho jaata hai.
+- `ackSender: (m: ChatMessage) => void` -- **Part 10 wali deewar ka asli implementation.** Service ko `ws` object nahi mila; usko ek **function** mila jo "sender ko ye message ack kar do" kaam karta hai. Gateway us function ke andar `ws.send(JSON.stringify({ type: 'ack', ... }))` karta hai. Test mein aap `jest.fn()` pass karke check kar lete ho ki ack **kab** call hua. Socket ka naam service mein kahin nahi hai.
+- `messageSendDuration.startTimer()` + `finally { done(); }` -- histogram. `message_send_duration_seconds` ka p95 hamara sender-side SLI hai (latency budget ka step 2-6 = ~15 ms).
+
+**Ab steps ka ORDER -- ye is poore file ka sabse important interview point hai:**
+
+- **Step 1: Validation sabse pehle, kyunki sabse sasti hai.** `Buffer.byteLength(body, 'utf8')` -- `body.length` **galat** hai. JS mein `.length` UTF-16 code units ginti hai: emoji ka `.length` 2 hai par bytes 4; Devanagari ka har akshar 3 bytes. Limit bytes mein hai toh naap bhi bytes mein hona chahiye. **Koi I/O nahi, koi Redis nahi** -- galat frame yahin mar jaata hai.
+- **Step 2: Authorization -- validation ke baad, kisi bhi write se pehle.** Agar ye check `INCR` ke baad hota toh ek attacker random `conversationId` bhej-bhej ke Redis mein laakhon `seq:*` keys bana deta (memory attack), chahe uska message kabhi save na ho. **Koi bhi state badalne se pehle authorize karo.**
+  - `conversations.isMember()` Redis-cached hai (`member:<conversationId>` set, TTL 300 s). Har send par Postgres jaana = 70K QPS peak on Postgres, aur +3-8 ms latency.
+  - **Ye check hata dene par kya hoga?** Koi bhi kisi bhi conversation mein message daal sakta hai. Ye **is system ka sabse bada security hole** hai (spec ke shabd). Aur ye chupchaap hota hai -- koi error nahi, bas ek ajnabi ka message aapke private group mein.
+- **Step 3: `INCR seq:<conversationId>`** -- Redis `INCR` **atomic** hai: 50 log ek saath bhejein toh bhi sabko unique, badhta hua number milega. Ye `SELECT MAX(seq)+1` se **kyun behtar** hai? Kyunki `SELECT MAX` aur `INSERT` ke beech mein doosra process bhi wahi `MAX` padh sakta hai -> dono ko same `seq` -> ek ka insert fail. Uske liye `SELECT ... FOR UPDATE` ya serializable transaction chahiye, jo per-conversation ek **lock** ban jaata hai aur throughput maar deta hai. `INCR` ek single atomic operation hai, ~0.3 ms.
+- **Step 4: Persist.** Ab, aur sirf ab, data durable hota hai.
+- **Step 5: `ackSender(message)` -- persist ke BAAD.**
+  - **Ye spec ki sabse pakki decision hai:** "`sent` ack tabhi jab message persist ho chuka ho." Agar hum step 3 ke baad ack dete aur step 4 fail ho jaata (DB down, disk full, connection pool khatam), toh Priya ki screen par **tick lag chuka hota** par message duniya mein exist hi nahi karta. User ko lagega bhej diya; Rohan ko kabhi nahi milega; aur ye baat kabhi pakdi bhi nahi jaayegi. **Ye trust todne wala bug hai.**
+  - Aur dhyaan do ki hum `ack` **`message.seq`** bhejte hain, `seq` variable nahi. Duplicate case mein `message.seq` **original** seq hai (1205), naya nahi (1206). Client ko wahi order milta hai jo pehle mila tha.
+- **Step 6: Kafka produce -- ack ke BAAD.**
+  - **Kyun baad mein?** Kafka produce p95 ~15 ms leta hai. Ack se pehle rakhoge toh sender ka tick 15 ms late. Sender ko sirf ye jaanna hai ki message **safe** hai; delivery uske baad ka kaam hai.
+  - `key: message.conversationId` -- **ye key hi per-conversation ordering ki guarantee hai.** Kafka same key ko hamesha same partition par bhejta hai, aur ek partition ke andar order guaranteed hai. Key na do toh messages round-robin se 64 partitions par bikhar jaayenge aur 64 workers unhe **kisi bhi order** mein deliver kar denge -- recipient ko "kal milte hain" pehle aur "kahan ho?" baad mein dikhega.
+  - `if (!duplicate)` -- retry par Kafka par dobara produce **nahi** karte. Warna Rohan ko wahi message do baar dikhta. (Woh `messageId` se dedup kar leta, par network aur uski battery bekaar kharch hoti.)
+- **Is ordering ka honest risk:** step 4 (persist) aur step 6 (produce) ke beech process mar gaya toh message DB mein hai par Kafka mein nahi -> real-time delivery nahi hui. Recipient ko woh reconnect/sync par mil jaayega (Flow 5). Poori safety chahiye toh **transactional outbox** pattern: message ke saath hi ek `outbox` row likho usi transaction mein, aur ek alag publisher usse Kafka par bhejta rahe. Ye ek extra moving part hai; v1 ke liye "sync par mil jaayega + ek reconciler job" kaafi hai. **Interview mein ye trade-off khud bolna chahiye** -- isse pata chalta hai ki aapko pata hai ki do alag systems ke beech atomicity nahi hoti.
+- `finally { done(); }` -- error ho ya success, timer band. Failed requests ki latency bhi dashboard par honi chahiye.
+
+### 5. `repositories/message.repository.ts` -- idempotent insert
+
+```ts
+import type { Pool } from 'pg';
+import type { ChatMessage } from '../types/frames';
+
+const INSERT_SQL = `
+  INSERT INTO messages (conversation_id, seq, message_id, sender_id, type, body, media_key)
+  VALUES ($1, $2, $3, $4, $5, $6, $7)
+  ON CONFLICT (conversation_id, message_id) DO NOTHING
+  RETURNING conversation_id, seq, message_id, sender_id, body, media_key, created_at`;
+
+const SELECT_BY_MSGID_SQL = `
+  SELECT conversation_id, seq, message_id, sender_id, body, media_key, created_at
+    FROM messages
+   WHERE conversation_id = $1 AND message_id = $2`;
+
+const BUMP_LAST_SEQ_SQL = `
+  UPDATE conversations
+     SET last_message_seq = GREATEST(last_message_seq, $2)
+   WHERE id = $1`;
+
+export interface InsertInput {
+  conversationId: string; seq: number; messageId: string; senderId: string;
+  type: 'text' | 'media' | 'system'; body: string; mediaKey?: string;
+}
+
+export class MessageRepository {
+  constructor(private readonly db: Pool) {}
+
+  async insert(m: InsertInput): Promise<{ message: ChatMessage; duplicate: boolean }> {
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+
+      const res = await client.query(INSERT_SQL, [
+        m.conversationId, m.seq, m.messageId, m.senderId, m.type, m.body, m.mediaKey ?? null,
+      ]);
+
+      if (res.rowCount === 1) {
+        await client.query(BUMP_LAST_SEQ_SQL, [m.conversationId, m.seq]);
+        await client.query('COMMIT');
+        return { message: toChatMessage(res.rows[0]), duplicate: false };
+      }
+
+      // 0 rows -> ON CONFLICT ne roka -> ye ek RETRY hai
+      const existing = await client.query(SELECT_BY_MSGID_SQL, [m.conversationId, m.messageId]);
+      await client.query('COMMIT');
+      return { message: toChatMessage(existing.rows[0]), duplicate: true };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async afterSeq(conversationId: string, afterSeq: number, limit: number): Promise<ChatMessage[]> {
+    const { rows } = await this.db.query(
+      `SELECT conversation_id, seq, message_id, sender_id, body, media_key, created_at
+         FROM messages
+        WHERE conversation_id = $1 AND seq > $2 AND deleted_at IS NULL
+        ORDER BY seq ASC
+        LIMIT $3`,
+      [conversationId, afterSeq, limit],
+    );
+    return rows.map(toChatMessage);
+  }
+
+  async beforeSeq(conversationId: string, beforeSeq: number, limit: number): Promise<ChatMessage[]> {
+    const { rows } = await this.db.query(
+      `SELECT conversation_id, seq, message_id, sender_id, body, media_key, created_at
+         FROM messages
+        WHERE conversation_id = $1 AND seq < $2 AND deleted_at IS NULL
+        ORDER BY seq DESC
+        LIMIT $3`,
+      [conversationId, beforeSeq, limit],
+    );
+    return rows.map(toChatMessage);
+  }
+}
+
+function toChatMessage(r: any): ChatMessage {
+  return {
+    messageId: r.message_id,
+    conversationId: r.conversation_id,
+    seq: Number(r.seq),
+    senderId: r.sender_id,
+    body: r.body ?? '',
+    mediaKey: r.media_key ?? undefined,
+    createdAt: r.created_at.toISOString(),
+  };
+}
+```
+
+**Code Explanation:**
+
+- **`ON CONFLICT (conversation_id, message_id) DO NOTHING RETURNING ...`** -- poore repository ka dil.
+  - `ON CONFLICT (...)` ke andar wale columns ko **exactly** us unique index se match karna hota hai jo humne banaya tha (`messages_msgid_uniq`). Index na hota toh ye query hi syntax error deti -- yaani schema aur code ek doosre ko force karte hain.
+  - `DO NOTHING` -- conflict par kuch mat karo, error mat do. `DO UPDATE` yahan **galat** hota: message immutable hai, retry par usko overwrite karne ka koi matlab nahi (aur attacker `messageId` reuse karke purana message badal deta).
+  - `RETURNING` -- insert **hua** toh nayi row wapas milti hai. Conflict hua toh `RETURNING` **kuch nahi** deta (`rowCount === 0`). Yahi hamara duplicate ka signal hai.
+- `if (res.rowCount === 1)` -- naya message. Ab `conversations.last_message_seq` bump karo.
+- `GREATEST(last_message_seq, $2)` -- **monotonic bump.** Do messages ek saath aaye (seq 1205 aur 1206) aur unke UPDATE ulte order mein commit hue: blindly `SET = 1205` karne se counter **peeche** chala jaata, aur phir har client ko lagta ki 1206 exist hi nahi karta -> woh message sync mein miss ho jaata. `GREATEST` isko namumkin bana deta hai.
+- **Dono queries ek `BEGIN`/`COMMIT` mein kyun?** Kyunki ye do statements ek hi **business fact** hain: "ye message ab is conversation ka hissa hai." Insert commit ho jaaye aur bump fail ho jaaye toh `last_message_seq` peeche reh jaayega -> `resume` sochega "kuch naya nahi hai" -> message **kabhi deliver nahi hoga**. Transaction ye guarantee deta hai: ya dono, ya koi nahi.
+- **Duplicate path (`rowCount === 0`):** hum `message_id` se **original row** padhte hain aur usi ko wapas karte hain, `duplicate: true` ke saath.
+  - **Client retry ke saath aur bina is sab ke, farak:**
+
+| | Index + `ON CONFLICT` ke BINA | Index + `ON CONFLICT` ke SAATH |
+|---|---|---|
+| Retry par DB mein | 2 rows (seq 1205 aur 1206) | 1 row (seq 1205) |
+| Sender ko ack | seq 1206 (naya) | seq 1205 (original) |
+| Recipient ko | message **do baar** dikha | ek baar |
+| Kafka par | 2 events | 1 event (duplicate par produce skip) |
+| Group mein 30 log | sabko duplicate | sab theek |
+| Naye device par sync | duplicate phir se dikhega (permanent) | saaf |
+| `seq` counter | 1206 istemaal | 1206 **jal gaya** = gap (acceptable) |
+
+- `client.release()` **`finally` mein** -- ye line bhoolna Node backend ka #1 production bug hai. `pg` Pool mein default ~10 connections hote hain. Ek bhi path jahan `release()` na ho, wahan connection hamesha ke liye leak ho jaata hai. 10 leaks ke baad **poori service hang** ho jaati hai -- har query pool se connection ka intezaar karti rehti hai, koi error bhi nahi aata, bas sab kuch ruk jaata hai.
+- `BEGIN` / `COMMIT` / `ROLLBACK` seedhe `client` par -- Pool par nahi. Pool har query ke liye **koi bhi** free connection de sakta hai; transaction ko **ek hi** connection par rehna zaruri hai. `pool.query('BEGIN')` likhna ek classic (aur bahut khatarnak) galti hai -- transaction ek connection par khulti hai aur agli query kisi doosre connection par chali jaati hai.
+- `afterSeq()` -- `seq > $2 ORDER BY seq ASC LIMIT $3`. PK `(conversation_id, seq)` par seedha index seek + forward scan. `OFFSET` kahin nahi (Part 8 ka keyset deep dive).
+- `beforeSeq()` -- `seq < $2 ORDER BY seq DESC`. **Wahi index, ulti direction.** B-tree dono taraf chal sakta hai, isliye ek index dono features deta hai.
+- `deleted_at IS NULL` -- soft-deleted messages history mein nahi aate. (Chaho toh tombstone bhej sakte ho: "This message was deleted".)
+- `seq: Number(r.seq)` -- **`pg` ka gotcha.** `pg` library `BIGINT` ko **string** mein deti hai (`"1205"`), kyunki 64-bit integer JS `number` mein overflow kar sakta hai. Yahin convert na karo toh `seq > lastSeq` comparison string comparison ban jaata hai: `"9" > "1205"` JavaScript mein **`true`** hai (lexicographic!). Ye bug production mein "kabhi-kabhi sync ajeeb behave karta hai" jaisa dikhta hai aur dhoondhne mein ghante lagte hain.
+- `createdAt: r.created_at.toISOString()` -- `pg` `TIMESTAMPTZ` ko JS `Date` deta hai. Wire par hamesha ISO string (protocol mein `createdAt: string` hai).
+- **Mapping sirf yahin** -- `message_id` -> `messageId` (snake_case se camelCase). Baaki poore app ko DB ke column names ka pata hi nahi. Kal Cassandra par jaaein toh sirf ye file badlegi.

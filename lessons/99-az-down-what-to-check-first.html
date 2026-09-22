@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AZ Down: What to Check First</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# One of Your Two AZs Goes Down and Users See Errors - What Do You Check First?
+
+> **Same-question flag**: the design answer is [[12-multi-az-availability]] (Multi-AZ ASG + ALB + RDS failover). That lesson is "how do I build it"; this one is the **incident** version - what you check in the first five minutes - plus how each named piece (ALB, Auto Scaling, Multi-AZ RDS, Route 53, health checks) should behave so users barely notice.
+
+## 1. First Question: Why Are Users Seeing Errors At All?
+
+You're already in 2 AZs, so a single AZ failure *should* be invisible. Errors mean one of these assumptions broke:
+
+1. **Health checks aren't failing fast enough.** The ALB keeps sending traffic to dead targets until they fail the threshold. With a 30-second interval and 5 unhealthy checks, that's 2.5 minutes of errors. Check: ALB target group health, `UnHealthyHostCount`, `HTTPCode_ELB_5XX_Count`.
+2. **The surviving AZ can't carry 100% of the traffic.** If both AZs ran at 60% capacity, the survivor is now at 120%. Check: instance count per AZ, CPU, and whether Auto Scaling is launching replacements *in the healthy AZ*.
+3. **The database primary was in the dead AZ.** Multi-AZ RDS failover is automatic but takes roughly 60-120 seconds, and apps that cache the DNS or don't retry will error through it. Check: RDS events for "failover started/completed", and your app's connection errors.
+4. **Something was single-AZ that you forgot.** A NAT gateway, an ElastiCache node, a Kafka broker, a worker that only ran in one AZ, or a subnet with no capacity. This is the most common real cause.
+
+## 2. The Five-Minute Checklist
+
+1. **AWS Health Dashboard** - confirm it's actually an AZ event, not your deploy.
+2. **ALB target health per AZ** - are dead targets still receiving traffic? Is cross-zone load balancing on?
+3. **Auto Scaling activity** - is it launching in the healthy AZs, or failing with "insufficient capacity" in the dead one?
+4. **RDS** - did failover happen, and is the app reconnecting?
+5. **Single-AZ dependencies** - NAT, cache, queues, cron hosts.
+6. Then: if the survivor is saturated, **raise desired capacity** and shed non-critical load ([[04-handling-traffic-spike-15k-rps]]).
+
+## 3. How Each Piece Should Be Configured So Users Barely Notice
+
+- **Health checks**: short interval (10s), low unhealthy threshold (2-3), and a real `/health` endpoint that checks the app's own dependencies - not a static 200.
+- **ALB**: enabled in **all** AZs, with **cross-zone load balancing on**, so the remaining targets share traffic evenly.
+- **Auto Scaling**: subnets in 3 AZs, not 2. With 2 AZs you lose 50% of capacity; with 3 you lose 33%. Keep enough headroom that the survivors can absorb the loss, and let the ASG replace lost instances automatically.
+- **Multi-AZ RDS**: standby in another AZ, app connects by the **endpoint name** (never a cached IP), with short connection timeouts and retry-on-reconnect so the 60-120s failover is a blip, not an outage.
+- **Route 53**: health-checked records matter for *multi-region*; within one region the ALB already handles AZ failure. Keep DNS TTLs low (60s) so a region-level switch is possible later.
+- **Stateless app** ([[06-ec2-autoscaling]]): sessions in a shared store, so a user whose instance vanished just continues on another.
+
+## 4. The Honest Trade-off
+
+Surviving an AZ loss invisibly means **paying for capacity you don't use on a normal day** (N+1 across 3 AZs). That's the actual decision, and saying it out loud is the senior answer ([[42-resilience-vs-overengineering]]).
+
+## 5. 🧠 Remember
+
+> In a 2-AZ setup, errors during an AZ failure mean health checks were too slow, the survivor was too small, the database was failing over, or something was quietly single-AZ - check those four, in that order.
+
+## 6. Quick Self-Test
+
+1. Why do 3 AZs need less spare capacity per AZ than 2?
+2. Why can an app still error during an RDS Multi-AZ failover, and what makes it a blip instead?
+3. Which AZ-failure symptoms does Route 53 *not* solve inside a single region?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

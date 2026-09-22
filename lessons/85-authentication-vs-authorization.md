@@ -55,9 +55,6 @@ app.delete('/api/suppliers/:id',
 - **Checking the role but not ownership** - a user may edit orders, but only **their own**: `WHERE id = $1 AND user_id = $2`. Missing this is an **IDOR** bug, one of the most common security holes.
 - **Trusting the user ID from the request body** instead of the verified token.
 
-## 6. Real Example (ThePipingMart admin panel)
-
-The admin panel has 24 permission keys (supplier access, RFQ access, Jamstack rebuild...). **Authentication** is the login token; **authorization** is the `PermissionRoute` guard in the UI plus a `checkPermission(key)` middleware on the API. The key lesson from that project: the UI check alone is not enough - the API must enforce the same permissions.
 
 ## 🧠 Remember
 
