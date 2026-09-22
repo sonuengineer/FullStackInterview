@@ -7377,6 +7377,310 @@ WHERE rnk = 3;
 2. When is a materialized view the wrong choice?
 3. What's the difference in output between `RANK()` and `DENSE_RANK()` when two people earn the same salary?
 </script>
+<script type="text/markdown" class="lesson-data" data-id="96" data-title="12 LPA to 22 LPA Is Not More LeetCode" data-category="Blog" data-order="96">
+# Blog: 12 LPA to 22 LPA Is Not "More LeetCode"
+
+*What actually moved the people I know. The jump is a packaging problem as much as a skill problem.*
+
+---
+
+## The Six Things That Moved People
+
+**1. One service they could explain under load.**
+Not five side projects. One system where you can answer: what breaks at 10x, which component saturates first, how you'd know. That's the whole method in [[53-blog-senior-system-design-without-big-scale]] - and you can practise it on the small system you already work on.
+
+**2. 8-10 DSA patterns, not 400 random Easy problems.**
+Sliding window, two pointers, hashing, binary search on answer, BFS/DFS, heap/top-k, intervals, prefix sums, basic DP, graph traversal. Patterns transfer; solved-problem counts don't.
+
+**3. SQL that uses `EXPLAIN`, not just `SELECT`.**
+Being able to read a query plan, spot a sequential scan, and add the right composite index is a senior signal that very few candidates show ([[50-slow-query-500m-rows]], [[57-two-indexes-still-slow-composite]], [[95-database-interview-questions]]).
+
+**4. A resume with latency, cost and users - not "worked on APIs".**
+Compare:
+- *Before:* "Worked on backend APIs using Node.js and MongoDB."
+- *After:* "Cut p95 checkout latency 2.4s -> 380ms for 40k daily users by removing sequential calls and adding a Redis cache; cloud bill down 18%."
+Same work. The second version tells the interviewer you measure things. If you don't have exact numbers, use honest ranges and say how you measured.
+
+**5. 12 targeted applications + 4 referrals, not 200 blasts.**
+A referral plus a short note about why *this* company is worth more than a hundred cold applications. Targeted means: you read what they build and can say which of your projects is closest.
+
+**6. 6 mock interviews where they said the trade-off out loud.**
+Not silent practice. The skill being graded is explaining *why this and not that* while someone pushes back ([[30-workload-before-conclusion]], [[42-resilience-vs-overengineering]]).
+
+## Why "Packaging" Is the Right Word
+
+Two engineers with the same three years of experience get very different offers, because one can *show* what they know in the 45 minutes the interviewer has. Packaging means:
+
+- **Evidence over claims:** numbers, not adjectives.
+- **Depth over breadth:** one system explained well beats five listed.
+- **Reasoning out loud:** the interviewer can only grade what you say.
+
+None of this replaces skill - it makes existing skill legible.
+
+## A Plan That Fits Around a Job
+
+| Weeks | Focus |
+|---|---|
+| 1-2 | Pick your one system. Write down its load, bottleneck at 10x, and failure modes. |
+| 3-4 | 8-10 DSA patterns, 5-8 problems each, revisited, not 200 new ones. |
+| 5 | SQL: `EXPLAIN` on your real slow queries; learn indexes and joins properly. |
+| 6 | Rewrite the resume around latency, cost, users, scale. |
+| 7-8 | 12 targeted applications, ask for 4 referrals, do 6 mocks and record yourself. |
+
+## 🧠 Remember
+
+> The jump usually isn't more problems solved - it's one system you can explain under load, patterns instead of volume, numbers on your resume, and trade-offs spoken out loud in a room.
+
+## Reflect
+
+1. Which single system would you pick as "the one you can explain under load"? Can you name what breaks first at 10x?
+2. Rewrite one resume line to include latency, cost, users or scale.
+</script>
+<script type="text/markdown" class="lesson-data" data-id="97" data-title="Bulk Price Update and Replica Lag" data-category="Databases" data-order="97">
+# `UPDATE products SET price = price * 1.1` on 12M Rows: Two Prices at Once
+
+> **Connects to**: [[81-delete-150m-rows-safely]] (same batching discipline for mass writes) and [[28-scaling-database-reads]] (why replicas lag). The new problem here is that a *partly applied* price change is visible to users.
+
+## 1. What Actually Went Wrong
+
+One statement rewrote 12 million rows. Two separate problems followed:
+
+1. **A giant transaction.** One long write holds locks, bloats the undo/WAL, and if it fails halfway it rolls back for just as long.
+2. **Replica lag of 40 seconds.** Reads that go to replicas still saw old prices while the primary had new ones. So the product listing showed the old price and the cart showed the new one: **two prices at the same moment**.
+
+Note the second one isn't fixed by batching alone. Smaller batches actually make the mixed-price window *longer*, just less violent. Users seeing two prices is a **rollout** problem, not a throughput problem.
+
+## 2. The Real Fix: Don't Mutate Prices In Place - Switch Versions
+
+Make the price change a single, instant, atomic event that every replica sees at once.
+
+**Option A - price list version (best for catalog-wide changes).**
+
+```sql
+-- prices live in a versioned table, never overwritten
+CREATE TABLE price_list (id serial PRIMARY KEY, name text, status text);  -- draft | active | retired
+CREATE TABLE price_item (price_list_id int, product_id bigint, price numeric,
+                         PRIMARY KEY (price_list_id, product_id));
+
+-- 1. Build the new list in the background, as slowly as you like. Nobody reads it yet.
+INSERT INTO price_item (price_list_id, product_id, price)
+SELECT 2, product_id, price * 1.1 FROM price_item WHERE price_list_id = 1;
+
+-- 2. Flip, in one tiny transaction (one row changes, replicas apply it instantly)
+BEGIN;
+UPDATE price_list SET status = 'retired' WHERE id = 1;
+UPDATE price_list SET status = 'active'  WHERE id = 2;
+COMMIT;
+```
+
+The heavy work is a background insert nobody reads; the *cutover* is one row. Rollback is flipping back. This is the same idea as dropping a partition instead of deleting rows ([[21-database-partitioning]]): make the expensive thing invisible, and the visible thing cheap.
+
+**Option B - effective-dated prices.** Store `price, effective_from` and have reads pick the row where `effective_from <= now()`. Write all the future prices ahead of time, and the change happens by clock, everywhere at once. (Mind timezone/DST handling - see [[67-dst-scheduled-jobs]].)
+
+## 3. If You Must Update In Place
+
+Then the goal is: keep lag low, and make sure nobody can see a half-applied catalog.
+
+**Batch and throttle, watching lag:**
+
+```javascript
+// Batch by primary key, commit each batch, and pause when replicas fall behind
+let lastId = 0;
+for (;;) {
+  const { rows } = await db.query(
+    `UPDATE products SET price = price * 1.1
+      WHERE id IN (SELECT id FROM products WHERE id > $1 ORDER BY id LIMIT 5000)
+      RETURNING id`, [lastId]);
+  if (!rows.length) break;
+  lastId = rows[rows.length - 1].id;
+
+  // Postgres: lag in seconds on the primary
+  const { rows: [lag] } = await db.query(
+    `SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - reply_time))), 0) AS sec FROM pg_stat_replication`);
+  while (lag.sec > 5) { await sleep(1000); }        // let replicas catch up
+  await sleep(50);                                   // be kind to the primary
+}
+```
+
+**And close the "two prices" window** with one of these:
+- **Read the price from the primary** (or from a cache written at cutover) for anything money-related: cart, checkout, invoice. Product listings can be slightly stale; the price you *charge* must not be.
+- **Pin one price per user session**: resolve the price once, carry it (or a `price_list_id`) through cart and checkout, so a user never sees it change mid-flow.
+- **Do it in a low-traffic window** and hide the catalog behind a cache that's refreshed after the update completes.
+
+## 4. Protect the User, Not Just the Database
+
+Whatever the mechanism, decide the rule before you start: **the price shown when the item was added is the price honoured at checkout** (or you clearly tell the user it changed). That rule is what stops "split brain" from becoming a support ticket or a refund.
+
+## 5. Checklist Before a Mass Write
+
+- [ ] Can this be a version flip or an effective date instead of an in-place update?
+- [ ] Batched, throttled, resumable (keyed by primary key, not `OFFSET`)?
+- [ ] Replica lag watched, with an automatic pause?
+- [ ] Money reads pinned to the primary or to a session-fixed price?
+- [ ] Rollback plan: one flip back, or a saved copy of the old values?
+- [ ] Run it off-peak, and announce it if prices are customer-visible.
+
+## 6. 🧠 Remember
+
+> Don't rewrite 12 million rows live - build the new prices in the background and flip a single version row, so every replica switches at the same instant; if you must update in place, batch with replica-lag checks and serve money-critical reads from the primary.
+
+## 7. Quick Self-Test
+
+1. Why do smaller batches fix lag but not the "two prices at once" problem?
+2. What makes the version-flip approach atomic for replicas as well as the primary?
+3. Which reads in an e-commerce flow must never come from a lagging replica?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="98" data-title="Job Scheduler for Millions (Hinglish)" data-category="System Design at Scale" data-order="98">
+# Job Scheduler Design (Hinglish): "Every Monday 9 AM" x Millions of Jobs
+
+> **Hinglish lesson** - aapne isi tarah maanga tha. Technical terms English mein hain.
+> **Connects to**: [[03-ttl-deletion-at-scale]] (delay queue pattern), [[67-dst-scheduled-jobs]] (local time + DST), [[19-idempotent-consumer-duplicate-events]] (duplicate execution), [[65-pagerduty-incident-dedup-paging]] (outbox + leasing), [[14-cascading-failure-recovery]] (retries with backoff).
+
+## 1. Problem Samjho
+
+User bolta hai: "Har Monday 9 AM par mera report job chalao." Millions aise schedules hain. Humein chahiye:
+
+- One-time **aur** recurring jobs
+- **No duplicate execution** (ek run exactly ek baar effect kare)
+- **Retry** failures
+- **Worker crash** ho jaaye to job lost na ho
+
+Naive solution: ek `setInterval` jo har minute poori table scan kare. 10 million rows par ye har minute database ko maar dega, aur agar wo ek server crash ho gaya to **saare** jobs ruk jaayenge. Isliye proper design chahiye.
+
+## 2. Scale Estimate (pehle numbers)
+
+Maan lo 10M schedules, average har schedule roz 1 baar chalta hai:
+
+- `10,000,000 / 86,400` = **~115 jobs/second average**
+- Peak bahut zyada, kyunki log round numbers chunte hain: 9:00 AM par lakhs jobs ek saath. Ye **thundering herd** hai ([[16-synchronized-connection-pool-expiry]] wali problem).
+- Isliye: due jobs ko **second-level buckets** mein baanto aur execution ko thoda **jitter** do.
+
+## 3. Core Idea: Schedule Store + Due Index + Workers
+
+Teen alag cheezein rakho (ye sabse important design decision hai):
+
+1. **Schedule table** (source of truth): kya chalana hai, kis rule se (cron expression + timezone).
+2. **Due index / queue**: *agla* run kab hai - yahin se trigger hota hai (Redis ZSET ya `next_run_at` column with index).
+3. **Run table** (execution log): har actual run ka record, jo duplicate rokta hai.
+
+```mermaid
+flowchart TB
+  API[Schedule API] --> DB[(schedules: cron, tz, next_run_at)]
+  DB --> P[Poller / Dispatcher - leader elected, sharded]
+  P -->|due jobs, batched| Q[Queue: Kafka / SQS / BullMQ]
+  Q --> W1[Worker 1]
+  Q --> W2[Worker 2]
+  Q --> W3[Worker N]
+  W1 --> R[(job_runs: unique job_id + run_at)]
+  W1 -->|success/fail| DB
+  W1 -->|failure| RT[Retry with backoff + jitter -> DLQ]
+```
+
+## 4. Trigger Kaise Kare (ye asli sawaal hai)
+
+**Poller approach (simple aur reliable):**
+
+```sql
+-- har 1 second: sirf due rows, batch mein, lock ke saath
+UPDATE schedules SET status = 'dispatching', locked_by = $worker, locked_at = now()
+WHERE id IN (
+  SELECT id FROM schedules
+  WHERE next_run_at <= now() AND status = 'active'
+  ORDER BY next_run_at
+  LIMIT 500
+  FOR UPDATE SKIP LOCKED          -- do pollers same row na uthayein
+)
+RETURNING id, cron_expr, timezone;
+```
+
+`FOR UPDATE SKIP LOCKED` ki wajah se aap **kai poller** chala sakte ho bina duplicate ke. Index chahiye: `(status, next_run_at)`.
+
+**Redis ZSET approach (bahut fast):** `ZADD due_jobs <next_run_epoch> <jobId>`, phir `ZRANGEBYSCORE due_jobs 0 now LIMIT 0 500` + atomic remove (Lua). Memory mein hone ki wajah se millions par bhi milliseconds. Lekin Redis source of truth nahi - **DB hi truth hai**, Redis sirf index hai, taaki restart par rebuild ho sake.
+
+**Scale karne ke liye sharding:** `shard = hash(job_id) % N`. Har poller instance apna shard dekhta hai. Ek poller mar gaya to uska shard doosre ko mil jaata hai (leader election / consistent hashing). Isse ek hi poller bottleneck nahi banta.
+
+## 5. Duplicate Execution Kaise Roke
+
+Sirf queue par bharosa mat karo - queues **at-least-once** hote hain, exactly-once nahi ([[19-idempotent-consumer-duplicate-events]]).
+
+```sql
+-- har run ka unique identity: job + uska scheduled time
+CREATE TABLE job_runs (
+  job_id bigint, run_at timestamptz, status text, attempt int,
+  PRIMARY KEY (job_id, run_at)
+);
+```
+
+Worker kaam shuru karne se pehle:
+
+```javascript
+// DB decide karega, application check nahi - yahi race-free hai
+const { rowCount } = await db.query(
+  `INSERT INTO job_runs (job_id, run_at, status, attempt)
+   VALUES ($1, $2, 'running', 1) ON CONFLICT DO NOTHING`, [jobId, runAt]);
+if (rowCount === 0) return;   // koi aur already chala raha hai / chala chuka hai
+await doTheWork(jobId, runAt);
+```
+
+Ye wahi check-then-act fix hai jo [[26-duplicate-email-race-condition]] mein hai: database uniqueness enforce kare, code nahi.
+
+## 6. Worker Crash Handle Karna (leasing / visibility timeout)
+
+Worker job utha kar mar gaya - ab kya? Har run ke saath ek **lease** do:
+
+- Worker `locked_at` set karta hai aur beech-beech mein **heartbeat** karke lease extend karta hai.
+- Ek **reaper** job un rows ko dhoondhta hai jinka `status='running'` hai lekin `locked_at` purana ho gaya (lease expired), aur unhe wapas `pending` kar deta hai.
+- SQS mein ye built-in hai (visibility timeout), Kafka mein consumer group rebalance karta hai.
+
+Isliye jobs **idempotent** hone chahiye - kyunki crash ke baad wahi run dobara chalega.
+
+## 7. Recurring Jobs: Agla Run Kab?
+
+Job complete hone ke **baad** next run calculate karo, purane schedule se:
+
+```javascript
+const { CronExpressionParser } = require('cron-parser');
+// local time + IANA timezone store karo, fixed UTC nahi (DST issue - Lesson 67)
+const it = CronExpressionParser.parse('0 9 * * 1', { tz: 'Asia/Kolkata', currentDate: lastRunAt });
+await db.query('UPDATE schedules SET next_run_at = $1, status = $2 WHERE id = $3',
+  [it.next().toDate(), 'active', jobId]);
+```
+
+Do zaroori baatein:
+- **Timezone + DST**: "9 AM local" ko har baar fresh calculate karo ([[67-dst-scheduled-jobs]]).
+- **Missed runs policy**: agar system 3 ghante down tha, to kya sab missed runs chalayenge (catch-up) ya sirf latest (skip)? Ye business decision hai - interview mein poochho. Reports ke liye aksar "skip, sirf latest chalao" sahi hota hai.
+
+## 8. Retries aur Failures
+
+- **Exponential backoff + jitter** (1m, 5m, 25m...), max attempts ke saath ([[14-cascading-failure-recovery]]).
+- Max attempts ke baad **dead letter queue** + alert - silently drop mat karo.
+- Ek customer ke jobs baaki sabko block na karein: per-tenant **rate limit** ya alag queue (bulkhead).
+
+## 9. Peak Handling (9 AM problem)
+
+- **Jitter**: `next_run_at + random(0..60s)`, taaki 9:00:00 par sab ek saath na chalein.
+- **Bounded worker concurrency** ([[61-1000-requests-10x-faster]]) aur queue depth par autoscaling ([[23-queue-backlog-after-spike]]).
+- Poller queue mein daal deta hai - agar workers slow hain to backlog banega, par jobs lost nahi honge.
+
+## 10. Trade-offs (interview mein bolne layak)
+
+| Approach | Plus | Minus |
+|---|---|---|
+| DB polling (`SKIP LOCKED`) | Simple, ek hi source of truth, crash-safe | Har second query; index aur sharding zaroori |
+| Redis ZSET | Bahut fast, millions handle karta hai | Redis restart/failover par rebuild chahiye; truth DB mein hi rakho |
+| Kafka delayed topics | High throughput, durable | Arbitrary per-job time set karna awkward |
+| Cloud (EventBridge/Cloud Scheduler) | Aapko kuch chalana nahi padta | Per-schedule limits aur cost, vendor lock-in |
+
+## 11. 🧠 Remember
+
+> Schedule (kya chalana hai), due index (kab chalana hai) aur run log (kya chal chuka hai) - teeno alag rakho: DB se due jobs `SKIP LOCKED` se batch mein uthao, `(job_id, run_at)` ke unique constraint se duplicate roko, lease + reaper se crash handle karo, backoff+jitter se retry karo, aur next run hamesha local time + timezone se calculate karo.
+
+## 12. Quick Self-Test
+
+1. Queue "at-least-once" hai - to phir duplicate execution kaunsi cheez rokti hai?
+2. Worker crash hone par job wapas kaise aata hai, aur uske liye job mein kya property honi chahiye?
+3. 9:00 AM par lakhs jobs ek saath due hain - aap kya badlenge?
+</script>
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>

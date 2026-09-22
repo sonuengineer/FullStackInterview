@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 LPA to 22 LPA Is Not More LeetCode</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# Blog: 12 LPA to 22 LPA Is Not "More LeetCode"
+
+*What actually moved the people I know. The jump is a packaging problem as much as a skill problem.*
+
+---
+
+## The Six Things That Moved People
+
+**1. One service they could explain under load.**
+Not five side projects. One system where you can answer: what breaks at 10x, which component saturates first, how you'd know. That's the whole method in [[53-blog-senior-system-design-without-big-scale]] - and you can practise it on the small system you already work on.
+
+**2. 8-10 DSA patterns, not 400 random Easy problems.**
+Sliding window, two pointers, hashing, binary search on answer, BFS/DFS, heap/top-k, intervals, prefix sums, basic DP, graph traversal. Patterns transfer; solved-problem counts don't.
+
+**3. SQL that uses `EXPLAIN`, not just `SELECT`.**
+Being able to read a query plan, spot a sequential scan, and add the right composite index is a senior signal that very few candidates show ([[50-slow-query-500m-rows]], [[57-two-indexes-still-slow-composite]], [[95-database-interview-questions]]).
+
+**4. A resume with latency, cost and users - not "worked on APIs".**
+Compare:
+- *Before:* "Worked on backend APIs using Node.js and MongoDB."
+- *After:* "Cut p95 checkout latency 2.4s -> 380ms for 40k daily users by removing sequential calls and adding a Redis cache; cloud bill down 18%."
+Same work. The second version tells the interviewer you measure things. If you don't have exact numbers, use honest ranges and say how you measured.
+
+**5. 12 targeted applications + 4 referrals, not 200 blasts.**
+A referral plus a short note about why *this* company is worth more than a hundred cold applications. Targeted means: you read what they build and can say which of your projects is closest.
+
+**6. 6 mock interviews where they said the trade-off out loud.**
+Not silent practice. The skill being graded is explaining *why this and not that* while someone pushes back ([[30-workload-before-conclusion]], [[42-resilience-vs-overengineering]]).
+
+## Why "Packaging" Is the Right Word
+
+Two engineers with the same three years of experience get very different offers, because one can *show* what they know in the 45 minutes the interviewer has. Packaging means:
+
+- **Evidence over claims:** numbers, not adjectives.
+- **Depth over breadth:** one system explained well beats five listed.
+- **Reasoning out loud:** the interviewer can only grade what you say.
+
+None of this replaces skill - it makes existing skill legible.
+
+## A Plan That Fits Around a Job
+
+| Weeks | Focus |
+|---|---|
+| 1-2 | Pick your one system. Write down its load, bottleneck at 10x, and failure modes. |
+| 3-4 | 8-10 DSA patterns, 5-8 problems each, revisited, not 200 new ones. |
+| 5 | SQL: `EXPLAIN` on your real slow queries; learn indexes and joins properly. |
+| 6 | Rewrite the resume around latency, cost, users, scale. |
+| 7-8 | 12 targeted applications, ask for 4 referrals, do 6 mocks and record yourself. |
+
+## 🧠 Remember
+
+> The jump usually isn't more problems solved - it's one system you can explain under load, patterns instead of volume, numbers on your resume, and trade-offs spoken out loud in a room.
+
+## Reflect
+
+1. Which single system would you pick as "the one you can explain under load"? Can you name what breaks first at 10x?
+2. Rewrite one resume line to include latency, cost, users or scale.
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>

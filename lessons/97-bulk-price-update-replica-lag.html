@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bulk Price Update and Replica Lag</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# `UPDATE products SET price = price * 1.1` on 12M Rows: Two Prices at Once
+
+> **Connects to**: [[81-delete-150m-rows-safely]] (same batching discipline for mass writes) and [[28-scaling-database-reads]] (why replicas lag). The new problem here is that a *partly applied* price change is visible to users.
+
+## 1. What Actually Went Wrong
+
+One statement rewrote 12 million rows. Two separate problems followed:
+
+1. **A giant transaction.** One long write holds locks, bloats the undo/WAL, and if it fails halfway it rolls back for just as long.
+2. **Replica lag of 40 seconds.** Reads that go to replicas still saw old prices while the primary had new ones. So the product listing showed the old price and the cart showed the new one: **two prices at the same moment**.
+
+Note the second one isn't fixed by batching alone. Smaller batches actually make the mixed-price window *longer*, just less violent. Users seeing two prices is a **rollout** problem, not a throughput problem.
+
+## 2. The Real Fix: Don't Mutate Prices In Place - Switch Versions
+
+Make the price change a single, instant, atomic event that every replica sees at once.
+
+**Option A - price list version (best for catalog-wide changes).**
+
+```sql
+-- prices live in a versioned table, never overwritten
+CREATE TABLE price_list (id serial PRIMARY KEY, name text, status text);  -- draft | active | retired
+CREATE TABLE price_item (price_list_id int, product_id bigint, price numeric,
+                         PRIMARY KEY (price_list_id, product_id));
+
+-- 1. Build the new list in the background, as slowly as you like. Nobody reads it yet.
+INSERT INTO price_item (price_list_id, product_id, price)
+SELECT 2, product_id, price * 1.1 FROM price_item WHERE price_list_id = 1;
+
+-- 2. Flip, in one tiny transaction (one row changes, replicas apply it instantly)
+BEGIN;
+UPDATE price_list SET status = 'retired' WHERE id = 1;
+UPDATE price_list SET status = 'active'  WHERE id = 2;
+COMMIT;
+```
+
+The heavy work is a background insert nobody reads; the *cutover* is one row. Rollback is flipping back. This is the same idea as dropping a partition instead of deleting rows ([[21-database-partitioning]]): make the expensive thing invisible, and the visible thing cheap.
+
+**Option B - effective-dated prices.** Store `price, effective_from` and have reads pick the row where `effective_from <= now()`. Write all the future prices ahead of time, and the change happens by clock, everywhere at once. (Mind timezone/DST handling - see [[67-dst-scheduled-jobs]].)
+
+## 3. If You Must Update In Place
+
+Then the goal is: keep lag low, and make sure nobody can see a half-applied catalog.
+
+**Batch and throttle, watching lag:**
+
+```javascript
+// Batch by primary key, commit each batch, and pause when replicas fall behind
+let lastId = 0;
+for (;;) {
+  const { rows } = await db.query(
+    `UPDATE products SET price = price * 1.1
+      WHERE id IN (SELECT id FROM products WHERE id > $1 ORDER BY id LIMIT 5000)
+      RETURNING id`, [lastId]);
+  if (!rows.length) break;
+  lastId = rows[rows.length - 1].id;
+
+  // Postgres: lag in seconds on the primary
+  const { rows: [lag] } = await db.query(
+    `SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - reply_time))), 0) AS sec FROM pg_stat_replication`);
+  while (lag.sec > 5) { await sleep(1000); }        // let replicas catch up
+  await sleep(50);                                   // be kind to the primary
+}
+```
+
+**And close the "two prices" window** with one of these:
+- **Read the price from the primary** (or from a cache written at cutover) for anything money-related: cart, checkout, invoice. Product listings can be slightly stale; the price you *charge* must not be.
+- **Pin one price per user session**: resolve the price once, carry it (or a `price_list_id`) through cart and checkout, so a user never sees it change mid-flow.
+- **Do it in a low-traffic window** and hide the catalog behind a cache that's refreshed after the update completes.
+
+## 4. Protect the User, Not Just the Database
+
+Whatever the mechanism, decide the rule before you start: **the price shown when the item was added is the price honoured at checkout** (or you clearly tell the user it changed). That rule is what stops "split brain" from becoming a support ticket or a refund.
+
+## 5. Checklist Before a Mass Write
+
+- [ ] Can this be a version flip or an effective date instead of an in-place update?
+- [ ] Batched, throttled, resumable (keyed by primary key, not `OFFSET`)?
+- [ ] Replica lag watched, with an automatic pause?
+- [ ] Money reads pinned to the primary or to a session-fixed price?
+- [ ] Rollback plan: one flip back, or a saved copy of the old values?
+- [ ] Run it off-peak, and announce it if prices are customer-visible.
+
+## 6. 🧠 Remember
+
+> Don't rewrite 12 million rows live - build the new prices in the background and flip a single version row, so every replica switches at the same instant; if you must update in place, batch with replica-lag checks and serve money-critical reads from the primary.
+
+## 7. Quick Self-Test
+
+1. Why do smaller batches fix lag but not the "two prices at once" problem?
+2. What makes the version-flip approach atomic for replicas as well as the primary?
+3. Which reads in an e-commerce flow must never come from a lagging replica?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>
