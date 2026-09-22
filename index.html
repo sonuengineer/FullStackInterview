@@ -389,6 +389,7 @@
     <button id="btn-links" title="Useful learning links">&#128279; Links</button>
     <button id="btn-images" title="System design diagrams with notes">&#128444;&#65039; Images</button>
     <button id="btn-sd" title="Full system design study material">&#127959;&#65039; System Design</button>
+    <button id="btn-net" title="15 network flows every backend dev should know">&#127760; Network Flows</button>
     <button id="theme-sepia">Sepia</button>
     <button id="theme-light">Light</button>
     <button id="theme-dark">Dark</button>
@@ -7718,6 +7719,1289 @@ Surviving an AZ loss invisibly means **paying for capacity you don't use on a no
 2. Why can an app still error during an RDS Multi-AZ failover, and what makes it a blip instead?
 3. Which AZ-failure symptoms does Route 53 *not* solve inside a single region?
 </script>
+<script type="text/markdown" class="lesson-data" data-id="100" data-title="React Interview: 7 Points (Hinglish)" data-category="Frontend" data-order="100">
+# React Interview 2026: Ye 7 Points Hi Poochhe Jaate Hain (Hinglish)
+
+> **Connects to**: [[33-react-performance-at-scale]] (rendering performance) aur [[51-fast-api-slow-page]] (page load).
+
+## 1. State vs Derived State
+
+**Rule:** ek hi source of truth rakho. Jo cheez already state se nikal sakti hai, use **state mat banao**.
+
+```javascript
+// GALAT - fullName ab sync mein rakhna padega, bug guarantee
+const [first, setFirst] = useState(''), [last, setLast] = useState('');
+const [fullName, setFullName] = useState('');
+
+// SAHI - derived value render ke time compute karo
+const fullName = first + ' ' + last;
+// mehenga calculation ho tabhi useMemo
+const sorted = useMemo(() => bigList.sort(cmp), [bigList]);
+```
+
+Interview line: *"Derived state duplicate truth banata hai, jo stale ho jaata hai."*
+
+## 2. Rendering Model (rerender kyun hota hai)
+
+- Component rerender hota hai jab: uska **state** badle, **props** badlein, ya **parent** rerender ho.
+- `key` reconciliation decide karta hai. Array index ko key banana list reorder par galat item update karta hai. **Stable id** use karo.
+- Key badalne par React purana component **unmount** karke naya mount karta hai - state chala jaata hai (accidental remount).
+
+## 3. Effects: `useEffect` vs Event Handler
+
+**Pehla sawaal:** ye kaam kisi *event* se hota hai ya *render ke baad sync* karne ke liye hai?
+
+- Button click par API call -> **event handler**, useEffect nahi.
+- External system se sync (subscription, timer, non-React widget) -> **useEffect**, cleanup ke saath.
+- Dependency array galat ho to fetch loop ban jaata hai (har render par fetch -> state set -> render...). Cleanup mein **abort** karo:
+
+```javascript
+useEffect(() => {
+  const ac = new AbortController();
+  fetch('/api/user/' + id, { signal: ac.signal }).then(r => r.json()).then(setUser).catch(() => {});
+  return () => ac.abort();          // stale response UI par nahi aayega
+}, [id]);
+```
+
+## 4. Performance: memo/useMemo/useCallback "default" nahi hain
+
+Pehle **measure** karo (React DevTools Profiler), phir fix karo. Warna aap har jagah memo lagake code ko slow + unreadable bana dete ho.
+
+- `React.memo` tabhi kaam karega jab props ki **reference equality** bane - inline object/function props usko tod dete hain.
+- Badi list = **virtualization** (react-window), memo se zyada faida ([[33-react-performance-at-scale]]).
+
+## 5. Data Fetching + Caching
+
+Har fetch ke 4 states hote hain: **loading, error, empty, success** - interview mein chaaron bolo.
+
+React Query / SWR kya *actually* dete hain: cache + dedupe (same key ke do request ek ho jaate hain), background refetch, stale-while-revalidate, retry, aur request cancellation. Ye khud likhoge to yahi sab dobara likhna padega.
+
+## 6. Forms: Controlled vs Uncontrolled
+
+- **Controlled** (`value` + `onChange`): React ke paas truth, validation easy, lekin bade form mein har keystroke par rerender.
+- **Uncontrolled** (`ref` / react-hook-form): DOM ke paas truth, tez, isliye 50+ fields wale forms mein behtar.
+- Validation: schema (Zod/Yup) se, aur **server par dobara** - client validation sirf UX hai ([[66-blog-before-first-backend-job]]).
+
+## 7. TypeScript + Component API
+
+Invalid state ko **type level par impossible** banao:
+
+```typescript
+// discriminated union - "loading ke saath data" jaisa invalid combo ban hi nahi sakta
+type State =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'success'; data: User[] };
+```
+
+Props mein optional flags ki bheed (`isPrimary`, `isDanger`, `isGhost`) ki jagah `variant: 'primary' | 'danger' | 'ghost'` rakho.
+
+## 🧠 Remember
+
+> Ek source of truth (derived state nahi), rerender ka kaaran samjho (state/props/parent + keys), effects sirf sync ke liye, memo measure karke, fetching ke chaar states, bade forms uncontrolled, aur types se invalid state impossible.
+
+## Quick Self-Test
+
+1. Array index ko `key` banane se list reorder par kya galat hota hai?
+2. Button click ki API call `useEffect` mein kyun nahi honi chahiye?
+3. `React.memo` lagane ke baad bhi component rerender ho raha hai - sabse common wajah?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="101" data-title="AI Aur Marketing (Hinglish)" data-category="Blog" data-order="101">
+# Blog: AI Almost Kuch Bhi Solve Kar Leta Hai - Phir Marketing Itni Mushkil Kyun Hai? (Hinglish)
+
+## Sawaal
+
+AI code likh deta hai, design bana deta hai, copy bhi likh deta hai. Phir bhi marketing "solve" nahi hui. Log ab bhi launch karte hain aur silence milti hai. Kyun?
+
+## Jawaab: Marketing ka bottleneck **output** nahi, **attention aur trust** hai
+
+Engineering mein problem *closed* hoti hai: "ye API 200ms mein response de" - sahi ya galat check ho sakta hai. Marketing ki problem *open* hai: "logon ko parwaah kyun ho?" Iska koi ek sahi jawab nahi, aur jawab time ke saath badalta rehta hai.
+
+Teen wajah:
+
+**1. Attention zero-sum hai.** Code likhna non-zero-sum hai - main likhun ya aap, dono ka code chal sakta hai. Par ek user ke din mein utne hi minutes hain. AI sabko tez bana deta hai, isliye **supply** badh jaati hai, demand utni hi rehti hai. Jab sab log roz 10 posts likh sakte hain, to average post ki value girti hai - AI se content sasta hua, *dhyaan* nahi.
+
+**2. Trust shortcut nahi le sakta.** Ek achhi landing page 10 minute mein ban jaati hai. "Ye log paisa lekar bhaag to nahi jaayenge" - ye feeling 10 minute mein nahi banti. Reviews, referrals, case studies, brand - ye sab **time aur repetition** maangte hain. AI likhawat tez karta hai, bharosa nahi.
+
+**3. Feedback loop slow aur shor-bhara hai.** Code: test fail hua to turant pata. Campaign: 2 hafte baad pata chalta hai ki kaam kiya ya nahi, aur us beech season, competitor, algorithm - sab badal gaya. Jahan feedback dheema ho, wahan "AI se 100 guna zyada try karo" bhi kaam nahi karta, kyunki aap seekh hi nahi paate ki kaunsa try chala.
+
+## Isi Wajah Se Ye Bhi Sach Hai
+
+Yehi baat [[55-blog-engineering-harder-building-easier]] wali hai, doosri jagah: **banana sasta ho gaya, isliye jo cheez sasti nahi hui uski keemat badh gayi**. Software mein wo judgment hai; business mein wo distribution hai ([[47-technology-vs-distribution]]).
+
+## Engineer Ke Liye Practical Takeaway
+
+- **Distribution pehle socho, product ke saath.** "Pehle 100 log kaun honge aur main unhe kaise dhoondhunga?" - ye code se pehle ka sawaal hai.
+- **Ek channel jeeto, 5 nahi.** Ek jagah bharosa banana 5 jagah shor karne se behtar hai.
+- **Repetition boring lagta hai, kaam wahi karta hai.** Aapko apna message 50th baar bolte hue bore hoga, tab jaakar log pehli baar sunenge.
+- **AI ko volume ke liye mat use karo, iteration ke liye karo:** 10 versions likhwa lo, par bhejo wahi jo aap khud defend kar sako.
+
+## 🧠 Remember
+
+> AI ne content banana sasta kar diya, par attention aur trust wahi ke wahi limited hain - isliye marketing ab bhi mushkil hai: bottleneck likhne mein nahi, suna jaane aur bharosa jeetne mein hai.
+
+## Sochne Ke Liye
+
+1. Aapke pichle project ke pehle 100 users kahan se aate? Kya wo plan code se pehle tha?
+2. Aapke kaam mein aisi kaunsi cheez hai jo AI sasti *nahi* kar sakta?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="102" data-title="LOWER(email) Aur Index (Hinglish)" data-category="Databases" data-order="102">
+# `WHERE LOWER(email) = ...` - Staging Mein Index, Production Mein Full Scan (Hinglish)
+
+> **Similar-question flag**: [[50-slow-query-500m-rows]] mein ye rule aa chuka hai ("column par function lagaoge to index use nahi hoga"). Naya yahan ye hai: **staging vs production ka farak** aur teen fixes mein se kaunsa lena chahiye.
+
+## 1. Pehli Galatfehmi Door Karo
+
+Index "gayab" nahi hua. `email` par bana normal B-tree index **dono jagah** is query ke liye useless hai:
+
+```sql
+SELECT * FROM users WHERE LOWER(email) = 'alex@gmail.com';
+```
+
+Index `email` ki **original values** sorted rakhta hai (`Alex@Gmail.com`), par aap `LOWER(email)` maang rahe ho. Database ko har row par function chalana padega, tabhi pata chalega match hua ya nahi - isliye index skip, **full scan**.
+
+**Phir staging mein "fast" kyun laga?** Kyunki 20,000 rows ka full scan bhi 5-10 ms mein ho jaata hai. Wahan bhi scan hi ho raha tha, bas dard nahi hua. 48 million rows par wahi scan seconds le leta hai.
+
+> Sabak: staging "sahi" nahi tha - sirf chhota tha. Production-jaisa data volume ke bina plan test karna dhokha hai.
+
+Pehla step hamesha: `EXPLAIN ANALYZE` - staging **aur** production dono par.
+
+## 2. Teen Fixes - Kaunsa Kab
+
+**Fix A: Expression (functional) index - turant raahat**
+
+```sql
+CREATE INDEX CONCURRENTLY idx_users_email_lower ON users (LOWER(email));
+```
+
+Ab index ki values wahi hain jo query maang rahi hai. Code badalna nahi padta. 48M rows par `CONCURRENTLY` zaroori hai warna table lock ho jaayega ([[81-delete-150m-rows-safely]] wali soch).
+
+**Fix B: Generated column + index**
+
+```sql
+ALTER TABLE users ADD COLUMN email_lower text GENERATED ALWAYS AS (LOWER(email)) STORED;
+CREATE INDEX CONCURRENTLY idx_users_email_lower2 ON users (email_lower);
+```
+
+Faida: doosri jagah bhi `email_lower` use kar sakte ho, aur `SELECT` mein saaf dikhta hai. Nuksan: extra storage aur schema change.
+
+**Fix C (asli, lamba jawab): column ko function mein lapetna band karo**
+
+Email case-insensitive hai hi - to **likhte waqt normalize karo**, padhte waqt nahi:
+
+```sql
+-- Postgres: citext extension, ya simply lowercase store karo
+ALTER TABLE users ADD CONSTRAINT users_email_lower_ck CHECK (email = LOWER(email));
+-- app side: user.email = email.trim().toLowerCase();  (signup + login dono par)
+CREATE UNIQUE INDEX CONCURRENTLY uq_users_email ON users (email);
+```
+
+Phir query seedhi ho jaati hai: `WHERE email = 'alex@gmail.com'` - normal index, normal plan, aur duplicate emails bhi ruk jaate hain ([[26-duplicate-email-race-condition]]).
+
+## 3. Interview Mein Kya Bolna Hai
+
+> "Index gayab nahi hua - `LOWER(email)` ki wajah se wo kabhi use ho hi nahi raha tha; staging mein 20k rows ka scan sasta tha isliye dikha nahi. Turant fix expression index hai. Sahi fix hai email ko write time par normalize karke store karna, phir plain index aur unique constraint dono milte hain. Migration ke liye pehle `CONCURRENTLY` index, phir backfill batches mein."
+
+## 4. Ek Aur Cheez: `SELECT *`
+
+48M rows wali table par `SELECT *` har column laata hai. Index-only scan ka faida lena hai to sirf zaroori columns maango ([[57-two-indexes-still-slow-composite]]).
+
+## 🧠 Remember
+
+> Column ko function mein lapetna index ko mara deta hai - chhoti staging table par ye dikhta nahi. Expression index turant bachata hai, par asli fix hai email ko lowercase mein store karna aur query seedhi rakhna.
+
+## Quick Self-Test
+
+1. Staging mein query "fast" thi - iska matlab index use ho raha tha? Kyun nahi?
+2. Expression index aur generated column - kab konsa chunoge?
+3. Email lowercase store karne se ek *aur* bug bhi rukta hai - kaunsa?
+</script>
+<!--NETWORK-DATA-START-->
+<script type="text/markdown" class="network-data" data-n="1" data-title="User -> DNS -> Application">
+# 1. User -> DNS -> Application
+
+**Ek line mein:** browser ko pehle naam se IP nikalni hoti hai (DNS), phir us IP tak TCP+TLS connection banta hai, tab jaakar aapka app request dekhta hai.
+
+```mermaid
+flowchart LR
+  U[Browser] -->|1. shop.com ka IP?| R[DNS Resolver]
+  R -->|2. IP| U
+  U -->|3. TCP connect| LB[Public IP / ALB]
+  U -->|4. TLS handshake| LB
+  LB -->|5. HTTP request| APP[App server]
+```
+
+## Steps detail mein
+
+1. **DNS lookup** - browser cache -> OS cache -> resolver (DHCP se mila, ya 8.8.8.8) -> root -> `.com` -> authoritative (Route 53). Resolver ki apni IP lookup nahi hoti, wo pehle se configured hoti hai.
+2. **Public IP / endpoint** - aksar IP nahi, ALB ka DNS naam milta hai (`my-alb-123.ap-south-1.elb.amazonaws.com`). Route 53 mein iske liye **ALIAS record** use karo, CNAME nahi (root domain par CNAME allowed nahi hota).
+3. **Routing** - packet internet se aapke VPC ke Internet Gateway tak, phir route table + subnet ke through ALB tak.
+4. **TLS** - certificate ALB par hota hai (ACM se). Handshake mein **SNI** batata hai ki kaunse domain ka cert chahiye.
+5. **App entry point** - ALB listener -> target group -> EC2/ECS ka port.
+
+## Kya-kya toot sakta hai
+
+| Symptom | Asli wajah |
+|---|---|
+| `DNS_PROBE_FINISHED_NXDOMAIN` | Record hi nahi hai, ya typo |
+| Purani IP par ja raha hai | DNS **TTL** - purana record cache mein hai |
+| `ERR_CERT_COMMON_NAME_INVALID` | Cert domain match nahi karta (www vs root) |
+| Connection timeout | Security group / NACL block, ya galat subnet |
+
+## Debug commands
+
+```bash
+dig +short shop.com            # kaunsi IP mil rahi hai
+dig shop.com +trace            # poora resolution chain
+curl -vI https://shop.com      # TLS + response headers
+openssl s_client -connect shop.com:443 -servername shop.com   # cert details
+```
+
+## 🧠 Remember
+
+> Naam -> IP (DNS), IP -> connection (TCP), connection -> secure (TLS), secure -> app (listener). "Page load nahi ho raha" hamesha in chaar mein se ek jagah ruka hota hai.
+
+**Aage padho:** [[78-who-resolves-the-dns-server]]
+</script>
+<script type="text/markdown" class="network-data" data-n="2" data-title="User -> CDN -> Origin">
+# 2. User -> CDN -> Origin
+
+**Ek line mein:** CDN aapke content ki copy duniya bhar ke edge locations par rakhta hai, taaki zyadatar request aapke server tak pahunche hi na.
+
+```mermaid
+flowchart LR
+  U[User - Mumbai] --> E[CDN Edge - Mumbai]
+  E -->|cache HIT| U
+  E -->|cache MISS| O[Origin - ALB / S3]
+  O --> E
+  E --> U
+```
+
+## Flow
+
+1. User ka request **nearest edge** par jaata hai (Anycast DNS ki wajah se).
+2. Edge apna cache dekhta hai: **HIT** = turant response (10-30ms), origin ko pata bhi nahi chalta.
+3. **MISS** = edge origin se maangta hai, response cache karke user ko deta hai.
+4. Agli baar usi region ke sab users ko HIT milta hai.
+
+## Cache control (yahi asli kaam hai)
+
+```
+Cache-Control: public, max-age=31536000, immutable   # hashed assets: app.a1b2c3.js
+Cache-Control: public, max-age=0, s-maxage=300       # HTML: browser fresh, CDN 5 min
+Cache-Control: private, no-store                     # user-specific pages
+```
+
+- **Cache key** mein kya jaata hai (path, query, kuch headers, cookies) - galat set kiya to ya sab MISS honge, ya ek user ka data doosre ko dikh jaayega.
+- **Invalidation**: file ka naam badlo (content hash) - sabse safe. `CreateInvalidation` slow aur costly hai.
+
+## Kya toot sakta hai
+
+- **Hit rate kam** -> har request origin par. Wajah: cookies/query cache key mein, ya `no-cache` headers.
+- **Purana content** -> TTL lamba aur asset ka naam nahi badla.
+- **Private data cache ho gaya** -> `Cache-Control: private` bhool gaye. Ye security bug hai.
+- **CORS error sirf CDN se** -> `Vary: Origin` aur allowed headers forward nahi ho rahe.
+
+## Debug
+
+```bash
+curl -I https://cdn.shop.com/app.js | grep -i "x-cache\|age\|cache-control"
+# CloudFront: X-Cache: Hit from cloudfront  /  Miss from cloudfront
+```
+
+## 🧠 Remember
+
+> CDN tabhi faayda deta hai jab hit rate high ho - asli kaam cache headers aur cache key sahi karna hai, sirf CloudFront on kar dena nahi.
+
+**Aage padho:** [[07-cors-error-fix]] [[38-first-thing-to-scale]]
+</script>
+<script type="text/markdown" class="network-data" data-n="3" data-title="Internet -> Load Balancer -> App">
+# 3. Internet -> Load Balancer -> App
+
+**Ek line mein:** load balancer magic nahi hai - chaar cheezein sahi honi chahiye: listener, target group, health check, security group.
+
+```mermaid
+flowchart LR
+  I[Internet] --> L["Listener :443 - cert + rules"]
+  L --> TG[Target Group - port 3000]
+  TG --> A1[App 1 - healthy]
+  TG --> A2[App 2 - healthy]
+  TG -.->|unhealthy, skip| A3[App 3]
+```
+
+## Chaar hisse
+
+1. **Listener** - kaunse port par sunna hai (80/443), TLS cert kahan hai, aur rules (path `/api/*` -> API target group).
+2. **Target group** - instances/IPs + **backend port**. ALB ka 443 aur app ka 3000 alag hote hain.
+3. **Health checks** - path (`/health`), interval, healthy/unhealthy threshold. Yahi decide karta hai ki AZ down hone par kitni jaldi traffic hatega.
+4. **Security groups** - do alag: ALB ka SG internet se 443 allow kare; **app ka SG sirf ALB ke SG se** 3000 allow kare (IP range nahi, SG reference).
+
+## Common failures
+
+| Dikhta hai | Wajah |
+|---|---|
+| 502 Bad Gateway | App crash, galat port, ya app `127.0.0.1` par bind |
+| 503 Service Unavailable | Koi healthy target hi nahi |
+| 504 Gateway Timeout | App slow, ya ALB idle timeout app se chhota |
+| Sab targets unhealthy | `/health` 200 nahi de raha, ya SG ne health check block kiya |
+
+## ALB vs NLB (ek line)
+
+**ALB** = layer 7 (HTTP rules, path routing, cookies). **NLB** = layer 4 (TCP, bahut tez, static IP, non-HTTP protocols).
+
+## Debug
+
+```bash
+aws elbv2 describe-target-health --target-group-arn <arn>   # reason code yahin milta hai
+curl -I http://<instance-private-ip>:3000/health            # bastion se seedha app
+```
+
+## 🧠 Remember
+
+> LB = listener (kahan sunna) + target group (kise bhejna) + health check (kaun zinda hai) + security group (kis se baat karni hai). 502/503/504 inhi chaar ki kahani hai.
+
+**Aage padho:** [[74-ingress-502-bad-gateway]] [[99-az-down-what-to-check-first]]
+</script>
+<script type="text/markdown" class="network-data" data-n="4" data-title="Public Subnet -> Private Subnet">
+# 4. Public Subnet -> Private Subnet
+
+**Ek line mein:** subnet public ya private uske naam se nahi, uske **route table** se banta hai -- jiska 0.0.0.0/0 Internet Gateway par jaata hai wo public, baaki private.
+
+```mermaid
+flowchart LR
+  IGW[Internet Gateway] --> PUB["Public subnet - ALB, NAT GW"]
+  PUB --> PRIV["Private subnet - app servers"]
+  PRIV --> DB["Private subnet - RDS"]
+  PRIV -.->|"no route to IGW"| IGW
+```
+
+## Public aur private ka asli farak
+
+Dono subnets ek hi VPC mein hote hain, dono ke paas private IP range hota hai, dono ek dusre se by-default baat kar sakte hain (VPC ka local route). Farak sirf do jagah hai:
+
+1. **Route table** -- public subnet ke route table mein `0.0.0.0/0 -> igw-xxxx` hota hai. Private subnet mein wo entry hoti hi nahi (ya NAT Gateway par jaati hai, lesson 5).
+2. **Public IP** -- public subnet mein instance ko public IPv4 milta hai (auto-assign ya Elastic IP). Bina public IP ke IGW route bekaar hai -- IGW 1:1 NAT karta hai private IP <-> public IP, IP hi nahi to translate kya kare.
+
+Isiliye **production layout** hamesha ye hota hai: internet-facing cheezein (ALB, NAT Gateway, bastion) public subnet mein, aur app + database private subnet mein. App ka koi public IP hi nahi -- internet se usko dial karna possible hi nahi.
+
+## Public se private tak traffic kaise pahunchta hai
+
+User -> ALB (public subnet) -> ALB naya connection kholta hai app ke **private IP** par (private subnet) -> app -> RDS. Beech mein internet kahin nahi hai. ALB ke paas dono subnets mein ENI hote hain? Nahi -- ALB apne public subnets mein hota hai aur VPC ke andar private IP par target se baat karta hai, kyunki VPC ka `local` route sab subnets ko jodta hai.
+
+Security groups yahan chain banate hain: `alb-sg` internet se 443 leta hai, `app-sg` sirf `alb-sg` se 3000 leta hai, `db-sg` sirf `app-sg` se 5432 leta hai.
+
+## Kya-kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| "Public subnet" mein instance internet se reachable nahi | Instance ko public IP assign hi nahi hua (auto-assign off) |
+| Instance ke paas public IP hai, phir bhi nahi chalta | Subnet ke route table mein IGW route missing |
+| ALB targets private subnet mein register nahi ho rahe | ALB ke liye kam se kam 2 AZ ke subnets chahiye, aur target same VPC mein hona chahiye |
+| App se DB connect nahi ho raha (same VPC) | SG chain galat -- db-sg mein app-sg allow nahi kiya |
+| SSH kaam karta hai par kuch bhi return nahi hota | NACL stateless hai -- outbound/ephemeral ports (1024-65535) block ho gaye |
+
+**Yaad rakho:** security group **stateful** hai (reply apne aap allow), NACL **stateless** hai (dono direction alag likhni padti hai). Zyadatar log NACL ko default hi chhodte hain, aur yahi sahi default hai.
+
+## Debug
+
+```bash
+# subnet kis route table se juda hai
+aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=subnet-abc123"
+
+# subnet public hai ya nahi (auto-assign public IP)
+aws ec2 describe-subnets --subnet-ids subnet-abc123 \
+  --query "Subnets[].[SubnetId,AvailabilityZone,MapPublicIpOnLaunch,CidrBlock]"
+
+# instance ke paas public IP hai kya
+aws ec2 describe-instances --instance-ids i-0abc --query \
+  "Reservations[].Instances[].[PrivateIpAddress,PublicIpAddress,SubnetId]"
+
+# private subnet ke instance se, bastion ke through
+nc -zv 10.0.2.15 5432
+```
+
+## 🧠 Remember
+
+> Subnet ko public uska naam nahi, uska route table banata hai -- `0.0.0.0/0 -> igw` + public IP. Dono na ho to wo private hai, chaahe tag kuch bhi kaho.
+
+**Aage padho:** [[08-ec2-no-internet-troubleshooting]] [[12-multi-az-availability]]
+</script>
+<script type="text/markdown" class="network-data" data-n="5" data-title="Private Subnet -> Internet">
+# 5. Private Subnet -> Internet
+
+**Ek line mein:** private instance ko internet chahiye (apt update, Stripe API) par internet ko wo instance nahi milna chahiye -- yahi one-way darwaza NAT Gateway hai.
+
+```mermaid
+flowchart LR
+  APP["App - private subnet"] --> RT["Route table: 0.0.0.0/0 -> nat"]
+  RT --> NAT["NAT Gateway - public subnet + EIP"]
+  NAT --> IGW[Internet Gateway]
+  IGW --> EXT["api.stripe.com"]
+  EXT -.->|"inbound blocked"| APP
+```
+
+## NAT ka kaam kya hai
+
+NAT Gateway **source NAT** karta hai. App ka packet nikalta hai `10.0.2.15:51234 -> 34.x.x.x:443`. NAT us packet ka source apne Elastic IP se badal deta hai, connection ka mapping table mein rakhta hai, aur reply aane par wapas usi instance ko de deta hai.
+
+Isliye **outbound-initiated** connections chalte hain, **inbound-initiated** nahi. Stripe apne aap tumhare app ko call nahi kar sakta -- mapping table mein uski entry hi nahi hai.
+
+Setup ke teen tukde, teeno chahiye:
+
+1. NAT Gateway **public subnet** mein banao (usko khud IGW route chahiye), Elastic IP attach karo.
+2. **Private** subnet ke route table mein `0.0.0.0/0 -> nat-xxxx`.
+3. App ka SG outbound 443 allow kare (default outbound allow-all hota hai, log isko tighten karke bhool jaate hain).
+
+## Public IP kyun nahi de dete?
+
+Tempting shortcut: instance ko public IP de do aur IGW route laga do -- outbound chal jayega. Problem ye hai ki public IP **do-tarfa** hai. Ab wo instance poori duniya ko dikhta hai, aur bachav sirf security group par tikta hai. Ek galat SG rule (`0.0.0.0/0` par 22 ya 5432) aur database internet par hai.
+
+NAT ke saath instance ka koi public IP hai hi nahi -- misconfigure karne ke liye kuch bacha hi nahi. Ye **defence in depth** hai: SG galat ho bhi jaye to routing tumhe bacha legi.
+
+## IPv6 -- egress-only IGW
+
+IPv6 mein NAT ka concept hi nahi hai (addresses itne hain ki sharing ki zaroorat nahi). IPv6 addresses globally routable hote hain, matlab public IP wali hi problem wapas.
+
+Iska jawab **Egress-Only Internet Gateway** hai. Ye stateful hai: outbound IPv6 allow, inbound initiate block -- bilkul NAT jaisa behaviour, bina address translation ke. Route aisa hota hai: `::/0 -> eigw-xxxx`.
+
+| Kya chahiye | IPv4 | IPv6 |
+|---|---|---|
+| Outbound only | NAT Gateway | Egress-Only IGW |
+| Two-way public | IGW + public IP | IGW + IPv6 address |
+| Charge | per hour + per GB | free |
+
+## Kya-kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| `apt update` hang, timeout | Private route table mein NAT route missing |
+| AZ down hote hi aadha fleet ka outbound band | NAT Gateway **AZ-scoped** hai -- har AZ mein alag NAT chahiye |
+| Bill mein surprise, NAT data processing bahut zyada | S3/ECR ka traffic NAT se ja raha hai, VPC endpoint chahiye (lesson 6) |
+| `ErrorPortAllocation` / random connection fail | Ek hi destination IP+port par 55k se zyada concurrent connections -- connections reuse karo |
+| NAT Gateway hi nahi ban raha | Public subnet mein nahi banaya, ya EIP attach nahi kiya |
+
+Cross-AZ cost ka point important hai: agar AZ-b ka instance AZ-a ke NAT ko use karega to cross-AZ data transfer charge bhi lagega **aur** AZ-a girne par AZ-b ka outbound bhi mar jayega. Per-AZ NAT = availability + cost dono.
+
+## Debug
+
+```bash
+# private subnet ka route table -- nat target dikhna chahiye
+aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=subnet-priv-1" \
+  --query "RouteTables[].Routes[]"
+
+# NAT gateway ki state aur uska subnet
+aws ec2 describe-nat-gateways \
+  --query "NatGateways[].[NatGatewayId,State,SubnetId,NatGatewayAddresses[0].PublicIp]"
+
+# instance se: bahar kaunsa IP dikh raha hai (NAT ka EIP aana chahiye)
+curl -s https://checkip.amazonaws.com
+
+# DNS theek hai par TCP nahi -- ye farak saaf karta hai
+dig +short api.stripe.com
+curl -sv --max-time 5 https://api.stripe.com/v1 2>&1 | head -20
+```
+
+## 🧠 Remember
+
+> NAT Gateway ek one-way darwaza hai: andar se bahar jaa sakte ho, bahar se andar nahi. IPv6 mein wahi kaam Egress-Only IGW karta hai -- aur dono per-AZ hone chahiye.
+
+**Aage padho:** [[08-ec2-no-internet-troubleshooting]] [[99-az-down-what-to-check-first]]
+</script>
+<script type="text/markdown" class="network-data" data-n="6" data-title="Private Resource -> AWS Service">
+# 6. Private Resource -> AWS Service
+
+**Ek line mein:** S3, SQS, Secrets Manager -- ye sab **public endpoints** hain, to private app inse baat karne ke liye by default NAT + internet se hokar jaata hai; VPC endpoint us traffic ko VPC ke andar hi rakh deta hai.
+
+```mermaid
+flowchart LR
+  APP["App - private subnet"] --> GW["Gateway endpoint - route table entry"]
+  APP --> IF["Interface endpoint - ENI + private IP"]
+  GW --> S3["S3 / DynamoDB"]
+  IF --> SVC["SQS, KMS, Secrets Mgr, ECR, ..."]
+  APP -.->|"bina endpoint: NAT + internet"| NAT[NAT Gateway]
+```
+
+## Problem pehle samjho
+
+`s3.ap-south-1.amazonaws.com` ek public DNS naam hai jo public IP deta hai. Tumhara app private subnet mein hai, to uska S3 call `0.0.0.0/0` route pakadta hai -> NAT Gateway -> IGW -> AWS ka public network -> S3. Traffic AWS network se bahar shayad na jaye, par:
+
+- NAT ka **per-GB data processing charge** lagta hai. Roz 500 GB backup S3 par bhejte ho? Sirf NAT processing ka bill hi mahine ka acchha khasa ban jaata hai.
+- App ko **internet route chahiye** hi rahega. Fully air-gapped subnet banana possible nahi.
+- Audit mein jawab dena mushkil: "data internet par gaya ya nahi?"
+
+VPC endpoint teeno theek karta hai -- traffic AWS ke private network par rehta hai, NAT bypass ho jaata hai.
+
+## Do type hote hain -- yahi asli exam question hai
+
+| | **Gateway endpoint** | **Interface endpoint (PrivateLink)** |
+|---|---|---|
+| Services | Sirf **S3 aur DynamoDB** | Baaki lagbhag sab (SQS, SNS, KMS, Secrets Manager, ECR, SSM, CloudWatch...) |
+| Kaise kaam karta hai | **Route table** mein prefix-list entry | Subnet mein **ENI** with private IP |
+| Cost | **Free** | Per-ENI per-hour + per-GB |
+| DNS | Public naam hi rehta hai, routing badalti hai | Private DNS on karo to wahi naam ENI ke private IP par resolve hota hai |
+| On-prem (VPN/Direct Connect) se | **Nahi** chalta | Chalta hai |
+| Cross-region | Nahi | Nahi |
+
+Gateway endpoint ka mental model: "route table mein likha hai ki S3 ke IP range ke liye internet mat jao, is endpoint se jao." Isliye jis **route table** se subnet juda hai usmein endpoint associate karna zaroori hai -- bhool gaye to traffic chupchaap NAT se jaata rahega aur kuch fail nahi hoga, sirf bill aayega.
+
+Interface endpoint ka mental model: "service ka ek chhota sa darwaza meri subnet ke andar hi rakh do." Uska apna **security group** hota hai -- app-sg se 443 allow karna padta hai, warna timeout.
+
+## Private DNS ka jaadu
+
+Interface endpoint banate waqt `PrivateDnsEnabled` on karo, to Route 53 ke private hosted zone se `sqs.ap-south-1.amazonaws.com` ab public IP ki jagah endpoint ENI ka private IP deta hai. Iska matlab: **code badalna nahi padta**. SDK wahi purana naam call karta rahega, traffic chupchaap private ho jayega.
+
+Off rakhoge to har endpoint ka apna DNS naam (`vpce-xxxx...`) code mein daalna padega -- ye sirf tab karo jab tum jaan-bujhkar kuch traffic public rakhna chahte ho.
+
+## Endpoint policy -- security angle
+
+Endpoint par ek **resource policy** lagti hai jo us darwaze se jaane wale har call par apply hoti hai. IAM policy kehti hai "ye principal kya kar sakta hai"; endpoint policy kehti hai "is raaste se kya guzar sakta hai".
+
+Classic use case -- data exfiltration rokna: endpoint policy mein sirf apne buckets allow karo. Ab agar koi compromised process kisi attacker ke S3 bucket mein data upload karne ki koshish kare, endpoint use denied kar dega. Dusri taraf S3 bucket policy mein `aws:SourceVpce` condition lagao -- bucket sirf tumhare endpoint se hi accessible.
+
+## Kya-kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| Endpoint bana diya, phir bhi NAT bill same | Gateway endpoint galat/kam route tables se associated hai |
+| Interface endpoint par har call timeout | Endpoint ke SG mein app-sg se 443 allow nahi |
+| `AccessDenied` sirf VPC ke andar se, bahar se theek | Endpoint policy bahut tight (default `*` ko badla hoga) |
+| On-prem server se S3 endpoint kaam nahi karta | Gateway endpoint VPN/DX se reachable hi nahi -- interface endpoint chahiye |
+| Endpoint hai par DNS abhi bhi public IP de raha | Private DNS disabled, ya VPC mein `enableDnsHostnames`/`enableDnsSupport` off |
+
+## Debug
+
+```bash
+# saare endpoints, type aur state
+aws ec2 describe-vpc-endpoints --query \
+  "VpcEndpoints[].[VpcEndpointId,ServiceName,VpcEndpointType,State,PrivateDnsEnabled]"
+
+# gateway endpoint kaunse route tables se juda hai
+aws ec2 describe-vpc-endpoints --vpc-endpoint-ids vpce-0abc \
+  --query "VpcEndpoints[].RouteTableIds"
+
+# is region mein kaunsi service ka endpoint available hai
+aws ec2 describe-vpc-endpoint-services --query "ServiceNames" | grep -i secretsmanager
+
+# instance se: private IP (10.x / 100.x) aana chahiye, public nahi
+dig +short sqs.ap-south-1.amazonaws.com
+dig +short s3.ap-south-1.amazonaws.com    # gateway endpoint mein ye PUBLIC IP hi dega -- normal hai
+
+# call actually chal raha hai ya nahi
+aws s3 ls s3://my-bucket --debug 2>&1 | grep -i "endpoint\|connection"
+```
+
+Note: gateway endpoint ke case mein DNS public IP hi dikhayega -- wo galat nahi hai. Routing route table mein badalti hai, DNS mein nahi. Verify karne ke liye VPC Flow Logs dekho ya NAT ke bytes gir rahe hain ya nahi.
+
+## 🧠 Remember
+
+> S3/DynamoDB = free **Gateway** endpoint (route table entry). Baaki sab = paid **Interface** endpoint (subnet mein ENI) + private DNS on, taki code same rahe. Endpoint policy = "is raaste se kya guzar sakta hai".
+
+**Aage padho:** [[46-build-vs-rent-infrastructure]] [[08-ec2-no-internet-troubleshooting]]
+</script>
+<script type="text/markdown" class="network-data" data-n="7" data-title="App -> Database">
+# 7. App -> Database
+
+**Ek line mein:** DB connection sasta nahi hota -- isliye hamesha **DNS endpoint** se connect karo (IP se kabhi nahi), pool banao, aur har request mein round trips ginna seekho.
+
+```mermaid
+flowchart LR
+  APP["App - pool of 20 conns"] --> DNS["DNS: mydb.xxxx.rds.amazonaws.com"]
+  DNS --> PRI["Primary - AZ a"]
+  PRI -.->|"sync replication"| STB["Standby - AZ b"]
+  APP --> RO["Reader endpoint"]
+  RO --> RR["Read replica"]
+```
+
+## Hamesha DNS endpoint, kabhi IP nahi
+
+RDS ka endpoint (`mydb.abc123.ap-south-1.rds.amazonaws.com`) ek **CNAME** hai jo current primary ke IP par point karta hai. Multi-AZ failover ke waqt AWS us DNS record ko standby ke IP par ghuma deta hai -- instance badal jaata hai, naam wahi rehta hai.
+
+Agar tumne config mein IP hardcode kiya, failover ke baad app purane (ab dead) instance ko dial karta rahega. Isliye rule: **connection string mein hamesha endpoint naam.**
+
+Ek aur trap: JVM jaise runtimes DNS ko forever cache kar lete hain (`networkaddress.cache.ttl`). Node/Python mein OS resolver ka TTL chalta hai. RDS DNS ka TTL chhota (~5s) hai -- app ko usko respect karna chahiye, warna failover hone ke baad bhi app 10 minute tak purane IP par atka rahega.
+
+## Connection pool -- kyun aur kab phategi
+
+Har nayi Postgres connection mahangi hai: TCP handshake + TLS handshake + auth + server side process/memory. Isliye app startup par N connections khol ke rakh leta hai aur reuse karta hai. Yahi **pool** hai.
+
+Math simple hai aur log yahin galti karte hain:
+
+```
+total DB connections = app instances x pool size per instance
+```
+
+10 pods x pool 20 = 200 connections. Agar RDS ka `max_connections` 200 hai to autoscaling ka 11th pod aate hi `FATAL: too many connections` aayega -- **DB par load kam hone par bhi**.
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| `too many connections` | pods x pool size > max_connections |
+| Request timeout, DB CPU sirf 10% | **Pool exhaustion** -- sab connections ek slow query par atki hain |
+| Failover ke baad 10 min tak error | DNS caching, ya pool mein dead connections pade hain |
+| Random `connection reset by peer` | Idle connection ko NAT/firewall ne kaat diya, pool ko pata nahi |
+| Har deploy par DB connection spike | Saare pods ek saath connect kar rahe hain |
+| Har ~1 hour par ek saath sab reconnect | Pool ka `maxLifetime` sab connections mein same, jitter nahi |
+
+Pool exhaustion sabse zyada confuse karta hai: **database bilkul idle dikhta hai**, phir bhi app 504 de raha hai. Kyunki bottleneck DB ka CPU nahi, pool ka free slot hai. Pool size badhana usually galat ilaaj hai -- slow query theek karo.
+
+## Security group chain + TLS
+
+DB ko kabhi IP CIDR se allow mat karo. `db-sg` ka inbound rule aisa ho: **port 5432, source = `app-sg`** (security group reference). Ab app kitne bhi scale ho, IP kuch bhi ho, rule badalna nahi padta -- aur koi doosra instance galti se DB tak nahi pahunch sakta.
+
+TLS: RDS in-transit encryption support karta hai. Client ko RDS CA bundle chahiye aur `sslmode=verify-full` (Postgres) -- `require` sirf encrypt karta hai, server verify nahi karta, matlab MITM ke against poora bachav nahi. Production mein `verify-full` + CA bundle.
+
+## Read replica routing
+
+Writes hamesha primary par. Reads replica par bhej sakte ho -- par replica **asynchronously** lag karta hai. Matlab: user ne profile update kiya (primary), turant page refresh kiya (replica), aur purana data dikha. Isko "read your own writes" problem kehte hain.
+
+Practical rule: analytics/reports/search -> replica. User ka apna data jo usne abhi likha -> primary. Aurora reader endpoint multiple replicas par load balance karta hai, par lag ka problem wahi rehta hai.
+
+## Latency aur N+1
+
+Har query ka cost = network round trip + query execution. Same-AZ mein RTT ~0.5ms, cross-AZ ~1-2ms. Chhota lagta hai, lekin:
+
+- 1 query lene wala endpoint: ~2ms network
+- ORM ka N+1 (1 list query + 100 child queries): ~200ms sirf network mein, DB dashboard par har query "0.3ms fast" dikhegi
+
+Isliye **query count** dekho, sirf query time nahi. Fix: JOIN, `IN (...)` batch, ya ORM ka eager loading (`include` / `preload`).
+
+## Debug
+
+```bash
+# RDS endpoint, Multi-AZ, kaunsa AZ primary hai
+aws rds describe-db-instances --db-instance-identifier mydb \
+  --query "DBInstances[].[Endpoint.Address,Endpoint.Port,MultiAZ,AvailabilityZone,DBInstanceStatus]"
+
+# endpoint abhi kis IP par point kar raha hai (failover ke pehle/baad chalao)
+dig +short mydb.abc123.ap-south-1.rds.amazonaws.com
+
+# app host se reachability -- SG chain test
+nc -zv mydb.abc123.ap-south-1.rds.amazonaws.com 5432
+
+# TLS ke saath connect
+psql "host=mydb.abc123.ap-south-1.rds.amazonaws.com dbname=app user=app sslmode=verify-full"
+
+# kaun kitni connections khaye baitha hai
+psql -c "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
+psql -c "SELECT count(*) FROM pg_stat_activity;"
+psql -c "SHOW max_connections;"
+
+# lambi chal rahi queries (pool exhaustion ka culprit)
+psql -c "SELECT pid, now()-query_start AS age, state, left(query,60)
+         FROM pg_stat_activity WHERE state <> 'idle' ORDER BY age DESC LIMIT 10;"
+
+# replica lag (seconds)
+psql -h reader-endpoint -c "SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()));"
+```
+
+## 🧠 Remember
+
+> DB connection ek scarce resource hai, request nahi. Endpoint naam se connect karo, pool ka size `pods x pool <= max_connections` rakho, aur jab DB idle ho par app slow -- to pool dekho, DB nahi.
+
+**Aage padho:** [[16-synchronized-connection-pool-expiry]] [[28-scaling-database-reads]]
+</script>
+<script type="text/markdown" class="network-data" data-n="8" data-title="Service -> Service">
+# 8. Service -> Service
+
+**Ek line mein:** east-west call mein do sawaal hai -- "doosri service kahan hai" (discovery) aur "wo slow/down ho to main kya karunga" (timeout, retry, breaker).
+
+```mermaid
+flowchart LR
+  O[Order service] --> D["Discovery - DNS / Cloud Map / k8s Service"]
+  D --> C["HTTP client - timeout + retry + breaker"]
+  C --> P1[Payment pod 1]
+  C --> P2[Payment pod 2]
+  C -.->|breaker open, fail fast| P3[Payment pod 3]
+```
+
+## Pehle: doosri service kahan hai?
+
+- **Private DNS (Route 53 private hosted zone)** - `payments.internal` ek record. Simple, par IP change hone par TTL tak stale rehta hai.
+- **AWS Cloud Map** - ECS tasks khud register/deregister hote hain; DNS ya API dono se discover kar sakte ho.
+- **Kubernetes Service** - `payments.prod.svc.cluster.local` -> ClusterIP. CoreDNS resolve karta hai, kube-proxy load balance karta hai. Pod die -> Endpoints se nikal jata hai.
+- **Internal ALB** - ek stable DNS name, health check built-in, par har call mein ek extra hop aur uska apna cost/latency. Direct (DNS/ClusterIP) faster hai, lekin health checking ki zimmedari tumhare client par aa jati hai.
+
+Rule of thumb: **HTTP routing/health chahiye -> internal ALB. Pure internal, high call volume -> direct discovery.**
+
+## Phir: failure handling (asli kaam yahan hai)
+
+1. **Timeout** - har call par `connect` aur `request` dono par. Default "infinite" wait sabse bada production killer hai.
+2. **Retry with exponential backoff + jitter** - sirf **idempotent** calls par (GET, ya idempotency key wali POST). Jitter na ho to saare clients ek saath retry karke thundering herd bana dete hain.
+3. **Retry budget** - max 2 retries. 3 services ki chain mein 3 retries = 27x load downstream.
+4. **Circuit breaker** - N consecutive failures -> breaker open -> fail fast bina call kiye, thodi der baad half-open. Ye cascading failure rokta hai.
+5. **mTLS** - dono taraf certificate. Service Mesh (App Mesh / Istio) ya ACM Private CA se issue hota hai. Fayda: network par koi bhi service kisi ko bhi call nahi kar sakti -- identity proven hai.
+
+```js
+// ek call, saare guardrails ke saath
+const res = await fetch(url, { signal: AbortSignal.timeout(800) }); // hard timeout
+// retry: 100ms, 200ms, 400ms + Math.random()*100 ka jitter, sirf GET/idempotent par
+```
+
+## Shared client library kyun
+
+Har team apna axios wrapper likhegi to timeouts alag, retry alag, tracing header koi bhaijega koi nahi. Ek internal `@company/http-client` package do: usme default timeout, backoff+jitter, breaker, trace-id propagation aur metrics pehle se ho. **Ek jagah fix, sab jagah fix.**
+
+## Kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| Random 5xx sirf deploy ke waqt | DNS/Endpoints mein purana pod, ya client connection pooling stale |
+| Ek service slow -> poora system down | Timeout nahi laga, threads/sockets block ho gaye |
+| Downstream par 10x spike | Retry storm, jitter missing |
+| `ECONNREFUSED` sirf kabhi kabhi | Target group/Endpoints mein unhealthy instance abhi tak registered |
+| Cross-service 403 after mesh rollout | mTLS cert expire, ya authorization policy miss |
+
+## Debug
+
+```bash
+dig +short payments.internal                                   # private zone resolve ho raha hai?
+kubectl get endpoints payments -n prod                         # k8s: kaunse pods actually attached hain
+aws servicediscovery discover-instances --namespace-name internal --service-name payments
+curl -sv -m 2 http://payments.internal:8080/health             # seedha call, 2s timeout
+ss -tn state established '( dport = :8080 )' | head            # kitne open connections hain
+```
+
+## 🧠 Remember
+
+> Service-to-service call network call hai, function call nahi -- isliye har call ko timeout, bounded retry with jitter, aur circuit breaker chahiye; aur ye teeno ek shared client library mein hone chahiye, har team ke code mein alag-alag nahi.
+
+**Aage padho:** [[14-cascading-failure-recovery]] [[13-hidden-latency-bottleneck]]
+</script>
+<script type="text/markdown" class="network-data" data-n="9" data-title="App -> Queue -> Worker">
+# 9. App -> Queue -> Worker
+
+**Ek line mein:** queue lagane ka matlab hai "user ko turant jawab do, kaam baad mein karo" -- par uske badle mein duplicate messages aur backlog tumhari zimmedari ban jate hain.
+
+```mermaid
+flowchart LR
+  U[User] --> A["API - 202 Accepted, turant"]
+  A --> Q[(Queue - SQS / Kafka)]
+  Q --> W1[Worker 1]
+  Q --> W2[Worker 2]
+  W1 --> DB[(DB)]
+  Q -.->|N baar fail| DLQ[(DLQ)]
+```
+
+## Flow kaise chalta hai
+
+1. API sirf message **enqueue** karta hai aur `202` return kar deta hai. Email bhejna, PDF banana, invoice generate karna -- user ko wait karane ki zarurat nahi.
+2. Queue message ko **durably** store karta hai. SQS multiple AZs mein replicate karta hai; Kafka partition ko `replication.factor` ke hisaab se brokers par. Worker crash ho jaye to message zinda rehta hai -- **yahi queue ka asli value hai**, speed nahi.
+3. Worker apni speed se consume karta hai. API spike hua -> queue lamba hua -> worker slow drain karega, par DB par sudden 10x load nahi padega. Queue = **shock absorber**.
+
+## SQS vs Kafka (mental model)
+
+| | SQS | Kafka |
+|---|---|---|
+| Message lene ka tarika | Worker receive karta hai, message **invisible** ho jata hai | Consumer group partition se offset padhta hai |
+| Safety knob | **Visibility timeout** -- itni der mein delete na kiya to message wapas queue mein | **Offset commit** -- commit na hua to rebalance par dobara milega |
+| Parallelism | Jitne workers chahiye utne, koi limit nahi | Max parallelism = **partition count** |
+| Replay | Delete hone ke baad gaya | Retention ke andar offset reset karke replay |
+
+Dono **at-least-once** hain. Iska seedha matlab: **duplicate aayega hi**, design mein maan ke chalo.
+
+## Idempotency (skip mat karna)
+
+Har message par ek stable `eventId` bhejo aur worker use processed-table/Redis mein record kare:
+
+```js
+const first = await db.query(
+  'INSERT INTO processed_events(event_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING event_id',
+  [msg.eventId]);
+if (first.rowCount === 0) return ack(msg);   // pehle ho chuka, chup-chaap ack
+await chargeCustomer(msg);                    // asli kaam
+```
+
+**Visibility timeout ka rule:** wo tumhare worst-case processing time se zyada hona chahiye. Warna worker abhi kaam kar hi raha hota hai aur message doosre worker ko dikh jata hai -> double charge.
+
+## DLQ aur backlog
+
+- **DLQ** -- SQS mein redrive policy: `maxReceiveCount` (jaise 5) ke baad message DLQ mein chala jata hai. Iske bina ek poison message infinite loop mein queue ko block-ish kar deta hai. DLQ par **alarm lagao** -- silent DLQ ka koi matlab nahi.
+- **Scaling** -- CloudWatch `ApproximateNumberOfMessagesVisible` par target tracking. Behtar metric: **backlog per worker** = visible messages / running workers. Isse target "har worker ke paas max 100 pending" ban jata hai.
+- **Backlog drain** -- 1 lakh backlog aur 100 msg/sec drain rate = ~17 min. Pehle **drain rate** naapo (consumed/sec), phir decide karo: workers badhao, ya batch size badhao, ya non-critical messages alag low-priority queue mein daalo.
+
+## Kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| Customer ko do baar email | Idempotency nahi, at-least-once delivery |
+| Message baar-baar reprocess | Visibility timeout processing time se chhota |
+| Queue badh raha hai, workers idle | DB/downstream bottleneck, ya Kafka mein partitions kam |
+| Workers scale ho gaye, drain fir bhi slow | Kafka: consumers > partitions, extra consumers idle baithe hain |
+| DLQ silently bhara hua | Redrive to hai, alarm nahi |
+
+## Debug
+
+```bash
+aws sqs get-queue-attributes --queue-url <url> \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible VisibilityTimeout
+aws sqs receive-message --queue-url <dlq-url> --max-number-of-messages 5 --visibility-timeout 0
+aws sqs get-queue-attributes --queue-url <url> --attribute-names RedrivePolicy   # maxReceiveCount
+kafka-consumer-groups.sh --bootstrap-server <broker:9092> --describe --group order-workers  # LAG
+```
+
+## 🧠 Remember
+
+> Queue request ko delete nahi karti, sirf use time ke saath faila deti hai -- aur uski keemat hai duplicate messages, isliye at-least-once + idempotent consumer + DLQ ek hi package hain.
+
+**Aage padho:** [[19-idempotent-consumer-duplicate-events]] [[23-queue-backlog-after-spike]]
+</script>
+<script type="text/markdown" class="network-data" data-n="10" data-title="VPC -> VPC">
+# 10. VPC -> VPC
+
+**Ek line mein:** do VPC jodne ke teen tareeke hain -- peering (sasta, 1-to-1, non-transitive), Transit Gateway (hub, scale karta hai, paisa lagta hai), PrivateLink (ek service expose karo, poora network nahi).
+
+```mermaid
+flowchart LR
+  subgraph Peering
+    A[VPC A] <--> B[VPC B]
+    B <-.->|no transit| C[VPC C]
+  end
+  subgraph TGW
+    D[VPC D] --> T{{Transit Gateway}}
+    E[VPC E] --> T
+    F[VPC F] --> T
+  end
+```
+
+## Teeno ka farq
+
+| | Peering | Transit Gateway | PrivateLink |
+|---|---|---|---|
+| Shape | Point-to-point mesh | Hub and spoke | Service endpoint |
+| Transitive? | **Nahi** | Haan (route tables se control) | N/A |
+| Overlapping CIDR? | Nahi chalega | Nahi chalega | **Chalega** |
+| Direction | Dono taraf | Dono taraf | **Ek taraf** -- consumer -> provider |
+| Cost | Sirf data transfer | Per attachment/hour + data processing | Per endpoint/hour + data |
+| Kab chuno | 2-3 VPC | 5+ VPC, hybrid, central inspection | Vendor/team ki ek service share karni hai |
+
+## Peering ke 4 gotchas (interview + prod dono)
+
+1. **Non-transitive** - A<->B aur B<->C hai, to A se C nahi pahunchega. A-C ka apna peering chahiye. N VPC ke liye N(N-1)/2 connections -- yahi par TGW jeet jata hai.
+2. **Overlapping CIDR** - dono VPC `10.0.0.0/16` hain to peering **ban hi nahi sakta**. Isiliye din 1 se ek IPAM plan banao (prod 10.10/16, stage 10.20/16, dev 10.30/16). Baad mein VPC ka CIDR badalna matlab re-launch.
+3. **Route table dono taraf** - sabse common bug. A mein B ka route daal diya, B mein A ka bhool gaye -> packet jata hai, reply nahi aata. Aur route sirf us **subnet ke route table** mein chahiye jahan se traffic chal raha hai, main route table mein nahi.
+4. **No edge-to-edge routing** - peer VPC tumhara Internet Gateway, NAT Gateway, VPN ya VPC endpoint use nahi kar sakta. "Ek VPC mein central NAT rakh lenge" -- peering se nahi hoga, TGW se hoga.
+
+## Security group referencing
+
+Same-region peering mein tum **peer VPC ke SG ID ko apne rule mein reference kar sakte ho** (`10.20.0.0/16` likhne ke bajaye `sg-abc123`). Zyada precise hai -- IP badle to rule wahi rehta hai. Do limits yaad rakho:
+
+- SG referencing **Transit Gateway par kaam nahi karta** -- wahan CIDR hi likhna padega.
+- Cross-region setup mein CIDR-based rules safe default hai.
+
+## PrivateLink kab better hai
+
+Tumhe pura network nahi jodna, sirf **ek service** dikhani hai. Provider apne NLB ke saamne ek *endpoint service* banata hai; consumer apne VPC mein ek **interface endpoint (ENI, private IP)** banata hai aur usi IP par call karta hai. Fayde: CIDR overlap ho to bhi chalta hai, traffic sirf ek direction mein initiate hota hai, aur consumer ka baaki network provider ko dikhta hi nahi. Yahi model AWS khud S3/SQS/Secrets Manager endpoints ke liye use karta hai.
+
+## Kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| Ping timeout, peering "active" | Ek taraf ka route table missing |
+| A -> C fail, A -> B theek | Transitive routing expect kar liya |
+| Peering request hi reject | Overlapping CIDR |
+| TGW ke baad bhi traffic block | SG mein sg-id reference likha hai (TGW par support nahi) |
+| Connect hota hai, reply nahi | NACL ne return traffic (ephemeral ports) block kiya |
+
+## Debug
+
+```bash
+aws ec2 describe-vpc-peering-connections --query 'VpcPeeringConnections[].[VpcPeeringConnectionId,Status.Code]'
+aws ec2 describe-route-tables --filters Name=vpc-id,Values=vpc-aaa --query 'RouteTables[].Routes'
+aws ec2 describe-transit-gateway-route-tables
+# Reachability Analyzer -- guess band, AWS khud batayega kahan block hua
+aws ec2 create-network-insights-path --source <eni-a> --destination <eni-b> --protocol tcp --destination-port 443
+aws ec2 start-network-insights-analysis --network-insights-path-id <nip-id>
+```
+
+## 🧠 Remember
+
+> Peering ek seedhi taar hai -- non-transitive, overlapping CIDR se allergic, aur dono taraf route chahiye; jaise hi VPC 4-5 se upar jayein, taar ki jagah Transit Gateway lo, aur agar sirf ek service share karni hai to poora network mat jodo, PrivateLink lo.
+
+**Aage padho:** [[08-ec2-no-internet-troubleshooting]] [[77-blog-microservices-are-a-tax]]
+</script>
+<script type="text/markdown" class="network-data" data-n="11" data-title="On-Prem -> Cloud">
+# 11. On-Prem -> Cloud
+
+**Ek line mein:** hybrid connectivity ke teen hisse hain -- pipe (VPN ya Direct Connect), routing (BGP), aur DNS (Route 53 Resolver) -- aur teenon mein se koi ek toota to "network down" jaisa lagta hai.
+
+```mermaid
+flowchart LR
+  DC["On-prem DC - 192.168.0.0/16"] --> CGW[Customer Gateway]
+  CGW -->|"IPsec VPN - internet"| TGW{{TGW / VGW}}
+  CGW -->|"Direct Connect - private line"| TGW
+  TGW --> V["VPC - 10.10.0.0/16"]
+  DC <-.->|DNS forwarding| R53["R53 Resolver endpoints"]
+  R53 -.-> V
+```
+
+## Pipe: VPN vs Direct Connect
+
+| | Site-to-Site VPN | Direct Connect |
+|---|---|---|
+| Path | Public internet, IPsec encrypted | Dedicated private circuit (partner/AWS facility) |
+| Setup time | Ghante | Hafte se mahine (cross-connect, LOA-CFA) |
+| Bandwidth | Per tunnel ~1.25 Gbps cap | 1/10/100 Gbps dedicated, ya hosted 50 Mbps se upar |
+| Latency | Variable -- internet jitter | Consistent, predictable |
+| Encryption | Built-in | **By default nahi** -- DX par VPN chalao ya MACsec use karo |
+| Cost | Sasta, per hour + data | Port + data, mehnga |
+
+Har VPN connection mein **do tunnels** hote hain (alag AWS endpoints). Dono configure karo -- ek tunnel AWS maintenance mein bhi down ho sakta hai, tab doosra sambhalta hai. Production pattern: **DX primary + VPN backup**, dono BGP par.
+
+## Routing: BGP ka minimum
+
+**BGP** = do networks ek doosre ko batate hain "mere paas ye prefixes hain". Static route ki tarah manually likhna nahi padta, aur link toot-ne par path apne aap hat jata hai.
+
+- Dono side ka ek **ASN** hota hai. On-prem par private ASN (64512-65534), AWS side VGW/TGW ka Amazon ASN.
+- On-prem `192.168.0.0/16` advertise karta hai, AWS `10.10.0.0/16` advertise karta hai.
+- Route selection: **longest prefix match pehle jeetta hai**. Same prefix par AWS Direct Connect ko VPN se prefer karta hai -- isiliye DX+VPN failover apne aap kaam karta hai.
+- Apne DX path ko failover ke liye kam preferred banana ho to **AS path prepending** karte ho.
+- Advertised prefixes par limit hoti hai, to on-prem se 500 chhote routes bhejne ke bajaye **summarize** karo.
+
+## DNS: hybrid resolution (yahan sabse zyada log phaste hain)
+
+VPN up hai, ping chal raha hai, phir bhi app `db.internal` resolve nahi kar pa rahi -- kyunki **routing aur DNS alag cheezein hain**.
+
+- **Inbound endpoint** -- on-prem servers ko AWS ke private names chahiye. Resolver inbound endpoint VPC mein ENIs banata hai; on-prem DNS server par conditional forwarder lagao: `internal.company.com -> <inbound endpoint IPs>`.
+- **Outbound endpoint + Resolver rule** -- AWS ke EC2/Lambda ko on-prem naam chahiye (`corp.local`). Ek forwarding rule banao: `corp.local -> <on-prem DNS IPs>`, aur rule ko VPC se **associate** karo. Associate bhoolna sabse common miss hai.
+
+Dono direction chahiye ho to dono endpoints banao -- ek se dusra nahi chalta.
+
+## Overlapping IP range
+
+On-prem bhi `10.0.0.0/8` use kar raha hai aur VPC bhi -- to BGP wo prefix advertise hi nahi kar payega saaf se. Options: VPC ko naye non-overlapping CIDR par le jao (best, par mehnga), ya customer gateway / firewall par **NAT** karke overlapping subnet ko ek alag range mein translate karo. Naye environments mein hamesha pehle **IP allocation plan** banao -- ye baad mein fix karne wali cheez nahi hai.
+
+## Kya tootta hai
+
+| Dikhta hai | Asli wajah |
+|---|---|
+| Tunnel UP, traffic nahi | VPC route table mein on-prem prefix ka route missing, ya route propagation off |
+| Ek taraf se ping, doosri se nahi | On-prem firewall ne return traffic block kiya, ya SG mein on-prem CIDR nahi |
+| Tunnel baar-baar flap | Internet path issue, ya DPD/IKE lifetime mismatch |
+| Ping chalta hai, naam resolve nahi | Resolver endpoint/rule missing ya VPC se associated nahi |
+| DX par speed expected se kam | Single TCP flow ek hi path par -- multi-flow test karo |
+| Failover par traffic wapas nahi aaya | Static routes use kiye, BGP nahi |
+
+## Debug
+
+```bash
+aws ec2 describe-vpn-connections --query 'VpnConnections[].VgwTelemetry[].[OutsideIpAddress,Status,StatusMessage]'
+aws directconnect describe-virtual-interfaces --query 'virtualInterfaces[].[virtualInterfaceId,virtualInterfaceState,bgpPeers[].bgpPeerState]'
+aws ec2 describe-route-tables --filters Name=vpc-id,Values=vpc-xxxx   # on-prem prefix dikh raha hai?
+aws route53resolver list-resolver-endpoints
+aws route53resolver list-resolver-rule-associations                    # rule VPC se juda hai?
+dig @<inbound-endpoint-ip> db.internal.company.com                     # on-prem se chalao
+mtr -n <aws-private-ip>                                                # packet loss kis hop par
+```
+
+## 🧠 Remember
+
+> Hybrid connectivity = pipe + route + DNS. VPN sasta aur turant hai par internet par chalta hai; Direct Connect predictable hai par hafte lagta hai; BGP failover khud sambhalta hai; aur jab "network down" lage to pehle check karo ki masla routing ka hai ya sirf DNS resolution ka.
+
+**Aage padho:** [[08-ec2-no-internet-troubleshooting]] [[13-hidden-latency-bottleneck]]
+</script>
+<script type="text/markdown" class="network-data" data-n="12" data-title="Region -> Region">
+# 12. Region -> Region
+
+**Ek line mein:** doosri region mein data bhejna network ka nahi, physics ka problem hai -- light ki speed fix hai, isliye cross-region replication hamesha async hoti hai aur lag ke saath jeena padta hai.
+
+```mermaid
+flowchart LR
+  U[User] --> RT["Route 53 - latency policy"]
+  RT --> P["Mumbai - primary"]
+  RT --> R["Virginia - replica"]
+  P -->|"async replication"| R
+```
+
+## Physics pehle, AWS baad mein
+
+Mumbai se Virginia roughly 13,000 km hai. Fibre mein light ~200,000 km/s chalti hai, plus routers aur hops. Practically round trip **~200-250 ms** dikhta hai (Mumbai-Singapore ~60-80 ms, Mumbai-Frankfurt ~110-130 ms). Ye rough ranges hain, exact path par depend karta hai.
+
+Matlab: cross-region **synchronous write** karoge to har request mein 200 ms+ baith jayega. Isliye AWS ke cross-region features almost hamesha asynchronous hain.
+
+| Service | Cross-region kaise | Lag |
+|---|---|---|
+| S3 | Cross-Region Replication, versioning zaroori | seconds se minutes |
+| RDS / Aurora | cross-region read replica, Aurora Global Database | usually ~1s, load par zyada |
+| DynamoDB | Global Tables -- multi-region read **aur** write | usually ~1s, last-writer-wins |
+
+## Traffic kaun bhejega -- Route 53
+
+- **Latency-based** -- user ko sabse kam latency wali region. Multi-region app ka default.
+- **Geolocation / Geoproximity** -- user ke location par, data residency ke liye useful.
+- **Failover** -- primary/secondary, health check fail hone par secondary. Active-passive ka backbone.
+- **Weighted** -- 90/10 split, region migration ya canary ke liye.
+
+Yaad rakho: Route 53 DNS hai aur DNS **cached** hota hai. TTL 300s hai to failover ke baad bhi kuch clients 5 min tak purani region par jayenge.
+
+## Active-active vs active-passive
+
+**Active-passive** -- sirf ek region likhti hai, doosri standby. Simple, koi conflict nahi, lekin failover par RTO aur thoda data loss (RPO) accept karna padta hai.
+
+**Active-active** -- dono regions likhti hain. Latency best, lekin ab **conflict resolution** tumhara problem hai: ek hi item do regions mein same second mein update hua to kaun jeeta? DynamoDB last-writer-wins karta hai -- yaani ek write chupchap gayab ho sakta hai. Isliye active-active tab lo jab data naturally partitioned ho (user ka data uski home region mein).
+
+## Paisa aur kya tootega
+
+Cross-region data transfer **free nahi** hai -- per GB charge (region pair ke hisab se alag). Rule: cross-region par **data** bhejo, chit-chat nahi.
+
+Tootne wali cheezein: **replication lag** (user Mumbai mein likhta hai, Virginia se padhta hai, apna order nahi dikhta), **backlog** (replication atke to failover par utna data gaya), aur **clock skew** (last-writer-wins timestamps par chalta hai, cross-region clocks same nahi hote).
+
+## Debug
+
+```bash
+aws s3api head-object --bucket <dest-bucket> --key <key>   # ReplicationStatus
+aws rds describe-db-instances --db-instance-identifier <replica-id>
+aws cloudwatch get-metric-statistics --namespace AWS/RDS \
+  --metric-name ReplicaLag --period 60 --statistics Average \
+  --start-time <iso> --end-time <iso> \
+  --dimensions Name=DBInstanceIdentifier,Value=<replica-id>
+
+dig +short api.example.com                                 # kaunsi region mil rahi hai
+curl -s -o /dev/null -w '%{time_total}\n' https://api.example.com/health
+```
+
+## 🧠 Remember
+
+> Cross-region latency physics hai, bug nahi -- isliye replication async hoti hai; async ka matlab lag, aur lag ka matlab ya stale reads ya conflicts. Dono mein se ek chunna padega.
+
+**Aage padho:** [[10-clock-skew-last-write-wins]] [[12-multi-az-availability]]
+</script>
+<script type="text/markdown" class="network-data" data-n="13" data-title="Container -> Container">
+# 13. Container -> Container
+
+**Ek line mein:** container ke andar `localhost` ka matlab "yahi container" hota hai -- isliye container-to-container ka 90% problem sirf naam, port aur bind address ka hota hai.
+
+```mermaid
+flowchart LR
+  subgraph H["Docker host"]
+    A["api container"]
+    D["db container"]
+  end
+  A -->|"host db, port 5432"| D
+  C[Client] -->|"published 8080"| A
+```
+
+## Docker: bridge vs host
+
+**bridge** (default) -- har container ko apna private IP, host par ek virtual switch. Bahar se pahunchne ke liye `-p 8080:3000` chahiye. Yahi default aur usually sahi choice hai.
+
+**host** (Linux only) -- container host ka network stack seedha use karta hai, `-p` ka matlab nahi rehta, port conflict ho sakta hai. Thoda tez, lekin isolation gaya.
+
+Compose mein containers ek user-defined network par hote hain aur Docker ka **embedded DNS** service name resolve karta hai -- `api` container seedha `postgres://db:5432/...` likh sakta hai. IP hardcode karne ki zaroorat nahi.
+
+Important: container-to-container baat **internal port** (3000) par hoti hai, published port (8080) par nahi. Published port sirf host se entry ke liye hai.
+
+## Kubernetes: flat network
+
+K8s ka model simple hai -- **har pod ko apna IP milta hai aur har pod har pod se NAT ke bina baat kar sakta hai**, node alag ho tab bhi. Ye CNI plugin (VPC CNI, Calico, etc.) implement karta hai.
+
+Lekin pod IP cattle hai, restart par badal jata hai. Isliye seedha pod IP kabhi mat likho. **Service** stable naam + ClusterIP deta hai aur label selector se matching pods ko traffic bhejta hai. Cluster DNS (CoreDNS, purane naam se kube-dns) `<service>.<namespace>.svc.cluster.local` resolve karta hai -- same namespace mein sirf `payments` kaafi hai.
+
+## ECS Fargate: awsvpc mode
+
+Fargate mein har **task** ko apna **ENI** milta hai -- apna VPC private IP aur apna **Security Group**. Ab rules EC2 instance ke SG par nahi, task ke SG par likhne hote hain: API task ke SG se DB task ke SG par 5432 allow karo (SG reference, IP nahi). awsvpc mode mein host port = container port hota hai.
+
+## Kya tootata hai
+
+| Symptom | Asli wajah |
+|---|---|
+| `connection refused` | app `127.0.0.1` par bind hai -- `0.0.0.0` chahiye |
+| `-p` diya phir bhi fail | published port use kiya, internal port chahiye tha |
+| Service ka endpoint khaali | selector labels pod labels se match nahi kar rahe |
+| DNS resolve nahi hota | galat namespace, ya containers alag docker network par |
+| Service jawab nahi deta | `targetPort` app ke actual port se alag hai |
+
+## Debug
+
+```bash
+docker network inspect <network>            # kaun kis network par hai
+docker exec -it api sh -c 'getent hosts db' # DNS chal raha hai?
+docker exec -it api sh -c 'nc -vz db 5432'  # reachability
+
+kubectl get endpoints <svc>                 # khaali = selector mismatch
+kubectl describe svc <svc>                  # selector aur targetPort
+kubectl exec -it <pod> -- nslookup <svc>.<ns>.svc.cluster.local
+ss -lntp                                    # 0.0.0.0 par hai ya 127.0.0.1 par
+```
+
+## 🧠 Remember
+
+> Teen sawaal poochho: naam resolve ho raha hai? sahi (internal) port par ja rahe ho? app `0.0.0.0` par bind hai? Teeno haan ho gaye to sirf firewall/SG bacha hai.
+
+**Aage padho:** [[24-kubernetes-pets-vs-cattle]] [[74-ingress-502-bad-gateway]]
+</script>
+<script type="text/markdown" class="network-data" data-n="14" data-title="Request -> Firewall Rules">
+# 14. Request -> Firewall Rules
+
+**Ek line mein:** ek packet app tak pahunchne se pehle kai layers se guzarta hai, aur har layer alag cheez dekh pati hai -- isliye "block kyun hua" ka jawab layer ke hisab se badalta hai.
+
+```mermaid
+flowchart TD
+  C[Client] --> R53["Route 53 - DNS"]
+  R53 --> E["CloudFront / WAF / Shield - edge"]
+  E --> N["NACL - subnet level"]
+  N --> S["Security Group - ENI level"]
+  S --> O["OS firewall - iptables/ufw"]
+  O --> A["App authz - JWT, roles"]
+```
+
+## Har layer kya dekh sakti hai
+
+| Layer | Kahan lagti hai | Kya dekh sakti hai | Kya nahi dekh sakti |
+|---|---|---|---|
+| Shield | AWS edge | volumetric L3/L4 flood | HTTP body |
+| WAF | ALB / CloudFront / API GW | HTTP method, path, headers, body, IP | TLS se pehle ka kuch nahi (WAF decrypt ke baad chalta hai) |
+| NACL | subnet boundary | source/dest IP, port, protocol | user kaun hai, path kya hai |
+| Security Group | ENI (instance/task/LB) | source IP **ya source SG**, port | HTTP path, payload |
+| OS firewall | host kernel | IP, port, process | business rules |
+| App authz | code | user, role, tenant, resource | kuch nahi chhootta -- sabse zyada context yahin hai |
+
+Neeche jate jate **context badhta hai, throughput kam hota hai**. Isliye sasta filtering upar (WAF, SG) aur mehenga decision neeche (app) karte hain.
+
+## Stateful vs stateless -- sabse bada trap
+
+**Security Group = stateful.** Tumne inbound 443 allow kiya, to uska response apne aap bahar ja sakta hai. Outbound rule likhne ki zaroorat nahi.
+
+**NACL = stateless.** Har direction alag evaluate hoti hai. Inbound 443 allow kiya lekin outbound **ephemeral ports (1024-65535)** allow nahi kiye to request andar aayegi aur response bahar nahi ja payega -- connection hang, phir timeout. Classic "sab sahi lag raha hai phir bhi timeout" ka reason.
+
+## Allow vs deny
+
+**SG mein sirf allow rules hote hain.** Deny likh hi nahi sakte. Default: sab inbound band, sab outbound khula. Matlab SG "kis ko andar aane du" ki list hai.
+
+**NACL mein allow aur deny dono**, aur rules **number order mein** evaluate hote hain -- pehla match jeet jata hai, baaki rules dekhe hi nahi jate. Isliye `100 DENY 0.0.0.0/0` likh diya to neeche ka koi allow kaam nahi karega. Ek specific IP block karni ho -- wo NACL ka kaam hai, SG ka nahi.
+
+## WAF rate-based rules
+
+WAF ka rate-based rule ek **rolling window** mein per-IP requests count karta hai aur threshold cross hone par us IP ko block/count karta hai. Do baatein yaad rakho:
+
+- Ye **per source IP** hai. Agar sab traffic ek proxy/NAT se aa raha hai to ek hi IP dikhegi -- pura traffic block ho sakta hai. Us case mein header-based key (jaise forwarded IP) configure karni padti hai.
+- Naye rule ko pehle **Count mode** mein chalao, CloudWatch mein dekho kitna match hua, tab Block karo. Warna production users block ho jayenge.
+
+WAF DDoS ka pura jawab nahi hai -- volumetric attack edge par Shield rokta hai, WAF application-layer abuse (SQLi, bot, scraping, brute force) rokta hai.
+
+## Debug
+
+```bash
+# SG kya allow kar raha hai
+aws ec2 describe-security-groups --group-ids <sg-id>
+
+# NACL -- rule number order aur dono directions dekho
+aws ec2 describe-network-acls --network-acl-ids <acl-id>
+
+# kaun sa layer maar raha hai: connection refused = app/OS, timeout = SG ya NACL
+nc -vz <private-ip> 3000
+sudo iptables -L -n -v        # OS firewall
+sudo ufw status verbose
+
+# WAF kya block kar raha hai
+aws wafv2 get-sampled-requests --web-acl-arn <arn> --rule-metric-name <name> \
+  --scope REGIONAL --time-window StartTime=<t1>,EndTime=<t2> --max-items 100
+```
+
+## 🧠 Remember
+
+> Timeout = kisi ne chupchap drop kiya (SG ya NACL). Connection refused = packet pahunch gaya, sunne wala koi nahi (app/OS). Aur NACL stateless hai -- ephemeral ports ka return path bhi allow karna padta hai.
+
+**Aage padho:** [[79-blog-rate-limiting]] [[27-cia-triad]]
+</script>
+<script type="text/markdown" class="network-data" data-n="15" data-title="Failed Request -> Debugging Path">
+# 15. Failed Request -> Debugging Path
+
+**Ek line mein:** random jagah mat kudo -- packet ke raaste par upar se neeche ek-ek layer check karo, aur har layer ke liye ek hi command chalao.
+
+```mermaid
+flowchart TD
+  S[Request fail hua] --> D{"DNS resolve hua?"}
+  D -->|Nahi| D1["Record / TTL / split-horizon check"]
+  D -->|Haan| RT{"Route table sahi hai?"}
+  RT -->|Nahi| RT1["IGW / NAT / peering route add"]
+  RT -->|Haan| SG{"SG allow karta hai?"}
+  SG -->|Nahi| SG1["Inbound rule, source SG use karo"]
+  SG -->|Haan| NA{"NACL dono direction?"}
+  NA -->|Nahi| NA1["Ephemeral ports allow karo"]
+  NA -->|Haan| LB{"LB jawab de raha hai?"}
+  LB -->|Nahi| LB1["Listener, cert, LB ka SG"]
+  LB -->|Haan| TH{"Target healthy hai?"}
+  TH -->|Nahi| TH1["Health check path aur port"]
+  TH -->|Haan| PB{"App sahi port + 0.0.0.0?"}
+  PB -->|Nahi| PB1["Bind address theek karo"]
+  PB -->|Haan| LG["App logs -- ab code ka issue hai"]
+```
+
+## Order kyun yahi hai
+
+Har step ka matlab hai "kya mera packet yahan tak pahunch bhi raha hai". Neeche wale step ko tab hi check karo jab upar wala pass ho gaya ho -- warna tum app logs mein baithe rahoge aur asal mein DNS galat tha.
+
+Ek shortcut jo hamesha kaam aata hai:
+
+- **NXDOMAIN / unknown host** -> DNS layer
+- **Timeout / hang** -> koi packet chupchap **drop** kar raha hai: SG, NACL, ya route missing
+- **Connection refused** -> packet pahunch gaya, us port par koi sun nahi raha: app down, galat port, ya `127.0.0.1` bind
+- **TLS error** -> cert, SNI, ya hostname mismatch -- network theek hai
+- **HTTP 5xx** -> network paar ho chuka, ab app ya LB-to-target ka issue hai
+
+## Step-by-step, command ke saath
+
+```bash
+# 1. DNS -- naam sahi IP de raha hai?
+dig +short api.example.com
+dig api.example.com @8.8.8.8          # apne resolver ka cache bypass
+
+# 2. Route table -- is subnet se bahar/andar ka raasta hai?
+aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=<subnet-id>
+#    public subnet ko 0.0.0.0/0 -> igw-..., private ko -> nat-...
+
+# 3. Security Group -- inbound allow hai? (stateful, outbound auto)
+aws ec2 describe-security-groups --group-ids <sg-id>
+
+# 4. NACL -- stateless, dono direction dekho (ephemeral 1024-65535)
+aws ec2 describe-network-acls --filters Name=association.subnet-id,Values=<subnet-id>
+
+# 5. Load balancer -- listener hai, SG khula hai?
+aws elbv2 describe-listeners --load-balancer-arn <lb-arn>
+curl -I https://api.example.com/health
+
+# 6. Target health -- reason code yahin milta hai
+aws elbv2 describe-target-health --target-group-arn <tg-arn>
+
+# 7. App port aur bind address -- 0.0.0.0 hona chahiye, 127.0.0.1 nahi
+ss -lntp
+curl -I http://<private-ip>:3000/health     # bastion/peer host se
+nc -vz <private-ip> 3000
+
+# 8. App logs
+journalctl -u myapp -n 200 --no-pager
+docker logs --tail 200 <container>
+kubectl logs deploy/<name> --tail=200
+```
+
+Ek aur beech ka check jab kuch samajh na aaye: `traceroute` ya `mtr` se dekho packet kahan tak jaata hai -- lekin yaad rakho AWS mein ICMP aksar block hota hai, isliye `ping` ka fail hona proof nahi hai. `nc -vz` zyada bharosemand signal hai.
+
+## Symptom -> sabse sambhavit layer
+
+| Dikhta hai | Sabse pehle kahan dekho |
+|---|---|
+| `could not resolve host` | DNS -- record, TTL, private hosted zone |
+| Browser hang, phir timeout | SG inbound, ya NACL outbound ephemeral |
+| Private subnet se package install fail | NAT gateway / route table |
+| `connection refused` | app down ya `127.0.0.1` par bind |
+| `certificate mismatch` | ACM cert ka SAN, ya galat hostname |
+| 502 Bad Gateway | target crash, galat backend port, bind address |
+| 503 Service Unavailable | koi healthy target nahi |
+| 504 Gateway Timeout | app slow, ya app ka timeout LB se bada |
+| Kabhi chalta hai, kabhi nahi | ek target unhealthy, ya ek AZ kharab |
+| Ek client ko fail, baaki ko theek | uska DNS cache, ya WAF rate-based block |
+
+## Do galtiyan jo sab karte hain
+
+1. **Seedha app logs se shuru karna.** Agar packet pahunch hi nahi raha to logs mein kuch hoga hi nahi -- khaali log ek clue hai, bug nahi.
+2. **Ek saath teen cheezein badalna.** SG kholo, NACL badlo, app restart karo -- ab chal gaya to pata hi nahi kis se chala. Ek baar mein ek change, phir retest.
+
+## 🧠 Remember
+
+> Packet ke raaste par upar se neeche chalo: DNS -> route -> SG -> NACL -> LB -> target health -> app port -> logs. Timeout ka matlab "drop", refused ka matlab "koi sun nahi raha" -- ye do shabd aadha debugging khatam kar dete hain.
+
+**Aage padho:** [[08-ec2-no-internet-troubleshooting]] [[20-sudden-latency-spike-checklist]]
+</script>
+<!--NETWORK-DATA-END-->
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
@@ -7848,6 +9132,34 @@ function buildSidebar(filterText) {
     tocContainer.prepend(group);
   }
 
+  // "Networking" group: one entry per flow
+  const netItems = NETWORK.filter((p) => !q || p.title.toLowerCase().includes(q) || 'networking'.includes(q));
+  if (netItems.length) {
+    const isOpen = q.length > 0 || currentNet !== null || netGroupOpen;
+    const group = document.createElement('div');
+    group.className = 'category-group';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'category-title' + (isOpen ? '' : ' collapsed');
+    titleEl.textContent = '\u{1F310} Network Flows (' + netItems.length + ')';
+    const itemsEl = document.createElement('div');
+    itemsEl.className = 'category-items' + (isOpen ? '' : ' collapsed');
+    titleEl.addEventListener('click', () => {
+      const nowCollapsed = titleEl.classList.toggle('collapsed');
+      itemsEl.classList.toggle('collapsed', nowCollapsed);
+      netGroupOpen = !nowCollapsed;
+    });
+    netItems.forEach((p) => {
+      const btn = document.createElement('button');
+      btn.className = 'toc-item' + (p.n === currentNet ? ' active' : '');
+      btn.innerHTML = '<span class="toc-num">' + p.n + '</span>' + escHtml(p.title);
+      btn.addEventListener('click', () => renderNetwork(p.n));
+      itemsEl.appendChild(btn);
+    });
+    group.appendChild(titleEl);
+    group.appendChild(itemsEl);
+    tocContainer.prepend(group);
+  }
+
   // "System Design" group at the very top: one entry per system
   const sdItems = SD.systems.filter((s) => !q || s.title.toLowerCase().includes(q) || 'system design'.includes(q));
   if (sdItems.length) {
@@ -7885,7 +9197,7 @@ function buildSidebar(filterText) {
 }
 
 function renderHome() {
-  currentId = null; currentImage = null; currentSD = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null;
   document.title = 'Learning Dashboard';
   progressEl.textContent = lessons.length + ' lessons';
   let html = '<h1>Your Learning Library</h1>' +
@@ -7966,7 +9278,7 @@ function buildSuggestions(lesson) {
 function openLesson(id) {
   const lesson = lessons.find(l => l.id === id);
   if (!lesson) return;
-  currentId = id; currentImage = null; currentSD = null;
+  currentId = id; currentImage = null; currentSD = null; currentNet = null;
   document.title = lesson.title + ' - Learning Dashboard';
   readerEl.innerHTML = marked.parse(linkifyCrossRefs(lesson.content), { renderer }) +
     buildSuggestions(lesson);
@@ -8008,7 +9320,7 @@ const LINKS = [
 ];
 
 function renderLinks() {
-  currentId = null; currentImage = null; currentSD = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null;
   document.title = 'Links - Learning Dashboard';
   progressEl.textContent = LINKS.length + ' links';
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -8289,7 +9601,7 @@ const escHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;',
 function renderImages() {
   currentId = null;
   currentImage = null;
-  currentSD = null;
+  currentSD = null; currentNet = null;
   document.title = 'Images - Learning Dashboard';
   progressEl.textContent = IMAGES.length + ' diagrams';
   readerEl.innerHTML = '<h1>&#128444;&#65039; Diagrams &amp; Cheat Sheets</h1>' +
@@ -8360,7 +9672,8 @@ async function renderSystemDesign(slug, n) {
   const wanted = n != null ? n : (last && last.slug === sys.slug ? last.n : sys.parts[0].n);
   const part = sys.parts.find((p) => p.n === wanted) || sys.parts[0];
 
-  currentId = null; currentImage = null; currentSD = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null;
+  currentNet = null;
   currentSD = { slug: sys.slug, n: part.n };
   try { localStorage.setItem('dashboard.sd', JSON.stringify(currentSD)); } catch (e) {}
   document.title = sys.title + ' - Part ' + part.n + ' - Learning Dashboard';
@@ -8431,6 +9744,65 @@ readerEl.addEventListener('click', (e) => {
   renderSystemDesign(el.dataset.sd, Number(el.dataset.part));
 });
 document.getElementById('btn-sd').addEventListener('click', () => renderSystemDesign(null, null));
+
+// ---- Networking tab ----------------------------------------------------
+// Pages are embedded by tools/build-networking.mjs from networking/NN-*.md,
+// so this works offline too. Each flow opens on its own page.
+const NETWORK = [...document.querySelectorAll('script.network-data')].map((el) => ({
+  n: el.dataset.n,
+  title: el.dataset.title,
+  md: el.textContent.trim(),
+}));
+let currentNet = null;
+let netGroupOpen = false;
+
+function renderNetworkList() {
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentNet = null;
+  document.title = 'Networking - Learning Dashboard';
+  progressEl.textContent = NETWORK.length + ' network flows';
+  readerEl.innerHTML = '<h1>&#127760; Network Flows</h1>' +
+    '<p style="color:var(--muted)">Traffic aapke app tak kaise pahunchta hai - har flow apne page par. Side menu mein bhi list hai.</p>' +
+    '<div class="link-list">' + NETWORK.map((p) =>
+      '<div class="suggest-card" data-net="' + p.n + '"><div class="cat">Flow ' + p.n + '</div>' +
+      '<div class="ttl">' + escHtml(p.title) + '</div></div>').join('') + '</div>';
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+
+function renderNetwork(n) {
+  const i = NETWORK.findIndex((p) => p.n === String(n));
+  if (i < 0) return renderNetworkList();
+  const page = NETWORK[i];
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentNet = page.n;
+  document.title = page.title + ' - Networking';
+  progressEl.textContent = 'Networking - flow ' + page.n + ' of ' + NETWORK.length;
+  const prev = NETWORK[i - 1], next = NETWORK[i + 1];
+  readerEl.innerHTML = marked.parse(linkifyCrossRefs(page.md), { renderer }) +
+    '<div class="suggest-nav">' +
+      (prev ? '<button data-net="' + prev.n + '">&larr; ' + escHtml(prev.title) + '</button>'
+            : '<button data-net="all">&larr; All flows</button>') +
+      (next ? '<button class="next" data-net="' + next.n + '">' + escHtml(next.title) + ' &rarr;</button>'
+            : '<button class="next" data-net="all">All flows &rarr;</button>') +
+    '</div>';
+  mermaid.run({ querySelector: '#reader .mermaid' });
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+  try { localStorage.setItem('dashboard.net', page.n); } catch (e) {}
+}
+
+readerEl.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-net]');
+  if (!el) return;
+  e.preventDefault();
+  el.dataset.net === 'all' ? renderNetworkList() : renderNetwork(el.dataset.net);
+});
+document.getElementById('btn-net').addEventListener('click', () => {
+  let last = null;
+  try { last = localStorage.getItem('dashboard.net'); } catch (e) {}
+  last && NETWORK.some((p) => p.n === last) ? renderNetwork(last) : renderNetworkList();
+});
 
 document.getElementById('btn-images').addEventListener('click', renderImages);
 document.getElementById('btn-links').addEventListener('click', renderLinks);

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>React Interview: 7 Points (Hinglish)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --callout-bg: #fff8c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #58a6ff;
+      --callout-bg: #3b3410;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 100px;
+  }
+  h1, h2, h3 { line-height: 1.3; }
+  h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+  h2 { font-size: 1.4rem; margin-top: 2.2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; color: var(--accent); }
+  p { margin: 0.9em 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  blockquote {
+    border-left: 4px solid var(--accent);
+    background: var(--callout-bg);
+    margin: 1.2em 0;
+    padding: 0.6em 1em;
+    border-radius: 0 6px 6px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 0.35em 0; }
+  .mermaid { background: white; border-radius: 8px; padding: 12px; margin: 1.2em 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+<div id="content">Loading...</div>
+<script type="text/markdown" id="md-source">
+# React Interview 2026: Ye 7 Points Hi Poochhe Jaate Hain (Hinglish)
+
+> **Connects to**: [[33-react-performance-at-scale]] (rendering performance) aur [[51-fast-api-slow-page]] (page load).
+
+## 1. State vs Derived State
+
+**Rule:** ek hi source of truth rakho. Jo cheez already state se nikal sakti hai, use **state mat banao**.
+
+```javascript
+// GALAT - fullName ab sync mein rakhna padega, bug guarantee
+const [first, setFirst] = useState(''), [last, setLast] = useState('');
+const [fullName, setFullName] = useState('');
+
+// SAHI - derived value render ke time compute karo
+const fullName = first + ' ' + last;
+// mehenga calculation ho tabhi useMemo
+const sorted = useMemo(() => bigList.sort(cmp), [bigList]);
+```
+
+Interview line: *"Derived state duplicate truth banata hai, jo stale ho jaata hai."*
+
+## 2. Rendering Model (rerender kyun hota hai)
+
+- Component rerender hota hai jab: uska **state** badle, **props** badlein, ya **parent** rerender ho.
+- `key` reconciliation decide karta hai. Array index ko key banana list reorder par galat item update karta hai. **Stable id** use karo.
+- Key badalne par React purana component **unmount** karke naya mount karta hai - state chala jaata hai (accidental remount).
+
+## 3. Effects: `useEffect` vs Event Handler
+
+**Pehla sawaal:** ye kaam kisi *event* se hota hai ya *render ke baad sync* karne ke liye hai?
+
+- Button click par API call -> **event handler**, useEffect nahi.
+- External system se sync (subscription, timer, non-React widget) -> **useEffect**, cleanup ke saath.
+- Dependency array galat ho to fetch loop ban jaata hai (har render par fetch -> state set -> render...). Cleanup mein **abort** karo:
+
+```javascript
+useEffect(() => {
+  const ac = new AbortController();
+  fetch('/api/user/' + id, { signal: ac.signal }).then(r => r.json()).then(setUser).catch(() => {});
+  return () => ac.abort();          // stale response UI par nahi aayega
+}, [id]);
+```
+
+## 4. Performance: memo/useMemo/useCallback "default" nahi hain
+
+Pehle **measure** karo (React DevTools Profiler), phir fix karo. Warna aap har jagah memo lagake code ko slow + unreadable bana dete ho.
+
+- `React.memo` tabhi kaam karega jab props ki **reference equality** bane - inline object/function props usko tod dete hain.
+- Badi list = **virtualization** (react-window), memo se zyada faida ([[33-react-performance-at-scale]]).
+
+## 5. Data Fetching + Caching
+
+Har fetch ke 4 states hote hain: **loading, error, empty, success** - interview mein chaaron bolo.
+
+React Query / SWR kya *actually* dete hain: cache + dedupe (same key ke do request ek ho jaate hain), background refetch, stale-while-revalidate, retry, aur request cancellation. Ye khud likhoge to yahi sab dobara likhna padega.
+
+## 6. Forms: Controlled vs Uncontrolled
+
+- **Controlled** (`value` + `onChange`): React ke paas truth, validation easy, lekin bade form mein har keystroke par rerender.
+- **Uncontrolled** (`ref` / react-hook-form): DOM ke paas truth, tez, isliye 50+ fields wale forms mein behtar.
+- Validation: schema (Zod/Yup) se, aur **server par dobara** - client validation sirf UX hai ([[66-blog-before-first-backend-job]]).
+
+## 7. TypeScript + Component API
+
+Invalid state ko **type level par impossible** banao:
+
+```typescript
+// discriminated union - "loading ke saath data" jaisa invalid combo ban hi nahi sakta
+type State =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'success'; data: User[] };
+```
+
+Props mein optional flags ki bheed (`isPrimary`, `isDanger`, `isGhost`) ki jagah `variant: 'primary' | 'danger' | 'ghost'` rakho.
+
+## 🧠 Remember
+
+> Ek source of truth (derived state nahi), rerender ka kaaran samjho (state/props/parent + keys), effects sirf sync ke liye, memo measure karke, fetching ke chaar states, bade forms uncontrolled, aur types se invalid state impossible.
+
+## Quick Self-Test
+
+1. Array index ko `key` banane se list reorder par kya galat hota hai?
+2. Button click ki API call `useEffect` mein kyun nahi honi chahiye?
+3. `React.memo` lagane ke baad bhi component rerender ho raha hai - sabse common wajah?
+</script>
+<script>
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  const src = document.getElementById('md-source').textContent;
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, lang) {
+    if (lang === 'mermaid') {
+      return '<div class="mermaid">' + code + '</div>';
+    }
+    return '<pre><code>' + code.replace(/</g,'&lt;') + '</code></pre>';
+  };
+  document.getElementById('content').innerHTML = marked.parse(src, { renderer });
+  mermaid.run({ querySelector: '.mermaid' });
+</script>
+</body>
+</html>
