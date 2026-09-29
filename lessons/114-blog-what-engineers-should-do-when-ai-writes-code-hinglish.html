@@ -79,9 +79,7 @@
 <script type="text/markdown" id="md-source">
 # Blog: AI Code Likh Dega - To Engineers Ka Time Kahan Jaaye? (Hinglish)
 
-Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions.
-
-Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, aur kahan wo help hi nahi kar sakta, aur **kyun**.
+Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions. Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, kahan **bilkul nahi**, aur har jagah **kyun**.
 
 ## 1. Requirements -- Human (AI ki help: kam)
 
@@ -146,30 +144,22 @@ Iska seedha matlab: reading aur testing skills ki value **badhi** hai, ghati nah
 
 - PR chhote rakho -- 200 lines review hote hain, 900 nahi
 - Test pehle maango, implementation baad mein: "ye 6 cases fail hone chahiye"
-- Generated code mein specifically dekho: error handling, transaction boundary, retry/idempotency, N+1 query, auth check. AI ka blind spot yahi hota hai
+- Generated code mein specifically dekho: error handling, transaction boundary, retry/idempotency, N+1 query, auth check -- AI ka blind spot yahi hota hai
 - "Tests pass ho gaye" ko proof na maano jab tests bhi AI ne likhe hon -- kam se kam ek assertion khud likho
 
 ## 9. Doosri Insight: Galat Decision Ki Cost Nahi Giri
 
-Code sasta hua. **Galat architecture ki keemat wahi hai.**
+Code sasta hua. **Galat architecture ki keemat wahi hai.** Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
 
-Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
-
-Isliye conclusion ulta hai: sasta code architecture ko **zyada** important banata hai, kam nahi ([[55-blog-engineering-harder-building-easier]]). Aur "AI se likha lo" ka sabse bada risk speed nahi, **bina soche direction** hai ([[76-blog-when-not-to-use-ai-agents]]).
+Isliye conclusion ulta hai: sasta code architecture ko **zyada** important banata hai, kam nahi ([[55-blog-engineering-harder-building-easier]]). "AI se likha lo" ka sabse bada risk speed nahi, **bina soche direction** hai ([[76-blog-when-not-to-use-ai-agents]]).
 
 ## 10. Honest Counterpoint: Juniors Ka Sawaal
 
-Mera argument ek jagah kamzor hai, aur wo maanna zaroori hai.
+Mera argument ek jagah kamzor hai, aur wo maanna zaroori hai. Review karna seekhne ka **koi shortcut nahi hai** -- aap code padhkar galti tabhi pakad paate ho jab aapne khud wo galti ki ho. Jisne kabhi khud deadlock nahi banaya, wo generated code mein deadlock risk nahi dekh paayega.
 
-Review karna seekhne ka **koi shortcut nahi hai** -- aap code padhkar galti pakadna tabhi seekhte ho jab aapne khud wo galti ki ho. Jisne kabhi khud deadlock nahi banaya, wo generated code mein deadlock risk nahi dekh paayega.
+To "junior log bas AI ko supervise karein" -- ye learning path nahi, dead end hai. Juniors ko abhi bhi kuch cheezein **haath se** likhni chahiye (jaan-boojhkar, bina autocomplete), apne bug khud debug karne chahiye jawab maangne se pehle, aur AI use karte waqt pehle apna answer likhkar phir compare karna chahiye.
 
-To "junior log bas AI ko supervise karein" -- ye learning path nahi hai, ye ek dead end hai. Juniors ko abhi bhi:
-
-- Kuch cheezein **haath se** likhni chahiye, jaan-boojhkar, bina autocomplete
-- Apne bug khud debug karne chahiye, jawab AI se maangne se pehle
-- AI use karein, par pehle apna answer likhein, phir compare karein -- "kya main isse behtar likh sakta tha?"
-
-Seniors ke liye bhi lesson: apni team se poori writing chheen lena short term mein productive dikhega, 2 saal mein review karne wala koi nahi bachega.
+Seniors ke liye bhi lesson: team se poori writing chheen lena short term mein productive dikhega, 2 saal mein review karne wala koi nahi bachega.
 
 ## 11. Ek Working Backend Engineer Ka Weekly Split (Rough)
 
@@ -183,10 +173,7 @@ Ye gospel nahi, ek starting point hai -- team aur phase ke hisaab se badlega:
 | Chalana | Debugging, on-call, monitoring, cost dekhna | 15-20% |
 | Baantna | Docs, knowledge sharing, mentoring | 5-10% |
 
-Kya measure karein (aur kya nahi):
-
-- **Achhe signals**: change failure rate, rollback count, review turnaround, incident MTTR, bug ka escape rate production tak
-- **Dhoka dene wale signals**: lines of code, PR count, "AI adoption %", story points
+Kya measure karein: **change failure rate, rollback count, review turnaround, incident MTTR, production tak pahunchne wale bugs**. Kya *na* measure karein: lines of code, PR count, "AI adoption %", story points.
 
 Agar output badha par change failure rate bhi badha, to aap tez nahi chal rahe -- aap tezi se karz bana rahe ho.
 

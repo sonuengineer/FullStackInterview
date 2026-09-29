@@ -1,8 +1,6 @@
 # Blog: AI Code Likh Dega - To Engineers Ka Time Kahan Jaaye? (Hinglish)
 
-Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions.
-
-Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, aur kahan wo help hi nahi kar sakta, aur **kyun**.
+Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions. Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, kahan **bilkul nahi**, aur har jagah **kyun**.
 
 ## 1. Requirements -- Human (AI ki help: kam)
 
@@ -72,9 +70,7 @@ Iska seedha matlab: reading aur testing skills ki value **badhi** hai, ghati nah
 
 ## 9. Doosri Insight: Galat Decision Ki Cost Nahi Giri
 
-Code sasta hua. **Galat architecture ki keemat wahi hai.**
-
-Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
+Code sasta hua. **Galat architecture ki keemat wahi hai.** Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
 
 Isliye conclusion ulta hai: sasta code architecture ko **zyada** important banata hai, kam nahi ([[55-blog-engineering-harder-building-easier]]). "AI se likha lo" ka sabse bada risk speed nahi, **bina soche direction** hai ([[76-blog-when-not-to-use-ai-agents]]).
 
@@ -98,10 +94,7 @@ Ye gospel nahi, ek starting point hai -- team aur phase ke hisaab se badlega:
 | Chalana | Debugging, on-call, monitoring, cost dekhna | 15-20% |
 | Baantna | Docs, knowledge sharing, mentoring | 5-10% |
 
-Kya measure karein (aur kya nahi):
-
-- **Achhe signals**: change failure rate, rollback count, review turnaround, incident MTTR, bug ka escape rate production tak
-- **Dhoka dene wale signals**: lines of code, PR count, "AI adoption %", story points
+Kya measure karein: **change failure rate, rollback count, review turnaround, incident MTTR, production tak pahunchne wale bugs**. Kya *na* measure karein: lines of code, PR count, "AI adoption %", story points.
 
 Agar output badha par change failure rate bhi badha, to aap tez nahi chal rahe -- aap tezi se karz bana rahe ho.
 

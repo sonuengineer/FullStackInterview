@@ -9863,9 +9863,7 @@ Interview line: *"Pehle dekhta hoon kaam I/O-bound hai ya CPU-bound. I/O hai to 
 
 User logged in hai, token valid hai, `/api/users/123/profile` apna data deta hai. Wo `124` kar deta hai -- aur dusre banda ka private data khul jaata hai.
 
-Naam: **IDOR -- Insecure Direct Object Reference**. Server request se aayi ID seedha use kar raha hai, bina check kiye ki *is* user ka *us* object par haq hai ya nahi.
-
-API security ki bhasha mein yahi cheez **OWASP API Security Top 10 ka API1: Broken Object Level Authorization (BOLA)** hai -- list ka **#1 risk**.
+Naam: **IDOR -- Insecure Direct Object Reference**. Server request se aayi ID seedha use kar raha hai, bina check kiye ki *is* user ka *us* object par haq hai ya nahi. API security ki bhasha mein yahi cheez **OWASP API Security Top 10 ka API1: Broken Object Level Authorization (BOLA)** hai -- list ka **#1 risk**.
 
 **Itna common kyun?** Kyunki ownership check **har endpoint par alag se** lagana padta hai. 300 endpoints hain, 299 par check hai, 1 par bhool gaye -- attacker ke liye wahi ek kaafi hai. Aur bhoolna easy hai: apne data par test karoge to sab sahi lagega.
 
@@ -9878,31 +9876,21 @@ API security ki bhasha mein yahi cheez **OWASP API Security Top 10 ka API1: Brok
 
 Yahan authentication **bilkul theek** tha ([[94-jwt-auth-safely-in-production]] wala poora kaam ho chuka tha). Authorization **gayab** tha. Ye "login bypass" nahi -- ye **missing check** hai. Confidentiality ka direct breach ([[27-cia-triad]]).
 
-## 3. Root Cause
+## 3. Root Cause Aur Fixes -- Isi Order Mein
 
-> Server ne **request se aayi ID ko trust kar liya**, ownership derive ya verify karne ki jagah.
+> Server ne **request se aayi ID ko trust kar liya**, ownership derive ya verify karne ki jagah. Request se aane wali har cheez attacker-controlled hai -- URL param, query string, body field, header. `userId` bhi usi list mein hai.
 
-Request se aane wali har cheez attacker-controlled hai -- URL param, query string, body field, header. `userId` bhi usi list mein hai.
+**(a) Apna data? URL se ID mat lo -- session/token se lo.** `/api/users/:id/profile` design hi galat hai jab wo sirf "mera profile" deta hai. `/api/me/profile` banao, `req.user.id` use karo. Jo ID request mein hi nahi hai, usse tamper nahi kar sakte.
 
-## 4. Fixes -- Isi Order Mein
+**(b) Genuinely shared resource? Ownership query ke andar daalo.** Order, invoice, document -- jinka owner alag ho sakta hai -- wahan ID lena padega. To check **database par** karwao: `WHERE id = $1 AND owner_id = $2`. Do-step `findById()` phir `if (order.ownerId !== user.id)` bhi chalta hai, par wo `if` delete ho sakti hai aur koi notice nahi karega. Query wala version **structurally** safe hai -- row hi nahi milti.
 
-**(a) Apna data? URL se ID mat lo -- session/token se lo.** `/api/users/:id/profile` design hi galat hai jab wo sirf "mera profile" deta hai. `/api/me/profile` banao aur `req.user.id` use karo. Jo ID request mein hi nahi hai, usse tamper nahi kar sakte.
-
-**(b) Genuinely shared resource? Ownership query ke andar daalo.** Order, invoice, document -- jinka owner alag ho sakta hai -- wahan ID lena padega. To check **database par** karwao:
-
-```sql
-SELECT * FROM orders WHERE id = $1 AND owner_id = $2;
-```
-
-Do-step `findById()` phir `if (order.ownerId !== user.id)` bhi chalta hai, par wo line delete ho sakti hai aur koi notice nahi karega. Query wala version **structurally** safe hai -- row hi nahi milti.
-
-**(c) Central authorization layer.** Per-route `if` likhte rahoge to kahin miss hoga. Ek policy helper -- `can(user, 'read', order)` -- aur rule ek jagah.
+**(c) Central authorization layer.** Per-route `if` likhte rahoge to kahin miss hoga. Ek policy helper -- `can(user, 'read', order)` -- rule ek jagah.
 
 **(d) Unguessable IDs (UUID/ULID) madad karte hain, authorization NAHI hain.** `124` guess karna trivial hai; UUID nahi -- ye **enumeration** kam karta hai ([[59-uuid-vs-auto-increment]]). Par jo ID leak ho gayi (email, logs, shared link) wo attacker ke paas hai, aur check na ho to data mil jaayega. UUID speed bump hai, lock nahi.
 
 **(e) Jahan existence bhi secret hai, 403 ki jagah 404 do.** 403 ka matlab: "object exist karta hai, par tera nahi" -- attacker isi se valid IDs ki list bana leta hai ([[18-http-status-codes-400-404-409-422]]).
 
-## 5. Code -- Before Aur After
+## 4. Code -- Before Aur After
 
 ```javascript
 // VULNERABLE: requireAuth ne token verify kiya -- authentication OK, authorization ZERO
@@ -9916,11 +9904,8 @@ app.get('/api/me/profile', requireAuth, async (req, res) => {
   const user = await db.users.findById(req.user.id); // token se, URL se nahi
   res.json(user);
 });
-```
 
-**Shared resource -- ownership query mein:**
-
-```javascript
+// FIXED: shared resource -- ownership query ke andar, DB enforce karta hai
 app.get('/api/orders/:id', requireAuth, async (req, res) => {
   const { rows } = await pool.query(
     'SELECT * FROM orders WHERE id = $1 AND owner_id = $2',
@@ -9943,26 +9928,24 @@ const policies = {
 
 function can(user, action, type, resource) {
   const rule = policies[type]?.[action];
-  if (!rule) return false; // naya action add karo to explicitly allow karna padega
+  if (!rule) return false;  // default DENY -- naya action explicitly allow karna padega
   return rule(user, resource);
 }
-
-// route mein:
-if (!can(req.user, 'read', 'order', order)) return res.sendStatus(404);
+// route mein: if (!can(req.user, 'read', 'order', order)) return res.sendStatus(404);
 ```
 
-`default deny` sabse important line hai: naya resource type apne aap allowed nahi ho jaata.
+Wo `return false` sabse important line hai: naya resource type apne aap allowed nahi ho jaata.
 
-## 6. Isko Dhoondhna Kaise Hai
+## 5. Isko Dhoondhna Kaise Hai
 
-- **Automated tests**: har object endpoint ke liye ek test jo **user B ke token se user A ka object** maange aur 403/404 expect kare. Sabse sasta safety net -- naye route par test bhool gaye to review mein pakda jaata hai.
+- **Automated tests**: har object endpoint par ek test jo **user B ke token se user A ka object** maange aur 403/404 expect kare. Sabse sasta safety net -- naye route par test bhool gaye to review mein pakda jaata hai.
 - **Code review checklist**: handler mein `req.params`/`req.body` se ID aa rahi hai? Saath ownership condition hai? Query mein hai ya sirf ek `if` mein? List endpoints (`GET /orders`) par `WHERE owner_id` laga hai?
-- **Logging + alerting**: ek hi account se repeated 403/404 on object endpoints = enumeration attempt. Alert rakho.
+- **Logging + alerting**: ek hi account se repeated 403/404 on object endpoints = enumeration attempt.
 - **Scanners ye miss karte hain** kyunki tool ko pata nahi ki `124` kisi *dusre* ka hai -- response 200 hai, error nahi. Detect karne ke liye **do valid accounts** chahiye aur "kya B ne A ka data dekha" wali business-level samajh. Isliye ye bug manual testing aur apne tests se milta hai, generic scanner se nahi.
 
-## 7. Sibling Bug -- Mass Assignment (BOPLA)
+## 6. Sibling Bug -- Mass Assignment (BOPLA)
 
-IDOR object *level* par hai: "ye object tera hai?" Uska bhai **property** level par: "ye **field** tu change kar sakta hai?" User body mein `role: "admin"` bhej deta hai:
+IDOR object *level* par hai: "ye object tera hai?" Uska bhai **property** level par: "ye **field** tu change kar sakta hai?" User body mein `role: "admin"` bhejta hai:
 
 ```javascript
 await db.users.update(req.user.id, req.body);          // galat -- role bhi save ho jaayega
@@ -9972,7 +9955,7 @@ await db.users.update(req.user.id, { name, phone });
 
 **Blocklist nahi, allowlist** -- naya sensitive column add hoga to blocklist update karna bhool jaoge.
 
-## 8. Interview Mein Kya Bolna Hai
+## 7. Interview Mein Kya Bolna Hai
 
 > "Ye IDOR hai -- OWASP API Top 10 mein API1, Broken Object Level Authorization. Authentication chal raha tha, authorization missing tha; root cause ye ki server ne request ki ID trust kar li. Fix: 'mera data' endpoints par ID hi mat lo, `req.user.id` use karo; shared resources par ownership query mein daalo taaki DB enforce kare; rules central policy helper mein default-deny ke saath. UUID enumeration kam karta hai par authorization nahi hai. Regression rokne ke liye cross-account tests likhte hain."
 
@@ -10309,9 +10292,7 @@ FROM pg_stat_activity WHERE state <> 'idle' ORDER BY dur DESC LIMIT 10;
 <script type="text/markdown" class="lesson-data" data-id="114" data-title="AI Code Likhega To Engineers Kya Karein (Hinglish)" data-category="Blog" data-order="114">
 # Blog: AI Code Likh Dega - To Engineers Ka Time Kahan Jaaye? (Hinglish)
 
-Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions.
-
-Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, aur kahan wo help hi nahi kar sakta, aur **kyun**.
+Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions. Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, kahan **bilkul nahi**, aur har jagah **kyun**.
 
 ## 1. Requirements -- Human (AI ki help: kam)
 
@@ -10376,30 +10357,22 @@ Iska seedha matlab: reading aur testing skills ki value **badhi** hai, ghati nah
 
 - PR chhote rakho -- 200 lines review hote hain, 900 nahi
 - Test pehle maango, implementation baad mein: "ye 6 cases fail hone chahiye"
-- Generated code mein specifically dekho: error handling, transaction boundary, retry/idempotency, N+1 query, auth check. AI ka blind spot yahi hota hai
+- Generated code mein specifically dekho: error handling, transaction boundary, retry/idempotency, N+1 query, auth check -- AI ka blind spot yahi hota hai
 - "Tests pass ho gaye" ko proof na maano jab tests bhi AI ne likhe hon -- kam se kam ek assertion khud likho
 
 ## 9. Doosri Insight: Galat Decision Ki Cost Nahi Giri
 
-Code sasta hua. **Galat architecture ki keemat wahi hai.**
+Code sasta hua. **Galat architecture ki keemat wahi hai.** Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
 
-Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
-
-Isliye conclusion ulta hai: sasta code architecture ko **zyada** important banata hai, kam nahi ([[55-blog-engineering-harder-building-easier]]). Aur "AI se likha lo" ka sabse bada risk speed nahi, **bina soche direction** hai ([[76-blog-when-not-to-use-ai-agents]]).
+Isliye conclusion ulta hai: sasta code architecture ko **zyada** important banata hai, kam nahi ([[55-blog-engineering-harder-building-easier]]). "AI se likha lo" ka sabse bada risk speed nahi, **bina soche direction** hai ([[76-blog-when-not-to-use-ai-agents]]).
 
 ## 10. Honest Counterpoint: Juniors Ka Sawaal
 
-Mera argument ek jagah kamzor hai, aur wo maanna zaroori hai.
+Mera argument ek jagah kamzor hai, aur wo maanna zaroori hai. Review karna seekhne ka **koi shortcut nahi hai** -- aap code padhkar galti tabhi pakad paate ho jab aapne khud wo galti ki ho. Jisne kabhi khud deadlock nahi banaya, wo generated code mein deadlock risk nahi dekh paayega.
 
-Review karna seekhne ka **koi shortcut nahi hai** -- aap code padhkar galti pakadna tabhi seekhte ho jab aapne khud wo galti ki ho. Jisne kabhi khud deadlock nahi banaya, wo generated code mein deadlock risk nahi dekh paayega.
+To "junior log bas AI ko supervise karein" -- ye learning path nahi, dead end hai. Juniors ko abhi bhi kuch cheezein **haath se** likhni chahiye (jaan-boojhkar, bina autocomplete), apne bug khud debug karne chahiye jawab maangne se pehle, aur AI use karte waqt pehle apna answer likhkar phir compare karna chahiye.
 
-To "junior log bas AI ko supervise karein" -- ye learning path nahi hai, ye ek dead end hai. Juniors ko abhi bhi:
-
-- Kuch cheezein **haath se** likhni chahiye, jaan-boojhkar, bina autocomplete
-- Apne bug khud debug karne chahiye, jawab AI se maangne se pehle
-- AI use karein, par pehle apna answer likhein, phir compare karein -- "kya main isse behtar likh sakta tha?"
-
-Seniors ke liye bhi lesson: apni team se poori writing chheen lena short term mein productive dikhega, 2 saal mein review karne wala koi nahi bachega.
+Seniors ke liye bhi lesson: team se poori writing chheen lena short term mein productive dikhega, 2 saal mein review karne wala koi nahi bachega.
 
 ## 11. Ek Working Backend Engineer Ka Weekly Split (Rough)
 
@@ -10413,10 +10386,7 @@ Ye gospel nahi, ek starting point hai -- team aur phase ke hisaab se badlega:
 | Chalana | Debugging, on-call, monitoring, cost dekhna | 15-20% |
 | Baantna | Docs, knowledge sharing, mentoring | 5-10% |
 
-Kya measure karein (aur kya nahi):
-
-- **Achhe signals**: change failure rate, rollback count, review turnaround, incident MTTR, bug ka escape rate production tak
-- **Dhoka dene wale signals**: lines of code, PR count, "AI adoption %", story points
+Kya measure karein: **change failure rate, rollback count, review turnaround, incident MTTR, production tak pahunchne wale bugs**. Kya *na* measure karein: lines of code, PR count, "AI adoption %", story points.
 
 Agar output badha par change failure rate bhi badha, to aap tez nahi chal rahe -- aap tezi se karz bana rahe ho.
 
