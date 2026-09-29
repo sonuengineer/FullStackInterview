@@ -9854,6 +9854,582 @@ Interview line: *"Pehle dekhta hoon kaam I/O-bound hai ya CPU-bound. I/O hai to 
 2. cluster lagane ke baad user ka session kabhi-kabhi "gayab" kyun ho jaata hai?
 3. `exec` aur `spawn` mein security ka kya farak hai?
 </script>
+<script type="text/markdown" class="lesson-data" data-id="110" data-title="IDOR / BOLA - URL Se Dusre Ka Data (Hinglish)" data-category="Auth &amp; Security" data-order="110">
+# IDOR / BOLA - Logged-in User Ne URL Mein ID Badli Aur Dusre Ka Data Dikh Gaya (Hinglish)
+
+> **Similar-question flag**: [[85-authentication-vs-authorization]] mein "kaun ho tum" vs "kya kar sakte ho" ka farak aa chuka hai. Naya yahan ye hai: wo farak **kaise ek real vulnerability ban jaata hai**, aur code mein kahan fix lagta hai.
+
+## 1. Bug Ka Naam
+
+User logged in hai, token valid hai, `/api/users/123/profile` apna data deta hai. Wo `124` kar deta hai -- aur dusre banda ka private data khul jaata hai.
+
+Naam: **IDOR -- Insecure Direct Object Reference**. Server request se aayi ID seedha use kar raha hai, bina check kiye ki *is* user ka *us* object par haq hai ya nahi.
+
+API security ki bhasha mein yahi cheez **OWASP API Security Top 10 ka API1: Broken Object Level Authorization (BOLA)** hai -- list ka **#1 risk**.
+
+**Itna common kyun?** Kyunki ownership check **har endpoint par alag se** lagana padta hai. 300 endpoints hain, 299 par check hai, 1 par bhool gaye -- attacker ke liye wahi ek kaafi hai. Aur bhoolna easy hai: apne data par test karoge to sab sahi lagega.
+
+## 2. Authentication vs Authorization -- Ek Line Mein
+
+| | Sawaal | Fail hone par |
+|---|---|---|
+| **Authentication** | "Tum kaun ho?" | **401 Unauthorized** -- token nahi/galat/expired |
+| **Authorization** | "Tumhe is cheez par haq hai?" | **403 Forbidden** -- pata hai tum kaun ho, par allowed nahi |
+
+Yahan authentication **bilkul theek** tha ([[94-jwt-auth-safely-in-production]] wala poora kaam ho chuka tha). Authorization **gayab** tha. Ye "login bypass" nahi -- ye **missing check** hai. Confidentiality ka direct breach ([[27-cia-triad]]).
+
+## 3. Root Cause
+
+> Server ne **request se aayi ID ko trust kar liya**, ownership derive ya verify karne ki jagah.
+
+Request se aane wali har cheez attacker-controlled hai -- URL param, query string, body field, header. `userId` bhi usi list mein hai.
+
+## 4. Fixes -- Isi Order Mein
+
+**(a) Apna data? URL se ID mat lo -- session/token se lo.** `/api/users/:id/profile` design hi galat hai jab wo sirf "mera profile" deta hai. `/api/me/profile` banao aur `req.user.id` use karo. Jo ID request mein hi nahi hai, usse tamper nahi kar sakte.
+
+**(b) Genuinely shared resource? Ownership query ke andar daalo.** Order, invoice, document -- jinka owner alag ho sakta hai -- wahan ID lena padega. To check **database par** karwao:
+
+```sql
+SELECT * FROM orders WHERE id = $1 AND owner_id = $2;
+```
+
+Do-step `findById()` phir `if (order.ownerId !== user.id)` bhi chalta hai, par wo line delete ho sakti hai aur koi notice nahi karega. Query wala version **structurally** safe hai -- row hi nahi milti.
+
+**(c) Central authorization layer.** Per-route `if` likhte rahoge to kahin miss hoga. Ek policy helper -- `can(user, 'read', order)` -- aur rule ek jagah.
+
+**(d) Unguessable IDs (UUID/ULID) madad karte hain, authorization NAHI hain.** `124` guess karna trivial hai; UUID nahi -- ye **enumeration** kam karta hai ([[59-uuid-vs-auto-increment]]). Par jo ID leak ho gayi (email, logs, shared link) wo attacker ke paas hai, aur check na ho to data mil jaayega. UUID speed bump hai, lock nahi.
+
+**(e) Jahan existence bhi secret hai, 403 ki jagah 404 do.** 403 ka matlab: "object exist karta hai, par tera nahi" -- attacker isi se valid IDs ki list bana leta hai ([[18-http-status-codes-400-404-409-422]]).
+
+## 5. Code -- Before Aur After
+
+```javascript
+// VULNERABLE: requireAuth ne token verify kiya -- authentication OK, authorization ZERO
+app.get('/api/users/:id/profile', requireAuth, async (req, res) => {
+  const user = await db.users.findById(req.params.id); // attacker-controlled ID
+  res.json(user);
+});
+
+// FIXED: apna data, ID hi nahi leta
+app.get('/api/me/profile', requireAuth, async (req, res) => {
+  const user = await db.users.findById(req.user.id); // token se, URL se nahi
+  res.json(user);
+});
+```
+
+**Shared resource -- ownership query mein:**
+
+```javascript
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM orders WHERE id = $1 AND owner_id = $2',
+    [req.params.id, req.user.id]
+  );
+  if (rows.length === 0) return res.sendStatus(404); // exist karta hai ya nahi, bataya nahi
+  res.json(rows[0]);
+});
+```
+
+**Policy helper -- rule ek jagah, default DENY:**
+
+```javascript
+const policies = {
+  order: {
+    read:  (user, order) => order.ownerId === user.id || user.role === 'support',
+    write: (user, order) => order.ownerId === user.id,
+  },
+};
+
+function can(user, action, type, resource) {
+  const rule = policies[type]?.[action];
+  if (!rule) return false; // naya action add karo to explicitly allow karna padega
+  return rule(user, resource);
+}
+
+// route mein:
+if (!can(req.user, 'read', 'order', order)) return res.sendStatus(404);
+```
+
+`default deny` sabse important line hai: naya resource type apne aap allowed nahi ho jaata.
+
+## 6. Isko Dhoondhna Kaise Hai
+
+- **Automated tests**: har object endpoint ke liye ek test jo **user B ke token se user A ka object** maange aur 403/404 expect kare. Sabse sasta safety net -- naye route par test bhool gaye to review mein pakda jaata hai.
+- **Code review checklist**: handler mein `req.params`/`req.body` se ID aa rahi hai? Saath ownership condition hai? Query mein hai ya sirf ek `if` mein? List endpoints (`GET /orders`) par `WHERE owner_id` laga hai?
+- **Logging + alerting**: ek hi account se repeated 403/404 on object endpoints = enumeration attempt. Alert rakho.
+- **Scanners ye miss karte hain** kyunki tool ko pata nahi ki `124` kisi *dusre* ka hai -- response 200 hai, error nahi. Detect karne ke liye **do valid accounts** chahiye aur "kya B ne A ka data dekha" wali business-level samajh. Isliye ye bug manual testing aur apne tests se milta hai, generic scanner se nahi.
+
+## 7. Sibling Bug -- Mass Assignment (BOPLA)
+
+IDOR object *level* par hai: "ye object tera hai?" Uska bhai **property** level par: "ye **field** tu change kar sakta hai?" User body mein `role: "admin"` bhej deta hai:
+
+```javascript
+await db.users.update(req.user.id, req.body);          // galat -- role bhi save ho jaayega
+const { name, phone } = req.body;                       // sahi -- allowlist
+await db.users.update(req.user.id, { name, phone });
+```
+
+**Blocklist nahi, allowlist** -- naya sensitive column add hoga to blocklist update karna bhool jaoge.
+
+## 8. Interview Mein Kya Bolna Hai
+
+> "Ye IDOR hai -- OWASP API Top 10 mein API1, Broken Object Level Authorization. Authentication chal raha tha, authorization missing tha; root cause ye ki server ne request ki ID trust kar li. Fix: 'mera data' endpoints par ID hi mat lo, `req.user.id` use karo; shared resources par ownership query mein daalo taaki DB enforce kare; rules central policy helper mein default-deny ke saath. UUID enumeration kam karta hai par authorization nahi hai. Regression rokne ke liye cross-account tests likhte hain."
+
+## 🧠 Remember
+
+> Authentication proves kaun ho, authorization proves kya tumhara hai -- aur request mein aayi ID kabhi ownership ka proof nahi hoti; ya user session se derive karo, ya `WHERE id = $1 AND owner_id = $2` likhkar database se enforce karwao.
+
+## Quick Self-Test
+
+1. Sab IDs UUID kar diye -- kya bug fix ho gaya? Kyun nahi?
+2. `if (order.ownerId !== user.id) throw` aur `WHERE id = $1 AND owner_id = $2` -- dono check karte hain, phir dusra behtar kyun hai?
+3. Kis situation mein 403 ki jagah 404 return karna chahiye, aur kyun?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="111" data-title="Flash Sale Fair Queue vs Bots (Hinglish)" data-category="System Design at Scale" data-order="111">
+# Flash Sale Mein Bots Ne Sab Le Liya - Fair Queue Kaise Design Karein? (Hinglish)
+
+> **Similar-question flag**: [[79-blog-rate-limiting]] aur [[106-rate-limiting-at-the-edge-hinglish]] mein "traffic kaise limit karein" aa chuka hai. Naya yahan ye hai: **fairness** ek business decision hai, aur usko enforce karne ke liye queue + inventory + bot defence teeno chahiye.
+
+## 1. Pehla Sawaal: "Fair" Ka Matlab Kya Hai?
+
+Iska jawaab design se pehle aana chahiye, kyunki teen bilkul alag systems ban te hain:
+
+| Model | Rule | Bots ke against |
+|---|---|---|
+| **FIFO by arrival** | jo pehle aaya, usko pehle | **Kamzor** -- bot insaan se 200 ms pehle aata hai, hamesha |
+| **Random lottery** | registered users mein se random winners | **Sabse strong** -- speed ka koi faida nahi bachta |
+| **Weighted** | loyalty / past orders / account age se weight | Strong, par "fair" ki definition explain karni padegi |
+
+Note karo: **FIFO ka matlab hi hai ki fastest network jeetega** -- aur wo insaan kabhi nahi hota. Isliye jab business "fair" bolta hai aur matlab "bots na jeeten" hota hai, to **lottery** hi sabse honest jawaab hai. Business kya chahta hai, wo decide karega -- engineering uske baad aati hai.
+
+## 2. Best Fix: Pre-Sale Registration + Lottery
+
+12:00:00 ki race ko **khatam** kar do:
+
+1. **Registration window** -- 3 din tak users "interested" mark karte hain. Yahan koi hurry nahi, isliye koi stampede nahi.
+2. **Eligibility filter** -- account age, verified phone, ek account per phone.
+3. **Draw** -- 10,000 units ke liye offline random selection (seed log karo, audit ke liye).
+4. **Winners ko time-boxed purchase token** -- "aapka 20-minute window 2 PM se". Token signed hai aur stock usi ke naam reserved hai.
+
+Ab checkout par ek time par 500 log hain, 5 lakh nahi. Load problem **hi gayab** ho gayi -- ye scaling se sasta hai.
+
+## 3. Jab Live Sale Chahiye: Virtual Waiting Room
+
+Marketing ko "12 baje live drop" chahiye, to queue **app ke bahar** rakho. Ek edge service (CloudFront + Lambda@Edge, ya koi managed waiting-room product) user ko ek **signed position token** deta hai -- cookie mein position, issue time aur signature.
+
+Sirf **N tokens per second** ko checkout mein admit karo. Baaki ko live position dikhao ("aap 84,201 number par, approx 6 min").
+
+**Ye edge par kyun hona chahiye, app ke andar kyun nahi?** Kyunki app ke andar waiting room ka matlab hai ki 5 lakh requests ne pehle aapka load balancer, TLS, app server, session lookup aur DB connection pool chhua -- "please wait" likhne ke liye. Queue ka poora point hi ye hai ki **origin ko traffic dikhe hi na**. Edge CDN POPs par distributed hai aur position issue karne ke liye aapke DB ki zaroorat nahi. App ke andar queue = queue ka page hi pehle girega.
+
+## 4. Inventory Correctness -- Yahan Overselling Hota Hai
+
+Queue fairness deti hai; **stock ki sahi ginti alag problem hai**. `SELECT stock` phir `UPDATE stock = stock - 1` classic race condition hai ([[60-cache-says-100-db-says-20]] wali soch).
+
+**Conditional SQL update** -- DB khud guard karta hai:
+
+```sql
+UPDATE products SET stock = stock - 1
+WHERE id = $1 AND stock > 0
+RETURNING stock;
+```
+
+Zero rows affected = sold out. Koi lock manually lena hi nahi pada.
+
+**Ya Redis atomic decrement** -- `DECR` atomic hai, par -1 tak chala jaayega, isliye Lua se guard karo:
+
+```javascript
+// stock 0 se neeche na jaaye -- pura script atomically chalta hai
+const DECR_IF_AVAILABLE = `
+  local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+  if left <= 0 then return -1 end
+  return redis.call('DECR', KEYS[1])
+`;
+
+async function reserve(productId, userId) {
+  const left = await redis.eval(DECR_IF_AVAILABLE, 1, `stock:${productId}`);
+  if (left < 0) return { ok: false, reason: 'sold_out' };
+
+  // reservation TTL: 10 min mein payment nahi hua to stock wapas
+  await redis.set(`resv:${productId}:${userId}`, '1', 'EX', 600, 'NX');
+  return { ok: true, left };
+}
+
+// payment fail / cart abandon -> stock release
+async function release(productId, userId) {
+  const existed = await redis.del(`resv:${productId}:${userId}`);
+  if (existed) await redis.incr(`stock:${productId}`); // sirf tab jab reservation asli thi
+}
+```
+
+Teen cheezein yahan zaroori hain:
+
+- **Short-lived reservations with TTL** -- warna abandoned carts stock ko hamesha ke liye lock kar dete hain. TTL expire hua to sweeper stock wapas kar deta hai.
+- **Release idempotent** -- `DEL` ka return check karo, warna double release stock badha dega.
+- **Purchase idempotent** -- user do baar "Buy" dabata hai. Client-generated `Idempotency-Key` par unique constraint lagao ([[32-payment-idempotency-double-click]]), warna retry do orders bana dega.
+
+Distributed lock (`SET NX` + TTL, [[44-distributed-locking-with-redis]]) yahan **zaroori nahi** hai -- atomic counter kaafi hai aur bahut sasta hai. Lock tab chahiye jab ek se zyada resources ko ek saath badalna ho.
+
+## 5. Bot Defence -- CAPTCHA Se Aage
+
+CAPTCHA jawaab nahi hai: solver services paisa lekar isko todte hain. Layers lagao:
+
+| Control | Kya rokta hai |
+|---|---|
+| **Account age + verified phone** | fresh throwaway accounts |
+| **Per-account limit, per-IP nahi** | bot residential proxies se IP badalta rehta hai; account nahi |
+| **Device fingerprinting** | ek device par 200 accounts |
+| **WAF bot rules + edge rate limit** | naive scripts, known bot signatures |
+| **Honeypot field** | form auto-fill karne wale simple bots |
+| **Purchase velocity checks** | "10 second mein checkout complete" wale patterns |
+| **Manual review / reseller flags** | ek address par 40 orders |
+
+**Per-IP limit kaafi nahi hai** -- ye sabse common galti hai. Ek office ya mobile carrier NAT ke peeche 5,000 genuine users ho sakte hain, aur bot ke paas 50,000 residential IPs. Limit **account** par lagao.
+
+Honest baat: **koi bhi single control determined bots ko nahi rokta.** Goal unhe impossible banana nahi hai -- unhe **mehnga** banana hai, aur unka speed advantage hatana hai. Lottery isiliye jeet ti hai: fast hone ka koi reward hi nahi bachta.
+
+## 6. Load Par Kya Todta Hai
+
+- **Queue depth** -- 5 lakh entries ka sorted set fine hai, par position calculate karne ke liye har request par `ZRANK` mehnga hai. Position periodically batch mein compute karke cache karo.
+- **Hot row contention** -- sabhi 5 lakh updates **ek hi product row** par ja rahe hain. Us row par lock queue ban jaati hai aur throughput gir jaata hai, chahe server kitne bhi ho. **Advanced trick: stock ko N counters mein shard karo** -- `stock:P1:0 .. stock:P1:9`, har user ek random shard hit kare. 10x contention kam. Cost: ek shard khali ho gaya aur dusre mein stock bacha ho to "sold out" galat dikh sakta hai, isliye shard khali milne par doosra shard try karo, phir sold out bolo.
+- **Notification fan-out** -- 5 lakh "sold out" / "you won" emails+SMS ek saath. Isko queue mein daalo aur workers se drain karo, warna provider throttle karega aur backlog banega ([[23-queue-backlog-after-spike]]).
+
+## 7. Admitting Users -- Fixed Rate Par
+
+```javascript
+// queue: Redis sorted set, score = arrival timestamp (FIFO model)
+// har second sirf `rate` users ko checkout token dete hain
+async function admitBatch(saleId, rate) {
+  const ids = await redis.zrange(`queue:${saleId}`, 0, rate - 1);
+  if (ids.length === 0) return 0;
+
+  const tx = redis.multi();
+  for (const userId of ids) {
+    // checkout window: 5 min. Iske baad token dead, seat wapas.
+    tx.set(`admit:${saleId}:${userId}`, '1', 'EX', 300);
+  }
+  tx.zrem(`queue:${saleId}`, ...ids);
+  await tx.exec();
+  return ids.length;
+}
+// setInterval(() => admitBatch('sale-42', 200), 1000);
+```
+
+`rate` ko checkout ki **asli capacity** se tie karo (p99 latency aur DB connections dekhkar), marketing ki umeed se nahi. Ye poora point hai: queue ka kaam origin ko uski capacity par chalaye rakhna hai, usse zyada nahi.
+
+## 🧠 Remember
+
+> FIFO queue "fair" nahi hoti -- wo sabse tez network ko inaam deti hai, aur wo insaan nahi hota; asli fairness pre-registration + lottery se aati hai, queue sirf origin ko uski capacity par chalaye rakhne ka tool hai, aur stock ki sacchai ek atomic conditional decrement + TTL reservation se aati hai.
+
+## Quick Self-Test
+
+1. Waiting room app ke andar banane se kya fayda nahi milta, jo edge par banane se milta hai?
+2. Reservations par TTL kyun zaroori hai, aur TTL na ho to kya galat dikhega?
+3. Ek product ka stock 10 counters mein shard karne se kya milta hai, aur iski kya keemat hai?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="112" data-title="AI Ke Daur Mein Relevant Kaise Rahein (Hinglish)" data-category="Blog" data-order="112">
+# Blog: AI Ke Daur Mein Software Engineer Relevant Kaise Rahe? (Hinglish)
+
+Har jagah ek hi baat chal rahi hai: "software engineering khatam ho gaya". Par solution kisi ne nahi bataya. Ye post solution wali side par hai.
+
+## 1. Pehle Theek Se Naam Do: Actually Kya Badla?
+
+Ek cheez sasti hui hai -- **code likhna**. Bas.
+
+Jo sasta nahi hua:
+
+- Ye decide karna ki **kya** banana hai
+- Likha hua code **padhkar samajhna** ki ye sahi hai ya nahi
+- Wo production mein chalne ke baad uski **zimmedari** lena
+
+Yaani generation cheap ho gayi, **verification aur accountability** nahi. Yehi baat [[55-blog-engineering-harder-building-easier]] mein thi: banana aasan hua, engineering mushkil hui. Agar aapki value sirf "main typing karke feature bana deta hoon" thi, to haan, dabaav aayega. Agar aapki value "main decide karta hoon aur jhelta hoon" hai, to wo demand badhi hai.
+
+## 2. Wo Skills Jo Compound Hoti Hain
+
+Ye woh cheezein hain jinme lagaya time saalon tak return deta hai:
+
+**Production debugging.** Live system ka behaviour repo mein likha nahi hota. Latency spike, connection pool exhaustion, ek slow query jo peak par hi dikhti hai -- ye pattern-matching se nahi, hypothesis banake aur measure karke pakde jaate hain ([[30-workload-before-conclusion]]).
+
+**System design aur trade-off reasoning.** AI aapko ek design de dega. Ye nahi bata sakta ki *aapki* team, budget, deadline aur traffic ke hisaab se konsa sacrifice theek hai. Aur chhoti company mein bhi ye seekha ja sakta hai ([[53-blog-senior-system-design-without-big-scale]]).
+
+**Tezi se code padhna.** Ab aap jitna likhte ho usse **kai guna zyada padhte ho**. Reading speed + "ye kahan galat ho sakta hai" ka instinct -- ye naya core skill hai.
+
+**Fundamentals: DB, networking, concurrency.** Fundamentals boring lagte hain, par asli faayda ye hai: **ye AI ki galtiyon ko explain karte hain**. AI ne `LOWER(email)` par query likh di ([[102-lower-email-index-hinglish]]), ya retry lagaya bina idempotency ke -- aap sirf tabhi pakad paoge jab aapko underlying model pata ho.
+
+**Domain knowledge.** Aapka business kaise paisa kamata hai, order flow mein kya invalid state hai, refund rule kya hai -- ye kisi repo mein poora likha nahi hota. Yahi cheez aapko replaceable hone se bachati hai.
+
+## 3. AI Ko *Direct* Karna Bhi Ek Skill Hai
+
+"AI use karta hoon" skill nahi hai. Skill ye hai:
+
+- **Precise spec dena**: inputs, outputs, edge cases, constraints -- pehle likho, phir generate karo
+- **Decompose karna**: ek 800-line feature ki jagah 6 chhote, review-able tukde
+- **Verification plan**: test, log, metric -- generate karne se *pehle* socho ki "sahi hone ka proof kya hoga"
+- **Kab haath se likhna tez hai** ye pehchanna: 15-line tricky concurrency code samjhane-review karne se seedha likh dena sasta padta hai ([[76-blog-when-not-to-use-ai-agents]])
+
+## 4. Ownership -- Jo AI Utha Hi Nahi Sakta
+
+AI on-call nahi jaata. 2 baje raat ko page aane par wo customer ko call nahi karta. Cloud bill dekhkar architecture nahi badalta. Incident ke baad postmortem likhkar team ko convince nahi karta.
+
+Isliye sabse safe position ye hai: **idea se production tak ek feature ko akele le jaa sakna** -- requirement clarify, design, build, rollout, monitor, cost, failure handling ([[42-resilience-vs-overengineering]]).
+
+Accountability transfer nahi hoti. Wahi aapki moat hai.
+
+## 5. Kaam Dikhna Bhi Chahiye
+
+Ek honest baat: achha engineer hona kaafi nahi hai agar kisi ko pata na ho.
+
+Distribution engineering mein bhi lagu hota hai ([[47-technology-vs-distribution]]). Jo log likhte hain, share karte hain, internally demo dete hain, review mein clearly bolte hain -- unko better problems milte hain, aur better problems se better skills. Ye loop hai.
+
+Practical: har mahine ek cheez likho jo aapne debug ki. Chhota post, internal wiki bhi chalega. Yehi cheez interview mein "why you over AI" ka jawab ban jaati hai ([[29-why-hire-you-over-ai]]) aur package negotiation mein bhi kaam aati hai ([[96-blog-12lpa-to-22lpa-packaging]]).
+
+## 6. Honest Section: Kya Genuinely Risk Mein Hai
+
+Hype nahi, seedhi baat:
+
+| Risk mein | Kyun | Relatively safe | Kyun |
+|---|---|---|---|
+| Pure boilerplate CRUD | Pattern repeat hai, context kam | Production ownership + on-call | Accountability delegate nahi hoti |
+| Low-context ticket closing | Spec already likha hua hai, AI wahi kar dega | Ambiguous requirement ko clear karna | Information kisi repo mein nahi hai |
+| "Main sirf ek framework jaanta hoon" | Framework AI ka strongest zone hai | Fundamentals + debugging | AI ki galti explain karne ke liye zaroori |
+| Manual test case likhna | Generate ho jaata hai | Test *strategy* -- kya test karna hai | Risk judgment hai, typing nahi |
+| Copy-paste integration work | Docs se derive ho jaata hai | Domain + data model design | Business context chahiye |
+
+Note: "risk mein" ka matlab job gayab nahi -- matlab wo kaam **aapka differentiator nahi rahega**. Usme hi atke rehna problem hai.
+
+## 7. 90-Din Ka Practical Plan
+
+| Mahina | Focus | Roz/hafte kya karo | Proof kya hoga |
+|---|---|---|---|
+| Month 1 | Fundamentals jo AI ki galti pakdein | Hafte mein 2 topic: index/query plan, TCP-HTTP timeouts, locks aur transactions -- chhote experiments chalao | Aap `EXPLAIN` padhkar bata sako query kyun slow hai |
+| Month 2 | Debugging + reading speed | Apne repo ke 3 purane bugs re-investigate karo; ek open-source PR padhkar summary likho | Ek written incident/RCA note |
+| Month 3 | Design + ownership + visibility | Ek chhota feature end-to-end (design doc -> build -> metric -> rollback plan); 2 posts likho | Design doc jisme trade-off section ho |
+
+Ye plan jaan-boojhkar "AI tool seekho" wala nahi hai. Tools 2 hafte mein badal jaate hain; ye layer nahi badlti.
+
+## 8. Kya Karna Band Karein
+
+- **Syntax rattna.** Us waqt ka koi return nahi bacha.
+- **Framework version chasing.** Naya minor release seekhne se pehle poocho: ye mera trade-off thinking badal raha hai?
+- **AI ka output bina padhe merge karna.** Aapka naam commit par hai, uska nahi.
+- **"AI se darr" wale posts padhte rehna.** Wo time ek experiment chalane mein lagao.
+- **Sirf tickets band karte rehna** aur ye kabhi na poochhna ki feature kis business problem ko solve kar raha hai.
+
+## 9. Counter-Argument (Ise Bhi Suno)
+
+Ho sakta hai ye baat galat nikle. Agar AI verification bhi bharosemand tarike se karne lage -- apna kaam test kare, apni galti pakde, live system mein hypothesis khud test kare -- to "review karna" bhi sasta ho jaayega, aur mera poora argument kamzor pad jaata hai.
+
+Par tab bhi do cheezein bachengi: **kya banana hai** ye decide karna, aur **galat hone par kaun jawab dega**. Wo technical problem nahi, organisational problem hai. Isliye ownership par bet lagana abhi bhi sabse safe bet lagta hai -- guarantee nahi, bet.
+
+## 🧠 Remember
+
+> Code likhna sasta ho gaya, par decide karna, verify karna aur zimmedari lena sasta nahi hua -- relevant rehne ka rasta yahi hai: fundamentals se AI ki galti pakdo, feature ko production tak akele le jao, aur apna kaam dikhna do.
+
+## Sochne Ke Liye
+
+1. Aapke pichle mahine ke kaam mein kitna hissa aisa tha jo ek achhe spec ke saath AI kar leta? Bacha hua hissa hi aapki asli value hai -- wo kya tha?
+2. Agar kal aapko ek 500-line AI-generated PR review karna pade, to aap confidently reject kar sakte ho ya bas "looks good" likhoge? Gap kahan hai?
+3. Aapke kaam ke baare mein aapki team ke bahar kitne log jaante hain? Usko badhane ka sabse sasta step kya hai?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="113" data-title="Dev Fast, Prod 30 Second (Hinglish)" data-category="Databases" data-order="113">
+# Dev Mein Query Fast, Production Mein 30 Second - Kya Badla? (Hinglish)
+
+> **Similar-question flag**: [[102-lower-email-index-hinglish]] mein ye pattern aa chuka hai (staging chhota tha isliye scan dikha nahi) aur method [[50-slow-query-500m-rows]] se hai. Yahan naya ye hai: ek **checklist** - dev aur prod ke beech exactly kya-kya alag hota hai, aur kis order mein check karna hai.
+
+## 1. Sabse Pehla Sawaal: "Kya Badla?" Ka Jawab Aksar "Kuch Nahi" Hota
+
+Code same hai, query same hai - phir bhi 30 second. Matlab badla hai **environment**. Chaar cheezein alag hoti hain:
+
+| | Dev / staging | Production |
+|---|---|---|
+| Data | 1000 rows, ya sirf recent | 1 million+, saalon ka |
+| Distribution | Uniform test data | Skewed - kuch users ke paas lakhs rows |
+| Concurrency | Sirf aap | Sau requests ek saath, locks, pool |
+| Cache/memory | Chhota data poora RAM mein | Working set RAM se bada, disk se padhna padta hai |
+
+Dev mein full scan bhi 3 ms hota hai, isliye **galat plan kabhi dikha hi nahi**.
+
+## 2. Check Order (upar se neeche)
+
+**1. `EXPLAIN ANALYZE` production par chalao** (read-only replica par safe hai). Dev ka plan mat dekho - dono ka plan alag ho sakta hai, kyunki planner **row count estimate** ke hisaab se decide karta hai.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT ... ;
+-- dekhna kya hai: Seq Scan vs Index Scan, rows estimated vs actual ka farak,
+-- "Sort Method: external merge  Disk: 240MB" (memory kam pad gayi),
+-- "Rows Removed by Filter" bahut zyada (matlab index se pehle hi bahut kuch padha)
+```
+
+**2. Index hai bhi ya nahi - production mein?** Aksar migration dev mein chali, prod mein nahi (ya `CONCURRENTLY` fail hui aur kisi ne dekha nahi).
+
+```sql
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'orders';
+```
+
+**3. Query index use kar paa rahi hai?** `LOWER(col)`, `col::text`, `LIKE '%abc'`, ya type mismatch - teeno index ko mar dete hain ([[102-lower-email-index-hinglish]]).
+
+**4. Statistics purane to nahi?** Planner stale stats se galat plan chun leta hai. `ANALYZE orders;` chalao aur phir plan dekho. Bade bulk import ke baad ye bahut common hai.
+
+**5. Data skew.** "Average user ke 50 orders" - lekin ek B2B customer ke 4 lakh. Wahi user ki request slow hoti hai. Test karo: `SELECT user_id, count(*) FROM orders GROUP BY 1 ORDER BY 2 DESC LIMIT 5;`
+
+**6. Concurrency aur locks.** Query akele fast, load mein slow = lock wait ya connection pool wait. Dekho:
+
+```sql
+SELECT pid, state, wait_event_type, wait_event, now() - query_start AS dur, left(query, 60)
+FROM pg_stat_activity WHERE state <> 'idle' ORDER BY dur DESC LIMIT 10;
+```
+
+**7. Cache/memory.** Pehli baar slow, dusri baar fast = data disk se aaya tha ([[63-query-faster-second-time]]). Agar working set RAM se bada ho gaya hai to har baar disk - buffer cache hit ratio dekho.
+
+**8. `SELECT *` aur N+1.** Dev mein 10 rows par N+1 dikhta hi nahi; prod mein wahi 1000 queries ban jaata hai ([[103-n-plus-1-vs-connection-pool-hinglish]]).
+
+## 3. Turant Kya Karein (aur baad mein kya)
+
+| Abhi (minutes) | Baad mein (permanent) |
+|---|---|
+| Sahi composite index `CONCURRENTLY` banao ([[57-two-indexes-still-slow-composite]]) | Prod-jaise data volume par test karo (anonymised dump ya generated data) |
+| `ANALYZE` chalao | CI mein "query plan regression" check ya slow query log alerts |
+| Query se function/`SELECT *` hatao | Pagination + result cap (no unbounded `LIMIT`) |
+| Statement timeout lagao taaki ek query poori DB na rok de | Bade table ke liye partitioning ([[21-database-partitioning]]) |
+
+## 4. Interview Mein Jawab
+
+> "Mera pehla step guess karna nahi, production par `EXPLAIN ANALYZE` dekhna hai. Dev mein 1000 rows par har plan fast lagta hai; 1 million par planner ka chunav badal jaata hai. Main dekhta hoon: index maujood hai ya nahi, query use kar paa rahi hai ya function ne use disable kar diya, stats fresh hain ya nahi, aur skew/locks to nahi. 90% cases mein ya to index missing hai, ya query index-friendly nahi hai."
+
+## 🧠 Remember
+
+> "Dev mein fast, prod mein slow" ka matlab hai data volume aur concurrency ne plan badal diya - guess mat karo, production ka `EXPLAIN ANALYZE` dekho, phir index / query shape / stats / skew / locks is order mein check karo.
+
+## Quick Self-Test
+
+1. Dev aur prod ka query plan alag kyun ho sakta hai, jabki query same hai?
+2. Bulk data import ke baad query achanak slow ho gayi - sabse pehla shak kis par?
+3. Query akele chalane par fast hai par load mein slow - ab kya dekhoge?
+</script>
+<script type="text/markdown" class="lesson-data" data-id="114" data-title="AI Code Likhega To Engineers Kya Karein (Hinglish)" data-category="Blog" data-order="114">
+# Blog: AI Code Likh Dega - To Engineers Ka Time Kahan Jaaye? (Hinglish)
+
+Maan lo AI aapka 70% code likhne lagta hai. Aapke din ke 8 ghante kahan jaane chahiye? Candidates: requirements, system design, architecture, security, debugging, users se baat karna, technical decisions.
+
+Chalo ek-ek par honest raay -- kahan AI **bahut** help karta hai, kahan **thodi**, aur kahan wo help hi nahi kar sakta, aur **kyun**.
+
+## 1. Requirements -- Human (AI ki help: kam)
+
+AI ke paas woh information **exist hi nahi karti**. "Refund 7 din mein milega ya 14?" -- ye kisi repo, kisi doc, kisi internet page par nahi likha. Ye aapke finance team ke dimaag mein hai, aur usme bhi aadha decide nahi hua hai.
+
+AI yahan sirf itna kar sakta hai: aapke likhe requirement mein gaps aur contradictions dhoondh de. Par wo **missing information create nahi kar sakta**. Isliye requirements clarify karna sabse high-leverage kaam ban jaata hai -- galat requirement par AI ab **tez** speed se galat cheez bana dega.
+
+## 2. Users Se Baat Karna -- Human (AI ki help: bohot kam)
+
+Same reason, plus ek extra: log apni asli problem bolte nahi, symptom bolte hain. "Export button slow hai" ka matlab shayad "mujhe ye data Excel mein nahi, dashboard mein chahiye" hai. Ye baat sunkar, follow-up poochhkar nikalti hai. AI ka role: notes summarise karna. Conversation karna nahi.
+
+## 3. System Design aur Architecture -- Mostly Human (AI ki help: thodi)
+
+AI aapko 5 standard designs sunaa dega -- queue lagao, cache lagao, read replica lagao. Genuinely useful starting point hai.
+
+Jo wo nahi kar sakta: **aapke constraints ke saath trade-off chunna**. Team 4 log ki hai, budget tight hai, ops maturity kam hai -- ab Kafka sahi hai ya ek DB table + cron kaafi hai? Ye judgment call hai ([[42-resilience-vs-overengineering]]). AI ka default bias over-engineering ki taraf hota hai, kyunki usne internet ke "best practice" posts padhe hain, aapki team ki reality nahi.
+
+## 4. Security -- Split (AI ki help: known patterns mein achhi, threat modelling mein nahi)
+
+Do alag cheezein hain:
+
+- **Known vulnerability patterns**: SQL injection, missing authz check, hardcoded secret, unsafe deserialization -- yahan AI achha scanner hai. Ise seriously use karo.
+- **Threat modelling aur blast radius**: "is service ke compromise hone par attacker kahan tak pahunchega?", "kaunsa data leak hone par company band ho jaayegi?" -- ye business impact ke judgment hain. AI advice de sakta hai, decide nahi kar sakta.
+
+Simple rule: **pattern-finding delegate karo, risk-accepting nahi.**
+
+## 5. Debugging -- Split, aur mazedaar split
+
+AI bahut madad karta hai: stack trace padhna, error message ka matlab, log parse karna, "ye exception aata hai jab..." type knowledge. Ye sach mein time bachata hai.
+
+Jo human ke paas rehta hai: **live system mein hypothesis banana aur test karna**. Asli production behaviour repo mein nahi hota -- wo traffic shape, data distribution, neighbour service ki hiccup aur us din ke deploy ka combination hai. Aapko decide karna padta hai: kya measure karein, kaunsa experiment safe hai, aur kab rukna hai ([[30-workload-before-conclusion]]). AI = reading assistant, human = investigator.
+
+## 6. Technical Decisions -- Human (AI: input, vote nahi)
+
+"Postgres ya Mongo", "monolith todein ya nahi", "migration abhi ya Q3" -- AI options aur trade-offs saaf likh dega. Par decision ka matlab hai **consequence accept karna**, aur AI consequence nahi bhugat sakta ([[29-why-hire-you-over-ai]]).
+
+## 7. Ranked Table: Aapke Ghante Kahan Jaayein
+
+High leverage se low leverage:
+
+| Rank | Kaam | AI ki madad | Kyun yahan time lagao |
+|---|---|---|---|
+| 1 | Requirements clarify karna | Kam | Galat requirement par AI aur tez galti karega |
+| 2 | Verification: review + test design | Thodi | Yahi naya bottleneck hai (agla section) |
+| 3 | Architecture aur trade-off decisions | Thodi | Galti ki cost girti nahi hai, badhti hai |
+| 4 | Production debugging aur observability | Thodi-medium | Live behaviour kisi repo mein likha nahi hai |
+| 5 | Users/stakeholders se baat | Bohot kam | Information sirf logon ke paas hai |
+| 6 | Threat modelling, blast radius | Kam | Risk accept karna human ka kaam |
+| 7 | Known-pattern security scanning | Bohot | Delegate karo, phir confirm karo |
+| 8 | Boilerplate, glue, CRUD, scaffolding | Bohot | Yahan apna time bachao |
+| 9 | Syntax, config recall, docs dhoondhna | Bohot | Ratne ka return zero |
+
+## 8. Asli Insight: Verification Naya Bottleneck Hai
+
+Pehle pipeline aisa tha: **socho -> likho -> review -> ship**. Likhna sabse slow step tha.
+
+Ab likhna almost free hai. To slowest step ban gaya hai **review aur test**. Aur ek kadwi line:
+
+> Jo code aap review nahi kar sakte, wo aap ship nahi kar sakte -- chahe wo compile ho jaaye.
+
+Iska seedha matlab: reading aur testing skills ki value **badhi** hai, ghati nahi. Practical steps:
+
+- PR chhote rakho -- 200 lines review hote hain, 900 nahi
+- Test pehle maango, implementation baad mein: "ye 6 cases fail hone chahiye"
+- Generated code mein specifically dekho: error handling, transaction boundary, retry/idempotency, N+1 query, auth check. AI ka blind spot yahi hota hai
+- "Tests pass ho gaye" ko proof na maano jab tests bhi AI ne likhe hon -- kam se kam ek assertion khud likho
+
+## 9. Doosri Insight: Galat Decision Ki Cost Nahi Giri
+
+Code sasta hua. **Galat architecture ki keemat wahi hai.**
+
+Aur ek naya khatra: pehle bad design dheere-dheere phailta tha, kyunki likhne mein time lagta tha. Ab aap ek hafte mein 30 files ka consistent-looking mess bana sakte ho. Fast generation ka matlab hai **fast accumulation of wrong decisions**.
+
+Isliye conclusion ulta hai: sasta code architecture ko **zyada** important banata hai, kam nahi ([[55-blog-engineering-harder-building-easier]]). Aur "AI se likha lo" ka sabse bada risk speed nahi, **bina soche direction** hai ([[76-blog-when-not-to-use-ai-agents]]).
+
+## 10. Honest Counterpoint: Juniors Ka Sawaal
+
+Mera argument ek jagah kamzor hai, aur wo maanna zaroori hai.
+
+Review karna seekhne ka **koi shortcut nahi hai** -- aap code padhkar galti pakadna tabhi seekhte ho jab aapne khud wo galti ki ho. Jisne kabhi khud deadlock nahi banaya, wo generated code mein deadlock risk nahi dekh paayega.
+
+To "junior log bas AI ko supervise karein" -- ye learning path nahi hai, ye ek dead end hai. Juniors ko abhi bhi:
+
+- Kuch cheezein **haath se** likhni chahiye, jaan-boojhkar, bina autocomplete
+- Apne bug khud debug karne chahiye, jawab AI se maangne se pehle
+- AI use karein, par pehle apna answer likhein, phir compare karein -- "kya main isse behtar likh sakta tha?"
+
+Seniors ke liye bhi lesson: apni team se poori writing chheen lena short term mein productive dikhega, 2 saal mein review karne wala koi nahi bachega.
+
+## 11. Ek Working Backend Engineer Ka Weekly Split (Rough)
+
+Ye gospel nahi, ek starting point hai -- team aur phase ke hisaab se badlega:
+
+| Hissa | Kaam | Rough % |
+|---|---|---|
+| Sochna | Requirements, design, decisions, design docs | 25-30% |
+| Verify karna | PR review, test design, manual verification | 25-30% |
+| Banana | Code likhna/guide karna (AI ke saath) | 20-25% |
+| Chalana | Debugging, on-call, monitoring, cost dekhna | 15-20% |
+| Baantna | Docs, knowledge sharing, mentoring | 5-10% |
+
+Kya measure karein (aur kya nahi):
+
+- **Achhe signals**: change failure rate, rollback count, review turnaround, incident MTTR, bug ka escape rate production tak
+- **Dhoka dene wale signals**: lines of code, PR count, "AI adoption %", story points
+
+Agar output badha par change failure rate bhi badha, to aap tez nahi chal rahe -- aap tezi se karz bana rahe ho.
+
+## 🧠 Remember
+
+> AI code likhna sasta kar deta hai, isliye engineer ka time wahan jaana chahiye jahan information hi repo mein maujood nahi -- requirements, live debugging, aur trade-off decisions -- aur verification par, kyunki jo aap review nahi kar sakte wo aap ship nahi kar sakte.
+
+## Sochne Ke Liye
+
+1. Aapke pichle hafte ke ghante in 5 buckets mein baanto (sochna/verify/banana/chalana/baantna). Actual split aur ideal split mein sabse bada gap kahan hai?
+2. Kal ek 500-line generated PR aaye -- aapke paas kaunsa checklist hai jisse aap confidently "no" keh sako?
+3. Agar aapki team ka aadha code AI likhne lage, to aapka junior review karna kaise seekhega? Uska ek concrete plan likho.
+</script>
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
