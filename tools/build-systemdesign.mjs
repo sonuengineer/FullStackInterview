@@ -12,8 +12,20 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sdDir = join(root, 'systemdesign');
 const indexFile = join(root, 'index.html');
 
-// Same order as systemdesign/README.md; anything else is appended alphabetically.
-const ORDER = ['url-shortener', 'rate-limiter', 'payment-system', 'file-storage', 'news-feed', 'chat-system', 'search-system', 'notification-paging'];
+// Category for each system, in the order they should appear in the dropdown.
+// A new folder that is not listed here lands in "Other".
+const CATEGORIES = [
+  ['Core Infrastructure & Foundations', ['rate-limiter', 'url-shortener', 'web-crawler', 'distributed-kv-store', 'search-system']],
+  ['Social Media & Feeds', ['twitter', 'instagram', 'news-feed', 'reddit']],
+  ['Messaging & Real-Time Communication', ['chat-system', 'discord', 'notification-paging', 'zoom']],
+  ['Media & Streaming', ['youtube', 'netflix', 'spotify']],
+  ['Storage & File Sharing', ['google-drive', 'dropbox', 'pastebin', 'file-storage']],
+  ['Location & Ride-Hailing', ['uber', 'google-maps', 'tinder']],
+  ['Booking & E-Commerce', ['amazon', 'ticketmaster', 'airbnb']],
+  ['Finance & Trading', ['payment-system']],
+];
+const ORDER = CATEGORIES.flatMap(([, slugs]) => slugs);
+const categoryOf = (slug) => (CATEGORIES.find(([, slugs]) => slugs.includes(slug)) || ['Other'])[0];
 
 const partNum = (f) => parseInt(f.slice(5), 10);
 const pretty = (slug) => slug.split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' ');
@@ -33,12 +45,14 @@ const systems = readdirSync(sdDir)
     });
     const firstH1 = (readFileSync(join(sdDir, slug, files[0]), 'utf8').match(/^#\s+(.+)$/m) || [])[1] || '';
     const title = firstH1.split(' -- ')[0].trim() || pretty(slug);
-    return { slug, title, parts };
+    // a folder holding only the part-0 placeholder has no real content yet
+    const todo = parts.length === 1 && parts[0].n === 0;
+    return { slug, title, category: categoryOf(slug), todo, parts };
   })
   .filter(Boolean)
   .sort((a, b) => {
     const ia = ORDER.indexOf(a.slug), ib = ORDER.indexOf(b.slug);
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.slug.localeCompare(b.slug);
+    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib) || a.slug.localeCompare(b.slug);
   });
 
 // Escape "<" so nothing in a title can close the surrounding <script> tag.
@@ -60,4 +74,8 @@ if (start >= 0 && end > start) {
 writeFileSync(indexFile, html);
 
 console.log('System Design list written to index.html:');
-systems.forEach((s) => console.log('  ' + s.title + ' - ' + s.parts.length + ' part(s): ' + s.parts.map((p) => p.n).join(', ')));
+let lastCat = '';
+systems.forEach((s) => {
+  if (s.category !== lastCat) { console.log('  [' + s.category + ']'); lastCat = s.category; }
+  console.log('    ' + s.title + (s.todo ? ' - TODO (coming soon)' : ' - ' + s.parts.length + ' part(s): ' + s.parts.map((p) => p.n).join(', ')));
+});
