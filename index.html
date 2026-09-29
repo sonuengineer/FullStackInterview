@@ -236,6 +236,14 @@
   }
   #toolbar button:hover { background: var(--accent); color: #fff; }
   #toolbar .spacer { flex: 1; }
+  /* Cheat Sheets tab: the PDF/HTML file itself is shown in a frame */
+  .cs-frame { width: 100%; height: calc(100vh - 230px); min-height: 420px; border: 1px solid var(--border);
+              border-radius: 10px; background: #fff; }
+  .cs-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .cs-actions a { font-size: 0.9rem; }
+  .cs-group-title { margin: 22px 0 8px; font-size: 0.8rem; letter-spacing: .08em; text-transform: uppercase;
+                    color: var(--muted); }
+  @media (max-width: 760px) { .cs-frame { height: 70vh; min-height: 320px; } }
   #progress { font-size: 0.78rem; color: var(--muted); }
   #reader {
     max-width: 760px;
@@ -467,6 +475,7 @@
     <button id="btn-links" title="Useful learning links">&#128279; Links</button>
     <button id="btn-images" title="System design diagrams with notes">&#128444;&#65039; Images</button>
     <button id="btn-sd" title="Full system design study material">&#127959;&#65039; System Design</button>
+    <button id="btn-cs" title="PDF cheat sheets and quick-revision notes">&#128196; Cheat Sheets</button>
     <button id="btn-net" title="15 network flows every backend dev should know">&#127760; Network Flows</button>
     <button id="btn-ai" title="AI / agent engineering questions">&#129302; AI</button>
     <button id="theme-sepia">Sepia</button>
@@ -10620,6 +10629,9 @@ Agar output badha par change failure rate bhi badha, to aap tez nahi chal rahe -
 2. Kal ek 500-line generated PR aaye -- aapke paas kaunsa checklist hai jisse aap confidently "no" keh sako?
 3. Agar aapki team ka aadha code AI likhne lage, to aapka junior review karna kaise seekhega? Uska ek concrete plan likho.
 </script>
+<!--CS-MANIFEST-START-->
+<script type="application/json" id="cs-manifest">{"items":[{"file":"systemdesginchectsheet/Complete_System_Design_Interview_Framework_Hinglish.pdf","title":"Complete System Design Interview Framework Hinglish","kind":"pdf","kb":54,"group":"Start here"},{"file":"systemdesginchectsheet/System Design Master Cheat Sheet (Hinglish).html","title":"System Design Master Cheat Sheet (Hinglish)","kind":"html","kb":98,"group":"Start here"},{"file":"systemdesginchectsheet/System_Design_Master_Checklist_Hinglish.pdf","title":"System Design Master Checklist Hinglish","kind":"pdf","kb":37,"group":"Start here"},{"file":"systemdesginchectsheet/API_Gateway_System_Design_Hinglish_Notes.pdf","title":"API Gateway System Design (Hinglish)","kind":"pdf","kb":44,"group":"System design"},{"file":"systemdesginchectsheet/Chat_System_Design_Hinglish_Notes.pdf","title":"Chat System Design (Hinglish)","kind":"pdf","kb":46,"group":"System design"},{"file":"systemdesginchectsheet/File_Upload_Media_Storage_System_Design_Hinglish_Notes.pdf","title":"File Upload Media Storage System Design (Hinglish)","kind":"pdf","kb":49,"group":"System design"},{"file":"systemdesginchectsheet/Load_Balancer_System_Design_Hinglish_Notes.pdf","title":"Load Balancer System Design (Hinglish)","kind":"pdf","kb":38,"group":"System design"},{"file":"systemdesginchectsheet/Message_Queue_Async_Processing_System_Design_Hinglish_Notes.pdf","title":"Message Queue Async Processing System Design (Hinglish)","kind":"pdf","kb":44,"group":"System design"},{"file":"systemdesginchectsheet/Microservices_Architecture_System_Design_Hinglish_Notes.pdf","title":"Microservices Architecture System Design (Hinglish)","kind":"pdf","kb":46,"group":"System design"},{"file":"systemdesginchectsheet/Notification_System_System_Design_Hinglish_Notes.pdf","title":"Notification System System Design (Hinglish)","kind":"pdf","kb":44,"group":"System design"},{"file":"systemdesginchectsheet/Observability_Monitoring_System_Design_Hinglish_Notes.pdf","title":"Observability Monitoring System Design (Hinglish)","kind":"pdf","kb":45,"group":"System design"},{"file":"systemdesginchectsheet/Payment_System_Design_Hinglish_Notes.pdf","title":"Payment System Design (Hinglish)","kind":"pdf","kb":46,"group":"System design"},{"file":"systemdesginchectsheet/Rate_Limiter_System_Design_Hinglish_Notes.pdf","title":"Rate Limiter System Design (Hinglish)","kind":"pdf","kb":43,"group":"System design"},{"file":"systemdesginchectsheet/S3_CloudFront_System_Design_Notes.pdf","title":"S3 CloudFront System Design Notes","kind":"pdf","kb":41,"group":"System design"},{"file":"systemdesginchectsheet/Search_System_Design_Hinglish_Notes.pdf","title":"Search System Design (Hinglish)","kind":"pdf","kb":48,"group":"System design"},{"file":"systemdesginchectsheet/URL_Shortener_System_Design_Hinglish_Notes.pdf","title":"URL Shortener System Design (Hinglish)","kind":"pdf","kb":46,"group":"System design"},{"file":"systemdesginchectsheet/Database_Indexing_System_Design_Hinglish_Notes.pdf","title":"Database Indexing System Design (Hinglish)","kind":"pdf","kb":40,"group":"Databases & caching"},{"file":"systemdesginchectsheet/Database_Partitioning_System_Design_Hinglish_Notes.pdf","title":"Database Partitioning System Design (Hinglish)","kind":"pdf","kb":40,"group":"Databases & caching"},{"file":"systemdesginchectsheet/Database_Scaling_System_Design_Hinglish_Notes.pdf","title":"Database Scaling System Design (Hinglish)","kind":"pdf","kb":42,"group":"Databases & caching"},{"file":"systemdesginchectsheet/PDF1_SQL_MongoDB_Parts_1-4.pdf","title":"PDF1 SQL MongoDB Parts 1-4","kind":"pdf","kb":200,"group":"Databases & caching"},{"file":"systemdesginchectsheet/PDF2_SQL_MongoDB_Parts_5-8.pdf","title":"PDF2 SQL MongoDB Parts 5-8","kind":"pdf","kb":162,"group":"Databases & caching"},{"file":"systemdesginchectsheet/PDF3_SQL_MongoDB_Parts_9-12.pdf","title":"PDF3 SQL MongoDB Parts 9-12","kind":"pdf","kb":179,"group":"Databases & caching"},{"file":"systemdesginchectsheet/Read_Replica_Replication_System_Design_Hinglish_Notes.pdf","title":"Read Replica Replication System Design (Hinglish)","kind":"pdf","kb":38,"group":"Databases & caching"},{"file":"systemdesginchectsheet/Redis_System_Design_Hinglish_Notes.pdf","title":"Redis System Design (Hinglish)","kind":"pdf","kb":44,"group":"Databases & caching"},{"file":"systemdesginchectsheet/Distributed_Systems_CAP_Consistency_Hinglish_Notes.pdf","title":"Distributed Systems CAP Consistency (Hinglish)","kind":"pdf","kb":46,"group":"Platform & practice"},{"file":"systemdesginchectsheet/Kubernetes_Container_Orchestration_Hinglish_Notes.pdf","title":"Kubernetes Container Orchestration (Hinglish)","kind":"pdf","kb":49,"group":"Platform & practice"},{"file":"systemdesginchectsheet/production_business_logic_20_patterns.pdf","title":"production business logic 20 patterns","kind":"pdf","kb":32,"group":"Platform & practice"},{"file":"systemdesginchectsheet/realtime_interview_cheatsheet.pdf","title":"realtime interview cheatsheet","kind":"pdf","kb":60,"group":"Platform & practice"}]}</script>
+<!--CS-MANIFEST-END-->
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
@@ -10720,6 +10732,35 @@ function buildSidebar(filterText) {
     group.appendChild(itemsEl);
     tocContainer.appendChild(group);
   });
+
+  // "Cheat Sheets" group: one entry per PDF/HTML file, opens in a frame
+  const csItems = (CS.items || []).map((it, i) => ({ it, i }))
+    .filter(({ it }) => !q || it.title.toLowerCase().includes(q) || 'cheat sheets'.includes(q));
+  if (csItems.length) {
+    const isOpen = q.length > 0 || currentCS !== null || csGroupOpen;
+    const group = document.createElement('div');
+    group.className = 'category-group';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'category-title' + (isOpen ? '' : ' collapsed');
+    titleEl.innerHTML = '<span class="cat-name">\u{1F4C4} Cheat Sheets</span><span class="cat-count">' + csItems.length + '</span>';
+    const itemsEl = document.createElement('div');
+    itemsEl.className = 'category-items' + (isOpen ? '' : ' collapsed');
+    titleEl.addEventListener('click', () => {
+      const nowCollapsed = titleEl.classList.toggle('collapsed');
+      itemsEl.classList.toggle('collapsed', nowCollapsed);
+      csGroupOpen = !nowCollapsed;
+    });
+    csItems.forEach(({ it, i }) => {
+      const btn = document.createElement('button');
+      btn.className = 'toc-item' + (i === currentCS ? ' active' : '');
+      btn.innerHTML = '<span class="toc-num">' + (i + 1) + '</span><span>' + escHtml(it.title) + '</span>';
+      btn.addEventListener('click', () => renderCheatsheet(i));
+      itemsEl.appendChild(btn);
+    });
+    group.appendChild(titleEl);
+    group.appendChild(itemsEl);
+    tocContainer.prepend(group);
+  }
 
   // "Images" group at the top: one entry per diagram, opens on its own page
   const imgItems = IMAGES.map((img, i) => ({ img, i }))
@@ -10853,7 +10894,7 @@ function buildSidebar(filterText) {
 }
 
 function renderHome() {
-  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
   document.title = 'Learning Dashboard';
   progressEl.textContent = lessons.length + ' lessons';
   let html = '<h1>Your Learning Library</h1>' +
@@ -10934,7 +10975,7 @@ function buildSuggestions(lesson) {
 function openLesson(id) {
   const lesson = lessons.find(l => l.id === id);
   if (!lesson) return;
-  currentId = id; currentImage = null; currentSD = null; currentNet = null; currentAi = null;
+  currentId = id; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
   document.title = lesson.title + ' - Learning Dashboard';
   readerEl.innerHTML = marked.parse(linkifyCrossRefs(lesson.content), { renderer }) +
     buildSuggestions(lesson);
@@ -10978,7 +11019,7 @@ const LINKS = [
 ];
 
 function renderLinks() {
-  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
   document.title = 'Links - Learning Dashboard';
   progressEl.textContent = LINKS.length + ' links';
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -11304,6 +11345,76 @@ readerEl.addEventListener('click', (e) => {
   el.dataset.img === 'all' ? renderImages() : renderImage(Number(el.dataset.img));
 });
 
+// ---- Cheat Sheets tab ---------------------------------------------------
+// The list comes from the cs-manifest block (written by tools/build-cheatsheets.mjs).
+// Each PDF/HTML file is loaded in a frame only when opened, so index.html stays small.
+let CS = { items: [] };
+try { CS = JSON.parse((document.getElementById('cs-manifest') || {}).textContent || '{"items":[]}'); } catch (e) {}
+let currentCS = null;
+let csGroupOpen = false;
+
+function renderCheatsheets() {
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
+  document.title = 'Cheat Sheets - Learning Dashboard';
+  progressEl.textContent = CS.items.length + ' cheat sheets';
+  const groups = [];
+  CS.items.forEach((it, i) => {
+    let g = groups.find((x) => x.name === it.group);
+    if (!g) { g = { name: it.group, rows: [] }; groups.push(g); }
+    g.rows.push({ it, i });
+  });
+  readerEl.innerHTML = '<h1>&#128196; Cheat Sheets</h1>' +
+    '<p style="color:var(--muted)">Quick-revision PDFs. Tap one to read it right here, or open it full screen.</p>' +
+    groups.map((g) =>
+      '<div class="cs-group-title">' + escHtml(g.name) + '</div><div class="link-list">' +
+      g.rows.map(({ it, i }) =>
+        '<a class="link-card" href="#" data-cs="' + i + '">' +
+          '<div class="ttl"><span class="num">' + (i + 1) + '.</span>' + escHtml(it.title) + '</div>' +
+          '<div class="desc">' + it.kind.toUpperCase() + ' &middot; ' + it.kb + ' KB</div></a>').join('') +
+      '</div>').join('');
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+
+function renderCheatsheet(i) {
+  const it = CS.items[i];
+  if (!it) return renderCheatsheets();
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
+  currentCS = i;
+  document.title = it.title + ' - Learning Dashboard';
+  progressEl.textContent = 'Cheat sheet ' + (i + 1) + ' of ' + CS.items.length;
+  const src = encodeURI(it.file);
+  const prev = CS.items[i - 1], next = CS.items[i + 1];
+  readerEl.innerHTML = '<h1>' + escHtml(it.title) + '</h1>' +
+    '<div class="cs-actions">' +
+      '<a href="' + src + '" target="_blank" rel="noopener">Open full screen &#8599;</a>' +
+      '<a href="' + src + '" download>Download</a>' +
+      '<a href="#" data-cs="all">All cheat sheets</a>' +
+    '</div>' +
+    '<iframe class="cs-frame" src="' + src + (it.kind === 'pdf' ? '#view=FitH' : '') +
+      '" title="' + escHtml(it.title) + '" loading="lazy"></iframe>' +
+    '<p style="color:var(--muted);font-size:0.9rem">Phone par PDF frame mein theek se na khule toh "Open full screen" use karo.</p>' +
+    '<div class="suggest-nav">' +
+      (prev ? '<button data-cs="' + (i - 1) + '">&larr; ' + escHtml(prev.title) + '</button>'
+            : '<button data-cs="all">&larr; All cheat sheets</button>') +
+      (next ? '<button class="next" data-cs="' + (i + 1) + '">' + escHtml(next.title) + ' &rarr;</button>'
+            : '<button class="next" data-cs="all">All cheat sheets &rarr;</button>') +
+    '</div>';
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+
+readerEl.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-cs]');
+  if (!el) return;
+  e.preventDefault();
+  el.dataset.cs === 'all' ? renderCheatsheets() : renderCheatsheet(Number(el.dataset.cs));
+});
+
+document.getElementById('btn-cs').addEventListener('click', renderCheatsheets);
+
 // ---- System Design tab -------------------------------------------------
 // The list of systems/parts comes from the sd-manifest block (written by
 // tools/build-systemdesign.mjs). Each part's text is fetched from
@@ -11330,7 +11441,7 @@ async function renderSystemDesign(slug, n) {
   const wanted = n != null ? n : (last && last.slug === sys.slug ? last.n : sys.parts[0].n);
   const part = sys.parts.find((p) => p.n === wanted) || sys.parts[0];
 
-  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
   currentNet = null;
   currentSD = { slug: sys.slug, n: part.n };
   try { localStorage.setItem('dashboard.sd', JSON.stringify(currentSD)); } catch (e) {}
@@ -11473,11 +11584,11 @@ const AIPAGES = [...document.querySelectorAll('script.ai-data')].map((el) => ({
   title: el.dataset.title,
   md: el.textContent.trim(),
 }));
-let currentAi = null;
+let currentAi = null; currentCS = null;
 let aiGroupOpen = false;
 
 function renderAiList() {
-  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null;
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
   document.title = 'AI - Learning Dashboard';
   progressEl.textContent = AIPAGES.length + (AIPAGES.length === 1 ? ' AI page' : ' AI pages');
   readerEl.innerHTML = '<h1>&#129302; AI Engineering</h1>' +

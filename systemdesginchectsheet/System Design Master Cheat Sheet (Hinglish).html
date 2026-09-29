@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>System Design Master Cheat Sheet (Hinglish) — Senior/Lead Backend & Full-Stack</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  --bg:#F5F7FA; --surface:#FFFFFF; --ink:#16202B; --muted:#586574; --line:#D9DFE7;
+  --accent:#2453D6; --accent-soft:#E4EBFB;
+  --code-bg:#0F1A2A; --code-ink:#DCE6F5;
+  --c-analogy:#0E7C6B; --c-analogy-bg:#E1F4F0;
+  --c-remember:#2453D6; --c-remember-bg:#E4EBFB;
+  --c-mistake:#B42318; --c-mistake-bg:#FDE9E7;
+  --c-interview:#6D3FC0; --c-interview-bg:#EEE7FA;
+  --c-prod:#9A5B00; --c-prod-bg:#FFF1D6;
+  --font:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0E141C; --surface:#151D28; --ink:#E7ECF3; --muted:#9AA7B8; --line:#2A3544;
+    --accent:#7FA2FF; --accent-soft:#1C2A4A;
+    --code-bg:#0A1119; --code-ink:#D5E0F0;
+    --c-analogy:#5FD3BE; --c-analogy-bg:#0F2B27;
+    --c-remember:#8FB0FF; --c-remember-bg:#1A2745;
+    --c-mistake:#FF8F84; --c-mistake-bg:#3A1714;
+    --c-interview:#BC9CF5; --c-interview-bg:#2A1E45;
+    --c-prod:#F2B860; --c-prod-bg:#33270E;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0E141C; --surface:#151D28; --ink:#E7ECF3; --muted:#9AA7B8; --line:#2A3544;
+  --accent:#7FA2FF; --accent-soft:#1C2A4A;
+  --code-bg:#0A1119; --code-ink:#D5E0F0;
+  --c-analogy:#5FD3BE; --c-analogy-bg:#0F2B27;
+  --c-remember:#8FB0FF; --c-remember-bg:#1A2745;
+  --c-mistake:#FF8F84; --c-mistake-bg:#3A1714;
+  --c-interview:#BC9CF5; --c-interview-bg:#2A1E45;
+  --c-prod:#F2B860; --c-prod-bg:#33270E;
+}
+html{scroll-padding-top:calc(env(safe-area-inset-top,0px) + 16px);scroll-behavior:smooth}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:16px;line-height:1.65;-webkit-text-size-adjust:100%}
+.layout{display:grid;grid-template-columns:1fr;gap:0;max-width:1240px;margin:0 auto;padding:0 16px}
+@media(min-width:1000px){.layout{grid-template-columns:270px minmax(0,1fr);gap:40px;padding:0 24px}}
+nav.toc{font-size:14px}
+nav.toc details{background:var(--surface);border:1px solid var(--line);border-radius:8px;margin:16px 0}
+nav.toc summary{cursor:pointer;padding:12px 16px;font-weight:600}
+nav.toc ol{margin:0;padding:0 16px 14px 40px}
+nav.toc li{margin:5px 0}
+nav.toc a{color:var(--ink);text-decoration:none}
+nav.toc a:hover{color:var(--accent);text-decoration:underline}
+@media(min-width:1000px){
+  nav.toc{position:sticky;top:0;align-self:start;max-height:100vh;overflow-y:auto;padding-top:16px}
+}
+main{min-width:0;padding-bottom:80px}
+.hero{padding:40px 0 24px;border-bottom:2px solid var(--ink);margin-bottom:8px}
+.hero h1{font-size:clamp(30px,5vw,46px);line-height:1.12;margin:0 0 14px;letter-spacing:-0.02em}
+.hero p{margin:0;color:var(--muted);max-width:62ch;font-size:17px}
+.hero .goal{margin-top:18px;padding:14px 16px;background:var(--surface);border-left:4px solid var(--accent);border-radius:0 8px 8px 0;color:var(--ink);font-size:15px}
+section{padding-top:36px}
+h2{font-size:clamp(23px,3.2vw,30px);line-height:1.22;margin:0 0 14px;letter-spacing:-0.01em;padding-bottom:10px;border-bottom:1px solid var(--line)}
+h2 .n{color:var(--accent);margin-right:8px;font-variant-numeric:tabular-nums}
+h3{font-size:19px;margin:26px 0 8px}
+h4{font-size:16px;margin:18px 0 6px;color:var(--accent)}
+p{margin:0 0 12px}
+ul,ol{padding-left:22px;margin:0 0 14px}
+li{margin:4px 0}
+code{font-family:var(--mono);font-size:.88em;background:var(--accent-soft);padding:1px 6px;border-radius:4px}
+pre{margin:0}
+pre.diagram,pre.code{background:var(--code-bg);color:var(--code-ink);font-family:var(--mono);font-size:13px;line-height:1.5;padding:16px 18px;border-radius:8px;overflow-x:auto;margin:14px 0;tab-size:2}
+pre.diagram{border-left:4px solid var(--accent)}
+pre code{background:none;padding:0;font-size:inherit;color:inherit}
+.tw{overflow-x:auto;margin:14px 0;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--line)}
+th{background:var(--accent-soft);font-weight:600;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td:first-child{font-weight:600}
+.co{border-left:5px solid var(--cc);background:var(--cb);border-radius:0 8px 8px 0;padding:12px 16px;margin:16px 0}
+.co>b:first-child{display:block;color:var(--cc);margin-bottom:4px;font-size:14.5px}
+.co p:last-child,.co ul:last-child{margin-bottom:0}
+.co.analogy{--cc:var(--c-analogy);--cb:var(--c-analogy-bg)}
+.co.remember{--cc:var(--c-remember);--cb:var(--c-remember-bg)}
+.co.mistake{--cc:var(--c-mistake);--cb:var(--c-mistake-bg)}
+.co.interview{--cc:var(--c-interview);--cb:var(--c-interview-bg)}
+.co.prod{--cc:var(--c-prod);--cb:var(--c-prod-bg)}
+.comp{background:var(--surface);border:1px solid var(--line);border-radius:8px;margin:16px 0;overflow:hidden}
+.comp>h4{margin:0;padding:10px 16px;background:var(--accent-soft);color:var(--ink);font-size:16px}
+.comp dl{margin:0;display:grid;grid-template-columns:1fr;padding:6px 16px 12px}
+.comp dt{font-weight:600;color:var(--accent);font-size:13.5px;margin-top:10px}
+.comp dd{margin:2px 0 0}
+@media(min-width:720px){
+  .comp dl{grid-template-columns:170px 1fr;column-gap:16px}
+  .comp dt{margin-top:0;padding:8px 0;border-top:1px solid var(--line)}
+  .comp dd{margin:0;padding:8px 0;border-top:1px solid var(--line)}
+  .comp dt:first-of-type,.comp dt:first-of-type+dd{border-top:none}
+}
+.cols{display:grid;grid-template-columns:1fr;gap:14px}
+@media(min-width:720px){.cols.two{grid-template-columns:1fr 1fr}}
+.cols>div{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 16px;min-width:0}
+.cols>div>b{display:block;margin-bottom:4px}
+.rule{background:var(--ink);color:var(--bg);padding:14px 18px;border-radius:8px;font-weight:600;margin:16px 0}
+footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.golden{counter-reset:g;list-style:none;padding:0}
+.golden li{counter-increment:g;background:var(--surface);border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:0 8px 8px 0;padding:10px 14px 10px 54px;position:relative;margin:8px 0;font-weight:500}
+.golden li::before{content:counter(g);position:absolute;left:14px;top:9px;width:28px;height:28px;border-radius:50%;background:var(--accent);color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:14px}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+@media print{
+  body{background:#fff;color:#000;font-size:11.5pt}
+  nav.toc{display:none}
+  .layout{display:block;padding:0}
+  section{break-inside:auto}
+  h2,h3,h4{break-after:avoid}
+  .co,.comp,.tw,pre{break-inside:avoid}
+  pre.diagram,pre.code{background:#f2f4f8;color:#111;border:1px solid #ccd}
+  html{scroll-behavior:auto}
+}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<details open>
+<summary>Contents</summary>
+<ol>
+<li><a href="#s1">Complete production architecture</a></li>
+<li><a href="#s2">DNS</a></li>
+<li><a href="#s3">CDN</a></li>
+<li><a href="#s4">Load Balancer</a></li>
+<li><a href="#s5">Auto Scaling</a></li>
+<li><a href="#s6">Stateful vs Stateless</a></li>
+<li><a href="#s7">JWT + Cookies</a></li>
+<li><a href="#s8">Redis</a></li>
+<li><a href="#s9">Database scaling</a></li>
+<li><a href="#s10">DB connection pool</a></li>
+<li><a href="#s11">DB replication</a></li>
+<li><a href="#s12">DB sharding</a></li>
+<li><a href="#s13">Object storage</a></li>
+<li><a href="#s14">Message queue</a></li>
+<li><a href="#s15">Rate limiting</a></li>
+<li><a href="#s16">HTTPS / TLS</a></li>
+<li><a href="#s17">Observability</a></li>
+<li><a href="#s18">Failure thinking</a></li>
+<li><a href="#s19">Performance debugging</a></li>
+<li><a href="#s20">One-page mental model</a></li>
+<li><a href="#s21">Interview cheat sheet</a></li>
+<li><a href="#s22">Mock interview</a></li>
+<li><a href="#golden">Final golden rules</a></li>
+</ol>
+</details>
+</nav>
+
+<main>
+<header class="hero">
+<h1>System Design Master Cheat Sheet</h1>
+<p>Senior / Lead Full-Stack &amp; Backend interview revision, Hinglish mein. Pehle common-sense analogy, phir technical explanation, phir production reality aur interview points.</p>
+<div class="goal"><b>Goal:</b> Ye document padhne ke baad koi bhi production architecture dekh ke tum bata sako ki har major component <i>kyun</i> hai, kya problem solve karta hai, aur fail ho jaye to kya hoga.</div>
+</header>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+<h2><span class="n">1</span>Complete production architecture</h2>
+<p>Ek real production app (jaise tumhara React + Node.js product) me request seedhe "server" tak nahi jaati. Beech me kai layers hoti hain, aur har layer ek specific problem solve karti hai.</p>
+
+<pre class="diagram">
+ USER (Browser / Mobile app)
+   │  types  www.myapp.com
+   ▼
+ DOMAIN  (myapp.com, registrar ke paas registered)
+   ▼
+ DNS / Route53 ........... "myapp.com ka address kya hai?"
+   ▼
+ CDN / CloudFront (Edge) . static files + cached responses
+   │          │
+   │ HIT ─────┴──► edge se hi response (origin tak nahi jaata)
+   │ MISS
+   ▼
+ LOAD BALANCER (ALB / Nginx) ... health check + traffic distribution
+   ▼
+ ┌─────────── AUTO SCALING GROUP ───────────┐
+ │  EC2 #1        EC2 #2        EC2 #3      │   (stateless app servers)
+ └──────────────────┬───────────────────────┘
+                    │
+         ┌──────────┴───────────┐
+         ▼                      ▼
+      REDIS                DATABASE
+   (cache/session/       Primary (writes)
+    rate limit)             │ replication
+                            ├──► Read Replica 1 (reads)
+                            └──► Read Replica 2 (reads)
+</pre>
+
+<h3>Request journey: Browser → Response</h3>
+<ol>
+<li><b>Browser</b> me user <code>myapp.com/dashboard</code> type karta hai. Browser ko IP chahiye, naam se network nahi chalta.</li>
+<li><b>DNS</b> lookup hota hai (browser cache → OS cache → resolver → root → TLD → authoritative). Result: CloudFront ya ALB ka address.</li>
+<li>Browser us address se <b>TCP + TLS (HTTPS)</b> connection banata hai.</li>
+<li><b>CDN edge</b> request receive karta hai. Static file (JS/CSS/image) cached hai to <b>HIT</b> aur turant response. Nahi hai to <b>MISS</b>, origin se laata hai, cache karta hai.</li>
+<li>Dynamic API request (<code>/api/orders</code>) CDN se origin ki taraf jaati hai, yaani <b>Load Balancer</b> ke paas.</li>
+<li>LB <b>healthy</b> servers me se ek choose karta hai (round robin / least connections).</li>
+<li><b>Backend (Node.js)</b> request process karta hai: auth verify (JWT/session), validation, business logic.</li>
+<li>Backend pehle <b>Redis</b> check karta hai. HIT = data mil gaya. MISS = aage jao.</li>
+<li>Redis miss pe <b>Database</b> query (reads replica se, writes primary pe). Result Redis me <code>SET</code> hota hai (TTL ke saath).</li>
+<li>Response wapas: Backend → LB → (CDN) → Browser. Browser React UI render karta hai.</li>
+</ol>
+
+<div class="co remember"><b>Remember this</b>
+<p>Har layer ka ek hi kaam hai: <i>request ko origin database tak pahunchne se pehle jitna ho sake rok lo ya halka kar do</i>. DNS naam resolve karta hai, CDN cache se answer deta hai, LB traffic baantta hai, Redis DB ka load kam karta hai. Database sabse expensive aur scale karne me sabse mushkil hai, isliye use last me rakha jaata hai.</p>
+</div>
+
+<h3>Har component ka breakdown</h3>
+
+<div class="comp"><h4>DNS / Route53</h4>
+<dl>
+<dt>What it does</dt><dd>Domain name ko IP address (ya CDN/LB ke address) me convert karta hai.</dd>
+<dt>Why we need it</dt><dd>Log <code>myapp.com</code> yaad rakhte hain, machines IP se baat karti hain. Phone ki contact list jaisa.</dd>
+<dt>Problem solved</dt><dd>Server ka IP badle to users ko kuch pata nahi chalta, sirf DNS record update hota hai. Route53 health check se traffic ko healthy region me bhi bhej sakta hai.</dd>
+<dt>If it fails</dt><dd>Naye users site khol hi nahi paate (site "down" dikhti hai) chahe servers bilkul theek hon. Already-cached DNS wale users kuch der chalte rehte hain. Isliye managed DNS (multi-AZ, anycast) use karte hain.</dd>
+<dt>Production example</dt><dd>Route53 Alias record <code>app.myapp.com → CloudFront distribution</code>, aur <code>api.myapp.com → ALB</code>.</dd>
+<dt>Interview point</dt><dd>"TTL kitna rakhoge?" Migration se pehle TTL kam karo (60s), migration ke baad wapas badhao.</dd>
+</dl></div>
+
+<div class="comp"><h4>CDN / CloudFront</h4>
+<dl>
+<dt>What it does</dt><dd>Duniya bhar ke edge locations pe content ki copy rakhta hai aur user ke sabse paas wale edge se serve karta hai.</dd>
+<dt>Why we need it</dt><dd>Mumbai ke user ko Virginia ke server tak har baar jaana pade to latency badhti hai. Edge paas hota hai.</dd>
+<dt>Problem solved</dt><dd>High latency, origin pe heavy load, DDoS absorption, bandwidth cost.</dd>
+<dt>If it fails</dt><dd>CloudFront itself bahut resilient hai, lekin agar edge me issue ho to traffic origin pe seedha aa sakta hai (origin overload risk). Multi-CDN ya DNS failover advanced setups me hota hai.</dd>
+<dt>Production example</dt><dd>React build (JS/CSS/images) S3 + CloudFront se serve hoti hai, hashed filenames (<code>main.a91f3.js</code>) ke saath long TTL.</dd>
+<dt>Interview point</dt><dd>Cache invalidation: hashed filenames &gt; manual invalidation.</dd>
+</dl></div>
+
+<div class="comp"><h4>Load Balancer (ALB / Nginx)</h4>
+<dl>
+<dt>What it does</dt><dd>Incoming traffic ko multiple healthy servers me distribute karta hai. TLS termination aur health check bhi karta hai.</dd>
+<dt>Why we need it</dt><dd>Ek server ki limit hoti hai. Bahut users aayenge to ek server dher ho jayega.</dd>
+<dt>Problem solved</dt><dd>Single point of failure hatata hai, horizontal scaling possible banata hai, zero-downtime deploys.</dd>
+<dt>If it fails</dt><dd>Poori app unreachable. Isliye ALB managed hai (multi-AZ, khud redundant). Self-managed Nginx ho to 2+ instances + floating IP / DNS failover.</dd>
+<dt>Production example</dt><dd>ALB path routing: <code>/api/*</code> → Node target group, <code>/admin/*</code> → admin service.</dd>
+<dt>Interview point</dt><dd>"LB khud SPOF kaise nahi banta?" Managed multi-AZ ya active-passive pair.</dd>
+</dl></div>
+
+<div class="comp"><h4>EC2 App Servers + Auto Scaling</h4>
+<dl>
+<dt>What it does</dt><dd>Tumhara Node.js code chalate hain. Auto Scaling load ke hisaab se servers ki count badhata/ghatata hai.</dd>
+<dt>Why we need it</dt><dd>Traffic constant nahi hota (sale, viral post, subah/shaam). Fixed servers ya to waste hote hain ya crash.</dd>
+<dt>Problem solved</dt><dd>Capacity vs cost balance, aur unhealthy instance ka auto-replacement.</dd>
+<dt>If it fails</dt><dd>Ek EC2 mara to LB health check use nikal deta hai, ASG naya bana deta hai. Users ko (ideally) fark nahi padta, agar app stateless hai.</dd>
+<dt>Production example</dt><dd>Min 2 (alag AZ me), desired 3, max 10; CPU 60% target tracking.</dd>
+<dt>Interview point</dt><dd>Servers <i>cattle</i> hain, <i>pets</i> nahi: replaceable.</dd>
+</dl></div>
+
+<div class="comp"><h4>Redis</h4>
+<dl>
+<dt>What it does</dt><dd>In-memory key-value store, sub-millisecond reads. Cache, session, rate limit, lock, counter.</dd>
+<dt>Why we need it</dt><dd>DB disk-based hai aur expensive. Repeated reads baar baar DB pe kyun bhejein?</dd>
+<dt>Problem solved</dt><dd>DB load, slow reads, shared state across servers.</dd>
+<dt>If it fails</dt><dd>Cache miss storm: sab requests DB pe. Agar Redis me sessions the to users logout. Isliye replica/cluster + DB protection (see section 8, 18).</dd>
+<dt>Production example</dt><dd>ElastiCache Redis (primary + replica, multi-AZ) for product-catalog cache aur rate limiting.</dd>
+<dt>Interview point</dt><dd>Redis <i>source of truth nahi</i> hai (usually). DB hai.</dd>
+</dl></div>
+
+<div class="comp"><h4>Database (Primary + Read Replicas)</h4>
+<dl>
+<dt>What it does</dt><dd>Durable business data store karta hai (orders, users, payments). Primary writes leta hai; replicas reads serve karte hain.</dd>
+<dt>Why we need it</dt><dd>Server/Redis restart pe data nahi jaana chahiye. Durability + consistency + queries.</dd>
+<dt>Problem solved</dt><dd>Data persistence, ACID transactions, read scalability via replicas.</dd>
+<dt>If it fails</dt><dd>Primary down = writes band. Managed DB (RDS Multi-AZ / Aurora) automatic failover karta hai (tens of seconds se ~2 min). Replica down = reads doosre replica pe.</dd>
+<dt>Production example</dt><dd>RDS PostgreSQL Multi-AZ + 2 read replicas; reports/analytics replica pe.</dd>
+<dt>Interview point</dt><dd>"Sabse pehle bottleneck kaun banta hai?" Aksar DB.</dd>
+</dl></div>
+
+<div class="co interview"><b>Interview tip</b>
+<p>Jab bhi architecture draw karo, request ki journey <i>left to right</i> bolte hue draw karo aur har box ke baad ek line bolo: "Ye ye problem solve karta hai, aur fail hone pe ye hoga." Ye Senior/Lead level ka signal hai.</p>
+</div>
+
+<div class="co mistake"><b>Common mistake</b>
+<p>Pehle hi din "microservices + Kafka + sharding + Kubernetes" bol dena. Interviewer ko dikhana hai ki tum <i>zaroorat</i> ke hisaab se complexity add karte ho: pehle single server + DB, phir cache, phir LB, phir replicas, aur sharding sabse last.</p>
+</div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+<h2><span class="n">2</span>DNS</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>DNS = internet ki <b>phonebook / contacts app</b>. Tum "Rahul" dhundhte ho, phone number (IP) milta hai. Website ka naam yaad rakhna aasan hai, IP nahi.</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Simple meaning</th></tr></thead>
+<tbody>
+<tr><td>Domain</td><td>Human-friendly naam: <code>myapp.com</code>.</td></tr>
+<tr><td>IP address</td><td>Machine ka numeric address: <code>13.233.10.5</code> (IPv4) ya IPv6.</td></tr>
+<tr><td>DNS</td><td>System jo domain → IP map karta hai.</td></tr>
+<tr><td>DNS resolver</td><td>Tumhare ISP/Google (8.8.8.8)/Cloudflare (1.1.1.1) ka server jo tumhari taraf se poori khoj karta hai.</td></tr>
+<tr><td>Recursive resolver</td><td>Resolver ka wo mode jo Root → TLD → Authoritative tak khud chakkar lagata hai aur final answer deta hai (client ko baar baar nahi bhejta).</td></tr>
+<tr><td>Authoritative DNS server</td><td>Domain ka <b>final sach</b> rakhne wala server (Route53, Cloudflare). Isi ke paas records hote hain.</td></tr>
+<tr><td>Nameserver</td><td>Wo server jo domain ke DNS records ka jawab deta hai. Domain ke NS records batate hain ki kaun sa nameserver authoritative hai.</td></tr>
+<tr><td>DNS hierarchy</td><td>Root (<code>.</code>) → TLD (<code>.com</code>) → Authoritative (<code>myapp.com</code>).</td></tr>
+<tr><td>DNS caching</td><td>Answer ko browser, OS, resolver level pe yaad rakhna, taaki har baar poori khoj na ho.</td></tr>
+<tr><td>TTL</td><td>Time To Live: cache is answer ko kitne seconds tak sach maane.</td></tr>
+</tbody></table></div>
+
+<h3>Lookup flow</h3>
+<pre class="diagram">
+ Browser cache ── miss ──► OS cache ── miss ──► DNS Resolver (ISP / 8.8.8.8)
+                                                     │  (cache miss)
+                                                     ▼
+                                              Root server (.)
+                                              "com ke liye TLD ko poochho"
+                                                     ▼
+                                              TLD server (.com)
+                                              "myapp.com ke nameservers ye hain"
+                                                     ▼
+                                              Authoritative DNS (Route53)
+                                              "myapp.com = 13.233.10.5"
+                                                     ▼
+                              IP wapas: Resolver ──► OS ──► Browser (sab cache karte hain, TTL tak)
+</pre>
+
+<h3>Record types</h3>
+<div class="tw"><table>
+<thead><tr><th>Record</th><th>Kaam</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>A</td><td>Domain → IPv4</td><td><code>myapp.com → 13.233.10.5</code></td></tr>
+<tr><td>AAAA</td><td>Domain → IPv6</td><td><code>myapp.com → 2406:da1a::1</code></td></tr>
+<tr><td>CNAME</td><td>Domain → <i>doosra domain</i> (alias). Root/apex domain pe normally allowed nahi.</td><td><code>www → cname.vercel-dns.com</code></td></tr>
+<tr><td>MX</td><td>Email kis mail server pe jaayegi</td><td><code>myapp.com → mail.google.com (priority 10)</code></td></tr>
+<tr><td>TXT</td><td>Free-text: domain verification, SPF/DKIM/DMARC</td><td><code>"v=spf1 include:_spf.google.com ~all"</code></td></tr>
+<tr><td>NS</td><td>Is domain ke authoritative nameservers</td><td><code>ns-123.awsdns-45.com</code></td></tr>
+</tbody></table></div>
+
+<div class="co prod"><b>Production note</b>
+<p>AWS me root domain ko CloudFront/ALB pe point karne ke liye Route53 ka <b>Alias record</b> use hota hai (CNAME jaisa, par apex pe chalta hai aur free queries hoti hain).</p>
+</div>
+
+<h3>Registrar vs DNS provider vs Hosting provider</h3>
+<div class="tw"><table>
+<thead><tr><th>Role</th><th>Kya karta hai</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Domain registrar</td><td>Domain ka naam <b>kharidna/renew</b> karna; ownership record; nameservers set karna.</td><td>BigRock, GoDaddy, Namecheap</td></tr>
+<tr><td>DNS provider</td><td>Records (A, CNAME, MX...) <b>host</b> karna aur queries ka jawab dena.</td><td>Route53, Cloudflare, registrar ka default DNS</td></tr>
+<tr><td>Hosting provider</td><td>Tumhara <b>app/server</b> chalana.</td><td>Vercel, AWS EC2, Render</td></tr>
+</tbody></table></div>
+
+<pre class="diagram">
+ Example: domain BigRock se khareeda, app Vercel/AWS pe
+
+ User ─► myapp.com
+          │
+          ▼
+   BigRock (registrar) me nameservers = Route53 ke NS   ◄── ownership + NS pointer
+          │
+          ▼
+   Route53 (DNS provider)  A/CNAME record  ─────────►  Vercel (76.76.21.21)  ya  AWS ALB/EC2
+                                                        ▲ hosting provider: app yahan chalta hai
+</pre>
+
+<div class="co remember"><b>Remember this</b>
+<p>Ek hi company teeno kaam kar sakti hai, par <b>roles alag</b> hain. Agar DNS records "kaam nahi kar rahe", pehle dekho <i>nameservers kahan point ho rahe hain</i>, records galat jagah edit karna bahut common galti hai.</p>
+</div>
+
+<div class="co mistake"><b>Common mistake</b>
+<p>DNS badalne ke baad "abhi tak purana site dikh raha hai" panic. Reason: TTL/caching. Migration se pehle TTL kam karo. Ye bhi yaad rakho ki DNS <b>propagation</b> asal me cache expiry hoti hai, koi global "push" nahi.</p>
+</div>
+
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>Browser me URL type karne se page dikhne tak kya hota hai? (DNS se shuru karo.)</li>
+<li>CNAME aur A record me farak? Apex domain pe CNAME kyun nahi? (Alias/ANAME workaround.)</li>
+<li>DNS-based load balancing / failover kaise hota hai? (Route53 weighted/latency/failover routing + health checks.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+<h2><span class="n">3</span>CDN</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Ek famous bakery sirf Delhi me hai (origin). Mumbai ke log biscuit mangayein to har baar Delhi se aana padega: slow. Isliye bakery har sheher me <b>local shops (edge)</b> me biscuit ka stock rakhti hai. Stock hai to turant (HIT), nahi hai to Delhi se mangao (MISS), rakh lo, agle customer ko turant do.</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Origin server</td><td>Asli content ka source: S3 bucket, ALB, tumhara Node server.</td></tr>
+<tr><td>Edge server</td><td>User ke paas wala CDN server jo cache rakhta hai.</td></tr>
+<tr><td>Cache HIT</td><td>Edge ke paas content hai, turant serve. Origin ko pata bhi nahi chalta.</td></tr>
+<tr><td>Cache MISS</td><td>Edge ke paas nahi hai, origin se laata, cache karta, phir serve karta.</td></tr>
+<tr><td>TTL</td><td>Edge kitni der content ko fresh maane. Uske baad revalidate/refetch.</td></tr>
+<tr><td>Static content</td><td>Sabke liye same: JS, CSS, images, fonts, video. CDN ke liye ideal.</td></tr>
+<tr><td>Dynamic content</td><td>User-specific ya real-time: <code>/api/me</code>, cart. Normally cache nahi (ya bahut short TTL / careful cache key).</td></tr>
+</tbody></table></div>
+
+<pre class="diagram">
+ HIT :   User ──► CloudFront Edge ──► (cache me hai) ──► Response to User        ~10-30 ms
+
+ MISS:   User ──► CloudFront Edge ──► (cache me nahi)
+                                          │
+                                          ▼
+                                       Origin (S3 / ALB)
+                                          │
+                                          ▼
+                              Edge me CACHE hota hai ──► Response to User
+                              (agla user isi edge se HIT paayega)
+</pre>
+
+<h3>CDN aur latency / origin load</h3>
+<ul>
+<li><b>Latency:</b> Physical distance kam, network hops kam. Speed of light ko hum badal nahi sakte, sirf content paas la sakte hain.</li>
+<li><b>Origin load:</b> 1 million users ek hi image maangein to origin ko sirf ek-do baar hit hota hai, baaki edge se. Cache hit ratio (90%+) ek key metric hai.</li>
+</ul>
+
+<h3>CloudFront vs Vercel CDN</h3>
+<div class="tw"><table>
+<thead><tr><th></th><th>CloudFront</th><th>Vercel CDN</th></tr></thead>
+<tbody>
+<tr><td>Kaun manage karta</td><td>Tum (distribution, behaviors, cache policy, origins)</td><td>Platform (deploy karte hi automatic)</td></tr>
+<tr><td>Kab use</td><td>AWS stack: S3/ALB origin, fine control</td><td>Next.js/React frontend, jaldi deploy</td></tr>
+<tr><td>Trade-off</td><td>Zyada control, zyada config</td><td>Simple, kam control</td></tr>
+</tbody></table></div>
+
+<div class="co remember"><b>Remember this</b>
+<p>Tum har file manually CDN pe <b>upload nahi</b> karte. CDN <i>pull-through cache</i> hai: pehli request pe origin se khud le aata hai. Tum sirf origin me deploy karte ho (S3 / Vercel build), aur CDN khud cache bharta hai. Naye release me <b>content-hashed filenames</b> use karo (<code>app.7c3f1.js</code>) taaki invalidation ki zaroorat hi na pade; sirf <code>index.html</code> ka TTL chhota rakho.</p>
+</div>
+
+<div class="co mistake"><b>Common mistake: DNS Cache ≠ CDN Cache</b>
+<div class="tw"><table>
+<thead><tr><th></th><th>DNS cache</th><th>CDN cache</th></tr></thead>
+<tbody>
+<tr><td>Kya cache hota hai</td><td>Domain → IP mapping</td><td>Actual content (HTML/JS/images/API response)</td></tr>
+<tr><td>Kahan</td><td>Browser, OS, resolver</td><td>Edge servers</td></tr>
+<tr><td>Purpose</td><td>"Kahan jaana hai" pata karna</td><td>"Wahan se jaldi content" dena</td></tr>
+<tr><td>Control</td><td>DNS TTL</td><td>Cache-Control headers, CDN cache policy</td></tr>
+</tbody></table></div>
+<p>DNS ne bataya ki CloudFront edge kahan hai. CDN cache ne wahan se content diya. Dono alag layers hain.</p>
+</div>
+
+<div class="co prod"><b>Production example</b>
+<p>Bug fix deploy hua par users ko purani JS mil rahi hai: <code>index.html</code> ko long TTL de diya tha. Fix: HTML pe <code>Cache-Control: no-cache</code> ya short TTL, assets pe <code>max-age=31536000, immutable</code> (hashed names).</p>
+</div>
+
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>Dynamic API responses CDN pe cache kar sakte ho? Kab? (Public, user-independent data, short TTL, correct cache key.)</li>
+<li>CDN cache poison ya private data leak kaise hota hai? (Cache key me Authorization/cookie ignore ho jaye to.)</li>
+<li>Cache invalidation kaise? (Versioned URLs &gt; invalidation API.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+<h2><span class="n">4</span>Load Balancer</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Traffic police chowk pe khada hai. Gaadiyan (requests) aati hain, wo dekhta hai kaunsi lane khaali hai aur wahan bhej deta hai. Jo lane band hai (accident = unhealthy server) wahan gaadi nahi bhejta.</p>
+</div>
+
+<pre class="diagram">
+ Users ──► Load Balancer ─┬─► Server 1
+                          ├─► Server 2
+                          └─► Server 3      (Server 3 unhealthy ho to LB use skip karega)
+</pre>
+
+<div class="rule">Load Balancer = decide karta hai <u>KIS</u> server ko traffic milega.</div>
+
+<div class="tw"><table>
+<thead><tr><th>Concept</th><th>Meaning</th><th>Production note</th></tr></thead>
+<tbody>
+<tr><td>ALB</td><td>AWS Application LB, Layer 7 (HTTP/HTTPS). Path/host based routing, WebSocket, HTTP/2.</td><td>Web apps/APIs ke liye default choice. (NLB = Layer 4, TCP, ultra low latency.)</td></tr>
+<tr><td>Nginx</td><td>Software reverse proxy/LB, khud configure aur manage karte ho.</td><td>Kubernetes ingress, on-prem, ya EC2 ke andar reverse proxy.</td></tr>
+<tr><td>Health check</td><td>LB periodically <code>GET /health</code> maarta hai. Fail hua to server rotation se bahar.</td><td>Health endpoint <b>shallow</b> rakho (app up hai?). Deep checks (DB down) se poore servers ek saath nikal sakte hain.</td></tr>
+<tr><td>Round Robin</td><td>1→2→3→1→2→3 baari baari.</td><td>Simple; requests barabar-heavy ho to theek.</td></tr>
+<tr><td>Least Connections</td><td>Jis server pe sabse kam active connections, use do.</td><td>Requests ka duration alag-alag ho (long uploads, websockets) to better.</td></tr>
+<tr><td>Weighted routing</td><td>Bade server ko zyada share (e.g. 70/30).</td><td>Canary deploy: 5% traffic new version ko.</td></tr>
+<tr><td>Connection draining</td><td>Server hataate waqt in-flight requests khatam hone do, naye request mat do.</td><td>Deploy/scale-in pe users ko 502 nahi milte. ALB me "deregistration delay".</td></tr>
+<tr><td>TLS termination</td><td>HTTPS decrypt LB pe hota hai, aage backend ko HTTP (ya re-encrypt).</td><td>Certificate ek jagah (ACM), servers ka CPU bachta hai.</td></tr>
+</tbody></table></div>
+
+<h3>HTTP request ≠ TCP connection</h3>
+<p>Beginners sochte hain "1 request = 1 connection". Aisa nahi hai.</p>
+<ul>
+<li><b>HTTP/1.1:</b> Keep-alive se ek TCP connection pe kai requests sequentially.</li>
+<li><b>HTTP/2:</b> Ek TCP connection pe <b>multiplexing</b>: kai requests parallel streams me.</li>
+<li><b>HTTP/3:</b> TCP ki jagah <b>QUIC (UDP)</b> pe; connection migration aur kam head-of-line blocking.</li>
+</ul>
+<div class="co remember"><b>Remember this</b>
+<p>Ek client ka ek long-lived connection ek hi server se chipka reh sakta hai. Isliye "round robin" me load kabhi-kabhi uneven dikhta hai: LB <i>connection</i> ya <i>request</i> level pe balance kar raha hai, ye check karo. ALB L7 hai, HTTP request level pe route kar sakta hai; NLB connection level pe.</p>
+</div>
+
+<h3>Conceptual Round Robin (sirf samajhne ke liye)</h3>
+<pre class="code"><code>// Concept demo: production me ye khud MAT likho
+const servers = ["http://s1:3000", "http://s2:3000", "http://s3:3000"];
+let i = 0;
+
+function nextServer() {
+  const s = servers[i];
+  i = (i + 1) % servers.length; // 0 → 1 → 2 → 0 ...
+  return s;
+}
+
+// Har request pe: proxy(req, nextServer())</code></pre>
+<div class="co mistake"><b>Common mistake</b>
+<p>Interview me "Node.js me apna load balancer bana lunga". Production me <b>ALB / Nginx / HAProxy / Envoy</b> use hote hain: health checks, TLS, connection draining, retries, observability, aur battle-tested performance ke saath. Custom Node LB khud ek SPOF aur maintenance bojh ban jaata hai. (Upar ka code sirf algorithm samjhane ke liye hai.)</p>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>L4 vs L7 load balancer?</li>
+<li>Health check fail hone pe kya hota hai? Draining kya hai?</li>
+<li>Load balancer khud fail ho jaye to? (Multi-AZ managed / redundant pair.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+<h2><span class="n">5</span>Auto Scaling</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Restaurant me 3 waiter hain. Shaam ko rush aata hai to manager 2 aur waiter bula leta hai (scale out). Raat ko bheed kam ho to extra waiter ghar bhej deta hai (scale in). Agar koi waiter bimaar ho jaye to naya bula leta hai (health replacement).</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Minimum</td><td>Kam se kam itne servers hamesha chalein (HA ke liye 2+, alag AZ me).</td></tr>
+<tr><td>Desired</td><td>Abhi jitne chalne chahiye (scaling policy isse badalti hai).</td></tr>
+<tr><td>Maximum</td><td>Upper cap: cost aur DB overload se bachne ke liye.</td></tr>
+<tr><td>Scale out / in</td><td>Servers ki count badhana / ghatana (horizontal).</td></tr>
+<tr><td>Health check</td><td>EC2 status + ELB health check; unhealthy instance terminate + replace.</td></tr>
+<tr><td>CPU-based</td><td>Average CPU 60% se upar → scale out. Simple, common.</td></tr>
+<tr><td>Request-based</td><td>Per-target requests (ALBRequestCountPerTarget). I/O-heavy apps me CPU se better signal.</td></tr>
+<tr><td>Latency-based</td><td>p95 latency threshold cross → scale out. User experience ke closest.</td></tr>
+<tr><td>Queue-based</td><td>Queue depth / messages per worker → workers scale. Background workers ke liye best.</td></tr>
+</tbody></table></div>
+
+<pre class="diagram">
+ Normal:                                   Traffic badha:
+ Users ─► ALB ─► Auto Scaling Group        Users ─► ALB ─► Auto Scaling Group
+                 ├─ EC2 #1                                 ├─ EC2 #1
+                 ├─ EC2 #2                                 ├─ EC2 #2
+                 └─ EC2 #3                                 ├─ EC2 #3
+                                                           ├─ EC2 #4   ◄── new
+                                                           └─ EC2 #5   ◄── new
+</pre>
+
+<h3>Naye EC2 ko application code kaise milta hai?</h3>
+<div class="tw"><table>
+<thead><tr><th>Piece</th><th>Kaam</th></tr></thead>
+<tbody>
+<tr><td>AMI</td><td>Machine ki "photo": OS + installed software. Naya EC2 isi se boot hota hai.</td></tr>
+<tr><td>Launch Template</td><td>Recipe: kaunsa AMI, instance type, security group, IAM role, User Data.</td></tr>
+<tr><td>User Data</td><td>Boot pe chalne wala script: docker install/start, config fetch, app run.</td></tr>
+<tr><td>Docker image</td><td>App + dependencies ka packaged, versioned, reproducible bundle.</td></tr>
+<tr><td>ECR</td><td>AWS ka private Docker image registry.</td></tr>
+<tr><td>CI/CD</td><td>Code push par test → build image → ECR push → rollout.</td></tr>
+</tbody></table></div>
+
+<pre class="diagram">
+ GitHub ─► CI/CD (Actions/CodePipeline) ─► Docker image build ─► ECR (myapp:v42)
+                                                                    │
+ Auto Scaling ─► launch new EC2 (Launch Template, AMI, User Data) ──┤
+      │                                                              ▼
+      └─► EC2 boot ─► docker pull myapp:v42 ─► start container ─► /health OK
+                                                                    │
+                                                                    ▼
+                                            ALB: healthy ho gaya ─► traffic milna shuru
+</pre>
+
+<div class="co remember"><b>Remember this: ephemeral servers</b>
+<p>Production me app servers <b>replaceable / ephemeral</b> hone chahiye: kabhi bhi mar sakte hain, naye ban sakte hain. Isliye: server pe manually SSH karke code mat daalo, local disk pe important data mat rakho, config environment/Secrets Manager se lo, aur har deploy ek naya immutable image ho. Isse scale, rollback, aur recovery sab predictable ho jaata hai.</p>
+</div>
+<div class="co mistake"><b>Common mistakes</b>
+<ul>
+<li>Auto scaling lagaya par app stateful hai (sessions RAM me, uploads local disk pe). Naya server aaya to kaam ka nahi.</li>
+<li>Sirf app scale kiya, DB nahi. 10 servers × 20 connections = 200 DB connections; DB ne jawab de diya.</li>
+<li>Slow startup: instance ready hone me 5 min lagte hain, tab tak spike nikal gaya. Pre-baked AMI/image, warm pool ya scheduled scaling use karo.</li>
+<li>Scale-in pe requests kaat di gayi: connection draining na ho.</li>
+</ul>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>CPU vs request-count vs queue-based scaling kab? </li>
+<li>Scale out fast hota hai par scale in slow kyun rakhte hain? (Flapping se bachne ke liye cooldown.)</li>
+<li>Deploy strategy: rolling, blue/green, canary me kya farak?</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+<h2><span class="n">6</span>Stateful vs Stateless</h2>
+
+<h3>Problem: session server ki RAM me</h3>
+<pre class="diagram">
+ Login request:
+ User ─► Server #1  (session RAM me store: {sid123: user=Rahul})     ✔ login ho gaya
+
+ Agli request:
+ User ─► Load Balancer ─► Server #2
+                          session? sid123 mujhe nahi pata               ❌ "Please login again"
+</pre>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Ek bank branch me clerk ne tumhari details apne <i>dimaag</i> me rakhi. Agli baar doosre clerk ke paas gaye to usse kuch pata nahi. Fix: details <b>shared register (Redis/DB)</b> me rakho jo sab clerks dekh sakte hain.</p>
+</div>
+
+<pre class="diagram">
+ User ─► Load Balancer ─┬─► Server #1 ─┐
+                        ├─► Server #2 ─┼──► Redis (sessions)   ✔ kisi bhi server pe chalega
+                        └─► Server #3 ─┘
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td>Stateful backend</td><td>Server khud user ki state (session, cart) memory/disk me rakhta hai.</td><td>Scale aur failover mushkil; server marne pe state gayab.</td></tr>
+<tr><td>Stateless backend</td><td>Har request me sab zaroori info aati hai ya shared store se li jaati hai; server kuch yaad nahi rakhta.</td><td>Kisi bhi server pe request chal jaati hai; scaling easy.</td></tr>
+<tr><td>Sticky sessions / Session affinity</td><td>LB ek user ko hamesha same server pe bhejta hai (cookie se).</td><td>Quick fix; par uneven load, server mara to session gaya, scale-in painful.</td></tr>
+<tr><td>Redis sessions</td><td>Session ID cookie me; session data Redis me. Server stateless rehta hai.</td><td>Har request pe Redis lookup; Redis HA zaroori. Instant revoke possible.</td></tr>
+<tr><td>JWT</td><td>State token ke andar (signed). Server sirf verify karta hai.</td><td>Lookup nahi; par revoke/logout mushkil (see section 7).</td></tr>
+</tbody></table></div>
+
+<div class="rule">Servers replaceable hone chahiye. Data durable hona chahiye.</div>
+
+<div class="co remember"><b>Remember this</b>
+<p>"Stateless" ka matlab ye nahi ki app me koi state nahi. Matlab: <b>state app server ke bahar</b> hai (Redis, DB, S3, token me). Isse server disposable ho jaata hai.</p>
+</div>
+<div class="co mistake"><b>Common mistake</b>
+<p>File uploads <code>/uploads</code> local folder me save karna, in-memory rate-limit counters, in-memory cache jo servers ke beech consistent nahi. Ye sab bhi <i>hidden state</i> hain. Multi-instance me alag-alag behaviour aayega.</p>
+</div>
+<div class="co interview"><b>Interview question</b>
+<p>"Sticky sessions kab theek hain?" Legacy app migration ke temporary step, ya WebSocket connection affinity. Long-term me shared session store better.</p>
+</div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+<h2><span class="n">7</span>JWT + Cookies</h2>
+
+<div class="rule">Cookie ≠ JWT. Cookie = storage / transport mechanism. JWT = token format.</div>
+
+<div class="co analogy"><b>Analogy</b>
+<p>JWT ek <b>signed ID card</b> hai jisme tumhara naam aur role likha hai aur uspe issuer ki mohar (signature) hai. Cookie wo <b>pocket/wallet</b> hai jisme browser wo card rakhta hai aur har request ke saath dikhata hai. Card koi bhi pocket me ho sakta hai (Authorization header, cookie, memory).</p>
+</div>
+
+<h3>JWT ke 3 parts</h3>
+<pre class="diagram">
+ xxxxx.yyyyy.zzzzz
+   │      │      └─ Signature : HMAC/RSA(header + payload, secret/private key)  → tamper detect
+   │      └──────── Payload   : claims {"sub":"u42","role":"admin","exp":1735689600}
+   └─────────────── Header    : {"alg":"RS256","typ":"JWT"}
+</pre>
+
+<div class="co mistake"><b>Common mistake: JWT signed hota hai, encrypted nahi</b>
+<p>Payload sirf <b>base64url encoded</b> hai, koi bhi decode karke padh sakta hai. Isliye password, secrets, card numbers, sensitive PII JWT me kabhi mat daalo. Signature sirf ye batata hai ki data <i>badla nahi gaya</i>, ye nahi ki wo <i>chhipa hua</i> hai.</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Access token</td><td>Short-lived (5-15 min) token jo API calls ke saath jaata hai. Chori ho to nuksan limited.</td></tr>
+<tr><td>Refresh token</td><td>Long-lived (days/weeks), sirf naya access token lene ke liye. Safe storage + rotation + server-side revoke list.</td></tr>
+<tr><td>Cookie</td><td>Browser ka key-value storage jo har matching request ke saath automatic server ko jaata hai.</td></tr>
+<tr><td>HttpOnly</td><td>JavaScript (<code>document.cookie</code>) cookie padh nahi sakta, XSS se token chori ka risk kam.</td></tr>
+<tr><td>Secure</td><td>Cookie sirf HTTPS pe jaayegi.</td></tr>
+<tr><td>SameSite</td><td><code>Lax/Strict/None</code>: cross-site requests me cookie kab jaayegi. CSRF risk kam karta hai.</td></tr>
+</tbody></table></div>
+
+<h3>Traditional session vs JWT</h3>
+<pre class="diagram">
+ Traditional Session (stateful):
+   Browser ──(Cookie: sid=abc123)──► Server ──► Redis: GET session:abc123 ──► user data
+                                                  ▲ har request pe server-side lookup
+
+ JWT (stateless):
+   Browser ──(Cookie/Header: JWT)──► Server ──► signature verify (public key/secret) ──► claims mil gaye
+                                                  ▲ koi DB/Redis lookup nahi
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th></th><th>Server-side session</th><th>JWT</th></tr></thead>
+<tbody>
+<tr><td>State kahan</td><td>Server-side store (Redis/DB)</td><td>Token ke andar (client ke paas)</td></tr>
+<tr><td>Stateful/Stateless</td><td>Stateful (shared store ke saath)</td><td>Generally stateless</td></tr>
+<tr><td>Instant logout / revoke</td><td>Easy: session delete</td><td>Hard: expiry tak valid; denylist ya short expiry + refresh rotation chahiye</td></tr>
+<tr><td>Per-request cost</td><td>Redis lookup</td><td>CPU verify</td></tr>
+<tr><td>Best for</td><td>Traditional web apps, strict control</td><td>APIs, microservices, service-to-service</td></tr>
+</tbody></table></div>
+
+<div class="co remember"><b>Remember this</b>
+<p>Browser web app ke liye safe pattern: <b>short-lived access JWT</b> + <b>refresh token</b>, dono <code>HttpOnly; Secure; SameSite</code> cookies me. JWT ko localStorage me rakhna XSS me chori ka aasan raasta hai. Aur JWT ko cookie me bhejne par CSRF ka dhyan rakho (SameSite + CSRF token).</p>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>JWT me logout kaise implement karoge?</li>
+<li>Cookie vs localStorage me token: security trade-off?</li>
+<li>JWT "stateless" hai to secret rotate kaise karoge? (<code>kid</code> header + JWKS.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="s8">
+<h2><span class="n">8</span>Redis</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Redis = <b>super-fast shared memory jo application server ke bahar hai</b>. Database godown hai (durable, door, slow). Redis dukaan ka counter hai jahan jo cheezein roz bikti hain wo haath ke paas rakhi hain.</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Use case</th><th>Kaise</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Cache</td><td><code>GET/SET</code> with TTL</td><td>Product details, user profile, expensive query result</td></tr>
+<tr><td>Session storage</td><td>Session ID → data, TTL = session expiry</td><td>Login sessions across servers</td></tr>
+<tr><td>Rate limiting</td><td><code>INCR</code> + <code>EXPIRE</code> / Lua</td><td>100 req/min/user</td></tr>
+<tr><td>Distributed lock</td><td><code>SET key val NX PX 30000</code></td><td>Cron job sirf ek instance pe chale, double payment na ho</td></tr>
+<tr><td>Counters</td><td>Atomic <code>INCR</code></td><td>Page views, likes, stock reservation</td></tr>
+<tr><td>Pub/Sub</td><td><code>PUBLISH/SUBSCRIBE</code></td><td>Multi-server websocket broadcast. (Fire-and-forget: subscriber offline to message gaya.)</td></tr>
+<tr><td>TTL</td><td>Key ki expiry</td><td>Stale data automatically hat jata hai</td></tr>
+</tbody></table></div>
+
+<h3>Cache-aside pattern (sabse common)</h3>
+<pre class="diagram">
+ HIT :  App ──► Redis GET user:42 ──► mil gaya ──► Response
+
+ MISS:  App ──► Redis GET user:42 ──► nahi mila
+            └─► Database SELECT ...
+            └─► Redis SET user:42 (TTL 300s)
+            └─► Response
+</pre>
+<pre class="code"><code>async function getUser(id) {
+  const key = `user:${id}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);          // HIT
+
+  const user = await db.query("SELECT * FROM users WHERE id=$1", [id]); // MISS
+  if (user) await redis.set(key, JSON.stringify(user), "EX", 300);       // TTL 5 min
+  return user;
+}
+
+async function updateUser(id, data) {
+  await db.query("UPDATE users SET ... WHERE id=$1", [id]);
+  await redis.del(`user:${id}`);                  // invalidate on write
+}</code></pre>
+
+<h3>Cache problems</h3>
+<div class="tw"><table>
+<thead><tr><th>Problem</th><th>Kya hota hai</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Cache invalidation</td><td>DB update hua par cache me purana data. ("Computer science ki 2 hard problems me se ek.")</td><td>Write pe <code>DEL</code>, short TTL, event-based invalidation. Naming/versioning keys.</td></tr>
+<tr><td>Cache stampede</td><td>Popular key expire hui, 10,000 requests ek saath DB pe.</td><td>Request coalescing / mutex lock, TTL jitter (random extra seconds), stale-while-revalidate, pre-warm.</td></tr>
+<tr><td>Cache penetration</td><td>Non-existent keys baar baar maange jaate hain, hamesha miss.</td><td>Null result short TTL pe cache, Bloom filter.</td></tr>
+<tr><td>Eviction (LRU/LFU)</td><td>Memory full hone pe kya nikaalna hai. <b>LRU</b> = sabse kam recently used. <b>LFU</b> = sabse kam frequently used.</td><td><code>maxmemory-policy allkeys-lru</code> (cache use case). Memory monitor karo.</td></tr>
+</tbody></table></div>
+
+<h3>Redis fail ho jaaye to?</h3>
+<ul>
+<li><b>Sirf cache tha:</b> sab requests DB pe. DB overload ho sakta hai. Fix: circuit breaker, rate limit, graceful degradation, Redis replica + auto failover (ElastiCache Multi-AZ / Sentinel / Cluster).</li>
+<li><b>Sessions the:</b> users logout ho jaayenge. Fix: replication/persistence (AOF), ya JWT-based approach.</li>
+<li><b>Rate limiter tha:</b> fail-open (traffic allow, risk) ya fail-closed (block, outage) ka decision business ke hisaab se.</li>
+<li><b>Lock tha:</b> double execution ka risk. Critical cases me DB constraint/idempotency bhi lagao.</li>
+</ul>
+<div class="co remember"><b>Remember this</b>
+<p>Cache ko hamesha aise design karo ki wo <b>optional optimization</b> ho, requirement nahi. App Redis ke bina bhi chalni chahiye (dheemi ho sakti hai, par chale). Aur Redis single-threaded command execution karta hai, isliye <code>KEYS *</code> jaisi heavy commands production me mat chalao (<code>SCAN</code> use karo).</p>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>Cache-aside vs write-through vs write-behind?</li>
+<li>Cache stampede kaise roka?</li>
+<li>Redis persistent hai? (RDB/AOF options hain, par usually cache/ephemeral store maano.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="s9">
+<h2><span class="n">9</span>Database scaling</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Ek hi cashier poore mall ka billing kare to line lambi hoti jaayegi. Pehle cashier ko fast banao (index, query tuning), phir ek aur counter kholo sirf enquiry ke liye (read replicas), aur last me mall ko alag-alag branches me baant do (sharding).</p>
+</div>
+
+<p>Ek single DB eventually bottleneck banta hai kyunki: CPU/RAM/disk IOPS ki limit, connections ki limit, writes sirf ek jagah (primary) jaate hain, aur data size badhne se index/queries slow hoti hain.</p>
+
+<h3>Scaling ki seedhi (isi order me socho)</h3>
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Kya</th><th>Kab</th></tr></thead>
+<tbody>
+<tr><td>1. Query + Index</td><td>Slow query dhundo (<code>EXPLAIN ANALYZE</code>), sahi index lagao, N+1 hatao.</td><td>Hamesha pehle. Sabse sasta aur sabse bada win.</td></tr>
+<tr><td>2. Cache (Redis)</td><td>Repeated reads DB tak na jaayein.</td><td>Read-heavy hot data.</td></tr>
+<tr><td>3. Connection pool</td><td>Connections reuse, DB ko overwhelm hone se bachao.</td><td>Har app me.</td></tr>
+<tr><td>4. Vertical scale</td><td>Bada DB instance.</td><td>Sabse simple; limit tak.</td></tr>
+<tr><td>5. Read replicas</td><td>Reads replicas pe, writes primary pe.</td><td>Read-heavy (90% reads).</td></tr>
+<tr><td>6. Partitioning</td><td>Ek badi table ko andar se chhote parts (e.g. month-wise) me todna, same DB.</td><td>Bahut badi tables, time-series/archival.</td></tr>
+<tr><td>7. Sharding</td><td>Data ko alag DB servers me baantna.</td><td>Write throughput / data size single node ki limit se bahar.</td></tr>
+</tbody></table></div>
+
+<pre class="diagram">
+ Writes :  Application ──► Primary DB
+ Reads  :  Application ──► Read Replica 1
+                       └─► Read Replica 2
+                (Primary ──replication──► Replica 1, Replica 2)
+</pre>
+
+<h3>Indexing (short)</h3>
+<p>Index = kitaab ka <b>index page</b>. Bina index ke DB poori table scan karta hai (full scan). Trade-off: reads fast, writes thode slow aur storage zyada. Composite index me column order matter karta hai (leftmost prefix). Har column pe index mat lagao.</p>
+
+<h3>Read replicas kab kaam aate hain, kab nahi</h3>
+<div class="cols two">
+<div><b>Useful</b>
+<ul><li>Read-heavy workload (feeds, catalog, dashboards)</li><li>Reports/analytics ko primary se alag rakhna</li><li>Read failover/HA support</li></ul></div>
+<div><b>Solve nahi karte</b>
+<ul><li>Write-heavy load (writes ab bhi primary pe)</li><li>Bad queries / missing index (replica pe bhi slow)</li><li>Data size ki limit</li><li>Strong "read-your-write" needs (replication lag)</li></ul></div>
+</div>
+<div class="co interview"><b>Interview tip</b>
+<p>Jab bhi "DB slow hai" suno, pehle pucho: read-heavy ya write-heavy? Slow queries hain ya connections exhausted? Bina diagnosis ke "sharding kar denge" bolna red flag hai.</p>
+</div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="s10">
+<h2><span class="n">10</span>Database connection pool</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Restaurant me tables (connections) limited hain. Har customer ke liye naya table banake, khaane ke baad tod dena bekaar hai. Pehle se 10 tables laga do, customers aate hain, baithte hain, uthte hain, table dobara use hota hai. Table khaali nahi to customer wait karta hai (queue).</p>
+</div>
+
+<pre class="diagram">
+ Without pool:   Request ─► DB connection banao (TCP + TLS + auth) ─► Query ─► Connection band
+                            ▲ har request pe 10-100 ms extra + DB pe load
+
+ With pool:      Application ─► Connection Pool ─► pehle se khula connection ─► DB
+                                 (borrow → query → release wapas pool me)
+</pre>
+
+<p>DB connection <b>expensive</b> kyun: TCP handshake, TLS, authentication, aur PostgreSQL me har connection ek alag process (kai MB memory). Bahut connections = DB memory/CPU context-switching me doob jaata hai.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Setting / Problem</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>max connections</td><td>Pool me maximum kitne connections. Sochke rakho: <code>instances × pool max ≤ DB max_connections</code> (aur buffer).</td></tr>
+<tr><td>idle connections</td><td>Khaali padi connections. <code>idleTimeoutMillis</code> baad close hoti hain; min idle warm rakhta hai.</td></tr>
+<tr><td>pool exhaustion</td><td>Sab connections busy, naye requests wait me. Latency spike, phir timeouts.</td></tr>
+<tr><td>timeout</td><td><code>connectionTimeoutMillis</code>: pool se connection milne ka max wait. Query timeout alag set karo.</td></tr>
+<tr><td>connection leak</td><td>Connection borrow kiya par release nahi kiya (error path me). Dheere dheere pool khatam.</td></tr>
+</tbody></table></div>
+
+<h3>Node.js practical example (node-postgres)</h3>
+<pre class="code"><code>import { Pool } from "pg";
+
+// App start pe EK BAAR banao, har request pe nahi
+export const pool = new Pool({
+  host: process.env.DB_HOST,
+  max: 10,                        // max connections per instance
+  idleTimeoutMillis: 30_000,      // idle 30s baad close
+  connectionTimeoutMillis: 2_000, // pool se connection ka wait limit
+});
+
+// Simple query: pool khud borrow + release karta hai
+const { rows } = await pool.query("SELECT * FROM orders WHERE user_id=$1", [uid]);
+
+// Transaction: ek hi connection chahiye, isliye manual borrow
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  await client.query("UPDATE accounts SET bal = bal - $1 WHERE id=$2", [amt, from]);
+  await client.query("UPDATE accounts SET bal = bal + $1 WHERE id=$2", [amt, to]);
+  await client.query("COMMIT");
+} catch (e) {
+  await client.query("ROLLBACK");
+  throw e;
+} finally {
+  client.release();               // MUST: warna connection leak
+}</code></pre>
+
+<div class="co mistake"><b>Common mistakes</b>
+<ul>
+<li><code>client.release()</code> <code>finally</code> me na karna: leak.</li>
+<li>Har request me naya <code>new Pool()</code> ya <code>new Client()</code> banana.</li>
+<li>Auto scaling ke saath pool size fix rakhna: 50 instances × 20 = 1000 connections, DB down. Fix: chhota pool per instance, ya <b>PgBouncer / RDS Proxy</b>.</li>
+<li>Serverless (Lambda) me har invocation nayi connection: proxy zaroori.</li>
+</ul>
+</div>
+<div class="co interview"><b>Interview question</b>
+<p>"Pool bada karne se performance hamesha badhti hai?" Nahi. DB ke CPU cores ke hisaab se ek limit ke baad throughput girta hai. Chhota, sahi-sized pool aksar behtar hota hai.</p>
+</div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="s11">
+<h2><span class="n">11</span>Database replication</h2>
+
+<pre class="diagram">
+ Application ──write──► PRIMARY ──replication──► Replica 1 ──► reads
+                                       └───────► Replica 2 ──► reads
+</pre>
+
+<ul>
+<li><b>Write to primary:</b> saare INSERT/UPDATE/DELETE sirf primary pe.</li>
+<li><b>Replication:</b> primary apne changes ka log (WAL / binlog) replicas ko bhejta hai; replicas usse apply karte hain.</li>
+<li><b>Read from replicas:</b> SELECT ko replicas pe bhejo; primary ka load kam.</li>
+<li><b>Failover:</b> primary mara to ek replica ko <b>promote</b> karke naya primary banate hain (managed DB automatic karta hai). Is dauraan kuch seconds/minutes writes fail ho sakte hain.</li>
+</ul>
+
+<div class="tw"><table>
+<thead><tr><th>Type</th><th>Meaning</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td>Asynchronous replication</td><td>Primary commit karke replica ka wait nahi karta.</td><td>Fast; par replication lag aur failover pe thoda data loss possible.</td></tr>
+<tr><td>Synchronous replication</td><td>Primary replica ke confirm ka wait karta hai.</td><td>Durable; par write latency zyada, replica slow to primary slow.</td></tr>
+<tr><td>Multi-AZ standby (RDS)</td><td>Alag AZ me sync standby, sirf failover ke liye (reads nahi).</td><td>HA hai, read scaling nahi.</td></tr>
+</tbody></table></div>
+
+<h3>Replication lag aur read-after-write consistency</h3>
+<div class="co analogy"><b>Analogy</b>
+<p>Head office ne naya notice board pe lagaya (write). Branch offices tak notice pahunchne me kuch der lagti hai. Branch me jaake turant dekhoge to purana notice dikhega (stale read).</p>
+</div>
+<pre class="diagram">
+ t0  User ──► POST /profile (name = "Rahul")  ──► PRIMARY  (updated ✔)
+ t1  User ──► GET  /profile                   ──► REPLICA (abhi replicate nahi hua)
+                                                    │
+                                                    ▼
+                                              name = "Rohit"  (stale ❌)   ← user confuse: "save nahi hua?"
+</pre>
+
+<div class="co remember"><b>Read-after-write fixes</b>
+<ul>
+<li>Write ke turant baad ki reads <b>primary</b> se karo (thodi der ya usi request flow me).</li>
+<li>User ke last-write timestamp ke baad tak us user ki reads primary pe bhejo (sticky-to-primary window).</li>
+<li>Critical reads (balance, payment status, inventory) hamesha primary.</li>
+<li>Replica lag monitor karo, threshold cross ho to reads primary pe fallback.</li>
+<li>UI me optimistic update (React Query) bhi user experience bacha leta hai.</li>
+</ul>
+</div>
+<div class="co interview"><b>Interview question</b>
+<p>"Eventual consistency kya hai aur kab acceptable hai?" Feeds/like counts/analytics me theek; payments/inventory/auth me nahi.</p>
+</div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="s12">
+<h2><span class="n">12</span>Database sharding</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Ek library me 30 lakh kitabein aur ek hi librarian. Ab library ko 3 branches me baanto: A-H kitabein branch 1, I-P branch 2, Q-Z branch 3. Har branch ka apna librarian, aur kaam baant gaya. Par ab agar koi "A se Z tak sab kitabein" maange to teeno branches se poochna padega.</p>
+</div>
+
+<pre class="diagram">
+ Range sharding:
+   Users 1 - 1M   ──► Shard 1 (DB server A)
+   Users 1M - 2M  ──► Shard 2 (DB server B)
+   Users 2M - 3M  ──► Shard 3 (DB server C)
+
+ Hash sharding:
+   shard = hash(user_id) % 3   ──►  Shard 0 / 1 / 2
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Shard key</td><td>Wo column jisse decide hota hai ki row kis shard pe jaayegi.</td><td>Sabse important decision. Ghalat key = hot shard aur cross-shard queries.</td></tr>
+<tr><td>Hash sharding</td><td><code>hash(key) % N</code>.</td><td>Data evenly failta; par range queries mushkil, aur N badalne pe rebalancing bhaari (consistent hashing se better).</td></tr>
+<tr><td>Range sharding</td><td>Key ranges ke hisaab se.</td><td>Range queries easy; par sequential keys (timestamp/auto-increment) latest shard ko hot bana dete hain.</td></tr>
+<tr><td>Hot shard</td><td>Ek shard pe zyada load (celebrity user, latest data).</td><td>Better key, sub-sharding, ya hot keys ko alag treat karo.</td></tr>
+<tr><td>Rebalancing</td><td>Naye shards add karke data move karna.</td><td>Live migration risky aur complex; plan pehle se karo.</td></tr>
+<tr><td>Cross-shard queries</td><td>JOIN/aggregate jo multiple shards cover kare.</td><td>Slow, complex; distributed transactions (2PC/saga) mushkil.</td></tr>
+</tbody></table></div>
+
+<div class="co remember"><b>Sharding kab chahiye?</b>
+<p>Jab optimization (index, cache, replicas, vertical scale, partitioning) ke baad bhi <b>write throughput</b> ya <b>data size</b> ek single primary handle nahi kar pa raha. Ye "last resort" hai kyunki isse operational complexity bahut badhti hai: joins, transactions, migrations, backups, debugging sab mushkil.</p>
+</div>
+<div class="co mistake"><b>Common mistake</b>
+<p>"10 million users hain to sharding chahiye" bolna. Ek achhi tarah tuned single PostgreSQL primary + replicas + Redis kaafi bade scale tak jaata hai. Numbers se justify karo: writes/sec, data size (TB), working set vs RAM.</p>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>Shard key kaise choose karoge? (High cardinality, even distribution, query patterns match.)</li>
+<li>Consistent hashing kya hai aur kyun? (Node add/remove pe minimal key movement.)</li>
+<li>Sharding vs partitioning me farak? (Partitioning single DB ke andar; sharding multiple DB servers me.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 13 ============ -->
+<section id="s13">
+<h2><span class="n">13</span>Object storage</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Database ek organized register hai (rows, columns, queries). S3 ek <b>bahut bada godown</b> hai: har saman (file) ka ek label (key) hota hai. Godown me saman rakh sakte ho, nikaal sakte ho, par "sab laal cheezein dikhao" jaisi query nahi.</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Object storage</td><td>Files (objects) ko flat namespace me store karta hai. HTTP API se access. Practically unlimited, cheap, durable (S3: 11 nines durability).</td></tr>
+<tr><td>S3</td><td>AWS ka object storage service.</td></tr>
+<tr><td>Bucket</td><td>Top-level container (folder jaisa). Globally unique naam.</td></tr>
+<tr><td>Object key</td><td>Object ka full path/naam: <code>users/42/avatar.png</code>.</td></tr>
+<tr><td>Presigned URL</td><td>Time-limited signed URL jo bina AWS credentials ke ek specific object upload/download allow karta hai.</td></tr>
+</tbody></table></div>
+
+<pre class="diagram">
+ Direct upload (recommended):
+   Browser ─(1) "upload karna hai"─► Backend ─(2) presigned URL generate (5 min valid)
+   Browser ◄──────────(3) URL────────┘
+   Browser ─(4) PUT file directly──► S3           ✔ backend file bytes touch nahi karta
+   Browser ─(5) "done"─► Backend ─► metadata DB me save
+
+ Proxy upload (avoid for big files):
+   Browser ──► Backend (file receive, memory/disk/bandwidth use) ──► S3
+</pre>
+
+<p><b>Direct upload kyun better:</b> backend ki bandwidth, CPU, memory aur request timeouts bachte hain; large files (video, 5GB) pe ALB/Node timeouts nahi aate; backend scale karna simple; upload speed S3 ke paas seedhi.</p>
+<pre class="code"><code>import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const s3 = new S3Client({ region: "ap-south-1" });
+
+app.post("/uploads/presign", auth, async (req, res) =&gt; {
+  const key = `users/${req.user.id}/${crypto.randomUUID()}.png`;
+  const url = await getSignedUrl(
+    s3,
+    new PutObjectCommand({ Bucket: "myapp-uploads", Key: key, ContentType: "image/png" }),
+    { expiresIn: 300 }               // 5 minute
+  );
+  res.json({ url, key });            // frontend seedha S3 pe PUT karega
+});</code></pre>
+
+<div class="co mistake"><b>Common mistakes</b>
+<ul>
+<li>Bucket public kar dena. Private rakho, CDN (OAC) ya presigned GET se serve karo.</li>
+<li>Presigned URL ka expiry bahut lamba, ya content-type/size limits na lagana.</li>
+<li>Files DB me BLOB store karna. DB me sirf metadata (key, size, owner) rakho.</li>
+<li>Large uploads me multipart upload na use karna.</li>
+</ul>
+</div>
+<div class="co interview"><b>Interview question</b>
+<p>"Upload ke baad processing (thumbnail, virus scan) kaise?" S3 event → queue → worker. (Section 14.)</p>
+</div>
+</section>
+
+<!-- ============ 14 ============ -->
+<section id="s14">
+<h2><span class="n">14</span>Message queue</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Restaurant me waiter (API) order ki <b>chit kitchen ke rail pe laga deta hai</b> (queue) aur agle customer ke paas chala jaata hai. Chefs (workers) apni speed se chit uthake khana banate hain. Waiter khana banne tak wait nahi karta. Rush aaye to chits jama hoti hain, par restaurant crash nahi hota.</p>
+</div>
+
+<pre class="diagram">
+ API (Producer) ──► Queue ──► Worker (Consumer) ──┬─► Database
+   turant 202 Accepted        (SQS / RabbitMQ /    ├─► Email provider
+   user ko wait nahi           Kafka topic)        └─► Push notification
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Producer</td><td>Message bhejne wala (tumhara API).</td></tr>
+<tr><td>Queue</td><td>Messages ko safely hold karta hai jab tak koi process na kare.</td></tr>
+<tr><td>Consumer / Worker</td><td>Message uthake <b>actual kaam</b> karne wala process.</td></tr>
+<tr><td>Retry</td><td>Fail hone pe dobara try (exponential backoff ke saath).</td></tr>
+<tr><td>Dead Letter Queue (DLQ)</td><td>N retries ke baad bhi fail hone wale messages ki alag queue; inspect/replay ke liye.</td></tr>
+<tr><td>At-least-once delivery</td><td>Message <b>kam se kam ek baar</b> milega, par duplicate ho sakta hai (worker crash, ack lost).</td></tr>
+<tr><td>Idempotency</td><td>Same message dobara process ho to bhi result same; double-charge nahi.</td></tr>
+</tbody></table></div>
+
+<h3>Queue kab use karo</h3>
+<ul>
+<li><b>Email / Notifications:</b> provider slow ya down ho to user request block nahi hoti.</li>
+<li><b>Video / image processing:</b> minutes lagte hain, HTTP request me nahi ho sakta.</li>
+<li><b>Payment processing:</b> retries, audit trail, webhook handling.</li>
+<li><b>Heavy background jobs:</b> reports, PDF, imports/exports.</li>
+<li><b>Traffic spikes ko smooth (load leveling):</b> DB ko ek constant speed pe writes milte hain.</li>
+</ul>
+
+<h3>Idempotent worker (example)</h3>
+<pre class="code"><code>async function handlePayment(msg) {
+  const { paymentId, orderId, amount } = msg;
+
+  // Idempotency: pehle check, ya DB unique constraint pe insert
+  const done = await db.query("SELECT 1 FROM processed_payments WHERE id=$1", [paymentId]);
+  if (done.rowCount) return;                 // duplicate delivery, skip
+
+  await db.tx(async (t) =&gt; {
+    await t.query("INSERT INTO processed_payments(id) VALUES($1)", [paymentId]); // UNIQUE
+    await t.query("UPDATE orders SET status='PAID' WHERE id=$1", [orderId]);
+  });
+  // message ack yahin (kaam ke BAAD)
+}</code></pre>
+
+<div class="rule">Kafka worker nahi hai. Kafka ek event streaming / message platform hai. Worker wo process hai jo messages consume karke asli kaam karta hai.</div>
+<div class="tw"><table>
+<thead><tr><th></th><th>SQS / RabbitMQ (task queue)</th><th>Kafka (event log/stream)</th></tr></thead>
+<tbody>
+<tr><td>Model</td><td>Message ek consumer ko, process hone ke baad delete/ack</td><td>Append-only log; consumers apna offset track karte hain, message retention tak rehta hai</td></tr>
+<tr><td>Replay</td><td>Generally nahi</td><td>Haan, offset reset karke purane events dobara</td></tr>
+<tr><td>Use</td><td>Background jobs, decoupling</td><td>Event streaming, analytics, multiple independent consumers, high throughput</td></tr>
+<tr><td>Kaun kaam karta hai</td><td>Tumhara worker</td><td>Tumhara consumer service (worker) hi karta hai</td></tr>
+</tbody></table></div>
+
+<div class="co mistake"><b>Common mistakes</b>
+<ul>
+<li>Exactly-once delivery maan lena. Practically at-least-once + idempotency design karo.</li>
+<li>DLQ na rakhna: poison message infinite retry me queue block kar deta hai.</li>
+<li>Message ack kaam se <i>pehle</i> kar dena: worker crash to kaam lost.</li>
+<li>Har cheez queue me daal dena. Jo user ko turant chahiye (login, balance) sync rakho.</li>
+</ul>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>Duplicate messages ko kaise handle karoge?</li>
+<li>Queue me backlog badh raha hai to? (Workers scale out, consumer lag metric, poison message check.)</li>
+<li>DB write + queue publish ek saath atomic kaise? (Transactional outbox pattern.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 15 ============ -->
+<section id="s15">
+<h2><span class="n">15</span>Rate limiting</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Metro station ka gate: ek time pe limited log andar. Bheed ko control na karo to platform pe stampede ho jaayega. Rate limiter API ka gate hai: ek user/IP/API key ko ek time window me limited requests.</p>
+</div>
+
+<p><b>Kyun chahiye:</b> abuse/bots, brute-force login attempts, accidental infinite loops (client bug), DDoS ka application-level layer, fair usage (ek heavy user baaki sabko slow na kare), aur cost control (third-party APIs).</p>
+
+<pre class="diagram">
+ User ──► API Gateway / Middleware ──► Rate Limiter (Redis counter) ──┬─ allowed ──► Backend
+                                                                       └─ exceeded ──► 429 Too Many Requests
+                                                                                       Retry-After: 30
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Algorithm</th><th>Kaise kaam karta hai</th><th>Pros / Cons</th></tr></thead>
+<tbody>
+<tr><td>Fixed window</td><td>Har minute ka counter; limit 100. Minute badalte hi reset.</td><td>Simple, sasta. Boundary problem: 11:00:59 pe 100 + 11:01:00 pe 100 = 2 second me 200.</td></tr>
+<tr><td>Sliding window</td><td>Pichhle 60 seconds ka rolling count (log ya weighted counters).</td><td>Accurate; thoda zyada memory/compute.</td></tr>
+<tr><td>Token bucket</td><td>Bucket me tokens fixed rate se bharte hain (max capacity). Har request 1 token leti hai.</td><td>Short <b>bursts allow</b> karta hai, average rate control. Most popular (API gateways).</td></tr>
+<tr><td>Leaky bucket</td><td>Requests bucket me aati hain, fixed rate se "leak" (process) hoti hain.</td><td>Output smooth/constant; burst absorb par delay ya drop.</td></tr>
+</tbody></table></div>
+
+<h3>Redis-based distributed rate limiting</h3>
+<p>Multiple servers hain to counter <b>shared</b> hona chahiye, isliye Redis. Server RAM me counter rakhoge to har server ki apni limit ban jaayegi (10 servers = 10x limit).</p>
+<pre class="code"><code>// 100 requests / minute / user  (fixed window)
+async function rateLimit(req, res, next) {
+  const key = `rl:${req.user.id}:${Math.floor(Date.now() / 60000)}`;
+
+  const count = await redis.incr(key);        // atomic
+  if (count === 1) await redis.expire(key, 60);
+
+  if (count &gt; 100) {
+    res.set("Retry-After", "30");
+    return res.status(429).json({ error: "Too many requests" });
+  }
+  next();
+}
+// Production: INCR + EXPIRE ko Lua script me atomic banao (ya library use karo).</code></pre>
+
+<h3>Limit cross hone par kya?</h3>
+<ul>
+<li><b>HTTP 429 Too Many Requests</b> + <code>Retry-After</code> header (aur <code>X-RateLimit-Remaining</code> jaise headers).</li>
+<li>Client side: <b>exponential backoff + jitter</b>, turant retry storm mat karo.</li>
+<li>Different limits: per user, per IP, per API key, per endpoint (login pe strict, GET pe relaxed).</li>
+<li>Redis down ho to <b>fail-open</b> (availability) ya <b>fail-closed</b> (security): login/OTP jaise sensitive endpoints ke liye soch-samajh ke decide karo.</li>
+</ul>
+<div class="co mistake"><b>Common mistake</b>
+<p>Sirf IP pe limit: office/college/NAT ke peeche hazaaron users ek IP share karte hain. Authenticated user ID/API key ke saath combine karo. Aur limiter ko app ke andar hi nahi, edge (CDN/WAF/API gateway) pe bhi lagao.</p>
+</div>
+<div class="co interview"><b>Interview questions</b>
+<ul>
+<li>Token bucket vs fixed window, kab kaunsa?</li>
+<li>Distributed limiter me race condition kaise avoid? (Atomic INCR/Lua.)</li>
+</ul>
+</div>
+</section>
+
+<!-- ============ 16 ============ -->
+<section id="s16">
+<h2><span class="n">16</span>HTTPS / TLS</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>HTTP = <b>postcard</b>: raaste me har koi padh sakta hai. HTTPS = <b>sealed, tamper-proof courier box</b>, jise sirf receiver kholta hai, aur courier ka ID bhi verified hota hai (ki sahi bank hai, nakli nahi).</p>
+</div>
+
+<pre class="diagram">
+ HTTP  :  Browser ──── "password=abc123" (plain text) ────► Server     ❌ WiFi/ISP/attacker padh sakta hai
+
+ HTTPS :  Browser ══ TLS encrypted tunnel ══► Server                  ✔ beech wala sirf gibberish dekhta hai
+          (HTTP request/response TLS ke andar)
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>TLS</td><td>Transport Layer Security. HTTPS = HTTP over TLS. (SSL purana naam/protocol hai.)</td></tr>
+<tr><td>Certificate</td><td>Server ka digital ID: domain name + server ki public key, jise trusted CA (Let's Encrypt, ACM) ne sign kiya.</td></tr>
+<tr><td>Public/private key</td><td>Public key sabko dikhti hai; private key sirf server ke paas. Public se locked cheez sirf private se khulti hai (asymmetric crypto).</td></tr>
+<tr><td>Encryption</td><td>Data ko padhne layak nahi rakhna (confidentiality). Asli data encryption fast symmetric key se hota hai.</td></tr>
+<tr><td>Authentication</td><td>Verify karna ki tum sahi server se baat kar rahe ho (certificate chain + domain match).</td></tr>
+<tr><td>Integrity</td><td>Data raaste me badla nahi gaya (MAC / AEAD).</td></tr>
+<tr><td>Handshake</td><td>Connection ke shuru me negotiation: version/cipher, certificate verify, keys agree.</td></tr>
+</tbody></table></div>
+
+<h3>Handshake (simplified, TLS 1.3)</h3>
+<ol>
+<li>Browser: "Main ye TLS versions/ciphers support karta hoon" + key-exchange share bhejta hai (ClientHello).</li>
+<li>Server: cipher chunta hai, apna key-exchange share aur <b>certificate</b> bhejta hai.</li>
+<li>Browser certificate verify karta hai: trusted CA ne sign kiya? domain match? expired to nahi?</li>
+<li>Dono taraf <b>ephemeral key exchange (ECDHE)</b> se ek shared <b>session key</b> banate hain (wire pe kabhi nahi jaati).</li>
+<li>Ab saara HTTP traffic is <b>symmetric session key</b> se encrypt hota hai.</li>
+</ol>
+
+<div class="co remember"><b>Remember this</b>
+<p>Asymmetric crypto (public/private) <b>slow</b> hai, isliye sirf identity prove karne aur key agree karne me use hota hai. Asli data symmetric key (AES/ChaCha20) se encrypt hota hai. HTTPS <b>data in transit</b> ko protect karta hai, data at rest (DB/S3) ko nahi, uske liye alag encryption chahiye. HTTPS sahi hone ka matlab ye bhi nahi ki site trustworthy hai.</p>
+</div>
+<div class="co prod"><b>Production</b>
+<p>TLS ALB/CloudFront pe terminate hota hai (ACM free cert, auto-renew). LB se backend ka hop private VPC me HTTP ho sakta hai; strict compliance me re-encrypt (end-to-end TLS). HSTS header se browser hamesha HTTPS force karta hai.</p>
+</div>
+<div class="co mistake"><b>Common mistake</b>
+<p>Certificate expire hone dena (sabse common outage!). Auto-renewal + expiry alerts lagao. Aur "HTTPS lagaya to security done" nahi: XSS, SQL injection, weak auth alag issues hain.</p>
+</div>
+<div class="co interview"><b>Interview question</b>
+<p>"HTTPS me man-in-the-middle kaise rokta hai?" Certificate authentication: attacker ke paas domain ka valid certificate/private key nahi hoga.</p>
+</div>
+</section>
+
+<!-- ============ 17 ============ -->
+<section id="s17">
+<h2><span class="n">17</span>Observability</h2>
+
+<div class="co analogy"><b>Analogy</b>
+<p>Car ka dashboard + black box. Speedometer/fuel gauge (metrics) batate hain <i>kuch galat hai</i>. Black box recording (logs) batati hai <i>kya hua</i>. Poori journey ka route map (traces) batata hai <i>kis raaste pe kahan der lagi</i>.</p>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Pillar</th><th>Kya hai</th><th>Sawal jo answer karta hai</th><th>Tools</th></tr></thead>
+<tbody>
+<tr><td>Logs</td><td>Events ki text/JSON records (structured logs, requestId ke saath)</td><td>Kya hua? Error kya tha?</td><td>CloudWatch Logs, ELK, Loki</td></tr>
+<tr><td>Metrics</td><td>Time-series numbers (aggregated)</td><td>Kitna? Trend? Kab se?</td><td>Prometheus, Grafana, CloudWatch, Datadog</td></tr>
+<tr><td>Traces</td><td>Ek request ki poori journey across services (spans)</td><td>Kahan slow? Kaunsa service/DB call?</td><td>OpenTelemetry, Jaeger, X-Ray</td></tr>
+</tbody></table></div>
+
+<h3>Kya measure karna hai</h3>
+<div class="tw"><table>
+<thead><tr><th>Signal</th><th>Meaning</th><th>Kab red flag</th></tr></thead>
+<tbody>
+<tr><td>CPU</td><td>Processor kitna busy</td><td>Sustained 80%+; ya ek core 100% (Node single thread)</td></tr>
+<tr><td>RAM</td><td>Memory usage</td><td>Steadily badhti (leak), OOM kill, swap</td></tr>
+<tr><td>Disk</td><td>Space, IOPS, latency</td><td>Disk full; high IO wait; DB disk saturation</td></tr>
+<tr><td>Network</td><td>Bandwidth, packet loss, connections</td><td>Saturation, retransmits, TIME_WAIT/ephemeral port exhaustion</td></tr>
+<tr><td>Latency</td><td>Request kitni der me complete</td><td>p95/p99 upar</td></tr>
+<tr><td>Throughput</td><td>Requests/sec (RPS), jobs/sec</td><td>Achanak girna (upstream problem) ya limit pe flat hona (saturation)</td></tr>
+<tr><td>Error rate</td><td>5xx / failed requests ka %</td><td>Baseline se upar; SLO burn</td></tr>
+</tbody></table></div>
+
+<h3>p50 / p95 / p99 (Hinglish me)</h3>
+<pre class="diagram">
+ p50 = 100 ms  →  50% requests 100 ms ya usse tez.         "Typical user ka experience"
+ p95 = 300 ms  →  95% requests 300 ms ya usse tez.         "20 me se 1 user 300 ms se zyada wait karta hai"
+ p99 = 800 ms  →  99% requests 800 ms ya usse tez.         "100 me se 1 user 800 ms+ wait karta hai (tail)"
+</pre>
+<div class="co analogy"><b>Analogy</b>
+<p>Office jaane me roz avg 30 min lagte hain (p50). Par 20 din me 1 din 1 ghanta lagta hai (p95), aur mahine me ek din 2 ghante (p99). Average kehta hai "sab theek", par wo ek din meeting miss karwa deta hai.</p>
+</div>
+<div class="co remember"><b>Remember this</b>
+<p><b>Average (mean) chhupa deta hai.</b> Slow tail ko p95/p99 dikhate hain. Ek page me 20 backend calls hon to user ko kam se kam ek p99-slow call milne ka chance high hota hai. Isliye SLO aksar p95/p99 pe likhe jaate hain, average pe nahi.</p>
+</div>
+
+<h3>Monitoring, alerting, debugging, bottleneck detection</h3>
+<ul>
+<li><b>Monitoring:</b> dashboards jo system ki health continuously dikhate hain (RED: Rate, Errors, Duration; USE: Utilization, Saturation, Errors).</li>
+<li><b>Alerting:</b> symptoms pe alert (error rate, p99, SLO burn), sirf causes (CPU 70%) pe nahi. Actionable ho, warna alert fatigue.</li>
+<li><b>Debugging:</b> alert → dashboard → trace (kahan slow) → logs (kyun) → fix → postmortem.</li>
+<li><b>Bottleneck detection:</b> jis resource ki utilization/saturation sabse pehle 100% ke paas jaaye (CPU, DB connections, disk IO, external API) wahi bottleneck.</li>
+</ul>
+<div class="co mistake"><b>Common mistake</b>
+<p>Unstructured logs, requestId/traceId na hona, aur high-cardinality metrics (labels me userId) daal ke monitoring bill/performance bigaad dena. Logs me passwords/tokens/PII mat likho.</p>
+</div>
+<div class="co interview"><b>Interview question</b>
+<p>"Monitoring aur observability me farak?" Monitoring = known problems ke liye pre-defined checks. Observability = unknown problems ko data (logs/metrics/traces) se explore kar pana.</p>
+</div>
+</section>
+
+<!-- ============ 18 ============ -->
+<section id="s18">
+<h2><span class="n">18</span>Failure thinking</h2>
+<p>Senior engineer ka default sawal: <b>"Ye component mar gaya to kya hoga?"</b> Failure normal hai, exception nahi.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Component dies</th><th>Kya hota hai</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Redis</td><td>Cache miss storm, DB pe spike; sessions/rate-limit/locks affected.</td><td>Replica + auto failover, circuit breaker, DB fallback with limits, stale data serve, sessions ke liye durable option.</td></tr>
+<tr><td>DB primary</td><td>Writes fail; reads replicas se chal sakte hain (stale).</td><td>Multi-AZ automatic failover, retries with backoff, app read-only mode / graceful degradation, backups + PITR.</td></tr>
+<tr><td>DB replica</td><td>Reads ka load baaki replicas/primary pe.</td><td>Multiple replicas, LB across replicas, fallback to primary.</td></tr>
+<tr><td>EC2 / app server</td><td>Us server ke in-flight requests fail; baaki servers serve karte hain.</td><td>Health checks, ASG replace, multi-AZ, stateless, client retries (idempotent).</td></tr>
+<tr><td>CDN</td><td>Cached content unavailable ya slow; origin pe direct traffic surge.</td><td>Origin shield/capacity, multi-CDN ya DNS failover, static fallback page.</td></tr>
+<tr><td>Load balancer</td><td>Total outage (entry point gayab).</td><td>Managed multi-AZ LB, redundant pair, DNS health-check failover.</td></tr>
+<tr><td>Message queue</td><td>Producers publish nahi kar paate; ya consumers ruk jaate.</td><td>Managed HA queue, publisher retry/outbox table, local buffering, DLQ, backlog alerts.</td></tr>
+<tr><td>Worker</td><td>Jobs pending; message visibility timeout ke baad dusre worker ko.</td><td>Multiple workers, idempotency, autoscale on queue depth.</td></tr>
+<tr><td>External API (payment/email)</td><td>Requests hang, threads/connections block, cascading failure.</td><td>Timeouts, retries with jitter, circuit breaker, queue + async, fallback provider.</td></tr>
+<tr><td>Availability Zone / Region</td><td>Us AZ ke saare resources gaye.</td><td>Multi-AZ by default; multi-region DR (RTO/RPO define karo).</td></tr>
+</tbody></table></div>
+
+<h3>Resilience toolkit</h3>
+<div class="tw"><table>
+<thead><tr><th>Technique</th><th>Simple meaning</th><th>Dhyan rakho</th></tr></thead>
+<tbody>
+<tr><td>Timeout</td><td>Har network call ka max wait. Bina timeout ke thread/connection hamesha atka rahega.</td><td>Sabse basic aur sabse zyada bhoola jaane wala.</td></tr>
+<tr><td>Retry</td><td>Transient failure pe dobara try.</td><td>Exponential backoff + jitter, max attempts, sirf idempotent operations. Warna retry storm.</td></tr>
+<tr><td>Circuit breaker</td><td>Baar baar fail ho rahi dependency ko kuch der ke liye call hi mat karo (open), phir half-open me test.</td><td>Fast fail; dependency ko recover hone ka time.</td></tr>
+<tr><td>Failover</td><td>Backup component pe switch (standby DB, doosra region).</td><td>Failover drill regularly test karo.</td></tr>
+<tr><td>Health check</td><td>Instance/service ki "alive + ready" check.</td><td>Liveness vs readiness alag; deep checks se cascading removal na ho.</td></tr>
+<tr><td>Redundancy</td><td>Har critical cheez ki 2+ copies, alag failure domains me.</td><td>Ek hi AZ me do copies = fake redundancy.</td></tr>
+<tr><td>Graceful degradation</td><td>Poora band hone ke bajay limited feature ke saath chalte raho (recommendations off, cached data, read-only mode).</td><td>Pehle se decide karo kaunsa feature core hai, kaunsa nice-to-have.</td></tr>
+<tr><td>Bulkhead / load shedding</td><td>Ek dependency ko poora resource na lene do; overload me kam-important requests reject.</td><td>Ship ke compartments jaisa.</td></tr>
+</tbody></table></div>
+<div class="co mistake"><b>Common mistake</b>
+<p>Retries + no timeout + no backoff = ek chhoti slowdown ko <b>cascading outage</b> bana dena. Har layer retry kare (client, gateway, service, SDK) to ek request 3×3×3 = 27 calls ban sakti hai.</p>
+</div>
+<div class="co interview"><b>Interview tip</b>
+<p>Diagram ke har box ke saamne bolo: "Failure pe: detect kaise (health check/metric), contain kaise (timeout/breaker), recover kaise (failover/replace), user ko kya dikhega (degrade)."</p>
+</div>
+</section>
+
+<!-- ============ 19 ============ -->
+<section id="s19">
+<h2><span class="n">19</span>Performance thinking</h2>
+<p>User: <b>"Mera API slow hai."</b> Engineer guess nahi karta. Wo <b>request ka path follow</b> karta hai aur har layer pe time naapta hai. Trace (waterfall) sabse tez tarika hai.</p>
+
+<pre class="diagram">
+ Frontend ─► Network ─► Load Balancer ─► Backend ─► External API ─► Redis ─► Database ─► Disk / CPU
+    │           │            │             │            │            │          │            │
+  render/    DNS/TLS/     queueing,     event loop,   3rd-party    latency,   slow query,  saturation,
+  bundle,    RTT, CDN     5xx, target   GC, CPU,      timeout,     hit ratio, locks, pool  IO wait
+  waterfall  hit ratio    resp time     N+1, blocking rate limit   evictions  wait
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Layer</th><th>Kya check karo</th><th>Metrics / logs</th></tr></thead>
+<tbody>
+<tr><td>Frontend</td><td>Kya sach me API slow hai ya UI? Bade bundle, bahut API calls, re-renders, waterfall.</td><td>Browser DevTools Network tab, Web Vitals (LCP, INP), RUM, API call count/timings</td></tr>
+<tr><td>Network</td><td>DNS lookup, TLS handshake, RTT, geography, CDN HIT ratio, payload size, compression.</td><td>DevTools timing (DNS/Connect/TLS/TTFB), CDN hit-ratio, packet loss</td></tr>
+<tr><td>Load balancer</td><td>LB pe wait? 5xx/502? Unhealthy targets? Connection limits?</td><td>ALB <code>TargetResponseTime</code>, request count, 4xx/5xx, healthy host count, surge queue</td></tr>
+<tr><td>Backend</td><td>Node event loop blocked? CPU heavy JSON/regex/crypto? Memory/GC? N+1 queries? Sync code?</td><td>CPU, memory, event-loop lag, GC pauses, per-route p50/p95/p99, error rate</td></tr>
+<tr><td>External API</td><td>Third-party slow/timeout? Retry storms?</td><td>Outbound call latency, timeout count, circuit breaker state (traces spans)</td></tr>
+<tr><td>Redis</td><td>Cache hit ratio gira? Slow commands? Evictions? Big keys? Network latency?</td><td><code>INFO</code> stats, hit/miss, latency, evicted_keys, memory, <code>SLOWLOG</code></td></tr>
+<tr><td>Database</td><td>Slow query? Missing index? Locks/deadlocks? Pool wait? Replication lag?</td><td>Query time, slow query log, <code>EXPLAIN ANALYZE</code>, active connections, pool wait time, lock waits</td></tr>
+<tr><td>Disk / CPU</td><td>Host saturated? IO wait? Noisy neighbor? Throttling (burst credits)?</td><td>CPU %, iowait, disk IOPS/latency, queue depth, credit balance</td></tr>
+</tbody></table></div>
+
+<h3>Debugging steps (order)</h3>
+<ol>
+<li><b>Scope pehchano:</b> Sabhi users ya kuch? Sabhi endpoints ya ek? Kab se? Deploy hua tha? (Change correlation.)</li>
+<li><b>Percentiles dekho:</b> p50 badha ya sirf p99? Sirf tail = specific slow path/query/dependency. Sabka badha = capacity/saturation.</li>
+<li><b>Trace kholo:</b> Kaunsa span sabse lamba hai? Wahin drill down.</li>
+<li><b>Saturation check:</b> CPU, DB connections, pool wait, queue depth, disk IO.</li>
+<li><b>Fix ka type:</b> index/query fix, cache, timeout/circuit breaker, scale out, async via queue, payload compress.</li>
+<li><b>Verify aur prevent:</b> metrics normal hue? Alert/SLO/load test add karo.</li>
+</ol>
+<div class="co remember"><b>Remember this</b>
+<p><b>Latency</b> = ek request ko kitna time. <b>Throughput</b> = ek second me kitni requests. Load badhne par throughput ek limit pe flat hota hai aur latency achanak khadi ho jaati hai (queueing). Wo point saturation hai, wahi bottleneck hai.</p>
+</div>
+<div class="co mistake"><b>Common mistakes</b>
+<ul>
+<li>Bina measure kiye optimize karna ("Redis laga dete hain").</li>
+<li>Sirf average latency dekhna.</li>
+<li>Server scale out karna jab bottleneck DB ya external API hai (problem aur badhti hai).</li>
+<li>Node me CPU-heavy kaam main thread pe (event loop block): worker threads/queue use karo.</li>
+</ul>
+</div>
+<div class="co interview"><b>Interview tip</b>
+<p>Ye chain bolo: "Pehle main dekhunga ki slowness kahan hai: client, network, ya server. Phir trace se dominant span, phir us layer ki saturation aur logs." Ye structured approach hi answer hai.</p>
+</div>
+</section>
+
+<!-- ============ 20 ============ -->
+<section id="s20">
+<h2><span class="n">20</span>One-page mental model</h2>
+
+<h3>Main request path</h3>
+<pre class="diagram">
+ USER ──► DOMAIN ──► DNS ──► CDN ──► LOAD BALANCER ──► AUTO SCALING
+                                                          │
+                                                          ▼
+                                                 APPLICATION SERVERS
+                                                 │        │        │
+                                                 ▼        ▼        ▼
+                                               REDIS   DATABASE   OBJECT STORAGE
+                                                     (primary + replicas)   (S3)
+</pre>
+
+<h3>Background work path</h3>
+<pre class="diagram">
+ APPLICATION ──► MESSAGE QUEUE ──► WORKERS ──► DB / Email / Notifications / S3
+</pre>
+
+<h3>Visibility path</h3>
+<pre class="diagram">
+ APPLICATION ──► OBSERVABILITY ──► LOGS  +  METRICS  +  TRACES  ──► Dashboards / Alerts
+</pre>
+
+<div class="tw"><table>
+<thead><tr><th>Layer</th><th>Ek line me purpose</th></tr></thead>
+<tbody>
+<tr><td>User</td><td>Browser/app jo request shuru karta hai.</td></tr>
+<tr><td>Domain</td><td>Insaanon ke liye yaad rakhne layak naam jo service ko pehchaanta hai.</td></tr>
+<tr><td>DNS</td><td>Domain naam ko sahi address me badalta hai, yaani batata hai service kahan hai.</td></tr>
+<tr><td>CDN</td><td>Content ko user ke paas cache karke latency aur origin load kam karta hai.</td></tr>
+<tr><td>Load Balancer</td><td>Aane wali requests ko healthy servers me baantta hai.</td></tr>
+<tr><td>Auto Scaling</td><td>Traffic ke hisaab se servers ki sankhya badhata-ghatata hai aur kharab servers badalta hai.</td></tr>
+<tr><td>Application servers</td><td>Business logic chalate hain aur stateless hone se replaceable rehte hain.</td></tr>
+<tr><td>Redis</td><td>Fast shared memory: cache, session, rate-limit counters, locks.</td></tr>
+<tr><td>Database</td><td>Durable, consistent business data ka source of truth.</td></tr>
+<tr><td>Object storage</td><td>Badi files (images, videos, backups) sasta aur durable store karta hai.</td></tr>
+<tr><td>Message queue</td><td>Heavy ya slow kaam ko request path se nikaal kar baad ke liye safely rakhta hai.</td></tr>
+<tr><td>Workers</td><td>Queue se kaam uthake background me asli processing karte hain.</td></tr>
+<tr><td>Observability</td><td>Logs, metrics, traces se batata hai system ke andar kya ho raha hai.</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ============ 21 ============ -->
+<section id="s21">
+<h2><span class="n">21</span>Interview cheat sheet</h2>
+
+<div class="tw"><table>
+<thead><tr><th>Concept</th><th>One-line meaning</th><th>Why needed</th><th>Common interview question</th></tr></thead>
+<tbody>
+<tr><td>DNS</td><td>Domain → IP phonebook</td><td>Naam se service dhundhna; IP badalne ki flexibility</td><td>URL type karne se page tak kya hota hai? A vs CNAME?</td></tr>
+<tr><td>CDN</td><td>Edge servers pe content cache</td><td>Kam latency, kam origin load, DDoS absorb</td><td>Dynamic content cache karoge? Invalidation kaise?</td></tr>
+<tr><td>Load Balancer</td><td>Traffic ko healthy servers me baantna</td><td>Scale + HA + zero-downtime deploy</td><td>L4 vs L7? LB fail ho to?</td></tr>
+<tr><td>Auto Scaling</td><td>Load ke hisaab se servers add/remove</td><td>Cost vs capacity balance, self-healing</td><td>Kis metric pe scale karoge? Naya server code kaise paata hai?</td></tr>
+<tr><td>Stateless</td><td>Server state nahi rakhta; state bahar</td><td>Kisi bhi server pe request; easy scale/replace</td><td>Sessions ko multiple servers pe kaise handle karoge?</td></tr>
+<tr><td>JWT</td><td>Signed token jisme claims hote hain</td><td>Server-side lookup ke bina auth verify</td><td>JWT logout/revoke kaise? Kya JWT encrypted hai?</td></tr>
+<tr><td>Cookie</td><td>Browser ka auto-sent storage</td><td>Session ID/token ka transport; HttpOnly se safer</td><td>Cookie vs localStorage? SameSite kya karta hai?</td></tr>
+<tr><td>Redis</td><td>In-memory shared key-value store</td><td>Fast cache, sessions, rate limit, locks</td><td>Cache-aside? Stampede? Redis mara to?</td></tr>
+<tr><td>Connection Pool</td><td>DB connections ka reusable set</td><td>Connection banana costly; DB ko overload se bachana</td><td>Pool exhaustion kaise debug karoge? Pool size kaise decide?</td></tr>
+<tr><td>Replication</td><td>Primary ka data replicas pe copy</td><td>HA, failover, read scaling</td><td>Sync vs async? Failover me data loss?</td></tr>
+<tr><td>Read Replica</td><td>Sirf reads serve karne wali copy</td><td>Read load primary se hatana</td><td>Replication lag ka kya karoge? Kab useless?</td></tr>
+<tr><td>Sharding</td><td>Data ko multiple DB servers me baantna</td><td>Write/data scale jab single node limit ho</td><td>Shard key kaise? Hot shard? Cross-shard join?</td></tr>
+<tr><td>Object Storage</td><td>S3 jaisa file/object store</td><td>Cheap, durable, scalable file storage; DB/servers se bhaari files door</td><td>Large upload kaise? Presigned URL kya hai?</td></tr>
+<tr><td>Queue</td><td>Messages ka durable buffer</td><td>Async work, decoupling, spike smoothing</td><td>Duplicate/lost messages? DLQ? Ordering?</td></tr>
+<tr><td>Worker</td><td>Queue consume karke kaam karne wala process</td><td>Heavy jobs request path se bahar, independent scaling</td><td>Worker crash ho to? Kafka aur worker me farak?</td></tr>
+<tr><td>Rate Limiting</td><td>Requests per time cap</td><td>Abuse, fairness, cost aur stability</td><td>Token bucket vs fixed window? Distributed limiter?</td></tr>
+<tr><td>HTTPS</td><td>HTTP over TLS</td><td>Encryption, server authentication, integrity in transit</td><td>TLS handshake? Certificate kya hai?</td></tr>
+<tr><td>p50</td><td>Median latency: 50% users isse tez</td><td>Typical experience</td><td>p50 achha par users complain kyun?</td></tr>
+<tr><td>p95</td><td>95% requests isse tez</td><td>Zyada users ka realistic slow experience</td><td>SLO p95 pe kyun rakhte hain?</td></tr>
+<tr><td>p99</td><td>99% requests isse tez</td><td>Tail latency; slow outliers dikhata hai</td><td>p99 high, p50 normal: kya check karoge?</td></tr>
+<tr><td>Observability</td><td>Logs + metrics + traces se system samajhna</td><td>Debugging, alerts, bottleneck detection</td><td>API slow hai to kaise investigate?</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ============ 22 ============ -->
+<section id="s22">
+<h2><span class="n">22</span>Mock interview</h2>
+
+<div class="co interview"><b>Interviewer</b>
+<p><b>"Design a URL Shortener like Bitly.</b> Assume: <b>10 million users</b>, <b>100 million redirects/day</b>. Design the complete production architecture."</p>
+</div>
+
+<p>Abhi answer nahi diya ja raha. Neeche interviewer ka evaluation sheet hai: interview me kya poochha jaayega aur kya expected hai. Pehle khud socho, phir answer do.</p>
+
+<h3>1. Requirements questions (tum interviewer se poochho)</h3>
+<ul>
+<li>Sirf shorten + redirect, ya custom alias, expiry, analytics, edit/delete bhi?</li>
+<li>Short URL kitna chhota chahiye? Kaunse characters? Kya guess na kiya ja sake?</li>
+<li>Kya same long URL ke liye same short URL milna chahiye?</li>
+<li>Users authenticated hain? API access bhi?</li>
+<li>Links kab expire hote hain? Kitne saal data rakhna hai?</li>
+<li>Multi-region users? Latency target?</li>
+</ul>
+
+<h3>2. Scale questions</h3>
+<ul>
+<li>100M redirects/day ka average aur peak QPS kya hoga? (Back-of-envelope: average ≈ 1,150/s; peak 5-10x.)</li>
+<li>Read:write ratio kya hai? Naye URLs/day kitne? 5 saal me total URLs kitne?</li>
+<li>Har record ka size kitna? Total storage?</li>
+<li>Kitna traffic cacheable hai (popular links)? Hit ratio target?</li>
+<li>Redirect latency ka SLO kya (p95/p99)?</li>
+</ul>
+
+<h3>3. Functional requirements (expected)</h3>
+<ul>
+<li>Long URL do → unique short URL milna.</li>
+<li>Short URL kholo → original URL par redirect.</li>
+<li>Optional: custom alias, expiry, click analytics, link disable.</li>
+</ul>
+
+<h3>4. Non-functional requirements (expected)</h3>
+<ul>
+<li>Redirect <b>highly available</b> aur <b>low-latency</b> (read path critical).</li>
+<li>Short codes <b>unique</b> aur collision-free; predictable/enumerable nahi.</li>
+<li>Durable storage (links kho nahi sakte).</li>
+<li>Read-heavy system; horizontally scalable; abuse protection (spam/malware links, rate limiting).</li>
+<li>Analytics eventual consistency me chalega, redirect path block nahi karna chahiye.</li>
+</ul>
+
+<h3>5. Expected architecture components</h3>
+<details>
+<summary><b>Interviewer ki checklist (pehle khud socho, phir kholo)</b></summary>
+<ul>
+<li>DNS + CDN/edge caching for popular redirects</li>
+<li>Load balancer + stateless app servers with auto scaling</li>
+<li>Redis cache for short code → long URL (cache-aside, TTL, LRU)</li>
+<li>Database choice with reasoning (key-value/NoSQL vs SQL), primary + replicas, index on short code</li>
+<li>Short code generation strategy (counter + base62, pre-generated key service/ranges, hashing + collision handling)</li>
+<li>301 vs 302 redirect trade-off (caching vs analytics)</li>
+<li>Async click analytics via queue + workers (redirect path me sync write nahi)</li>
+<li>Rate limiting, URL validation/abuse checks, expiry cleanup</li>
+<li>Sharding/partitioning plan and when it is needed (with numbers)</li>
+<li>Observability, failure handling (cache/DB/queue down), multi-AZ / multi-region</li>
+</ul>
+</details>
+
+<h3>6. Follow-up questions</h3>
+<ul>
+<li>Do servers ek hi waqt same short code generate kar dein to collision kaise rokoge?</li>
+<li>Redis down ho jaye aur saari redirects DB pe aa jaayein to?</li>
+<li>Ek viral link pe achanak 1M requests/min aayein (hot key), to?</li>
+<li>Analytics accurate rakhna hai par redirect latency nahi badhani: kaise?</li>
+<li>Kab tak single DB chalega? Sharding kab aur kis key pe karoge?</li>
+<li>Multi-region me ek link ka data kaise consistent rakhoge?</li>
+<li>Malicious/phishing URLs kaise handle karoge?</li>
+</ul>
+
+<div class="co remember"><b>Ab tumhari baari</b>
+<p><b>Apna answer likho.</b> Is order me chalo: (1) requirements clarify, (2) back-of-envelope numbers, (3) high-level architecture diagram, (4) short code generation + data model, (5) read/redirect path (CDN → LB → app → Redis → DB), (6) write path, (7) async analytics, (8) scaling aur failure handling, (9) trade-offs.</p>
+<p>Jab ready ho, apna answer yahin chat me bhejo. Main interviewer ki tarah follow-up sawal poochhunga aur feedback dunga.</p>
+</div>
+</section>
+
+<!-- ============ GOLDEN ============ -->
+<section id="golden">
+<h2>Final golden rules</h2>
+<ol class="golden">
+<li>DNS finds where the service is.</li>
+<li>CDN brings content closer to users.</li>
+<li>Load Balancer distributes traffic.</li>
+<li>Auto Scaling changes server count.</li>
+<li>Stateless servers make scaling easier.</li>
+<li>Redis provides fast shared state/cache.</li>
+<li>Database stores durable business data.</li>
+<li>Replicas improve read scalability.</li>
+<li>Sharding distributes database data/workload.</li>
+<li>Object storage handles files.</li>
+<li>Queues move heavy work out of request paths.</li>
+<li>Workers perform background work.</li>
+<li>Rate limiting protects services.</li>
+<li>HTTPS protects data in transit.</li>
+<li>Observability tells us what is happening.</li>
+<li>p95/p99 expose slow-tail requests.</li>
+<li>Every production design should ask: "What happens when this component fails?"</li>
+</ol>
+</section>
+
+<footer>System Design Master Cheat Sheet. Aankhein band karke bhi apna architecture request ke saath trace kar sako, tab tak revise karo.</footer>
+</main>
+</div>
+<script>
+try{ if(window.innerWidth<1000){ var d=document.querySelector("nav.toc details"); if(d) d.removeAttribute("open"); } }catch(e){}
+</script>
+</body>
+</html>
