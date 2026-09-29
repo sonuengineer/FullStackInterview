@@ -85,9 +85,7 @@
 
 User logged in hai, token valid hai, `/api/users/123/profile` apna data deta hai. Wo `124` kar deta hai -- aur dusre banda ka private data khul jaata hai.
 
-Naam: **IDOR -- Insecure Direct Object Reference**. Server request se aayi ID seedha use kar raha hai, bina check kiye ki *is* user ka *us* object par haq hai ya nahi. API security ki bhasha mein yahi cheez **OWASP API Security Top 10 ka API1: Broken Object Level Authorization (BOLA)** hai -- list ka **#1 risk**.
-
-**Itna common kyun?** Kyunki ownership check **har endpoint par alag se** lagana padta hai. 300 endpoints hain, 299 par check hai, 1 par bhool gaye -- attacker ke liye wahi ek kaafi hai. Aur bhoolna easy hai: apne data par test karoge to sab sahi lagega.
+Naam: **IDOR -- Insecure Direct Object Reference**. Server request se aayi ID seedha use kar raha hai, bina check kiye ki *is* user ka *us* object par haq hai ya nahi. API security ki bhasha mein yahi cheez **OWASP API Security Top 10 ka API1: Broken Object Level Authorization (BOLA)** hai -- list ka **#1 risk**. **Itna common kyun?** Kyunki ownership check **har endpoint par alag se** lagana padta hai: 300 endpoints hain, 299 par check hai, 1 par bhool gaye -- attacker ke liye wahi ek kaafi hai. Aur bhoolna easy hai, kyunki apne data par test karoge to sab sahi lagega.
 
 ## 2. Authentication vs Authorization -- Ek Line Mein
 
