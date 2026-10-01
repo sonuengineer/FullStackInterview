@@ -755,3 +755,685 @@ flowchart TD
 - **Trade-off:** pull model se presence thodi stale dikhegi, aur business inbox banana ek naya product hai -- par alternative (broadcast) ka math kaam hi nahi karta.
 
 ---
+
+## PART 25 -- Node.js Specific Interview Questions
+
+> Ab tak sab architecture tha. Ye section **implementation ka dard** hai: wahi jagahein jahan Node.js ka chat gateway production mein sach mein marta hai. Yaad rakho hamara gateway kya hai -- **250 nodes x 50,000 connections, ~20 KB per connection (~1 GB sirf sockets ke liye), 8 GB RAM per node, 460,000 deliveries/sec peak.** Har answer inhi numbers par tika hai.
+
+### Q1 -- Event loop aur 50,000 sockets
+
+**Interviewer:** "Ek Node process mein 50,000 WebSocket connections hain. Event loop ke hisaab se wahan andar ho kya raha hai? Aur agar main ek bade payload par `JSON.stringify` synchronously chala doon toh kya hoga?"
+
+**My Answer:** "Pehle ek cheez clear kar doon: 50,000 sockets ka matlab 50,000 threads nahi hai. Node ke andar **ek hi JS thread** hai, aur neeche libuv `epoll` se OS ko poochta hai 'in 50,000 file descriptors mein se kis-kis par data aaya hai?'. OS sirf **ready** sockets ki list wapas deta hai -- maan lo 300. Toh ek event loop tick mein JS thread 300 callbacks chalata hai, baaki 49,700 sockets bas kernel ke paas padi hain aur **zero CPU** le rahi hain.
+
+Isliye idle connections sasti hain (woh **memory** ka problem hain, CPU ka nahi) -- aur yahi wajah hai ki hamara bottleneck `ws_connections_active` aur RSS hai, CPU utilization nahi.
+
+Ab aapka doosra sawaal, aur yahi asli dard hai: JS thread **ek** hai, toh jo bhi synchronous kaam main us thread par karunga, us dauraan **baaki 49,999 sockets ke liye duniya ruk jaati hai**. `JSON.stringify` ek 2 MB object par ~15-30 ms le sakta hai. Us 20 ms mein koi frame read nahi hoga, koi frame write nahi hoga, heartbeat timers late chalenge, aur agar ye har fan-out par ho raha hai toh event loop lag badh ke 100 ms+ chala jaayega. Metric mein ye dikhega: `message_delivery_latency_seconds` p95 achanak upar, aur `ws_disconnect_total{reason="heartbeat_timeout"}` bhi upar -- kyunki hamara apna server ping late bhej raha hai, client ka network bilkul theek hai.
+
+Isliye mere do niyam hain: **(1) payload ko spec se bound rakho** -- message body max 4 KB, aur `ws` par `maxPayload` set karke bade frames server tak aane hi mat do. **(2) Fan-out mein serialize ek hi baar karo.** Ek group message 256 members ko jaa raha hai toh 256 baar `JSON.stringify` mat karo -- ek baar string banao aur wahi string 256 sockets par likho."
+
+```ts
+// src/gateway/fanout.ts
+import type { WebSocket } from 'ws';
+import type { ServerFrame } from '../protocol';
+
+export function broadcast(sockets: Iterable<WebSocket>, frame: ServerFrame): number {
+  const payload = JSON.stringify(frame);   // ek hi baar, N baar nahi
+  let written = 0;
+  for (const ws of sockets) {
+    if (ws.readyState !== ws.OPEN) continue;
+    ws.send(payload);                      // same string, N sockets
+    written++;
+  }
+  return written;
+}
+```
+
+**Code Explanation:**
+
+- `JSON.stringify(frame)` loop ke **bahar** -- 256 member group par ye 256 stringify ko 1 bana deta hai. Yahi ek line fan-out ka CPU ~99% kam kar deti hai.
+- `for (const ws of sockets)` -- ye loop synchronous hai, par har iteration bahut chhota (ek `send` jo kernel buffer mein likhta hai aur turant lautta hai). 256 iterations ~0.1 ms, acceptable.
+- `ws.readyState !== ws.OPEN` -- socket closing/closed ho toh `send` throw karta ya silently drop karta hai; pehle hi skip kar do.
+- `ws.send(payload)` ko **string** do, object nahi -- `ws` object ko khud stringify nahi karta, par agar hum Buffer banate toh har socket ke liye alag allocation hoti.
+- `written` return -- isi se `fanout_size` histogram bharta hai (spec ka metric).
+- Dhyaan: agar fan-out 50,000 sockets ka hota (broadcast channel), toh ye loop bhi lamba ho jaata -- tab use `setImmediate` se **chunks** mein todna padta hai (1,000 sockets per tick), warna wahi event loop block wapas aa jaata hai.
+
+```ts
+// src/infra/metrics.ts -- event loop lag ko maapo, warna pata hi nahi chalega
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const h = monitorEventLoopDelay({ resolution: 10 });
+h.enable();
+
+setInterval(() => {
+  metrics.eventLoopLagP99.set(h.percentile(99) / 1e6);   // ns -> ms
+  h.reset();
+}, 10_000).unref();
+```
+
+**Code Explanation:**
+
+- `monitorEventLoopDelay` libuv ke andar se lag maapta hai -- `setInterval` se khud maapne se zyada sahi, kyunki wahi timer bhi toh block ho sakta hai.
+- `resolution: 10` -- har 10 ms sample.
+- `percentile(99) / 1e6` -- nanoseconds ko milliseconds mein. Gateway par mera alert yahan hai: **p99 lag > 50 ms matlab koi sync kaam JS thread kha raha hai.**
+- `h.reset()` -- har scrape ke baad window saaf, warna purana spike hamesha dikhta rahega.
+- `.unref()` -- ye timer process ko zinda na rakhe shutdown ke waqt.
+
+> **Interview line:** "50,000 idle sockets CPU nahi khate -- woh memory khate hain. CPU tab marta hai jab main ek synchronous kaam JS thread par kar deta hoon, aur tab **sab** 50,000 ek saath slow ho jaate hain. Isliye gateway par koi bhi lambi synchronous cheez allowed nahi."
+
+### Q2 -- `ws` vs `uWebSockets.js`: memory kahan jaati hai
+
+**Interviewer:** "Aapne spec mein ~20 KB per connection likha hai. Woh 20 KB jaata kahan hai? Aur `uWebSockets.js` usko kaise kam karta hai?"
+
+**My Answer:** "Ye sawaal mujhe pasand hai kyunki log '20 KB' ratt lete hain par breakdown nahi bata paate. Ek `ws` connection par memory roughly teen jagah jaati hai:
+
+| Kahan | Kitna (approx) | Kyun |
+|---|---|---|
+| **Kernel socket buffers** (send + receive) | 8-12 KB | Har TCP socket ke do buffers hote hain. Ye **Node ke heap mein nahi** hain, par node ki RSS/machine memory mein count hote hain |
+| **TLS state** (OpenSSL per-connection) | 4-8 KB | `wss://` hai, toh har connection ka apna cipher state + read/write BIO buffer. Plain `ws://` hota toh ye bachta |
+| **JS objects** (`ws` instance, `Sender`, `Receiver`, `net.Socket`, hamara session object) | 3-6 KB | Har socket ke liye kai JS objects, unke hidden classes, aur hamara apna `{ userId, deviceId, subscriptions, isAlive }` |
+
+Jod do toh **~20 KB**, aur 50,000 x 20 KB = **~1 GB per node sirf connections ke liye**. Isiliye spec mein node ko 8 GB diya hai -- 1 GB baseline, baaki message buffers, V8 heap, GC headroom aur spikes ke liye.
+
+`uWebSockets.js` C++ mein likha hai aur JS objects ki jagah native structs rakhta hai. Woh **kernel buffers aur TLS ko nahi mita sakta** (woh OS/OpenSSL ka hissa hai), par JS wala hissa aur per-socket overhead bahut chhota kar deta hai -- aur yahi wajah hai ki wahan ek node par **150,000-250,000 connections** realistic ho jaate hain, 50,000 nahi. Part 24 ke #1 mein maine yahi bola tha: 100M connections par raw `ws` 2,500 nodes maangta hai, uWS ~500-700 par nipta deta hai.
+
+**Par main v1-v3 mein `ws` hi rakhunga**, aur wajah honest hai: 250 nodes manageable hain, `ws` ka ecosystem/debugging seedha hai, aur uWS ka API alag hai (Express/middleware ka poora stack badalna padta hai). uWS tab jab per-connection memory **sach mein** hamara cost driver ban jaaye -- matlab jab node count 1,000 paar karne lage."
+
+```ts
+// src/gateway/ws-server.ts -- memory ko config se control karna
+import { WebSocketServer } from 'ws';
+
+export const wss = new WebSocketServer({
+  noServer: true,                 // HTTP server ka upgrade hum khud handle karenge (auth ke liye)
+  maxPayload: 64 * 1024,          // 64 KB; message body spec mein 4 KB hai, ye uska safety margin
+  perMessageDeflate: false,       // << sabse bada memory switch
+  clientTracking: false,          // wss.clients Set hum nahi chahte, apna registry hai
+});
+```
+
+**Code Explanation:**
+
+- `noServer: true` -- `ws` apna HTTP server na banaye; hum `server.on('upgrade')` par pehle JWT verify karenge, phir `wss.handleUpgrade()` call karenge. Fayda: bina auth wale connection ke liye WebSocket object banta hi nahi.
+- `maxPayload: 64 * 1024` -- isse bada frame aaya toh `ws` khud connection close kar deta hai (code 1009). Ye Q1 wale "bada payload = event loop block" attack ko **protocol level par** rok deta hai. Spec ka message limit 4 KB hai; 64 KB isliye rakha ki `resume` frame mein bahut saari conversations ka map aa sakta hai.
+- `perMessageDeflate: false` -- **ye line hazaaron MB bachati hai.** Compression on karne par zlib har connection ke liye ek context allocate karta hai, jo ~300 KB tak ja sakta hai. 50,000 x 300 KB = 15 GB. Hamare messages 300 bytes ke hain -- compress karne ka fayda hi nahi. Bade payload wale systems mein on karo, chat mein kabhi nahi.
+- `clientTracking: false` -- `ws` ka apna `Set` of clients disable; hum `connection-manager.ts` mein apna `Map<userId, Set<WebSocket>>` rakhte hain (Q11), do copies memory mein nahi chahiye.
+
+> **Interview line:** "20 KB mein se zyadatar kernel buffers aur TLS hai -- woh library badalne se nahi jaata. uWS JS-side overhead khatam karta hai. Aur sabse sasta optimization library switch nahi, `perMessageDeflate: false` hai."
+
+### Q3 -- Saare cores kaise use karoge? `cluster` + `SO_REUSEPORT`
+
+**Interviewer:** "Node single-threaded hai, par aapki machine 8-core hai. Ek node par 50,000 connections ek hi core par? Baaki 7 core khaali?"
+
+**My Answer:** "Nahi. Ek **node** matlab ek machine, aur us machine par main `cluster` se **8 worker processes** chalata hoon -- har worker ko ~6,250 connections. Har worker ka apna V8 instance, apna event loop, apna core. Memory thodi duplicate hoti hai (har worker ka apna heap) par ye theek hai.
+
+Asli sawaal ye hai: ek hi port 8080 par 8 processes kaise sunenge? Do tareeke:
+
+1. **Classic `cluster` (SCHED_RR):** primary process port kholta hai aur har naye connection ko round-robin se kisi worker ko handover karta hai. Problem: **primary har connection ke liye ek hop ban jaata hai**, aur 50,000 long-lived connections ke accept storm mein (deploy ke baad reconnect wave) ye primary hi bottleneck hai.
+2. **`SO_REUSEPORT`:** har worker **khud** usi port par listen karta hai, aur **kernel** decide karta hai ki naya SYN kis worker ko jaaye. Koi userland hop nahi, accept load kernel mein distribute hota hai. Node 22 se ye `server.listen({ port, reusePort: true })` se seedha milta hai. Purane Node par `cluster.schedulingPolicy = cluster.SCHED_NONE` se OS ko decide karne do.
+
+Long-lived sockets ke liye main **`reusePort` wala raasta** lunga."
+
+```ts
+// src/server.ts
+import cluster from 'node:cluster';
+import { availableParallelism } from 'node:os';
+import http from 'node:http';
+import { attachGateway } from './gateway/ws-server';
+
+const PORT = Number(process.env.PORT ?? 8080);
+
+if (cluster.isPrimary) {
+  const workers = Number(process.env.WORKERS ?? availableParallelism());
+  for (let i = 0; i < workers; i++) cluster.fork();
+
+  cluster.on('exit', (worker, code, signal) => {
+    logger.error({ pid: worker.process.pid, code, signal }, 'worker died, forking replacement');
+    if (!shuttingDown) cluster.fork();
+  });
+} else {
+  const server = http.createServer();
+  attachGateway(server);                             // 'upgrade' handler + auth
+  server.listen({ port: PORT, reusePort: true });    // Node >= 22: kernel load balances
+  logger.info({ pid: process.pid }, 'gateway worker listening');
+}
+```
+
+**Code Explanation:**
+
+- `cluster.isPrimary` -- primary sirf workers ko fork aur supervise karta hai; usmein koi socket handling nahi.
+- `availableParallelism()` -- `os.cpus().length` se behtar, kyunki container ke cgroup CPU limit ko respect karta hai. Kubernetes mein 2 CPU limit par 64 workers fork karna classic blunder hai.
+- `cluster.on('exit')` -- ek worker mara toh uske saare (~6,250) clients disconnect ho gaye; replacement turant fork karo, warna baaki workers par load aur reconnect dono badh jaate hain. `if (!shuttingDown)` -- graceful shutdown ke dauraan naya worker mat banao (Q7).
+- `server.listen({ port, reusePort: true })` -- har worker apna listening socket banata hai; kernel SYN distribute karta hai. Agar aapka Node 22 se purana hai toh primary mein `cluster.schedulingPolicy = cluster.SCHED_NONE` set karo.
+- Ek important consequence: ab "50,000 connections per node" asal mein "8 workers x ~6,250" hai, aur hamari **session registry mein `nodeId` ko worker-level hona chahiye** (`node-17-w3`), process-level, machine-level nahi. Warna `gw:<nodeId>` par publish karne par galat worker sunega jiske paas socket hai hi nahi.
+
+**Aur worker threads kyun nahi:**
+
+"Worker threads **CPU-bound** kaam ke liye hain -- image resize, crypto, bada parse. Gateway **I/O-bound** hai: socket se bytes padho, JSON parse (microseconds), Redis par bhejo, wapas likho. Agar main socket ko worker thread mein daalun toh:
+
+- Socket (file descriptor) ek hi thread ka hai -- har frame ko main thread se worker tak bhejna padega, aur `postMessage` **structured clone** karta hai (copy). Ye copy khud frame handling se mehenga hai.
+- Workers memory share nahi karte -- mera `Map<userId, Set<WebSocket>>` har worker mein alag hoga, matlab fan-out ke liye intra-process routing ka ek aur layer.
+- Ek machine par 8 worker threads aur 8 cluster processes dono 8 core use karte hain -- par processes **isolated** hain (ek crash hua toh baaki zinda), threads nahi (ek thread ka OOM poora process le jaata hai).
+
+Toh: **cluster/processes for I/O-bound scaling, worker threads for CPU-bound work.** Gateway par worker thread ka ek hi sahi use-case ho sakta hai -- agar hum message body par koi heavy CPU kaam kar rahe hote (E2EE re-encryption, image thumbnail), par hamare design mein media chat server se hoke jaata hi nahi."
+
+### Q4 -- Backpressure aur `socket.bufferedAmount`
+
+**Interviewer:** "Ek user 2G network par hai aur aap use 460K deliveries/sec wale system se messages bhej rahe hain. `ws.send()` toh turant return kar deta hai. Woh data kahan jaa raha hai?"
+
+**My Answer:** "Ye is poore system ka sabse important Node sawaal hai, aur **gateway OOM ka asli kaaran** yahi hai.
+
+`ws.send()` ka return 'bhej diya' ka matlab nahi hai. Flow aisa hai: `send()` bytes ko pehle kernel ke socket send buffer mein likhne ki koshish karta hai. Kernel buffer bhar gaya (kyunki receiver slow hai aur TCP ka receive window chhota ho gaya), toh baaki bytes **Node ke andar, process ki memory mein, ek queue mein** pade rehte hain. `ws` us queue ka size `socket.bufferedAmount` mein batata hai.
+
+Ab picture dekho: ek slow client 50 conversations mein hai, 460K deliveries/sec wale system mein uske paas 2,000 messages/minute aa rahe hain, aur uska socket 20 KB/sec drain kar pa raha hai. Us ek client ka buffer badhta jaayega -- 1 MB, 10 MB, 100 MB. Ek client. Ab **200 aise clients** ek node par -- 20 GB. Node ka 8 GB RAM khatam, OOM kill, aur uske saath **50,000 bilkul healthy connections bhi mar gaye.**
+
+Isiliye spec ka rule hai: **`bufferedAmount > 1 MB` par us client ko drop kar do, close code `1013` (try again later) ke saath.** Woh reconnect karega aur `resume` se `lastSeqByConversation` bhej ke missed messages sync kar lega -- matlab hum **kuch kho nahi rahe**, hum sirf us client ko 'batch mode' par bhej rahe hain. Ek slow client ko sacrifice karna poore node ko girane se hamesha behtar hai."
+
+```ts
+// src/gateway/backpressure.ts
+import type { WebSocket } from 'ws';
+
+const MAX_BUFFERED_BYTES = 1024 * 1024;   // 1 MB -- spec ka threshold
+const SLOW_CLIENT_CLOSE  = 1013;          // "try again later"
+
+export function safeSend(ws: WebSocket, payload: string, ctx: { userId: string; deviceId: string }): boolean {
+  if (ws.readyState !== ws.OPEN) return false;
+
+  metrics.wsBufferedAmountBytes.observe(ws.bufferedAmount);
+
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+    metrics.slowClientDropsTotal.inc({ reason: 'buffered_amount' });
+    logger.warn({ ...ctx, buffered: ws.bufferedAmount }, 'slow client dropped');
+    ws.close(SLOW_CLIENT_CLOSE, 'slow consumer');
+    return false;                          // caller ko pata chale: ye frame gaya nahi
+  }
+
+  ws.send(payload);
+  return true;
+}
+```
+
+**Code Explanation:**
+
+- `metrics.wsBufferedAmountBytes.observe(...)` -- spec ka `ws_buffered_amount_bytes` histogram. Ye metric **pehle se** dekhna hota hai; p99 ka dheere dheere upar jaana OOM ka sabse pehla warning hai.
+- `ws.bufferedAmount > MAX_BUFFERED_BYTES` -- check **send se pehle**, send ke baad nahi. Baad mein check karoge toh ek aur MB chadh chuka hoga.
+- `ws.close(1013, ...)` -- `close()` (`terminate()` nahi) isliye ki client zinda hai, bas slow hai; use proper close frame milega aur woh `1013` dekh ke **backoff ke saath** reconnect karega. `terminate()` karte toh client ko network error lagta aur woh aggressive retry karta.
+- `return false` -- delivery worker/caller ko ye batana zaruri hai, taaki `deliveries_total{result="dropped"}` sahi count ho. "Bhej diya" maan lena hi woh jhooth hai jisse debugging asambhav ho jaati hai.
+- Jo yahan **nahi** hai: koi retry, koi per-user outbound queue. Queue banaoge toh wahi memory problem aapke code mein aa jaayegi -- bas jagah badlegi. **Durable queue hamara message store hai, aur recovery ka tareeka `resume` protocol hai.**
+
+> **Interview line:** "`bufferedAmount` production mein chat gateway ka blood pressure hai. Jo use nahi dekhta, uska node slow clients ki memory se marta hai -- aur crash dump mein kuch bhi galat nahi dikhta."
+
+### Q5 -- Binary frames, Buffers aur streams
+
+**Interviewer:** "WebSocket binary frames support karta hai. Aap JSON bhej rahe ho -- kyun? Aur agar binary bhejna pade toh Node mein kya dhyaan rakhoge?"
+
+**My Answer:** "Hum JSON text frames bhejte hain kyunki hamare messages chhote hain (~300 bytes), protocol debuggable rehta hai (`wscat` se dekh lo), aur har platform ka client bina library ke parse kar leta hai. 23K msg/sec par JSON parse ka CPU hamara bottleneck nahi hai -- memory hai.
+
+Binary (MessagePack/protobuf) ka fayda tab hai jab payload bada ho ya rate bahut high ho. Hamare 300-byte message par binary ~30-40% bytes bachayega par debuggability khatam kar dega -- v1 mein ye trade galat hai.
+
+Jahan binary sach mein aata hai: **media**. Aur hamara design mein media **gateway se hoke jaata hi nahi** -- client S3 par presigned URL se direct upload karta hai aur message mein sirf `mediaKey` jaata hai. Ye decision hi hamein 30 TB/day gateways se bachata hai. Agar hum galti se media socket par leta, toh har upload ek **stream** banta aur Node mein uska sahi handling yeh hoti:"
+
+```ts
+// agar kabhi binary frame handle karna pada -- do raaste
+const MAX_BINARY_BYTES = 64 * 1024;
+
+ws.on('message', (data: Buffer | Buffer[], isBinary: boolean) => {
+  if (!isBinary) {
+    handleTextFrame(data.toString('utf8'));        // hamara normal JSON path
+    return;
+  }
+  // ws fragmented frame par Buffer[] de sakta hai
+  const buf = Array.isArray(data) ? Buffer.concat(data) : data;
+  if (buf.length > MAX_BINARY_BYTES) {
+    ws.close(1009, 'message too big');             // 1009 = Message Too Big
+    return;
+  }
+  handleBinaryFrame(buf);
+});
+```
+
+**Code Explanation:**
+
+- `ws.on('message', (data, isBinary))` -- `ws` v8+ mein doosra argument batata hai ki frame text tha ya binary. **`data.toString()` ko blindly mat karo**: binary frame par woh garbage string banata hai aur memory bhi double.
+- `Array.isArray(data)` -- jab client ne message ko fragments mein bheja ho, `ws` aapko chunks ka array de sakta hai. `Buffer.concat` unhe jodta hai -- aur yahi line khatarnak hai, kyunki concat ek **nayi allocation** hai.
+- `buf.length > MAX_BINARY_BYTES` -- concat ke **baad** check karna der ho chuki hoti hai; asli protection `WebSocketServer({ maxPayload })` hai (Q2) jo frame ko accept hi nahi karta. Ye check second line of defence hai.
+- `ws.close(1009)` -- standard "Message Too Big" close code.
+- **Streams kab:** jab data itna bada ho ki poora memory mein lena hi galat ho (file upload). Tab pattern hota hai `pipeline(socketStream, hashCheck, s3Upload)` -- aur Node streams ka asli fayda built-in backpressure hai (slow S3 khud-ba-khud read slow kar deta hai). Par hamare design mein ye poora code **hai hi nahi**, kyunki presigned S3 upload client ko seedha S3 se baat karwa deta hai. Jo code nahi likha, wahi sabse reliable code hai.
+
+> **Interview line:** "Chat ke liye JSON text frames sahi hain. Binary ka asli case media hai, aur media ko humne design se hi gateway se bahar rakha hai -- isliye streams ka dard hamare gateway par aata hi nahi."
+
+### Q6 -- Heartbeat: `ping`/`pong`, aur `terminate()` vs `close()`
+
+**Interviewer:** "Client ka laptop ka lid band ho gaya. TCP connection ko ye pata kaise chalega? Aur aap `close()` karoge ya `terminate()`?"
+
+**My Answer:** "TCP ko pata **nahi** chalega -- yahi poori problem hai. Lid band hone par koi FIN packet nahi jaata, koi RST nahi aata. Server ke liye connection bilkul zinda dikhti hai (**half-open connection**). Agar main kuch na karun toh:
+
+- Session registry mein `conn:<userId>:<deviceId>` zinda rahegi,
+- Delivery worker us node par publish karta rahega,
+- Hum `delivered` maan lenge jo kabhi hua hi nahi,
+- Aur woh socket apni 20 KB memory hamesha ke liye roke rahegi.
+
+Isliye spec ka rule: **server har 30 s `ping` bhejta hai, 2 miss (60 s) par connection band + registry se entry delete.** Dhyaan do -- ye **WebSocket protocol-level ping** hai, hamara JSON `{type:'ping'}` frame nahi. Protocol-level ping ka fayda ye hai ki **browser uska `pong` apne aap bhejta hai**, JavaScript chale ya na chale. Background tab mein `setInterval` throttle ho jaata hai (Part 24 ka #11), par protocol pong phir bhi aata hai."
+
+```ts
+// src/gateway/heartbeat.ts
+import type { WebSocket, WebSocketServer } from 'ws';
+
+const PING_INTERVAL_MS = 30_000;   // spec: 30 s
+type Live = WebSocket & { isAlive?: boolean; ctx?: { userId: string; deviceId: string } };
+
+export function startHeartbeat(wss: WebSocketServer, sessions: SessionRepository) {
+  wss.on('connection', (ws: Live) => {
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });     // protocol pong, browser auto-bhejta hai
+  });
+
+  const timer = setInterval(() => {
+    for (const ws of connectionManager.allSockets() as Iterable<Live>) {
+      if (ws.isAlive === false) {                     // pichhla ping ka pong nahi aaya
+        metrics.wsDisconnectTotal.inc({ reason: 'heartbeat_timeout' });
+        void sessions.remove(ws.ctx!.userId, ws.ctx!.deviceId);
+        ws.terminate();                               // close() NAHI
+        continue;
+      }
+      ws.isAlive = false;
+      ws.ping();
+    }
+  }, PING_INTERVAL_MS);
+
+  timer.unref();
+  return () => clearInterval(timer);
+}
+```
+
+**Code Explanation:**
+
+- `ws.isAlive = true` connection par, aur har `pong` par wapas `true`. Ye classic `ws` heartbeat pattern hai.
+- `ws.on('pong', ...)` -- protocol-level pong. Isme koi application code client par nahi chahiye; browser aur `ws` client dono apne aap jawab dete hain.
+- Loop mein pehle **check** phir `isAlive = false` phir `ping()` -- matlab har socket ke paas jawab dene ke liye poora 30 s window hai. `isAlive` do baar `false` milna = 60 s chup = spec ka "2 miss".
+- `sessions.remove(...)` -- **registry se entry hatana ping timeout par sabse zaruri kaam hai.** Nahi hataoge toh TTL 90 s tak delivery worker is mare hue socket par publish karta rahega aur messages chup-chaap gir jaayenge.
+- `ws.terminate()` aur `ws.close()` ka farak -- yahi asli sawaal hai:
+
+| | `ws.close(code, reason)` | `ws.terminate()` |
+|---|---|---|
+| **Kya karta hai** | Close frame bhejta hai aur peer ke close frame ka **intezaar** karta hai (graceful handshake) | TCP socket ko turant phaad deta hai, koi handshake nahi |
+| **Client ko kya dikhta hai** | `onclose` with `event.code` aur `event.wasClean = true` -- woh code dekh ke decide kar sakta hai | Network error jaisa close, `wasClean = false` |
+| **Kab sahi hai** | Jab peer **zinda** hai: slow client drop (`1013`), auth fail (`4001`), graceful drain (Q7). Hum chahte hain client ko reason mile taaki woh sahi backoff kare | Jab peer **mar chuka hai**: heartbeat timeout. Dead peer close frame ka jawab kabhi nahi dega -- `close()` karoge toh socket 30 s ke timeout tak **latki rahegi**, memory roke hue |
+
+- Isliye niyam: **"Zinda client ko `close()` ek code ke saath; mare hue client ko `terminate()`."** Heartbeat timeout matlab client already mar chuka hai -- wahan `close()` ka matlab hi nahi.
+- `timer.unref()` -- shutdown par ye akela timer process ko zinda na rakhe.
+
+### Q7 -- Graceful shutdown jo reconnect storm na banaye
+
+**Interviewer:** "Deploy ke liye aapko 250 nodes restart karne hain. Har node par 50,000 connections hain. `process.exit()` kyun nahi?"
+
+**My Answer:** "Kyunki `process.exit()` 50,000 TCP connections ko ek **hi instant** mein RST ke saath maar deta hai. 50,000 clients ko ek saath network error dikhta hai, aur woh sab **ek saath** reconnect karte hain -- woh bhi bina kisi code ke jo unhe batata ki thoda ruk jao. Load balancer un 50,000 ko baaki 249 nodes par daal deta hai, jo ek achanak accept + TLS handshake spike hai. Aur TLS handshake CPU-heavy hai, toh agla node bhi slow hota hai, uske heartbeats late hote hain, uske clients bhi reconnect karte hain -- **yahi hamara signature failure, thundering herd hai** (spec ka `reconnect_storm_rate` metric isi ke liye hai).
+
+Aur ek rolling deploy mein ye 250 baar hota hai.
+
+Isliye mera shutdown **waves** mein hota hai: readiness fail karo, LB naye connections bhejna band kare, phir connections ko **batches mein, gaps ke saath** close karo -- har close par code `1013` ('try again later') taaki client ka backoff logic trigger ho, na ki aggressive retry."
+
+```ts
+// src/gateway/shutdown.ts
+const DRAIN_CLOSE_CODE = 1013;          // "try again later" -- client full-jitter backoff kare
+const WAVE_SIZE = 2_000;                // 50,000 / 2,000 = 25 waves
+const WAVE_GAP_MS = 2_000;              // 25 x 2 s = ~50 s drain
+
+export async function gracefulShutdown(server: http.Server) {
+  shuttingDown = true;
+  readiness.setReady(false);                        // /ready -> 503, LB is node ko hata dega
+  await sleep(5_000);                               // LB ko health check fail dekhne ka time
+
+  server.close();                                   // naye HTTP/upgrade requests band
+
+  const sockets = [...connectionManager.allSockets()];
+  for (let i = 0; i < sockets.length; i += WAVE_SIZE) {
+    for (const ws of sockets.slice(i, i + WAVE_SIZE)) {
+      void sessions.remove(ws.ctx.userId, ws.ctx.deviceId);   // registry pehle saaf
+      ws.close(DRAIN_CLOSE_CODE, 'server draining');
+    }
+    metrics.wsDisconnectTotal.inc({ reason: 'drain' }, Math.min(WAVE_SIZE, sockets.length - i));
+    await sleep(WAVE_GAP_MS);
+  }
+
+  await Promise.allSettled([kafka.disconnect(), redis.quit(), pg.end()]);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void gracefulShutdown(server));
+```
+
+**Code Explanation:**
+
+- `readiness.setReady(false)` **sabse pehle** -- `/ready` 503 dene lagta hai, LB is node ko rotation se nikaal deta hai. Agar ye na karein toh jin clients ko hum abhi drop kar rahe hain, LB unhe wapis **isi marte hue node** par bhej dega.
+- `await sleep(5_000)` -- LB ke health check interval ko hisaab mein lo (usually 2-5 s, 2 fail par remove). Ye paanch second ignore karna sabse common production bug hai.
+- `server.close()` -- naye connections band, purane chalte rahenge. Ye aur `process.exit()` ka farak hi poora answer hai.
+- `WAVE_SIZE = 2_000` aur `WAVE_GAP_MS = 2_000` -- 50,000 clients 25 waves mein, ~50 s mein. Reconnect rate ab 50,000/instant ki jagah **1,000/sec** hai, jise baaki fleet aaram se absorb kar leti hai. Ye numbers tune karne layak hain: `drainTime = (conns / waveSize) * gap`, aur ise Kubernetes ke `terminationGracePeriodSeconds` se **kam** rakho (warna k8s beech mein `SIGKILL` de dega aur poora fayda khatam).
+- `sessions.remove(...)` close se **pehle** -- warna us chhote window mein delivery worker is node par publish karega aur message gir jaayega. (At-least-once + `resume` usse bacha lega, par `deliveries_total{result="no_session"}` kyun badhaana.)
+- `ws.close(1013, 'server draining')` -- `terminate()` **nahi**, kyunki client zinda hai aur hum chahte hain use saaf close code mile. Client side par `1013` ka matlab hai: full-jitter backoff `random(0, min(30s, 2^attempt))` se reconnect karo -- wahi formula jo spec mein hai.
+- `Promise.allSettled([...])` -- Kafka/Redis/PG ko band karo, par ek ke fail hone par baaki na rukein. `allSettled`, `all` nahi.
+- `process.on('SIGTERM')` -- Kubernetes/systemd pehle SIGTERM bhejta hai; agar handler nahi hai toh Node default behaviour = turant exit = wahi storm jo hum rok rahe the.
+
+> **Interview line:** "Shutdown ek rate-limiting problem hai, cleanup problem nahi. 50,000 clients ko ek saath nahi, 1,000 per second ke hisaab se jaane do -- aur unhe close code se batao ki backoff karein."
+
+### Q8 -- `ulimit -n` aur `net.core.somaxconn`
+
+**Interviewer:** "Aapne likha hai har node par `ulimit -n >= 200,000`. 50,000 connections ke liye 200,000 kyun? Aur OS level par aur kya tune karoge?"
+
+**My Answer:** "Pehle basic: Linux mein har cheez file descriptor hai -- har TCP socket, har file, har pipe. `ulimit -n` ek process ke liye max open fd ka cap hai. **Default aksar 1024 hota hai**, aur yahi is poore system ka sabse classic production trap hai: aapka server 1,024 connections tak bilkul theek chalega, aur 1,025th par `EMFILE: too many open files` phenk ke naye connections lena band kar dega. Load test chhota tha toh kabhi pata hi nahi chalega.
+
+200,000 kyun jab connections 50,000 hain? Kyunki fd sirf client sockets ke liye nahi hain:
+
+| Kaun fd leta hai | Kitne |
+|---|---|
+| Client WebSocket connections | 50,000 |
+| Redis Cluster connections (session registry + pub/sub, har worker se) | ~100 |
+| Kafka broker connections | ~50 |
+| Postgres pool connections | ~50 |
+| Outbound HTTP (notification service, metrics push), log files, DNS sockets | ~100 |
+| **TIME_WAIT / closing sockets** jo reconnect churn ke dauraan jama hote hain | **yahi sabse bada buffer** |
+
+Aakhri row hi 4x headroom ki asli wajah hai: ek reconnect storm ke dauraan purane 50,000 sockets abhi `TIME_WAIT`/`FIN_WAIT` mein hain aur naye 50,000 aa rahe hain. Us pal fd count dogna ho jaata hai. 4x rakhna sasta hai (fd ek integer hai, memory nahi khata), aur kam rakhne ka nateeja outage hai.
+
+OS level par main teen cheezein aur tune karta hoon:
+- **`net.core.somaxconn`** -- accept queue ki lambai. Default 128 (ya 4096 naye kernels par). 50,000 clients ek saath reconnect karein aur meri app accept karne mein ek pal bhi lagaye, toh queue bhar jaati hai aur kernel **SYN chup-chaap drop** kar deta hai -- client ko lagta hai network kharab hai. Main ise 65535 karta hoon **aur** `server.listen({ backlog })` bhi badhata hoon, kyunki Node ka default backlog 511 hai -- sysctl badalne se Node ka apna backlog nahi badalta. Ye do-jagah wali galti bahut common hai.
+- **`net.ipv4.ip_local_port_range`** -- ye gateway par nahi, hamare **load balancer aur load-generator** par matter karta hai (outbound ports khatam ho jaate hain).
+- **`net.ipv4.tcp_tw_reuse`** -- `TIME_WAIT` sockets ka reuse, reconnect churn mein madad karta hai."
+
+```ts
+// src/infra/fd-guard.ts -- startup par verify karo, chalu hone ke baad discover mat karo
+import { execFileSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+
+const REQUIRED_FDS = 200_000;
+
+export function assertFdLimit() {
+  const hard = Number(execFileSync('sh', ['-c', 'ulimit -n']).toString().trim());
+  if (!Number.isFinite(hard) || hard < REQUIRED_FDS) {
+    logger.error({ current: hard, required: REQUIRED_FDS },
+      'fd limit too low -- gateway will fail with EMFILE under load');
+    process.exit(1);                      // boot hi mat ho
+  }
+}
+
+export function openFdCount(): number {
+  return readdirSync('/proc/self/fd').length;      // abhi kitne fd khule hain
+}
+```
+
+**Code Explanation:**
+
+- `ulimit -n` ko startup par padho aur **kam ho toh process ko boot hi mat hone do**. Ye "fail fast" hai: ek pod jo start hi nahi hua woh CI/deploy mein turant dikh jaata hai; ek pod jo 1,024 connections par chup-chaap fail karta hai woh raat 2 baje pata chalta hai.
+- `process.exit(1)` -- Kubernetes ise CrashLoopBackOff dikhayega with a clear log line. Ye silent degradation se hamesha behtar hai.
+- `readdirSync('/proc/self/fd').length` -- abhi kitne fd khule hain. Main ise ek gauge metric banata hoon (`process_open_fds`) aur alert lagata hoon **80% par** -- warna `EMFILE` bina kisi warning ke aata hai.
+- Dhyaan: container mein limit **Dockerfile ya Kubernetes se** aati hai, Node se set nahi hoti. Docker: `--ulimit nofile=200000:200000`. Kubernetes mein ye node-level sysctl/kubelet config hai, pod spec mein seedha nahi milta -- isliye infra team se baat karni padti hai. Interview mein ye bolna ki "ye app ka setting nahi, platform ka setting hai" maturity dikhata hai.
+- Aur `server.listen({ port, backlog: 65535, reusePort: true })` -- sysctl ke saath Node ka backlog bhi.
+
+> **Interview line:** "Default `ulimit -n` 1024 hai. Jo engineer ye nahi jaanta, uska chat server exactly 1,024 users par marta hai -- aur CPU, memory, latency sab graph par green dikhte hain."
+
+### Q9 -- Postgres connections, 250 gateway nodes, aur pgBouncer
+
+**Interviewer:** "250 gateway nodes hain. Har node Postgres se baat karega. Connection pool ka size kya rakhoge? Math karo."
+
+**My Answer:** "Pehle ek design point jo is sawaal ka aadha jawab hai: **hamare gateway nodes Postgres se seedha baat nahi karte.** Gateway ka kaam socket terminate karna, auth, frame routing aur Redis session registry hai. Postgres ko **Chat Service** (stateless tier) aur workers touch karte hain. Ye separation hi connection count ko kaabu mein rakhta hai.
+
+Par math phir bhi karte hain, kyunki sawaal yahi hai:
+
+```
+Agar har gateway node Postgres se baat kare:
+  250 nodes x 8 cluster workers          = 2,000 processes
+  har process mein pool max 10           = 20,000 Postgres connections
+  Postgres default max_connections       = 100
+  Aggressive tuned max_connections       = 500 (iske upar jaana ulta nuksan hai)
+  20,000 / 500                           = 40x oversubscribed  [X]
+```
+
+**Code Explanation:**
+
+- `250 nodes x 8 cluster workers` -- har cluster worker ek **alag process** hai jiska apna pool hai. Log yahan 250 gin ke ruk jaate hain; asli multiplier workers ka hai.
+- `pool max 10` -> 20,000 -- pool ka `max` hamesha **per process** hota hai, fleet-wide nahi. Yahi is poore calculation ki jaan hai.
+- `max_connections = 100 / 500` -- Postgres mein har connection ek **alag OS process** hai (thread nahi), jiska apna ~5-10 MB footprint hai, aur sab ek shared lock/snapshot structure par compete karte hain. 500 ke upar jaake throughput badhta nahi, **girta** hai -- context switching aur lock contention mein. Ye 'bas `max_connections` badha do' wali galti ka seedha jawab hai.
+- `40x oversubscribed [X]` -- matlab ye design chalega hi nahi: app start hote hi `FATAL: sorry, too many clients already` milega, aur woh bhi deploy ke beech mein jab aadhe pods purane aur aadhe naye connections pakde baithe hain.
+
+Isliye do cheezein:
+
+1. **Sahi architecture:** gateways ko Postgres se door rakho. Chat Service ke ~50 instances x 4 workers x pool 10 = **2,000 connections** -- abhi bhi zyada.
+2. **pgBouncer** (transaction pooling mode): app 2,000 client connections pgBouncer se banata hai; pgBouncer Postgres se sirf **~100-200 server connections** rakhta hai aur unhe **transaction ke hisaab se** reuse karta hai. Jab tak 2,000 mein se sirf ~100 ek pal mein sach mein query chala rahe hain (aur chat mein yahi sach hai -- queries ~2 ms ki hain), ye aaram se chalta hai."
+
+```ts
+// src/infra/postgres.ts
+import { Pool } from 'pg';
+
+export const pg = new Pool({
+  host: config.pgBouncerHost,            // app -> pgBouncer, Postgres se seedha NAHI
+  port: 6432,                            // pgBouncer ka default port
+  max: 10,                               // per process; 4 workers = 40 per instance
+  min: 2,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 2_000,        // pool khaali -> 2 s mein fail, hamesha ke liye wait nahi
+  statement_timeout: 3_000,              // ek slow query poora pool na roke
+  application_name: `chat-service-${process.env.POD_NAME}`,
+});
+```
+
+**Code Explanation:**
+
+- `host: config.pgBouncerHost`, `port: 6432` -- app ke liye pgBouncer bilkul Postgres jaisa dikhta hai; code mein koi aur badlav nahi.
+- `max: 10` -- **per process**, per instance nahi. Sabse common galti yahi hai: log `max` ko fleet-wide socha karte hain. Asli number = `max x workers x instances`. Chat ki queries 2-5 ms ki hain, toh ek process ko 10 se zyada ki zarurat hi nahi.
+- `connectionTimeoutMillis: 2_000` -- pool khatam hone par request **fail** ho, anant intezaar na kare. Bina iske, DB slow hone par aapke saare requests memory mein queue ban jaate hain -- wahi backpressure problem jo Q4 mein thi, bas dusre layer par.
+- `statement_timeout: 3_000` -- ek bhatki hui query poora pool block na kar sake.
+- `application_name` -- `pg_stat_activity` mein dikhta hai; incident ke waqt "ye 400 connections kaun khol raha hai" ka jawab 10 second mein mil jaata hai.
+- **pgBouncer transaction mode ki keemat (ye bolna zaruri hai):** session-level features toot jaate hain -- `SET` statements, session advisory locks, `LISTEN/NOTIFY`, aur **prepared statements** (pgBouncer 1.21 se support hai, usse pehle `pg` mein named prepared statements band karne padte the). Toh pgBouncer free nahi hai, par 2,000 connections ka alternative isse kahin bura hai.
+- Redis se contrast: Redis connection **multiplexed** hai -- ek connection par hazaaron in-flight commands pipeline ho sakti hain, isliye wahan pool chahiye hi nahi (ek client per process kaafi). Postgres mein ek connection ek hi query ek time par chala sakta hai. Yahi farak hai jo ye poora sawaal banata hai.
+
+### Q10 -- Frame handler ke andar timeouts aur `AbortController`
+
+**Interviewer:** "Ek `send` frame handle karte waqt aap Redis, Postgres aur Kafka -- teeno ko call karte ho. Agar unme se koi hang ho jaaye toh?"
+
+**My Answer:** "Toh woh `await` hamesha ke liye latka rehta hai, aur uske saath hamare paas ek **adhoori request memory mein** padi rehti hai: closure, frame ka data, user ka context. Ek hang nahi, 50,000 clients ka traffic -- har second hazaaron aise atke hue awaits jama hote hain. Ye gateway OOM ka **doosra** raasta hai (pehla Q4 ka backpressure tha).
+
+Mera niyam: **har downstream call ka ek deadline hona chahiye, aur ek bhi `await` bina timeout ke nahi.** Node mein iska modern tareeka `AbortController` + `AbortSignal.timeout()` hai."
+
+```ts
+// src/services/chat.service.ts
+const SEND_BUDGET_MS = 400;              // p95 delivery budget 500 ms hai; 400 ms hamara server-side cap
+
+export async function handleSend(ctx: SocketCtx, frame: SendFrame): Promise<void> {
+  const signal = AbortSignal.timeout(SEND_BUDGET_MS);
+
+  try {
+    const ok = await conversations.isMember(frame.conversationId, ctx.userId, { signal });
+    if (!ok) return send(ctx.ws, { type: 'error', code: 'NOT_A_MEMBER', message: 'not a member' });
+
+    const seq = await redis.incr(`seq:${frame.conversationId}`);
+    const saved = await messages.insert({ ...frame, senderId: ctx.userId, seq }, { signal });
+
+    send(ctx.ws, { type: 'ack', messageId: saved.messageId, seq: saved.seq, serverTs: saved.createdAt });
+
+    await kafka.send({ topic: 'chat-events', messages: [{ key: frame.conversationId, value: JSON.stringify(saved) }] });
+  } catch (err) {
+    if ((err as Error).name === 'TimeoutError' || signal.aborted) {
+      metrics.sendTimeoutTotal.inc();
+      return send(ctx.ws, { type: 'error', code: 'TIMEOUT', message: 'please retry' });
+    }
+    throw err;                            // asli bug -- upar error handler par
+  }
+}
+```
+
+**Code Explanation:**
+
+- `AbortSignal.timeout(400)` -- Node 17.3+ ka built-in. Ye ek signal deta hai jo 400 ms baad apne aap abort ho jaata hai; `clearTimeout` ki jhanjhat nahi, aur timer `unref`'d hai.
+- Ek hi `signal` poore handler ke liye -- matlab ye **per-call timeout nahi, poori request ka budget** hai. Teen calls 150 ms each lein toh teesri cut ho jaayegi. Yahi sahi hai: client ka SLA poore `send` par hai, individual query par nahi.
+- `{ signal }` ko har downstream call mein pass karna **zaruri** hai -- `pg` aur `kafkajs` jo signal support nahi karte, unke liye main ek chhota `withTimeout(promise, signal)` wrapper rakhta hoon. **Signal banana aur use pass na karna** sabse common aadha-adhoora implementation hai: timeout "lagta hai" par kuch cancel nahi hota.
+- `send(ack)` **persist ke baad** -- spec ka durability rule: `sent` tick tabhi jab message sach mein store ho chuka ho. Kafka ke baad nahi, Kafka se pehle bhi nahi -- insert ke turant baad.
+- Kafka `send` `ack` ke **baad** hai jaan-boojh kar: agar Kafka slow hai toh bhi user ko uska tick time par mil jaata hai (message durable hai), aur delivery thodi late hoti hai. Trade-off saaf hai.
+- `err.name === 'TimeoutError'` -- abort ki wajah se aaya error aur asli bug alag karo. Timeout par client ko `error` frame milta hai aur woh **wahi `messageId`** retry karta hai -- idempotency (`ON CONFLICT` on `(conversation_id, message_id)`) duplicate nahi banne deti. Ye poora loop tabhi safe hai jab `messageId` client-generated UUID ho, jo hamare spec mein hai.
+- `throw err` -- jo samajh nahi aaya use chhupao mat; upar wala handler log karega aur metric badhega.
+
+### Q11 -- Socket `Map` ka memory leak (buggy code + fix)
+
+**Interviewer:** "Aapka gateway 6 ghante chalta hai aur memory dheere dheere badhti rehti hai, par `ws_connections_active` flat hai. Kya ho raha hai?"
+
+**My Answer:** "Ye classic hai, aur `ws_connections_active` ka flat hona hi sabse bada clue hai: connections **count** mein nahi badh rahe, par unke JS objects release nahi ho rahe. Matlab maine socket ko kisi `Map` mein daala aur **disconnect par nikaala nahi**.
+
+Ek socket object apne saath buffers, TLS state aur mera context pakde rehta hai -- ~20 KB. 50,000 connections ek din mein (churn ke saath) kai baar aate-jaate hain. Agar main 100,000 dead sockets rok loon toh 2 GB ja chuke. GC unhe reclaim nahi kar sakta, kyunki **mera `Map` unka reference pakde baitha hai** -- aur GC ke liye reference ka matlab 'zinda' hai.
+
+Pehle **galat code**, jo pehli nazar mein bilkul theek lagta hai:"
+
+```ts
+// [X] BUGGY -- connection-manager.ts
+class ConnectionManager {
+  private byUser = new Map<string, Set<WebSocket>>();
+
+  add(userId: string, ws: WebSocket) {
+    let set = this.byUser.get(userId);
+    if (!set) { set = new Set(); this.byUser.set(userId, set); }
+    set.add(ws);
+  }
+
+  socketsFor(userId: string): Set<WebSocket> {
+    return this.byUser.get(userId) ?? new Set();
+  }
+  // remove() hai hi nahi -- aur 'close' par koi cleanup nahi
+}
+```
+
+**Code Explanation:**
+
+- `byUser` har socket ka **strong reference** rakhta hai. Socket close hone par `ws` library apna kaam kar deti hai, par **mera** reference bacha rehta hai -- toh V8 us object ko, uske buffers ko, aur uske saare closures ko reclaim nahi kar sakta.
+- `remove()` method ka na hona bug nahi dikhta kyunki code compile hota hai, tests pass hote hain (unit test mein ek connection kholo-band karo, koi assert nahi karta ki Map khaali hua).
+- Doosra, chhupa hua leak: agar `remove` hota bhi aur sirf `set.delete(ws)` karta, toh **khaali `Set` phir bhi `byUser` mein pada rehta.** Ek `Set` chhota hai (~100 bytes) par 50M users ke system mein lakhon khaali Sets = sau MB, aur `byUser.size` badhta hi jaata hai. Ye wala leak dhoondhna sabse mushkil hai.
+
+**Ab fix:**
+
+```ts
+// [OK] FIXED -- connection-manager.ts
+class ConnectionManager {
+  private byUser = new Map<string, Set<WebSocket>>();
+  private bySocket = new WeakMap<WebSocket, { userId: string; deviceId: string }>();
+
+  add(userId: string, deviceId: string, ws: WebSocket) {
+    let set = this.byUser.get(userId);
+    if (!set) { set = new Set(); this.byUser.set(userId, set); }
+    set.add(ws);
+    this.bySocket.set(ws, { userId, deviceId });
+
+    const cleanup = () => this.remove(userId, ws);
+    ws.once('close', cleanup);
+    ws.once('error', cleanup);              // error ke baad 'close' aata hai, par 'once' double-run safe hai
+  }
+
+  remove(userId: string, ws: WebSocket) {
+    const set = this.byUser.get(userId);
+    if (!set) return;
+    set.delete(ws);
+    if (set.size === 0) this.byUser.delete(userId);   // << khaali Set bhi hatao
+    metrics.wsConnectionsActive.set(this.size());
+  }
+
+  size(): number {
+    let n = 0;
+    for (const set of this.byUser.values()) n += set.size;
+    return n;
+  }
+}
+```
+
+**Code Explanation:**
+
+- `ws.once('close', cleanup)` -- **har** socket ka ek hi exit raasta hona chahiye, aur wahi registry saaf kare. `on` ki jagah `once` isliye ki listener khud bhi leak na ho.
+- `ws.once('error', cleanup)` -- `ws` mein `error` ke baad usually `close` bhi aata hai, par kuch edge cases (ECONNRESET during handshake) mein nahi. Dono par cleanup = `once` ki wajah se idempotent.
+- `if (set.size === 0) this.byUser.delete(userId)` -- **yahi woh line hai jo log bhool jaate hain.** Iske bina `byUser.size` monotonically badhta rahega aur aapko ek dheema, saal bhar chalne wala leak milega jo sirf lambe-chalte pods par dikhta hai.
+- `bySocket` ko `WeakMap` banaya -- socket ka reference kahin aur na ho toh ye entry GC apne aap utha leta hai. Note: `WeakMap` sirf tab madad karta hai jab **doosri jagah strong reference na ho**; isliye `byUser` ki cleanup ab bhi manual hai. `WeakMap` leak ka ilaaj nahi, bas ek layer kam karta hai.
+- `metrics.wsConnectionsActive.set(this.size())` -- `size()` O(users) hai, isliye isse har disconnect par chalana 50,000 par mehenga ho jaata hai; production mein main ek counter maintain karta hoon aur `size()` sirf ek periodic scrape par. (Yahan clarity ke liye simple rakha hai.)
+- **Leak dhoondhne ka tareeka** (ye bolna aapko senior dikhata hai): (1) `process.memoryUsage().heapUsed` ko ek gauge banao aur 2 ghante ka slope dekho -- flat traffic par chadhta slope = leak. (2) Do heap snapshots lo (`node --heapsnapshot-signal=SIGUSR2` ya `v8.writeHeapSnapshot()`), Chrome DevTools mein 'Comparison' view par dekho kaun sa object count badh raha hai. (3) Us object par 'Retainers' dekho -- woh seedha aapke `byUser` Map par ungli rakh dega. (4) `--max-old-space-size` ko realistically set karo aur `--heapsnapshot-near-heap-limit=1` rakho taaki OOM se **pehle** apne aap snapshot gir jaaye; production OOM ke baad kuch nahi milta.
+
+> **Interview line:** "Connections flat hain par memory badh rahi hai -- iska matlab lagbhag hamesha ek `Map` hai jiska `delete` kisi ne nahi likha. Aur agar `delete` likha bhi hai, toh dekho ki khaali `Set` hata rahe ho ya nahi."
+
+### Q12 -- Client ka `userId` kabhi mat maano
+
+**Interviewer:** "Aapke frame spec mein `send` frame hai. Agar client usmein `senderId` bhej de toh?"
+
+**My Answer:** "Toh ye system ka **sabse bada security hole** ban jaata hai, aur dhyaan do ki hamare `ClientFrame` spec mein `senderId` hai hi nahi -- ye jaan-boojh kar hai.
+
+Niyam simple hai: **identity socket par bandhi jaati hai, ek baar, auth ke waqt. Uske baad har frame ki identity socket se aati hai, frame se kabhi nahi.**
+
+Agar main frame par bharosa karun toh attacker apne hi socket se `{ type:'send', senderId:'<boss-ka-id>', conversationId:'...' }` bhej ke kisi aur ke naam se message daal dega. Aur ye sirf spoofing nahi -- `receipt` frame par `userId` spoof karke woh dusre ka 'read' mark kar dega, `typing` se fake presence banayega, aur rate limits bhi bypass ho jaayengi kyunki woh per-user lagti hain.
+
+Flow ye hai: connect -> pehla frame `auth` with JWT -> **server token verify karta hai** -> `ws.ctx = { userId, deviceId }` set hota hai (server-side, frozen) -> session registry mein `conn:<userId>:<deviceId> = nodeId` -> uske baad har frame par `ctx.userId` use hota hai.
+
+Aur ek doosri cheez jo isi ke saath jaati hai: **authorization har `send` par.** Identity sahi hona kaafi nahi -- ye bhi check karna hai ki ye user us `conversationId` ka member hai. Warna koi bhi authenticated user kisi bhi random conversation ID par message bhej sakta hai aur padh sakta hai."
+
+```ts
+// src/gateway/frame-router.ts
+type SocketCtx = Readonly<{ userId: string; deviceId: string; authedAt: number }>;
+
+export function routeFrame(ws: Live, raw: string): void {
+  let frame: ClientFrame;
+  try { frame = parseClientFrame(raw); }          // zod schema -- unknown keys stripped
+  catch { return send(ws, { type: 'error', code: 'BAD_FRAME', message: 'invalid frame' }); }
+
+  if (frame.type === 'auth') {
+    const claims = verifyJwt(frame.token);        // throw -> close(4001)
+    ws.ctx = Object.freeze({ userId: claims.sub, deviceId: frame.deviceId, authedAt: Date.now() });
+    void sessions.set(claims.sub, frame.deviceId, NODE_ID);
+    return send(ws, { type: 'auth_ok', userId: claims.sub });
+  }
+
+  if (!ws.ctx) return ws.close(4001, 'unauthenticated');   // auth se pehle koi frame nahi
+
+  switch (frame.type) {
+    case 'send':    return void handleSend(ws.ctx, frame);      // senderId = ws.ctx.userId
+    case 'receipt': return void handleReceipt(ws.ctx, frame);   // userId   = ws.ctx.userId
+    case 'typing':  return void handleTyping(ws.ctx, frame);
+    case 'resume':  return void handleResume(ws.ctx, frame);
+    case 'ping':    return send(ws, { type: 'pong' });
+  }
+}
+```
+
+**Code Explanation:**
+
+- `parseClientFrame` ek **zod** (ya similar) schema hai jo sirf spec ke fields rakhta hai aur **unknown keys strip** kar deta hai. Agar attacker `senderId` bhejega bhi, toh woh parse ke baad object mein hai hi nahi -- TypeScript ka type bhi ye guarantee nahi deta (types runtime par mitt jaate hain), schema deta hai.
+- `verifyJwt(frame.token)` -- signature + expiry verify. Fail par `close(4001)` -- spec ka custom auth-failure close code, taaki client ko pata chale ki token refresh karna hai, na ki andhadhund reconnect.
+- `Object.freeze({...})` -- `ctx` set hone ke baad kisi handler se badla na ja sake. Chhota sa defence, par ye intent saaf kar deta hai ki identity immutable hai.
+- `if (!ws.ctx) return ws.close(4001)` -- **auth se pehle koi bhi frame allowed nahi.** Iske bina ek unauthenticated socket `send` frames bhejta reh sakta hai; aur yahan bhi main socket ko ek chhota idle timeout deta hoon (auth 10 s ke andar na aaya toh close), warna anonymous sockets kholna hi ek DoS hai.
+- `handleSend(ws.ctx, frame)` -- `senderId` **argument se nahi, context se** jaata hai. Yahi poore answer ka crux hai: handler ke signature mein `senderId` daalne ki jagah hi nahi chhodi.
+- `handleReceipt(ws.ctx, frame)` -- `ServerFrame` ke `receipt` mein `userId` hota hai (recipients ko batane ke liye), par `ClientFrame` ke `receipt` mein **nahi**. Spec ka ye asymmetry jaan-boojh kar hai: server bolta hai "kisne padha", client sirf bolta hai "maine `conversationId` ka `seq` tak padha".
+- `handleTyping` ke andar bhi `conversationId` par membership check lagti hai -- warna koi bhi kisi bhi group mein typing dikha sakta hai.
+- Note: JWT ki expiry socket ke lifetime se chhoti ho sakti hai. Ek socket 6 ghante khula hai aur token 1 ghante ka tha -- toh? Mera jawab: `authedAt` rakho, aur ya toh periodically re-auth maango (client naya token bheje) ya long-lived sessions ke liye revocation list Redis mein dekho. Ek baar auth karke 6 ghante tak bhool jaana ek asli gap hai, aur interview mein ise khud bolna chahiye.
+
+### Node.js answers ka summary
+
+| Topic | Hamare chat gateway mein ek line |
+|---|---|
+| Event loop | 50,000 idle sockets ka CPU ~0; ek sync `JSON.stringify` **sab** ko rok deta hai -- fan-out mein serialize ek baar |
+| `ws` vs uWS | 20 KB = kernel buffers + TLS + JS objects; uWS JS wala hissa kaatta hai; sabse sasta fix `perMessageDeflate: false` |
+| Cluster | `cluster` + `reusePort` se saare cores; worker threads I/O ke liye galat tool; `nodeId` worker-level rakho |
+| Backpressure | `bufferedAmount > 1 MB` -> `close(1013)`; apni outbound queue mat banao, `resume` hi recovery hai |
+| Binary | JSON text frames; media gateway se jaata hi nahi (presigned S3), isliye streams ka dard nahi |
+| Heartbeat | Protocol `ping`/`pong` 30 s, 2 miss -> registry delete + **`terminate()`**; zinda client ko `close(code)` |
+| Shutdown | Readiness off -> 5 s -> `server.close()` -> 2,000 sockets per 2 s with `1013`; `process.exit()` = reconnect storm |
+| fd / sysctl | `ulimit -n` 200,000 (default 1024 ka trap); `somaxconn` **aur** Node ka `backlog` dono |
+| Postgres | Gateways DB ko chhute hi nahi; `max` per process hai; 2,000 connections -> pgBouncer transaction mode |
+| Timeouts | `AbortSignal.timeout(400)` poore `send` ka budget; signal pass karna mat bhoolo; retry safe kyunki `messageId` idempotent |
+| Memory leak | `Map` cleanup on `close` **aur** khaali `Set` delete; heap snapshot comparison + retainers |
+| Identity | Identity socket par auth ke waqt bandho; frame ka `senderId` kabhi nahi; har `send` par membership check |
+
+---
+
+## Remember
+
+> **Chat gateway mein har Node.js bug ek hi sawaal ka jawab hai -- "ye memory kab chhootegi?": slow client ka buffer, mare hue socket ka `Map` entry, atka hua `await`, ya ek saath aaye 50,000 reconnects. Socket kholna aasaan hai; use saaf band karna hi asli engineering hai.**
+
+## Quick Self-Test
+
+1. Ek gateway node par `ws_connections_active` 6 ghante se flat 50,000 hai, par RSS 2 GB se 6 GB ho gaya hai. Teen alag kaaran batao aur har ek ko confirm karne ke liye kaunsa metric ya tool dekhoge?
+2. Heartbeat timeout par `terminate()` kyun aur slow-client drop par `close(1013)` kyun? Dono ko ulta kar do toh exactly kya tootega?
+3. `process.exit()` se 50,000 sockets girane par kya hota hai jo waves-with-`1013` se nahi hota? Apne waves ka drain time calculate karo aur batao use Kubernetes ki kaunsi setting se kam rakhna padega.
+4. Gateway node 50,000 connections handle karta hai par `ulimit -n` 200,000 chahiye -- baaki 150,000 fd kaun le raha hai, aur `somaxconn` badhane ke baad bhi Node mein ek setting kyun badalni padti hai?
+5. Ek group message 256 members ko jaa raha hai. Batao `JSON.stringify` kitni baar chalna chahiye, `bufferedAmount` kitni baar check hona chahiye, aur agar ye group 100,000 members ka ho jaaye toh is loop mein kya badalna padega?
+
+---
+
+**Next (Part 6):** Implement it (TypeScript: ek chhota chat server zero se), 30-second answer, 5-minute answer, whiteboard drawing order, final cheat sheet. "next" bolo.
