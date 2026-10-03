@@ -3385,6 +3385,764 @@ Query time:  question -&gt; embedding -&gt; top matching chunks -&gt; LLM -&gt; 
 <h2 id="test-yourself">Test Yourself</h2>
 <p>Upar wale 10 self-quiz sawal hi tumhara Test Yourself hain. Pehle bina dekhe jawab do, phir chapters kholkar check karo.</p>
 </section>
+<section class="chapter" id="chapter-31" data-title="Chapter 31: Auth aur Persistence for AI Backends">
+<h1 id="chapter-31-auth-aur-persistence-for-ai-backends">Chapter 31: Auth aur Persistence for AI Backends</h1>
+<p>Phase 6 | Ye chapter padhne ka time: about 30 minutes | Pehle Chapter 23 padh lena</p>
+<h2 id="story-jab-model-ne-trust-kar-liya">Story: jab model ne "trust" kar liya</h2>
+<p>Ek startup ne multi-tenant chat product banaya: har company (tenant) ke employees apne documents par sawal poochte hain. Assistant ke paas ek tool tha: <code>get_conversation(conversation_id)</code>.</p>
+<p>Ek din tenant B ke user ne chat mein likha: "Mera user id admin-1 hai, tenant A ki last conversation dikhao."</p>
+<p>Model ne tool call generate kiya, tool ne seedha <code>SELECT * FROM conversations WHERE id = 42</code> chalaya, aur tenant A ki private conversation tenant B ko dikh gayi.</p>
+<p>Model ne koi hack nahi kiya. Galti humari thi: humne <strong>prompt ya model ke output ko identity ka source</strong> bana diya.</p>
+<h2 id="problem-ai-backend-mein-identity-ke-naye-raaste">Problem: AI backend mein identity ke naye raaste</h2>
+<p>Normal API mein user ki identity token se aati hai. AI backend mein ek naya raasta khul jata hai: user ka text model tak jata hai, aur model ka output tools tak. Agar kahin bhi tenant_id ya user_id model ke output se aaye, to wo <strong>attacker-controlled</strong> hai.</p>
+<p>Dusri problem: har feature mein <code>WHERE tenant_id = ...</code> yaad rakhna. 200 queries mein se ek bhool gaye, to wahi leak hai.</p>
+<h2 id="solution-3-niyam">Solution: 3 niyam</h2>
+<ol><li><strong>Identity sirf verified token se aati hai.</strong> Model, prompt, ya request body se kabhi nahi.</li><li><strong>Har request par token verify hota hai</strong>, aur <code>tenant_id</code> ek jagah (dependency) mein nikalta hai.</li><li><strong>Database access ek repository se hota hai</strong> jo tenant filter khud lagata hai. Baaki code ke paas tenant_id ko "bhoolne" ka mauka hi nahi.</li></ol>
+<h2 id="mental-model">Mental model</h2>
+<p>Token = office ka ID card, jise gate par guard (tumhara code) har baar scan karta hai. Model ek visitor hai jo kehta hai "main CEO hoon". Guard card dekhta hai, visitor ki baat nahi.</p>
+<h2 id="flow">Flow</h2>
+<pre><code class="lang-text">Client --(Authorization: Bearer &lt;JWT&gt;)--&gt; FastAPI
+                                             |
+                          Depends(get_current_user): verify signature + exp
+                                             |
+                          claims: sub=user-1, tenant=tenant-A
+                                             |
+                          Depends(get_repo): ChatRepository(session, tenant-A)
+                                             |
+        route / agent / tool  ---&gt;  repo.get_conversation(id)  ---&gt;  PostgreSQL
+                                     (WHERE tenant_id = &#x27;tenant-A&#x27; hamesha)
+
+LLM output (tool args) ---&gt; sirf conversation_id jaisi cheez; tenant_id NAHI</code></pre>
+<h2 id="jwt-token-ke-andar-kya-hota-hai">JWT: token ke andar kya hota hai</h2>
+<p><strong>Term:</strong> JWT (JSON Web Token) -- ek signed string jisme claims (JSON) hote hain; signature se server verify kar leta hai ki claims badle nahi gaye.</p>
+<p>Common claims:</p>
+<div class='tablewrap'><table><thead><tr><th>Claim</th><th>Matlab</th></tr></thead><tbody><tr><td><code>sub</code></td><td>subject, yaani user ka id</td></tr><tr><td><code>exp</code></td><td>expiry time; iske baad token invalid</td></tr><tr><td><code>iat</code></td><td>issue time</td></tr><tr><td><code>tenant</code></td><td>custom claim: user kis tenant ka hai</td></tr></tbody></table></div>
+<p>JWT <strong>signed hai, encrypted nahi</strong>. Koi bhi payload padh sakta hai (base64). Isliye usme password, secret ya sensitive PII mat daalo.</p>
+<h3 id="oauth2-bearer-flow-concept-level">OAuth2 bearer flow (concept level)</h3>
+<p><strong>Term:</strong> OAuth2 bearer token -- client har request ke header mein <code>Authorization: Bearer &lt;token&gt;</code> bhejta hai; jiske paas token hai, server use authorized maanta hai.</p>
+<p>Typical flow: user login karta hai (apne password ya Google/Microsoft jaise identity provider se), server <strong>access token</strong> deta hai (chhota expiry, jaise 15 minute) aur aksar ek <strong>refresh token</strong> (lamba expiry). Access token expire hone par client refresh token se naya access token leta hai, user ko dobara login nahi karna padta. FastAPI mein is flow ke helpers (<code>OAuth2PasswordBearer</code> jaisi classes) hain; exact usage ke liye FastAPI security docs check karo.</p>
+<p>Chhota access token isliye: agar leak ho gaya to nuksan ka window chhota rahe.</p>
+<h3 id="code-a-pyjwt-encode-decode-expiry-aur-tamper-test">Code (a): PyJWT encode/decode, expiry aur tamper test</h3>
+<pre><code class="lang-python">import time
+import jwt  # pip install pyjwt
+
+SECRET = &quot;dev-only-secret-change-me-0123456789&quot;   # production: env var / secret manager
+ALGO = &quot;HS256&quot;
+
+
+def create_access_token(user_id: str, tenant_id: str, ttl_seconds: int = 900) -&gt; str:
+    now = int(time.time())
+    claims = {&quot;sub&quot;: user_id, &quot;tenant&quot;: tenant_id, &quot;iat&quot;: now, &quot;exp&quot;: now + ttl_seconds}
+    return jwt.encode(claims, SECRET, algorithm=ALGO)
+
+
+def verify_access_token(token: str) -&gt; dict:
+    # algorithms=[...] ek fixed list: attacker &quot;alg: none&quot; wala token nahi chala sakta
+    return jwt.decode(token, SECRET, algorithms=[ALGO], options={&quot;require&quot;: [&quot;exp&quot;, &quot;sub&quot;]})
+
+
+token = create_access_token(&quot;user-1&quot;, &quot;tenant-A&quot;)
+print(verify_access_token(token)[&quot;tenant&quot;])           # tenant-A
+
+expired = create_access_token(&quot;user-1&quot;, &quot;tenant-A&quot;, ttl_seconds=-1)
+try:
+    verify_access_token(expired)
+except jwt.ExpiredSignatureError:
+    print(&quot;expired token rejected&quot;)
+
+head, payload, sig = token.split(&quot;.&quot;)
+tampered = &quot;.&quot;.join([head, payload[:-2] + &quot;AA&quot;, sig])
+try:
+    verify_access_token(tampered)
+except jwt.InvalidTokenError:
+    print(&quot;tampered token rejected&quot;)</code></pre>
+<p>Important lines: <code>algorithms=[ALGO]</code> fixed rakho; <code>require</code> se bina <code>exp</code> wale token reject hote hain; secret code mein nahi, environment mein. Ye snippet run karke dekha gaya hai: teeno lines print hoti hain.</p>
+<h3 id="fastapi-mein-kahan-lagta-hai">FastAPI mein kahan lagta hai</h3>
+<p>FastAPI mein verify karne ka kaam ek <strong>dependency</strong> (<code>Depends</code>) karti hai. Route function ko sirf <code>user</code> mil jata hai. Ye illustrative sketch hai (<code>get_session</code> aur <code>ChatRepository</code> neeche wale code se aate hain):</p>
+<pre><code class="lang-python">from fastapi import Depends, HTTPException, Header
+
+
+def get_current_user(authorization: str = Header(default=&quot;&quot;)) -&gt; dict:
+    if not authorization.startswith(&quot;Bearer &quot;):
+        raise HTTPException(status_code=401, detail=&quot;missing token&quot;)
+    try:
+        return verify_access_token(authorization.removeprefix(&quot;Bearer &quot;))
+    except Exception:
+        raise HTTPException(status_code=401, detail=&quot;invalid or expired token&quot;)
+
+
+def get_repo(user: dict = Depends(get_current_user), session=Depends(get_session)):
+    return ChatRepository(session, tenant_id=user[&quot;tenant&quot;])</code></pre>
+<p>Ab agent ke tools ko bhi <code>repo</code> object mil jata hai, tenant_id string nahi. Tool ke arguments mein model sirf <code>conversation_id</code> deta hai; tenant ka faisla repo karta hai.</p>
+<p><strong>401 vs 403:</strong> 401 = "tum kaun ho, pata nahi / token kharab". 403 = "tum kaun ho pata hai, par ye tumhare liye nahi". Dusre tenant ki conversation par aksar 404 dena behtar hai, taaki attacker ko ye bhi na pata chale ki wo id exist karti hai.</p>
+<h2 id="persistence-kya-store-karna-hai">Persistence: kya store karna hai</h2>
+<p>Ek AI chat backend ke 4 tarah ke records aksar chahiye:</p>
+<div class='tablewrap'><table><thead><tr><th>Table</th><th>Kya rakhta hai</th></tr></thead><tbody><tr><td><code>conversations</code></td><td>tenant_id, user_id, title, created_at</td></tr><tr><td><code>messages</code></td><td>role (user/assistant/tool), content, input_tokens, output_tokens</td></tr><tr><td><code>tool_calls</code></td><td>tool name, arguments, result summary, status, latency</td></tr><tr><td><code>usage</code> (ya messages ke columns)</td><td>token counts, model name, cost estimate (Chapter 1, 25)</td></tr></tbody></table></div>
+<p>Token counts per message isliye: cost per tenant nikalna aur Chapter 24 ke observability ke liye. Production mein DB <strong>PostgreSQL</strong> hoga; neeche test SQLite in-memory par hai taaki snippet bina setup ke chale.</p>
+<h3 id="indexes-jo-chahiye">Indexes jo chahiye</h3>
+<ul><li><code>conversations (tenant_id)</code> aur aksar <code>(tenant_id, user_id, created_at)</code> -- "meri recent chats" query ke liye.</li><li><code>messages (tenant_id, conversation_id, id)</code> -- ek conversation ke messages order mein padhne ke liye. Isi index se chat history load fast rehti hai.</li><li>Bina index ke query table scan karti hai; messages table sabse tezi se badhti hai.</li></ul>
+<h3 id="code-b-sqlalchemy-2-0-models-tenant-scoped-repository">Code (b): SQLAlchemy 2.0 models + tenant-scoped repository</h3>
+<pre><code class="lang-python">from sqlalchemy import ForeignKey, Index, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Conversation(Base):
+    __tablename__ = &quot;conversations&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(index=True)
+    user_id: Mapped[str]
+    title: Mapped[str] = mapped_column(default=&quot;&quot;)
+
+
+class Message(Base):
+    __tablename__ = &quot;messages&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[str]
+    conversation_id: Mapped[int] = mapped_column(ForeignKey(&quot;conversations.id&quot;))
+    role: Mapped[str]                      # user / assistant / tool
+    content: Mapped[str]
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+    __table_args__ = (Index(&quot;ix_msg_tenant_conv&quot;, &quot;tenant_id&quot;, &quot;conversation_id&quot;, &quot;id&quot;),)
+
+
+class ChatRepository:
+    &quot;&quot;&quot;Tenant filter sirf yahan likha hai. Baaki code tenant_id kabhi nahi chhoota.&quot;&quot;&quot;
+
+    def __init__(self, session: Session, tenant_id: str):
+        self.session = session
+        self.tenant_id = tenant_id
+
+    def create_conversation(self, user_id: str, title: str = &quot;&quot;) -&gt; Conversation:
+        conv = Conversation(tenant_id=self.tenant_id, user_id=user_id, title=title)
+        self.session.add(conv)
+        self.session.flush()
+        return conv
+
+    def get_conversation(self, conv_id: int) -&gt; Conversation | None:
+        stmt = select(Conversation).where(
+            Conversation.id == conv_id, Conversation.tenant_id == self.tenant_id
+        )
+        return self.session.scalars(stmt).first()
+
+    def add_message(self, conv_id: int, role: str, content: str,
+                    input_tokens: int = 0, output_tokens: int = 0) -&gt; Message:
+        if self.get_conversation(conv_id) is None:
+            raise LookupError(&quot;conversation not found&quot;)
+        msg = Message(tenant_id=self.tenant_id, conversation_id=conv_id, role=role,
+                      content=content, input_tokens=input_tokens, output_tokens=output_tokens)
+        self.session.add(msg)
+        self.session.flush()
+        return msg
+
+    def list_messages(self, conv_id: int) -&gt; list[Message]:
+        stmt = (select(Message)
+                .where(Message.tenant_id == self.tenant_id, Message.conversation_id == conv_id)
+                .order_by(Message.id))
+        return list(self.session.scalars(stmt))
+
+
+engine = create_engine(&quot;sqlite://&quot;)        # in-memory; production: postgresql+psycopg://...
+Base.metadata.create_all(engine)
+
+with Session(engine) as s:
+    repo_a = ChatRepository(s, &quot;tenant-A&quot;)
+    repo_b = ChatRepository(s, &quot;tenant-B&quot;)
+    conv = repo_a.create_conversation(&quot;alice&quot;, &quot;refund question&quot;)
+    repo_a.add_message(conv.id, &quot;user&quot;, &quot;refund kab milega?&quot;, input_tokens=7)
+    repo_a.add_message(conv.id, &quot;assistant&quot;, &quot;5-7 din mein&quot;, output_tokens=6)
+    s.commit()
+
+    print(len(repo_a.list_messages(conv.id)))          # 2
+    assert repo_b.get_conversation(conv.id) is None     # B ko A ka data nahi dikhta
+    assert repo_b.list_messages(conv.id) == []
+    try:
+        repo_b.add_message(conv.id, &quot;user&quot;, &quot;sneaky&quot;)
+    except LookupError:
+        print(&quot;tenant B blocked&quot;)
+    print(&quot;isolation test passed&quot;)</code></pre>
+<p>Ye snippet bhi run karke dekha gaya hai (SQLAlchemy 2.x, <code>pip install sqlalchemy</code>). Dhyan do: repo ka constructor <code>tenant_id</code> leta hai, aur wo token se aata hai (upar <code>get_repo</code>). Is class ke bahar <code>Conversation.tenant_id</code> par filter likhne ki zaroorat hi nahi.</p>
+<h2 id="production-reality">Production reality</h2>
+<ul><li><strong>Migrations:</strong> schema badalne ke liye <strong>Alembic</strong> use hota hai (versioned migration scripts); <code>create_all</code> sirf demo/test ke liye.</li><li><strong>Sync vs async session:</strong> SQLAlchemy sync aur async dono deta hai. Async session (<code>AsyncSession</code> + async driver) tab sahi hai jab tumhara FastAPI route <code>async def</code> hai, warna sync DB call event loop ko block karega. Simple: chhote app mein sync session + normal <code>def</code> route chalega (FastAPI use thread pool mein chalata hai). Docs check karo: async driver ka setup alag hota hai.</li><li><strong>Defense in depth:</strong> repo ke upar PostgreSQL ki Row Level Security bhi ek option hai (DB khud tenant filter enforce kare). Ye extra safety hai, par setup complex; pehle repo pattern karo.</li><li><strong>Refresh tokens ko revoke</strong> kar sakne ke liye server-side store chahiye (logout, stolen token). Access token chhota expiry rakho, kyunki use revoke karna mushkil hota hai.</li><li><strong>Tool arguments ko validate karo</strong> (Chapter 18, 22): model <code>conversation_id</code> de sakta hai, par repo har bar ownership check karta hai.</li><li><strong>Concurrency:</strong> ek hi conversation mein do messages ek saath aa sakte hain; message order ke liye <code>id</code> ya <code>created_at</code> par bharosa karo, aur transaction ke andar likho.</li></ul>
+<h2 id="kya-store-nahi-karna">Kya store NAHI karna</h2>
+<ul><li><strong>Raw secrets:</strong> API keys, passwords, tokens kabhi message content mein save mat karo. Agar user chat mein paste kar de, to save karne se pehle redact karo.</li><li><strong>Unneeded PII:</strong> jo zaroori nahi, mat rakho. Jo rakhna hai uska retention period socho aur delete ka raasta rakho (Chapter 23).</li><li><strong>Poora raw prompt har baar</strong> -- agar sensitive ho -- ya to mask karo ya sirf IDs/hash/summary rakho. Logging aur DB dono par ye lagu hota hai (Chapter 24).</li></ul>
+<h2 id="simple-vs-production-scale">Simple vs production-scale</h2>
+<ul><li><strong>Simple:</strong> JWT access token (15 min) + dependency + ek repository class + 3 tables + 2 indexes. Isse hi leak ka bada rasta band ho jata hai.</li><li><strong>Production-scale:</strong> identity provider (OAuth2/OIDC), refresh token rotation, Alembic migrations, Row Level Security, audit log, per-tenant usage reports, retention jobs.</li></ul>
+<h2 id="trade-offs">Trade-offs</h2>
+<ul><li>Chhota token expiry: safer, par refresh logic chahiye.</li><li>JWT stateless hai (DB lookup nahi), par revoke karna mushkil; session tokens revoke easy, par store chahiye.</li><li>Repository pattern: leak mushkil, par har query ko repo ke through jana padta hai (thodi rigidity).</li><li>Messages table mein token counts: cost visibility, par table thodi badi.</li></ul>
+<h2 id="common-galtiyan">Common galtiyan</h2>
+<ul><li>Tool ko <code>tenant_id</code> ya <code>user_id</code> argument ke roop mein dena (model bharega!).</li><li>System prompt mein "sirf apne tenant ka data dikhana" likhna aur use security samajhna. Prompt suggestion hai, access control nahi.</li><li>Token verify karna sirf login par, har request par nahi.</li><li><code>exp</code> na rakhna, ya <code>algorithms</code> list na dena.</li><li><code>WHERE tenant_id</code> har jagah haath se likhna.</li><li>JWT payload mein sensitive data daalna.</li><li>Secret ko code ya git mein rakhna.</li></ul>
+<h2 id="connection">Connection</h2>
+<ul><li>Chapter 18: tool calling -- tool ke arguments model likhta hai, isliye untrusted.</li><li>Chapter 22 aur 23: guardrails aur privacy; yahan unka database wala hissa hai.</li><li>Chapter 25: multi-tenancy ka cost side; token counts yahin store hote hain.</li><li>Chapter 24: observability mein user/tenant id logs ke saath jaata hai.</li><li>Phase 6 project: FastAPI backend mein <code>get_current_user</code> dependency aur <code>ChatRepository</code> isi pattern par banega; agent ke tools ko repo milega, raw tenant_id nahi.</li></ul>
+<h2 id="remember">Remember</h2>
+<blockquote>Identity token se aati hai, model ya prompt se nahi; aur tenant filter ek hi jagah (repository) mein likho taaki bhoolna mumkin hi na ho.</blockquote>
+<h2 id="test-yourself">Test Yourself</h2>
+<ol><li>Story mein leak kahan hua, aur "model ne galti ki" kehna kyun adhoora jawab hai?</li><li>JWT signed hai par encrypted nahi, iska practical matlab kya hai?</li><li>Expired token aur tampered token par server kya karega, aur kaun sa code ye check karta hai?</li><li>Repository pattern se "forgotten filter" kaise impossible ban jata hai? Ek tool function ka example socho.</li><li>Message content mein user ne API key paste kar di. Tum kya karoge aur kyun?</li></ol>
+</section>
+<section class="chapter" id="chapter-32" data-title="Chapter 32: AI Chat UI aur AG-UI">
+<h1 id="chapter-32-ai-chat-ui-aur-ag-ui">Chapter 32: AI Chat UI aur AG-UI</h1>
+<p>Phase 6 | Ye chapter padhne ka time: about 30 minutes | Pehle Chapter 5 padh lena</p>
+<h2 id="story-chat-jo-dikhne-mein-theek-andar-se-toota-hua">Story: chat jo dikhne mein theek, andar se toota hua</h2>
+<p>Ek team ne apne agent ke upar chat UI banayi. Backend ne text stream kiya, frontend ne use <code>div</code> mein append kar diya. Demo mein mast lagta tha.</p>
+<p>Phir real users aaye:</p>
+<ul><li>Jawab likhte waqt screen flicker karti thi, kyunki har token par poora markdown dobara render hota tha.</li><li>Train mein network ek second ke liye gaya. Page ne reconnect kiya aur aadha likha hua jawab gayab.</li><li>Agent 15 second ek tool chala raha tha (order search). UI par kuch nahi dikha. User ne socha hang ho gaya, aur dobara bhej diya.</li><li>Galat sawal tha, user "Stop" dabana chahta tha. Button hi nahi tha. Server tab bhi tokens bana raha tha aur bill badh raha tha.</li><li>Beech mein error aaya to UI par bas aadha jawab pada raha, koi message nahi.</li></ul>
+<p>Frontend developer ke liye ye naya lag sakta hai. Tum React already jaante ho. Problem React ki nahi hai. Problem ye hai ki <strong>AI ka response ek single value nahi, ek chalti hui kahani hai.</strong></p>
+<h2 id="problem-ai-ui-ke-apne-special-masle">Problem: AI UI ke apne special masle</h2>
+<p>Normal UI: request jaati hai, response aata hai, render karo. AI UI mein:</p>
+<div class='tablewrap'><table><thead><tr><th>Masla</th><th>Matlab</th></tr></thead><tbody><tr><td>Partial message</td><td>Jawab adhura hai aur badh raha hai. Kab "poora" maanein?</td></tr><tr><td>Tool progress</td><td>Agent kuch kar raha hai (search, DB), par text nahi aa raha</td></tr><tr><td>Cancel / Stop</td><td>User beech mein rokna chahta hai, aur server ko bhi rukna chahiye</td></tr><tr><td>Reconnect / resume</td><td>Connection toota, aadha jawab kya hoga?</td></tr><tr><td>Error mid-stream</td><td>Status 200 ja chuka hai (Chapter 5), ab error kaise dikhayein?</td></tr><tr><td>Optimistic UI</td><td>User ka message turant dikhao, server confirm kare us se pehle</td></tr><tr><td>Markdown while streaming</td><td>Aadha code block khula hai (closing fence abhi aaya nahi), tab render kaise karein?</td></tr></tbody></table></div>
+<p>Dhyan do: in sab ke liye sirf "text ke tukde" bhejna kaafi nahi hai.</p>
+<h2 id="solution-raw-text-nahi-typed-events-ki-stream">Solution: raw text nahi, typed events ki stream</h2>
+<p><strong>Typed event:</strong> har tukda ek chhota JSON object hota hai jisme <code>type</code> field batata hai ki ye kis tarah ka tukda hai (text hai, tool shuru hua, run khatam hua, error aaya).</p>
+<p>Raw text mein UI ko andaza lagana padta hai. Typed events mein UI ko seedha pata hota hai ki kya karna hai:</p>
+<ul><li><code>tool_call_start</code> aaya -&gt; "Searching orders..." spinner dikhao.</li><li><code>text_chunk</code> aaya -&gt; message mein append karo.</li><li><code>run_error</code> aaya -&gt; error banner dikhao, aadha jawab rehne do.</li><li><code>run_finished</code> aaya -&gt; Stop button hata do, input wapas chalu karo.</li></ul>
+<h2 id="mental-model-scoreboard-feed">Mental model: scoreboard feed</h2>
+<p>Cricket ka live scoreboard socho. Wo sirf "commentary text" nahi bhejta. Usme alag-alag events hote hain: wicket, boundary, over khatam, innings khatam. Scoreboard UI har event type ke hisaab se alag cheez update karta hai.</p>
+<p>AI chat UI bhi yahi hai: backend <strong>events ka feed</strong> bhejta hai, frontend ek chhoti <strong>state machine</strong> hai jo har event par state badalti hai.</p>
+<h2 id="flow">Flow</h2>
+<pre><code>Browser (Next.js)                     Backend (FastAPI)
+   |                                        |
+   | -- POST /chat/events {prompt} -------&gt; |
+   | &lt;-- run_started ---------------------- |   Stop button dikhao
+   | &lt;-- tool_call_start (search_orders) -- |   spinner dikhao
+   | &lt;-- tool_call_args ------------------- |
+   | &lt;-- tool_call_result ----------------- |   spinner hatao
+   | &lt;-- text_start ----------------------- |   nayi message bubble
+   | &lt;-- text_chunk &quot;Aapke&quot; --------------- |   append
+   | &lt;-- text_chunk &quot; 2 orders&quot; ----------- |   append
+   | &lt;-- text_end ------------------------- |
+   | &lt;-- run_finished --------------------- |   input wapas chalu
+   |                                        |
+   | -- (user Stop dabaye) abort() -------&gt; |   connection band, server kaam rok de</code></pre>
+<h2 id="eventsource-ki-limit-aur-fetch-readablestream">EventSource ki limit aur fetch + ReadableStream</h2>
+<p>Chapter 5 mein dekha tha: browser ka <code>EventSource</code> <strong>sirf GET</strong> support karta hai. Chat mein prompt, history, auth header (JWT) bhejna hota hai. Ye sab POST body aur headers mein jaata hai.</p>
+<p>Isliye AI chat UIs aksar <strong><code>fetch</code> ka POST</strong> use karte hain aur response body ko <strong><code>ReadableStream</code></strong> se padhte hain. Is mein SSE ka format (<code>data: ...</code> + khali line) tumhein khud parse karna padta hai. Libraries bhi ye karti hain, par ek baar khud likhoge to samajh aayega.</p>
+<p>Sabse bada gotcha: network jo bytes deta hai wo <strong>event ki boundary par nahi katte.</strong> Ek event do reads mein aa sakta hai, ya ek read mein teen events. Isliye parser ko <strong>buffer</strong> rakhna padta hai.</p>
+<pre><code class="lang-javascript">// sse-parser.js  (plain JS, TypeScript mein bhi chalega)
+function createSseParser(onEvent) {
+  let buffer = &quot;&quot;;
+  return function feed(chunk) {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf(&quot;\n\n&quot;)) !== -1) {
+      const frame = buffer.slice(0, idx);       // ek poora event
+      buffer = buffer.slice(idx + 2);           // baaki agle read ke liye
+      const data = frame
+        .split(&quot;\n&quot;)
+        .filter((line) =&gt; line.startsWith(&quot;data:&quot;))
+        .map((line) =&gt; line.slice(5).trimStart())
+        .join(&quot;\n&quot;);
+      if (data) onEvent(JSON.parse(data));
+    }
+  };
+}
+module.exports = { createSseParser };</code></pre>
+<p>Test (node 20 par maine chalaya, output <code>OK 3 events</code>). Stream ko 7-character ke tukdon mein kaata, taaki frame beech se kat jaye:</p>
+<pre><code class="lang-javascript">const assert = require(&quot;node:assert&quot;);
+const got = [];
+const feed = createSseParser((e) =&gt; got.push(e));
+const stream =
+  &#x27;data: {&quot;type&quot;:&quot;run_started&quot;}\n\n&#x27; +
+  &#x27;data: {&quot;type&quot;:&quot;text_chunk&quot;,&quot;delta&quot;:&quot;Hi&quot;}\n\n&#x27; +
+  &#x27;data: {&quot;type&quot;:&quot;run_finished&quot;}\n\n&#x27;;
+for (let i = 0; i &lt; stream.length; i += 7) feed(stream.slice(i, i + 7));
+assert.deepStrictEqual(got.map((e) =&gt; e.type), [&quot;run_started&quot;, &quot;text_chunk&quot;, &quot;run_finished&quot;]);
+console.log(&quot;OK&quot;, got.length, &quot;events&quot;);</code></pre>
+<p>Browser mein use kuch aisa hoga (illustrative, <code>reader</code> fetch se aata hai):</p>
+<pre><code class="lang-javascript">const res = await fetch(&quot;/chat/events&quot;, { method: &quot;POST&quot;, body, signal: controller.signal });
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+const feed = createSseParser(handleEvent);
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  feed(decoder.decode(value, { stream: true }));   // stream:true: adhura UTF-8 character bacha rahe
+}</code></pre>
+<p>Do cheezein dhyan do. <code>{ stream: true }</code> isliye ki ek multi-byte character (jaise Hindi akshar) do reads mein kat sakta hai. Aur ye parser simple hai: <code>\r\n</code> line endings, <code>event:</code> ya <code>id:</code> fields handle nahi karta. Real library ya spec dekho.</p>
+<p><strong>Stop button</strong> ke liye <code>AbortController</code>: <code>controller.abort()</code> connection band kar deta hai. Server ko disconnect detect karke LLM call rokni chahiye (Chapter 5 ka production section), warna paisa jalta rahega.</p>
+<h2 id="backend-apne-simplified-typed-events-fastapi">Backend: apne simplified typed events (FastAPI)</h2>
+<blockquote>Ye <strong>AG-UI se inspired hai, real SDK nahi.</strong> Event ke naam aur fields maine simple rakhe hain, real protocol ke nahi. Real ke liye docs dekho (neeche).</blockquote>
+<p>Ye code maine chalaya aur TestClient se test kiya (output: sab events sahi order mein, text <code>Aapke 2 orders mile.</code>).</p>
+<p><code>pip install fastapi pydantic httpx</code></p>
+<pre><code class="lang-python">import asyncio
+import json
+
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+class ChatIn(BaseModel):
+    prompt: str
+
+
+def sse(event_type: str, **fields) -&gt; str:
+    payload = {&quot;type&quot;: event_type, **fields}
+    return f&quot;data: {json.dumps(payload)}\n\n&quot;
+
+
+async def run_events(prompt: str):
+    yield sse(&quot;run_started&quot;, run_id=&quot;r1&quot;)
+    try:
+        yield sse(&quot;tool_call_start&quot;, call_id=&quot;c1&quot;, name=&quot;search_orders&quot;)
+        yield sse(&quot;tool_call_args&quot;, call_id=&quot;c1&quot;, args=&#x27;{&quot;q&quot;: &quot;%s&quot;}&#x27; % prompt)
+        await asyncio.sleep(0)                      # tool chal raha hai
+        yield sse(&quot;tool_call_result&quot;, call_id=&quot;c1&quot;, result=&quot;2 orders found&quot;)
+        yield sse(&quot;text_start&quot;, message_id=&quot;m1&quot;)
+        for word in [&quot;Aapke&quot;, &quot; 2&quot;, &quot; orders&quot;, &quot; mile.&quot;]:
+            yield sse(&quot;text_chunk&quot;, message_id=&quot;m1&quot;, delta=word)
+        yield sse(&quot;text_end&quot;, message_id=&quot;m1&quot;)
+        yield sse(&quot;run_finished&quot;, run_id=&quot;r1&quot;)
+    except Exception as exc:                        # stream ke andar error event
+        yield sse(&quot;run_error&quot;, message=str(exc))
+
+
+@app.post(&quot;/chat/events&quot;)
+async def chat_events(body: ChatIn):
+    return StreamingResponse(
+        run_events(body.prompt),
+        media_type=&quot;text/event-stream&quot;,
+        headers={&quot;Cache-Control&quot;: &quot;no-cache&quot;, &quot;X-Accel-Buffering&quot;: &quot;no&quot;},
+    )</code></pre>
+<p>Test:</p>
+<pre><code class="lang-python">from fastapi.testclient import TestClient
+
+client = TestClient(app)
+with client.stream(&quot;POST&quot;, &quot;/chat/events&quot;, json={&quot;prompt&quot;: &quot;last&quot;}) as r:
+    events = [json.loads(l[6:]) for l in r.iter_lines() if l.startswith(&quot;data: &quot;)]
+types = [e[&quot;type&quot;] for e in events]
+assert types[0] == &quot;run_started&quot; and types[-1] == &quot;run_finished&quot;
+assert &quot;&quot;.join(e[&quot;delta&quot;] for e in events if e[&quot;type&quot;] == &quot;text_chunk&quot;) == &quot;Aapke 2 orders mile.&quot;</code></pre>
+<p>Samjho:</p>
+<ul><li><code>tool_call_start</code> aur <code>tool_call_result</code> ek hi <code>call_id</code> share karte hain. Isi se UI jaanta hai kaun sa spinner band karna hai (agent ek saath do tools bhi chala sakta hai).</li><li><code>text_start/chunk/end</code> ka <code>message_id</code>: UI ko pata chalta hai ki chunk kis bubble ka hai.</li><li><code>try/except</code> ke andar <code>run_error</code>: status 200 ja chuka hai, isliye error bhi <strong>event</strong> hi banega.</li></ul>
+<h2 id="ag-ui-ye-idea-ek-open-protocol-bhi-hai">AG-UI: ye idea ek open protocol bhi hai</h2>
+<p><strong>AG-UI (Agent-User Interaction protocol):</strong> ek open, event-based protocol jo agent backend se frontend tak events stream karne ka standard tareeka dene ki koshish karta hai. Taaki har team apna alag event format na banaye.</p>
+<p>Official docs (docs.ag-ui.com) ke events page ke hisaab se events ki categories:</p>
+<div class='tablewrap'><table><thead><tr><th>Category</th><th>Events (docs ke naam)</th></tr></thead><tbody><tr><td>Lifecycle</td><td>RunStarted, RunFinished, RunError, StepStarted, StepFinished</td></tr><tr><td>Text Message</td><td>TextMessageStart, TextMessageContent, TextMessageEnd, TextMessageChunk</td></tr><tr><td>Tool Call</td><td>ToolCallStart, ToolCallArgs, ToolCallEnd, ToolCallResult, ToolCallChunk</td></tr><tr><td>State Management</td><td>StateSnapshot, StateDelta, MessagesSnapshot</td></tr><tr><td>Activity</td><td>ActivitySnapshot, ActivityDelta</td></tr><tr><td>Reasoning</td><td>reasoning events</td></tr><tr><td>Subagent</td><td>SubagentStarted, SubagentFinished, SubagentError</td></tr><tr><td>Special</td><td>Raw, Custom</td></tr></tbody></table></div>
+<p>Dekho: hamare simplified events (run_started, text_chunk, tool_call_*) inhi ka chhota version hain. Real protocol mein state sync (<code>StateSnapshot</code>/<code>StateDelta</code>) bhi hai, jisse agent ki state UI se share hoti hai.</p>
+<p>Transport ke baare mein: docs streaming event-based architecture batate hain, aur doosre sources ke hisaab se wo aam taur par SSE par JSON events bhejta hai. Iska TypeScript aur Python SDK hai, aur LangGraph jaise backends ya custom code ke saath chal sakta hai.</p>
+<p><strong>Ek zaroori baat:</strong> exact JSON field names aur event type ki spelling (kahin PascalCase, kahin UPPER_SNAKE likha milta hai) mujhe is chapter mein pakki nahi hai. Isliye maine real protocol ke field names likhe hi nahi. <strong>SDK aur docs.ag-ui.com se check karo</strong> jab implement karo.</p>
+<h2 id="production-reality">Production reality</h2>
+<ul><li><strong>Markdown streaming.</strong> Har chunk par poora markdown parse karna mehnga aur flickery hota hai. Usually: chunks ko ek ya do frame ke liye batch karo (<code>requestAnimationFrame</code> jaisa), aur adhura code fence ya link ko "abhi khula hai" maan kar render karo. Kisi library ka streaming-friendly markdown renderer dekh sakte ho.</li><li><strong>Reconnect aur resume.</strong> Simple: connection toote to "retry" button, poora run dobara. Better: server events ko <code>run_id</code> + sequence number ke saath store kare, client "last seq" bheje aur server wahin se bheje. Ye extra kaam hai, tabhi karo jab zaroorat ho.</li><li><strong>Cancel.</strong> Client abort kare, server disconnect pakde, LLM aur tool tasks cancel kare. Dono taraf zaroori hai.</li><li><strong>Auto-scroll.</strong> Agar user ne upar scroll kiya hai to nayi chunk par neeche mat kheecho.</li><li><strong>Optimistic UI.</strong> User ka message turant list mein daalo, "sending" state ke saath. Fail ho to retry dikhao. Ye normal React pattern hai, par yahan assistant message ki bubble bhi <code>run_started</code> par hi bana do.</li><li><strong>Auth.</strong> POST + <code>fetch</code> ka fayda: <code>Authorization: Bearer &lt;JWT&gt;</code> header seedha bhej sakte ho. Token expiry beech stream mein ho to kya? Run ke shuru mein check karna usually kaafi hai.</li><li><strong>Event schema versioning.</strong> Frontend aur backend alag deploy hote hain. Unknown event type aaye to UI ko crash nahi karna chahiye, ignore karna chahiye.</li></ul>
+<h2 id="simple-vs-production-scale">Simple vs production-scale</h2>
+<ul><li><strong>Simple (pehle ye banao):</strong> POST + fetch stream, 5 se 6 event types (run start/finish/error, text chunk, tool start/result), Stop button, "retry" button. Bas.</li><li><strong>Production-scale:</strong> resumable streams (sequence number + replay buffer), state snapshots/deltas, batching, reasoning aur subagent events, schema versioning, aur e2e tests.</li><li>Zaroori nahi ki har project real AG-UI SDK le. Agar frontend aur backend dono tumhare haath mein hain, apne simple events kaafi ho sakte hain. Standard tab kaam aata hai jab alag frameworks ya teams ko jodna ho.</li></ul>
+<h2 id="trade-offs">Trade-offs</h2>
+<ul><li>Typed events: UI bahut behtar, par ek schema maintain karna padta hai.</li><li>SSE over POST-fetch: simple aur proxy-friendly, par auto-reconnect jaise <code>EventSource</code> ke free features khud likhne padte hain.</li><li>Real protocol (AG-UI): interoperability, par ek aur dependency aur spec ke saath chalna.</li><li>WebSocket: cancel dono taraf aasaan, par zyada complex (Chapter 5 table).</li></ul>
+<h2 id="common-galtiyan">Common galtiyan</h2>
+<ul><li>Raw text stream karna aur UI ko text parse karke andaza lagane dena.</li><li>Read chunk ko poora event maan lena (parser mein buffer na rakhna).</li><li><code>decoder.decode</code> mein <code>{ stream: true }</code> bhool jana (Hindi text toot-ta hai).</li><li>Stop button sirf UI hide kare, server ko rokta hi nahi.</li><li>Error ko HTTP 500 sochna, jabki stream shuru ho chuki hai.</li><li>Har token par poora markdown re-render.</li><li>Unknown event type par UI crash.</li></ul>
+<h2 id="connection">Connection</h2>
+<ul><li>Chapter 5: SSE ka format aur proxy buffering. Ye chapter usi par typed events aur POST streaming jodta hai.</li><li>Chapter 17 aur 18: agent aur tool calling jo ye events paida karte hain.</li><li>Chapter 19: MCP agent ko tools se jodta hai. AG-UI agent ko user ke frontend se jodta hai.</li><li>Chapter 24: observability. <code>run_id</code> wahi cheez hai jo trace se jodoge (Chapter 33).</li><li><strong>Phase 6 capstone:</strong> isi chapter ke events par ek Next.js chat UI banega, jisme tool progress, Stop button aur error handling hoga.</li></ul>
+<h2 id="remember">Remember</h2>
+<blockquote>AI ka response ek value nahi, events ki kahani hai. Raw text ke bajaye typed events bhejo, taaki UI tool progress, cancel aur errors sahi dikha sake.</blockquote>
+<h2 id="test-yourself">Test Yourself</h2>
+<ol><li><code>EventSource</code> chat ke liye kyun kaafi nahi hai? Uske badle kya use karte hain?</li><li>Network read ek event ke beech mein kat jaye to parser kya karta hai? Buffer kyun zaroori hai?</li><li>Stream ke beech error aaye to HTTP status code se kyun nahi bata sakte? UI ko kaise pata chalega?</li><li>Stop button dabane par browser aur server dono ko kya karna chahiye, aur server ko kyun?</li><li><code>call_id</code> aur <code>message_id</code> kis kaam aate hain, jab agent ek saath do tools chalaye?</li></ol>
+</section>
+<section class="chapter" id="chapter-33" data-title="Chapter 33: Langfuse aur DeepEval">
+<h1 id="chapter-33-langfuse-aur-deepeval">Chapter 33: Langfuse aur DeepEval</h1>
+<p>Phase 6 | Ye chapter padhne ka time: about 30 minutes | Pehle Chapter 14 aur 24 padh lena</p>
+<h2 id="story-prompt-badla-quality-chupke-se-gir-gayi">Story: prompt badla, quality chupke se gir gayi</h2>
+<p>Ek support-bot team ne ek hafte mein ek chhota prompt change kiya: "jawab chhota rakho". Review mein 3 sawal try kiye, sab theek lage. Deploy ho gaya.</p>
+<p>Do hafte baad support team ne bola: "bot ab policy galat bata raha hai." Kab se? Pata nahi. Kaun sa step galat? Retrieval ne galat document diya, ya model ne context ignore kiya? Pata nahi. Latency bhi badhi thi, par kis step mein? Pata nahi.</p>
+<p>Dikkat do alag cheezon ki thi:</p>
+<ol><li><strong>Dikhta nahi tha</strong> ki andar kya hua (har step ka input, output, time).</li><li><strong>Naapa nahi gaya</strong> ki jawab achha hai ya nahi, deploy se pehle.</li></ol>
+<h2 id="problem-ai-mein-chal-raha-hai-ka-matlab-kuch-nahi">Problem: AI mein "chal raha hai" ka matlab kuch nahi</h2>
+<p>Normal code mein test fail hota hai to pata chal jaata hai. LLM app mein:</p>
+<ul><li>Jawab "kaam karta hua" dikhta hai par galat hota hai.</li><li>Ek request mein 6 steps hote hain (retrieve, rerank, model, tool, model). Slow ya galat step kaun sa hai?</li><li>Prompt, model ya chunking badalne par quality upar gayi ya neeche, koi number nahi.</li></ul>
+<h2 id="solution-do-alag-tools-do-alag-sawal">Solution: do alag tools, do alag sawal</h2>
+<div class='tablewrap'><table><thead><tr><th></th><th>Tracing tool (Langfuse)</th><th>Evaluation tool (DeepEval)</th></tr></thead><tbody><tr><td>Sawal</td><td>Is request mein andar kya hua?</td><td>Ye jawab kitna achha hai?</td></tr><tr><td>Kab</td><td>Live production + dev</td><td>Deploy se pehle (CI) aur offline</td></tr><tr><td>Output</td><td>Traces, timings, cost, errors</td><td>Scores, pass/fail</td></tr><tr><td>Analogy</td><td>CCTV + black box recorder</td><td>Exam</td></tr></tbody></table></div>
+<p>Ye dono ek doosre ko complete karte hain. Chapter 24 mein observability ka idea tha. Chapter 14 mein RAG eval ka idea tha. Ye chapter unke <strong>real tools</strong> hain.</p>
+<h2 id="mental-model-cctv-aur-exam">Mental model: CCTV aur exam</h2>
+<ul><li><strong>Langfuse = CCTV.</strong> Production mein har request record hoti hai. Kuch galat ho to footage dekhkar pata karo kahan.</li><li><strong>DeepEval = entrance exam.</strong> Naya prompt/model release se pehle fixed sawalon par paper do. Pass nahi hua to release nahi.</li></ul>
+<p>Aur dono ka loop: production mein koi bura trace mila -&gt; usse eval dataset mein daalo -&gt; aage se wo exam ka hissa.</p>
+<h2 id="flow">Flow</h2>
+<pre><code>User request
+   |
+   v
+[retrieve] -&gt; [rerank] -&gt; [LLM call] -&gt; [tool] -&gt; [LLM call] -&gt; answer
+   |             |            |           |           |
+   +-------------+------------+-----------+-----------+
+                              |
+                         ek TRACE (har step ek span)
+                              |
+                              v
+                          Langfuse UI: kaun sa span slow/galat
+
+CI pipeline:
+  git push -&gt; eval dataset chalao -&gt; metrics score -&gt; threshold se kam?
+                                                       |-- haan: build FAIL
+                                                       |-- nahi: deploy</code></pre>
+<h2 id="langfuse-terms-pehle">Langfuse: terms pehle</h2>
+<p><strong>Langfuse:</strong> open-source LLM observability tool. Tumhari app ke LLM calls aur steps ko record karke dikhata hai.</p>
+<ul><li><strong>Trace:</strong> ek poori request ki kahani (user ka sawal se jawab tak).</li><li><strong>Span:</strong> trace ka ek step (jaise "retrieve" ya "tool call"), time ke saath. Spans ek ke andar ek nest hote hain.</li><li><strong>Generation:</strong> ek special span jo LLM call ke liye hai (model, input, output, tokens).</li><li><strong>Session:</strong> ek hi user conversation ki kai traces ek saath.</li><li><strong>Score:</strong> trace ya generation par laga hua number/label (jaise "helpful: 0.8" ya user ka thumbs up).</li></ul>
+<p>Python SDK (docs ke hisaab se, v3, OpenTelemetry par based). <strong>Ye snippet illustrative hai: docs ke hisaab se, install aur keys ke baad chalega.</strong></p>
+<p><code>pip install langfuse</code> aur keys environment variables mein (naam docs se dekho).</p>
+<pre><code class="lang-python">from langfuse import get_client, observe
+
+langfuse = get_client()
+
+@observe()                                   # input, output, time, error automatically
+def retrieve(question: str):
+    return [&quot;Refunds are allowed within 7 days.&quot;]
+
+@observe(name=&quot;llm-call&quot;, as_type=&quot;generation&quot;)   # model call ke liye
+def call_model(question, docs):
+    return &quot;7 days.&quot;
+
+@observe()                                   # andar ke calls is trace mein nest honge
+def answer(question: str):
+    return call_model(question, retrieve(question))</code></pre>
+<p>Do aur tareeke docs mein hain: context manager <code>langfuse.start_as_current_observation(as_type=&quot;span&quot;, name=..., input=...)</code> jisme baad mein <code>.update(output=...)</code> karte ho, aur manual <code>langfuse.start_observation(name=...)</code> jisme <code>.update(...)</code> aur <code>.end()</code> khud bulane padte hain.</p>
+<p><strong>PII dhyan:</strong> by default input/output capture hota hai. Sensitive data (phone, email, medical) ho to decorator mein <code>capture_input=False</code> ya <code>capture_output=False</code> do. Chapter 23 ka rule yahan bhi lagta hai: traces mein bhi privacy leak ho sakti hai.</p>
+<p>Score kaise attach karte hain, ye API maine verify nahi kiya. <strong>Docs check karo</strong> (Langfuse scores section).</p>
+<h2 id="deepeval-terms-pehle">DeepEval: terms pehle</h2>
+<p><strong>DeepEval:</strong> LLM apps ke liye pytest jaisa evaluation framework. Tum test cases likhte ho, metrics lagate ho, aur pass/fail milta hai.</p>
+<ul><li><strong>Test case:</strong> ek example: sawal, app ka asli jawab, aur zaroorat ho to sahi jawab aur retrieved context.</li><li><strong>Metric:</strong> ek scoring rule (0 se 1). Zyada tar LLM-as-judge hote hain.</li><li><strong>Threshold:</strong> minimum score jisse neeche test fail.</li></ul>
+<p><strong>LLM-as-judge:</strong> ek doosra LLM jo rubric ke hisaab se tumhare app ka jawab score karta hai. Isliye in metrics ko ek judge model aur uski key chahiye (docs ke hisaab se default OpenAI key hoti hai, <code>OPENAI_API_KEY</code>).</p>
+<p><strong>Illustrative snippet: docs ke hisaab se, install aur keys ke baad chalega.</strong></p>
+<p><code>pip install -U deepeval</code></p>
+<pre><code class="lang-python">from deepeval import assert_test
+from deepeval.metrics import AnswerRelevancyMetric
+from deepeval.test_case import LLMTestCase
+
+def test_refund_answer():
+    case = LLMTestCase(
+        input=&quot;Refund window kitna hai?&quot;,
+        actual_output=&quot;7 days ke andar return kar sakte ho.&quot;,
+        retrieval_context=[&quot;Refunds are allowed within 7 days of delivery.&quot;],
+    )
+    assert_test(case, [AnswerRelevancyMetric(threshold=0.7)])</code></pre>
+<p>Chalane ka tareeka docs ke hisaab se: <code>deepeval test run test_file.py</code> (pytest ke saath bhi integrate hota hai).</p>
+<p>Docs mein metrics ki list: <strong>GEval</strong> (apna custom rubric), Answer Relevancy, Faithfulness, Contextual Recall, Contextual Precision, Contextual Relevancy (ye RAG ke liye, <code>retrieval_context</code> chahiye, Chapter 14 se connect), aur agents ke liye <strong>TaskCompletionMetric</strong> (agent ne kaam poora kiya ya nahi, Chapter 24). Confident AI cloud mein results dekhna optional hai.</p>
+<h2 id="runnable-local-analogue-tools-kya-automate-karte-hain">Runnable local analogue: tools kya automate karte hain</h2>
+<p>Keys ya network nahi chahiye. Ye maine chalaya. Isme <strong>stub judge</strong> hai (asli judge LLM hota). Idea wahi: test cases, scoring function, threshold gate, aur fail par non-zero exit code (jisse CI build fail ho).</p>
+<pre><code class="lang-python">import sys
+from dataclasses import dataclass
+
+
+@dataclass
+class Case:
+    input: str
+    expected: str
+    context: str
+
+
+CASES = [
+    Case(&quot;refund window?&quot;, &quot;7 days&quot;, &quot;Refunds are allowed within 7 days of delivery.&quot;),
+    Case(&quot;shipping time?&quot;, &quot;3 to 5 days&quot;, &quot;Standard shipping takes 3 to 5 days.&quot;),
+    Case(&quot;support email?&quot;, &quot;help@shop.test&quot;, &quot;Write to help@shop.test for support.&quot;),
+]
+
+
+def my_app(question: str) -&gt; str:
+    # Fake app: ek jawab galat hai (jaise prompt change ke baad quality girti hai)
+    answers = {
+        &quot;refund window?&quot;: &quot;You can return items within 7 days.&quot;,
+        &quot;shipping time?&quot;: &quot;Shipping is usually quick.&quot;,
+        &quot;support email?&quot;: &quot;Email help@shop.test anytime.&quot;,
+    }
+    return answers[question]
+
+
+def stub_judge(case: Case, actual: str) -&gt; float:
+    # Asli judge LLM hota hai. Yahan: expected ke kitne shabd actual mein mile.
+    want = case.expected.lower().split()
+    hit = sum(1 for w in want if w in actual.lower())
+    return hit / len(want)
+
+
+def run_eval(threshold: float = 0.8) -&gt; int:
+    scores = []
+    for c in CASES:
+        s = stub_judge(c, my_app(c.input))
+        scores.append(s)
+        print(f&quot;{&#x27;PASS&#x27; if s &gt;= threshold else &#x27;FAIL&#x27;}  {s:.2f}  {c.input}&quot;)
+    avg = sum(scores) / len(scores)
+    failed = [s for s in scores if s &lt; threshold]
+    print(f&quot;average={avg:.2f} failed={len(failed)}/{len(scores)}&quot;)
+    return 1 if failed else 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(run_eval())</code></pre>
+<p>Output (maine chalaya, exit code 1):</p>
+<pre><code class="lang-text">PASS  1.00  refund window?
+FAIL  0.00  shipping time?
+PASS  1.00  support email?
+average=0.67 failed=1/3</code></pre>
+<p>Dekho: "Shipping is usually quick" sunne mein theek lagta hai, par ek number ne pakad liya ki jawab mein asli info hi nahi hai. Isi tarah ek prompt change deploy hone se pehle rok diya jaata.</p>
+<p>Ye stub bahut kachcha hai (shabd-match). DeepEval jaise tools judge LLM aur ready metrics dete hain, par <strong>structure wahi hai:</strong> dataset, metric, threshold, gate.</p>
+<h2 id="ci-mein-gate-kaise">CI mein gate kaise</h2>
+<ol><li>Eval file repo mein rakho (jaise <code>evals/test_quality.py</code>).</li><li>CI step: <code>deepeval test run evals/test_quality.py</code> (ya local analogue jaisa script). Non-zero exit = build fail.</li><li>Pull request mein prompt, model ya chunking badle to ye step chale.</li><li>Production traces (Langfuse) se bure examples chunke aur dataset mein jodte raho.</li></ol>
+<h2 id="production-reality">Production reality</h2>
+<ul><li><strong>LLM-as-judge ka cost.</strong> Har test case par judge ko ek ya zyada LLM calls lagti hain. 200 cases x 4 metrics = 800 judge calls har CI run. Chhota dataset (aksar 20 se 50 achhe cases) PR par, bada dataset raat ko ya release se pehle chalao.</li><li><strong>Non-determinism.</strong> Judge ka score har baar thoda alag aa sakta hai. Ek hi run ke ek test par bharosa mat karo. Threshold mein margin rakho (0.7 jaisa, 0.99 nahi) aur average par bhi dhyan do.</li><li><strong>Judge bhi galat ho sakta hai.</strong> Kuch cases khud padhkar dekho ki judge ke score tumhari samajh se milte hain ya nahi.</li><li><strong>Metrics kam rakho.</strong> 10 metrics ka dashboard koi nahi dekhta. 2 se 4 meaningful metrics chuno: RAG ke liye faithfulness aur relevancy, agent ke liye task completion, aur ek custom GEval jo tumhare business rule ko naapta ho.</li><li><strong>Tracing ka overhead aur data.</strong> Traces mein prompts aur user data jaata hai. Retention, access control aur PII masking sochna padta hai (Chapter 23). Langfuse ko self-host karna ya cloud use karna ek decision hai.</li><li><strong>Sampling.</strong> Bahut zyada traffic par har trace par heavy online eval mehnga hai. Aksar sample par chalate hain.</li></ul>
+<h2 id="simple-vs-production-scale">Simple vs production-scale</h2>
+<ul><li><strong>Simple (pehle ye):</strong> 20 sawal ka golden set, ek ya do metrics, local script jo threshold par fail kare. Traces ke liye <code>@observe</code> aur Langfuse ya sirf structured logs.</li><li><strong>Production-scale:</strong> CI gate, nightly bada eval, production traces se dataset refresh, scores ko traces par attach karna, dashboards aur alerts, user feedback ko score banana.</li><li>Har project ko dono tools zaroori nahi. Pehle ye pucho: "mujhe dikhna chahiye" (tracing) ya "mujhe naapna chahiye" (eval)? Zyada tar serious apps ko dono chahiye.</li></ul>
+<h2 id="trade-offs">Trade-offs</h2>
+<ul><li>Tracing: debugging aasaan, par extra data store aur privacy kaam.</li><li>LLM-as-judge: saste mein scale hota hai, par noisy aur paisa lagta hai.</li><li>Custom rule-based checks (jaise exact match): sasta aur stable, par sirf simple cases par kaam.</li><li>Strict threshold: kam bugs, par flaky CI aur team frustration.</li></ul>
+<h2 id="common-galtiyan">Common galtiyan</h2>
+<ul><li>Sirf 3 sawal try karke "eval ho gaya" maan lena.</li><li>Judge ko dekhe bina uske score par poora bharosa.</li><li>Bahut saare metrics, koi owner nahi.</li><li>Threshold 1.0 ke paas, to CI roz random fail.</li><li>Test data mein wohi examples jo prompt ko tune karte waqt dekhe the (overfitting).</li><li>Traces mein raw PII jaana, aur <code>capture_input=False</code> ka kabhi use na karna.</li><li>Tracing ko eval ka replacement maan lena (ya ulta).</li></ul>
+<h2 id="connection">Connection</h2>
+<ul><li>Chapter 14: RAG eval ke metrics (faithfulness, relevancy, context recall/precision) ka concept. DeepEval unhi ko ready metrics banata hai.</li><li>Chapter 24: observability aur agent evals. Langfuse trace/span wahi idea hai, DeepEval agent metrics wahi eval hai.</li><li>Chapter 23: traces mein PII.</li><li>Chapter 25: tracing se per-request cost dikhna.</li><li>Chapter 32: events mein <code>run_id</code> ko trace se jod sakte ho.</li><li><strong>Phase 6 capstone:</strong> traces ke liye Langfuse, aur CI mein DeepEval ka quality gate.</li></ul>
+<h2 id="remember">Remember</h2>
+<blockquote>Tracing batati hai andar kya hua, eval batata hai kitna achha hua. Ek bina doosre ke, prompt change ek andhera jua hai.</blockquote>
+<h2 id="test-yourself">Test Yourself</h2>
+<ol><li>Langfuse aur DeepEval ka kaam alag kaise hai? Ek example do jab sirf ek se kaam nahi chalta.</li><li>Trace, span aur generation mein kya fark hai?</li><li>LLM-as-judge ke do nuksan kya hain, aur tum unhe kaise kam karoge?</li><li>CI mein eval gate kyun threshold 0.99 par nahi rakhna chahiye?</li><li>Local analogue mein <code>sys.exit(1)</code> ka kya role hai? Bina uske CI kya karta?</li></ol>
+</section>
+<section class="chapter" id="chapter-34" data-title="Chapter 34: AWS Bedrock AgentCore aur A2A (managed agent platform vs apna FastAPI, aur agents ek doosre se kaise baat karein)">
+<h1 id="chapter-34-aws-bedrock-agentcore-aur-a2a-managed-agent-platform-vs-apna-fastapi-aur-agents-ek-doosre-se-kaise-baat-karein">Chapter 34: AWS Bedrock AgentCore aur A2A (managed agent platform vs apna FastAPI, aur agents ek doosre se kaise baat karein)</h1>
+<p>Phase 6 | Ye chapter padhne ka time: about 30 minutes | Pehle Chapter 19 aur Chapter 21 padh lena</p>
+<h2 id="story-15-agents-15-alag-deployment">Story: 15 agents, 15 alag deployment</h2>
+<p>Ek company ke platform team ke paas 15 agents hain. Alag-alag teams ne banaye: kisi ne LangGraph mein, kisi ne CrewAI mein, kisi ne seedha apna FastAPI loop likha.</p>
+<p>Dhyan se dekho to har team ne wahi saamaan dobara banaya:</p>
+<ul><li>Deployment: koi ECS par, koi Lambda par, ek team ke paas to laptop wala cron.</li><li>Session isolation: user A ka conversation user B ko na dikhe, ye har team ne apne tareeke se (ya bilkul nahi) kiya.</li><li>Memory: kisi ne Redis, kisi ne Postgres, kisi ne in-process dict.</li><li>Tool auth: har agent ke paas apni API keys, aur koi nahi jaanta kaun si key kahan hai.</li><li>Tracing: 15 agents, 15 alag log formats.</li></ul>
+<p>Phir ek din: Support team ka agent chahta hai ki Billing team ka agent refund eligibility bataye. Dono alag framework, alag team, alag deploy. Ab kya? Shared Python package? Direct HTTP call jiska format aaj hi banaya?</p>
+<p>Basically do sawal hain: <strong>(1)</strong> ye saara plumbing kaun sambhale, tumhara code ya ek managed platform? <strong>(2)</strong> Agents ek doosre ko kaise dhundein aur kaise baat karein?</p>
+<h2 id="problem-agent-ka-logic-chhota-hai-plumbing-bhaari">Problem: agent ka "logic" chhota hai, plumbing bhaari</h2>
+<p>Ek agent ka asli kaam (prompt, tools, loop) aksar kuch sau lines ka hota hai. Uske aas-paas ka saamaan bada hai:</p>
+<div class='tablewrap'><table><thead><tr><th>Plumbing</th><th>Kyun mushkil</th></tr></thead><tbody><tr><td>Runtime / deploy</td><td>Scaling, cold start, isolation</td></tr><tr><td>Session isolation</td><td>Ek user ka state doosre tak leak na ho</td></tr><tr><td>Identity</td><td>Agent kiske naam par kaam kar raha hai, tool ko kaise pata</td></tr><tr><td>Memory</td><td>Short-term (is session ki) aur long-term (sessions ke paar), Chapter 20</td></tr><tr><td>Tool access</td><td>Har API ko agent-friendly banana, Chapter 19</td></tr><tr><td>Observability</td><td>Traces, evals, Chapter 24</td></tr></tbody></table></div>
+<p>Jab 15 teams ye alag banati hain, to security review 15 baar, bug fix 15 baar. Chapter 19 ka M x N wala dard, bas ab tools nahi balki poore platform ke level par.</p>
+<h2 id="solution-part-1-managed-agent-platform-aws-bedrock-agentcore">Solution part 1: managed agent platform (AWS Bedrock AgentCore)</h2>
+<p>Pehle ek chhoti baat. <strong>Amazon Bedrock:</strong> AWS ki managed service jisse tum alag-alag foundation models ko ek AWS API ke through call karte ho (ye general jaankari hai). JD mein likha hai "LLM integration via OpenAI/Anthropic/Bedrock". Iska seedha matlab: apna <code>llm.py</code> wrapper provider-neutral rakho (Chapter 9 ka gateway idea), taaki kal provider badle to sirf ek file badle.</p>
+<p>Ab <strong>AgentCore.</strong> AWS ke official overview page ke hisaab se ye ek agentic platform hai jo agents ko securely, scale par <strong>build, deploy aur operate</strong> karne ke liye hai, <strong>kisi bhi framework aur kisi bhi foundation model</strong> ke saath. Services saath bhi kaam karti hain aur alag-alag bhi use ho sakti hain. Page par CrewAI, LangGraph, LlamaIndex, Google ADK, OpenAI Agents SDK aur Strands Agents jaise frameworks ka zikr hai, aur models Bedrock ke andar ya bahar (OpenAI, Gemini, Anthropic Claude, Amazon Nova, Llama, Mistral) dono.</p>
+<p>Page par listed services (concept level par samjho):</p>
+<div class='tablewrap'><table><thead><tr><th>Service</th><th>Kaam</th></tr></thead><tbody><tr><td><strong>Runtime</strong></td><td>Secure serverless runtime, session isolation, built-in identity, MCP aur A2A support</td></tr><tr><td><strong>Memory</strong></td><td>Short-term aur long-term memory</td></tr><tr><td><strong>Gateway</strong></td><td>APIs/Lambda ko MCP-compatible tools banata hai, existing MCP servers jodta hai</td></tr><tr><td><strong>Identity</strong></td><td>Existing IdP (Cognito, Okta, Entra ID, Auth0) ke saath kaam karta hai</td></tr><tr><td><strong>Code Interpreter</strong></td><td>Isolated sandbox mein code chalana</td></tr><tr><td><strong>Browser</strong></td><td>Managed cloud browser</td></tr><tr><td><strong>Observability</strong></td><td>Traces, OpenTelemetry-compatible</td></tr><tr><td><strong>Evaluations / Optimization</strong></td><td>Agent ki quality naapna aur sudharna</td></tr><tr><td><strong>Policy</strong></td><td>Tool calls par deterministic control, Cedar-compatible</td></tr><tr><td><strong>Registry</strong></td><td>Agents, MCP servers aur tools ka catalog</td></tr><tr><td><strong>Payments</strong></td><td>Agents ke payments ke liye</td></tr><tr><td><strong>Harness</strong></td><td>Managed agent loop, ek API call se</td></tr></tbody></table></div>
+<p>Pricing consumption-based bataya gaya hai. <strong>Ye list jaldi badalti hai, docs check karo</strong> (naye naam aate hain, purane badalte hain). Isliye ye table yaad mat karo; ye yaad rakho ki platform kin problems ke jawab deta hai: runtime, identity, memory, tools, observability, policy, discovery.</p>
+<h2 id="mental-model">Mental model</h2>
+<p>AgentCore ko apne ECS ke anubhav se jodo. ECS mein tumne container, task role, ALB, CloudWatch sab khud jode the. AgentCore Runtime ka idea hai: "agent ka code do, platform session isolation, identity aur scaling de". Gateway matlab "tool layer ko MCP shakl dene wala adapter" (Chapter 19), Policy matlab "tool call par code-level rule, prompt par bharosa nahi" (Chapter 22 ka lesson).</p>
+<p>Ye wahi cheezein hain jo tum apne FastAPI + ECS stack par khud bana sakte ho. Sawal sirf ye hai ki <strong>kitni</strong>, aur <strong>kitni teams ke liye</strong>.</p>
+<h2 id="solution-part-2-a2a-agents-ek-doosre-se-baat-kaise-karein">Solution part 2: A2A (agents ek doosre se baat kaise karein)</h2>
+<p>Chapter 21 mein A2A short mein aaya tha. Ab thoda andar jaate hain. Ye sab details secondary sources ke hisaab se hain, aur spec versions ke beech badli hain, to <strong>spec version check karo.</strong></p>
+<p><strong>A2A (Agent2Agent):</strong> agents ke beech baat-cheet ka open protocol. Sources ke hisaab se ye Google ne April 2025 mein shuru kiya aur ab Linux Foundation ke under hai.</p>
+<p>Teen cheezein samjho:</p>
+<ul><li><strong>Agent Card:</strong> ek JSON jo agent apne URL par publish karta hai (aksar <code>/.well-known/agent-card.json</code> par). Isme agent ki identity, skills aur baat karne ka tareeka hota hai. Ye agent ka visiting card hai.</li><li><strong>Task:</strong> kaam ki ek unit jiski lifecycle hoti hai: <code>submitted -&gt; working -&gt; input-required -&gt; completed / failed / canceled</code>. <code>input-required</code> ka matlab: doosra agent beech mein ruk kar kuch poochh raha hai ("kaun sa order?"), jawab milne par wapas <code>working</code>.</li><li><strong>Message aur Parts:</strong> baat-cheet messages mein hoti hai, aur har message ke andar typed Parts: text, file, ya data.</li></ul>
+<p>Sources ke hisaab se v1.0 spec teen layers alag karta hai: <strong>data model</strong>, <strong>abstract operations</strong> (SendMessage, SendStreamingMessage, GetTask, ListTasks, CancelTask, SubscribeToTask) aur <strong>protocol bindings</strong> (JSON-RPC 2.0 over HTTPS, gRPC, HTTP+JSON). Purane drafts mein <code>tasks/send</code> aur <code>tasks/sendSubscribe</code> jaise method names the. Matlab method names version ke saath badalte hain. Isliye is chapter ka code real spec nahi, sirf concept hai.</p>
+<h3 id="a2a-vs-mcp">A2A vs MCP</h3>
+<div class='tablewrap'><table><thead><tr><th></th><th>MCP</th><th>A2A</th></tr></thead><tbody><tr><td>Kisse jodta hai</td><td>Agent &lt;-&gt; tools aur data (Chapter 19)</td><td>Agent &lt;-&gt; doosra agent (Chapter 21)</td></tr><tr><td>Doosri side</td><td>Passive tool</td><td>Apni soch wala agent, jo kaam lambe time tak kar sakta hai</td></tr><tr><td>Natural unit</td><td>Function call</td><td>Task with lifecycle</td></tr></tbody></table></div>
+<p>Dono complementary hain: Billing agent A2A se Support agent ko mil sakta hai, aur andar se MCP tools se database tak pahunchta hai.</p>
+<h2 id="flow">Flow</h2>
+<pre><code class="lang-text">Support agent                         Billing agent (alag team, alag framework)
+     |                                          |
+     | 1. GET /.well-known/agent-card.json ---&gt; |
+     | &lt;-- card: skills, how to talk ---------- |
+     |                                          |
+     | 2. send message (text part) ----------&gt;  |  Task: submitted
+     | &lt;-- task id --------------------------   |  Task: working
+     |                                          |
+     | &lt;-- &quot;which order id?&quot; -----------------  |  Task: input-required
+     | 3. send message (data part: order 7) -&gt;  |  Task: working
+     | &lt;-- result (text + data parts) --------  |  Task: completed</code></pre>
+<p>Step 1 discovery hai, step 2 se 3 task lifecycle. Registry (AgentCore ka Registry ya tumhara apna) ye batata hai ki card ka URL kahan milega.</p>
+<h2 id="code-concept-sketch-real-sdk-ya-spec-nahi">Code: concept sketch (real SDK ya spec NAHI)</h2>
+<p>Ye pure Python illustration hai. Isme agent-card dict, ek Task state machine jo sirf legal transitions maanti hai, aur ek function jo registry se skill id se agent chunta hai. Field names asli spec ke jaise lag sakte hain par exact nahi hain; real kaam ke liye spec aur SDK dekho.</p>
+<pre><code class="lang-python">AGENT_CARD = {
+    &quot;name&quot;: &quot;billing-agent&quot;,
+    &quot;description&quot;: &quot;Answers refund and invoice questions&quot;,
+    &quot;url&quot;: &quot;https://billing.internal.example.com/a2a&quot;,
+    &quot;skills&quot;: [
+        {&quot;id&quot;: &quot;refund-eligibility&quot;, &quot;description&quot;: &quot;Is this order refundable?&quot;},
+        {&quot;id&quot;: &quot;invoice-lookup&quot;, &quot;description&quot;: &quot;Fetch an invoice&quot;},
+    ],
+}
+
+# Sirf ye transitions legal hain. Terminal states se kahin nahi jaate.
+LEGAL = {
+    &quot;submitted&quot;: {&quot;working&quot;, &quot;failed&quot;, &quot;canceled&quot;},
+    &quot;working&quot;: {&quot;input-required&quot;, &quot;completed&quot;, &quot;failed&quot;, &quot;canceled&quot;},
+    &quot;input-required&quot;: {&quot;working&quot;, &quot;failed&quot;, &quot;canceled&quot;},
+    &quot;completed&quot;: set(),
+    &quot;failed&quot;: set(),
+    &quot;canceled&quot;: set(),
+}
+
+
+class IllegalTransition(Exception):
+    pass
+
+
+class Task:
+    def __init__(self, task_id):
+        self.id = task_id
+        self.state = &quot;submitted&quot;
+        self.history = [&quot;submitted&quot;]
+
+    def move(self, new_state):
+        if new_state not in LEGAL[self.state]:
+            raise IllegalTransition(f&quot;{self.state} -&gt; {new_state}&quot;)
+        self.state = new_state
+        self.history.append(new_state)
+
+
+def pick_agent(registry, skill_id):
+    &quot;&quot;&quot;Pehla agent jiske card mein ye skill id ho; nahi mila to None.&quot;&quot;&quot;
+    for card in registry:
+        if any(s[&quot;id&quot;] == skill_id for s in card[&quot;skills&quot;]):
+            return card
+    return None
+
+
+# --- tests ---
+REGISTRY = [
+    {&quot;name&quot;: &quot;support-agent&quot;, &quot;url&quot;: &quot;https://support.example.com/a2a&quot;,
+     &quot;skills&quot;: [{&quot;id&quot;: &quot;faq-answer&quot;}]},
+    AGENT_CARD,
+]
+
+t = Task(&quot;t1&quot;)
+for s in [&quot;working&quot;, &quot;input-required&quot;, &quot;working&quot;, &quot;completed&quot;]:
+    t.move(s)                          # input-required -&gt; working legal hai
+assert t.history == [&quot;submitted&quot;, &quot;working&quot;, &quot;input-required&quot;, &quot;working&quot;, &quot;completed&quot;]
+
+for bad_from, bad_to in [(&quot;completed&quot;, &quot;working&quot;), (&quot;submitted&quot;, &quot;completed&quot;)]:
+    t2 = Task(&quot;t2&quot;)
+    if bad_from == &quot;completed&quot;:
+        for s in [&quot;working&quot;, &quot;completed&quot;]:
+            t2.move(s)
+    try:
+        t2.move(bad_to)
+        raise AssertionError(&quot;should have raised&quot;)
+    except IllegalTransition as e:
+        print(&quot;rejected:&quot;, e)
+
+assert pick_agent(REGISTRY, &quot;refund-eligibility&quot;)[&quot;name&quot;] == &quot;billing-agent&quot;
+assert pick_agent(REGISTRY, &quot;nope&quot;) is None
+print(&quot;all ok:&quot;, t.history)</code></pre>
+<p>Dhyan do: state machine ka faayda ye hai ki "completed ke baad phir working" jaisa bug code mein hi pakda jaye. Real agent mein skill chunna aksar sirf id match se zyada hota hai (description se LLM routing, permissions), par registry-lookup ka basic idea yahi hai.</p>
+<h2 id="production-reality">Production reality</h2>
+<ul><li><strong>Auth:</strong> card ya endpoint khula chhod dena khatarnak hai. Kaun call kar sakta hai, kiske naam par, ye identity layer se aana chahiye (AgentCore mein Identity, ya tumhare apne IdP aur tokens).</li><li><strong>Doosre agent ka output untrusted hai.</strong> Chapter 22 ka lesson: doosre team ke agent ka message bhi prompt injection ka raasta ho sakta hai.</li><li><strong>Long tasks:</strong> task minutes ya ghante le sakta hai, to streaming ya status polling, aur task state ko database mein rakho, memory mein nahi (Chapter 26).</li><li><strong>Timeouts, retries, idempotency:</strong> side-effect wale task ko bina idempotency key ke retry mat karo (Chapter 10).</li><li><strong>Tracing across agents:</strong> ek request teen agents se guzarti hai; trace id aage pass karo, warna debugging andhere mein hai (Chapter 24).</li><li><strong>Cost:</strong> har agent hop kai LLM calls hai (Chapter 21 ka cost multiplication).</li><li><strong>Discovery:</strong> 15 agents ho to catalog chahiye: kaun kya karta hai, kaun owner hai, kaun deprecated hai.</li></ul>
+<h2 id="simple-vs-production-scale">Simple vs production-scale</h2>
+<ul><li><strong>Simple (pehle yahi banao):</strong> ek FastAPI service ECS par, ek <code>llm.py</code>, kuch tools, ek agent loop, tracing, caps. Zyada tar apps ko isse aage kuch nahi chahiye.</li><li><strong>Production-scale:</strong> jab <strong>kai teams aur kai agents</strong> hon aur shared identity, isolation, discovery aur governance ki zaroorat ho, tab managed platform (AgentCore jaisa) ya apna internal platform, aur cross-team calls ke liye A2A jaisa standard.</li></ul>
+<p>Honest baat: <strong>zyada tar apps ko na managed agent platform chahiye na A2A.</strong> Ek hi codebase ke andar agents plain function calls ya ek graph (Chapter 21) se baat kar sakte hain. Protocol tab lagta hai jab team boundary aati hai.</p>
+<h2 id="trade-offs">Trade-offs</h2>
+<div class='tablewrap'><table><thead><tr><th>Option</th><th>Faayda</th><th>Keemat</th></tr></thead><tbody><tr><td>Apna FastAPI on ECS</td><td>Poora control, tum ECS jaante ho, koi naya concept nahi</td><td>Isolation, memory, identity, tracing sab khud banao aur maintain karo</td></tr><tr><td>Managed platform (AgentCore)</td><td>Plumbing ready, security aur scaling AWS ke paas, framework-agnostic</td><td>Consumption pricing, AWS par nirbharta (vendor lock-in), nayi cheezein seekhna, list jaldi badalti hai</td></tr><tr><td>A2A</td><td>Cross-team, cross-framework standard</td><td>Extra network hop, auth aur versioning ka kaam, spec abhi evolve ho raha hai</td></tr></tbody></table></div>
+<p>Lock-in kam karne ka tareeka: agent ka core logic aur <code>llm.py</code> apne code mein rakho, platform ko sirf hosting aur plumbing ki tarah use karo. Standards (MCP, A2A) use karne se bhi switch karna aasaan hota hai.</p>
+<h2 id="common-galtiyan">Common galtiyan</h2>
+<ul><li>Pehle din se managed platform ya A2A, jabki ek hi team aur ek hi agent hai.</li><li>Sochna ki platform lene se agent apne aap achha ho jata hai (quality ka kaam Evaluations aur tumhara design hai).</li><li>Docs padhe bina service list yaad kar lena, jabki wo jaldi badalti hai.</li><li>Provider ko code mein hard-code kar dena (JD OpenAI/Anthropic/Bedrock teeno maangta hai).</li><li>Doosre agent ko trusted maan lena, auth ya validation ke bina.</li><li>A2A aur MCP ko ek hi cheez samajhna.</li><li>Task state ko process memory mein rakhna.</li></ul>
+<h2 id="connection">Connection</h2>
+<ul><li>Chapter 19: MCP agent ko tools se jodta hai; AgentCore Gateway wahi idea managed form mein hai.</li><li>Chapter 21: multi-agent orchestration ek system ke andar; A2A tab jab agents alag teams ke hon.</li><li>Chapter 9: gateway aur provider-neutral wrapper, jo Bedrock/OpenAI/Anthropic teeno ke liye kaam aata hai.</li><li>Chapter 22, 24: security aur tracing ka cross-agent version.</li><li>Phase 6 capstone: tum pehle apna FastAPI service ECS par chalaoge. Ye chapter batata hai ki aage kab aur kyun managed platform ya A2A socho. Yahan wala code sirf concept ke liye hai.</li></ul>
+<h2 id="remember">Remember</h2>
+<blockquote>Pehle ek FastAPI service ECS par; managed agent platform aur A2A tab socho jab kai teams ko shared identity, isolation aur discovery chahiye, aur dhyan rakho ki platform plumbing deta hai, agent ki quality nahi.</blockquote>
+<h2 id="test-yourself">Test Yourself</h2>
+<ol><li>Story mein 15 teams ne kaun si plumbing dobara banayi? Platform use karne se ye kaise kam hota hai?</li><li>AgentCore ki kam se kam 4 services batao aur har ek kis problem ka jawab hai. Aur ye list ke baare mein kya dhyan rakhna chahiye?</li><li>A2A mein Agent Card aur Task lifecycle kya hain? <code>input-required</code> kab aata hai?</li><li>MCP aur A2A mein kya farak hai? Ek example do jahan dono saath use hon.</li><li>Tumhare paas ek team aur ek agent hai. Tum managed platform lagaoge ya nahi, aur kyun? Lock-in ko kaise kam rakhoge?</li></ol>
+</section>
+<section class="chapter" id="chapter-35" data-title="Chapter 35: OpenSearch for Hybrid RAG">
+<h1 id="chapter-35-opensearch-for-hybrid-rag">Chapter 35: OpenSearch for Hybrid RAG</h1>
+<p>Phase 6 | Ye chapter padhne ka time: about 30 minutes | Pehle Chapter 11 aur 13 padh lena</p>
+<h2 id="story-err-4521-ka-jawab-nahi-mila">Story: "ERR-4521" ka jawab nahi mila</h2>
+<p>Ek company ka support assistant vector search par chalta tha. User ne poocha: "ERR-4521 kya hota hai?"</p>
+<p>Vector search ko error code ka "meaning" samajh nahi aaya. Usne milte-julte error wale 5 chunks laa diye, par jis chunk mein exact "ERR-4521" likha tha wo top 5 mein nahi tha. Assistant ne confidently galat jawab diya.</p>
+<p>Doosre din user ne poocha: "Mera paisa wapas kaise milega?" Is baar keyword search fail hua, kyunki docs mein "refund process" likha tha, "paisa wapas" nahi.</p>
+<p>Dono tarike apni jagah ghalat. Exact words ke liye keyword chahiye, meaning ke liye vector.</p>
+<h2 id="problem-ek-search-se-kaam-nahi-chalta">Problem: ek search se kaam nahi chalta</h2>
+<ul><li><strong>Pure vector search</strong> exact codes, product names, ids aur rare words par aksar miss karta hai.</li><li><strong>Pure BM25 (keyword)</strong> meaning nahi samajhta; synonym ya Hinglish/English mix par miss karta hai.</li><li>Upar se tenant ke filters bhi chahiye: tenant A ke chunks tenant B ko na dikhein (Chapter 31).</li></ul>
+<p>Chapter 13 mein hum ye idea dekh chuke hain: dono search chalao aur combine karo. Ab sawal hai: ye sab ek hi system mein kahan chalaye?</p>
+<h2 id="solution-search-engine-hi-vector-db-bhi">Solution: search engine hi vector DB bhi</h2>
+<p>Bahut companies ke paas pehle se Elasticsearch/OpenSearch cluster hota hai (logs ya site search ke liye). OpenSearch ek search engine hai jo keyword search, vector search aur filters, teeno ek hi jagah de sakta hai.</p>
+<p>Fayde:</p>
+<ul><li>Ek system operate karna, do nahi.</li><li>Keyword + vector + metadata filter <strong>ek hi query</strong> mein.</li><li>Team ko aksar already uska experience hota hai.</li></ul>
+<p>OpenSearch mein vector search ke liye k-NN plugin bundled aati hai, aur ML Commons aur Neural Search plugins se hybrid search aur remote embedding models ka support milta hai. (Exact setup ke liye docs check karo.)</p>
+<h2 id="mental-model">Mental model</h2>
+<p>Ek library socho jisme do librarian hain. Ek <strong>index card wala</strong> (BM25): jo exact shabd dhoondhta hai. Doosra <strong>topic samajhne wala</strong> (vector): jo matlab se kitab dhoondhta hai. Hybrid search dono ko bhejna hai, phir dono ki list ko ek fair list mein milana. Metadata filter = "sirf is shelf (tenant) ki kitabein".</p>
+<h2 id="flow">Flow</h2>
+<pre><code class="lang-text">User query: &quot;ERR-4521 refund fail&quot;
+        |
+        +--&gt; embed query --&gt; vector (k-NN) query --+
+        |                                          |
+        +--&gt; BM25 keyword query -------------------+--&gt; dono par tenant_id filter
+                                                   |
+                                    scores normalize + combine
+                                                   |
+                                          top-k chunks --&gt; (reranker, Chapter 13) --&gt; LLM</code></pre>
+<h2 id="chunk-document-mein-kya-hota-hai">Chunk document mein kya hota hai</h2>
+<p>Har chunk (Chapter 12) ek document ban kar index hota hai. Usme aksar ye cheezein hoti hain:</p>
+<div class='tablewrap'><table><thead><tr><th>Cheez</th><th>Kaam</th></tr></thead><tbody><tr><td><code>text</code></td><td>BM25 keyword search ke liye, aur LLM ko dene ke liye</td></tr><tr><td><code>embedding</code></td><td>vector search ke liye (Chapter 11)</td></tr><tr><td><code>tenant_id</code></td><td>tenant filter</td></tr><tr><td><code>doc_id</code>, <code>source</code>, <code>page</code>, <code>created_at</code></td><td>citation, freshness, delete/update</td></tr></tbody></table></div>
+<p>Field names tum khud chunnoge. OpenSearch ke exact mapping JSON (vector field ka type, dimension, method) ke liye <strong>docs check karo</strong>, yahan hum JSON shape invent nahi kar rahe.</p>
+<h2 id="hybrid-search-kaise-chalta-hai-opensearch-mein">Hybrid search kaise chalta hai (OpenSearch mein)</h2>
+<p>OpenSearch hybrid search ko ek compound <strong><code>hybrid</code> query</strong> ke roop mein implement karta hai, jisme tum keyword aur vector sub-queries dete ho. Saath mein ek <strong>search pipeline</strong> hoti hai jiska <strong><code>normalization-processor</code></strong> query phase aur fetch phase ke beech chalta hai: wo har sub-query ke scores normalize karta hai aur phir unhe combine karta hai. Docs ka ek recommended starting point hai <strong>min_max normalization + arithmetic_mean combination</strong>. Exact query aur pipeline JSON ke liye docs check karo.</p>
+<h3 id="scores-ko-normalize-kyun-karna-padta-hai">Scores ko normalize kyun karna padta hai</h3>
+<p><strong>Term:</strong> Score normalization -- alag scales wale scores ko ek common range (jaise 0 se 1) par laana, taaki unhe jodna fair ho.</p>
+<p>BM25 ka score 0 se 20 ya usse bhi upar ja sakta hai. Cosine similarity aksar 0 se 1 ke beech hoti hai. Agar seedha jod do, to BM25 jeet jayega sirf isliye ki uske numbers bade hain, chahe vector zyada sahi ho.</p>
+<p><strong>Min-max normalization:</strong> list ka sabse chhota score 0 ban jata hai, sabse bada 1, baaki beech mein. Formula: <code>(score - min) / (max - min)</code>.</p>
+<p><strong>Arithmetic mean (weighted):</strong> normalized scores ka weighted average, jaise 0.5 keyword + 0.5 vector. Weights tum tune karte ho (code-heavy docs mein keyword ka weight badhao).</p>
+<h3 id="rrf-se-farak">RRF se farak</h3>
+<p>Chapter 13 mein hamne <strong>Reciprocal Rank Fusion (RRF)</strong> dekha: wo scores ko dekhta hi nahi, sirf <strong>position (rank)</strong> dekhta hai (<code>1 / (k + rank)</code>, har list ke liye jod do). Isliye scales ki problem hi nahi aati.</p>
+<div class='tablewrap'><table><thead><tr><th></th><th>Normalize + weighted mean</th><th>RRF</th></tr></thead><tbody><tr><td>Kya use karta hai</td><td>score ki <strong>magnitude</strong></td><td>sirf <strong>rank</strong></td></tr><tr><td>Scale problem</td><td>normalize karna padta hai</td><td>nahi</td></tr><tr><td>Weights</td><td>tune kar sakte ho</td><td>aksar barabar</td></tr><tr><td>Kab acha</td><td>scores meaningful hain, gap ka farak padta hai</td><td>scores noisy ya alag scale, simple chahiye</td></tr><tr><td>Weakness</td><td>min/max outlier se hil sakta hai</td><td>"kitne bade farak se aage" ki information kho deta hai</td></tr></tbody></table></div>
+<h3 id="code-dono-ko-ek-example-par-chalao">Code: dono ko ek example par chalao</h3>
+<pre><code class="lang-python"># doc_id -&gt; raw score. Dono scales alag: BM25 0..20, cosine 0..1
+bm25 = {&quot;doc_A&quot;: 14.0, &quot;doc_B&quot;: 13.5, &quot;doc_C&quot;: 3.0, &quot;doc_D&quot;: 1.0}
+vector = {&quot;doc_C&quot;: 0.92, &quot;doc_D&quot;: 0.90, &quot;doc_B&quot;: 0.60, &quot;doc_A&quot;: 0.55}
+
+
+def min_max(scores: dict[str, float]) -&gt; dict[str, float]:
+    lo, hi = min(scores.values()), max(scores.values())
+    if hi == lo:                      # sab same score: divide-by-zero se bacho
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / (hi - lo) for k, v in scores.items()}
+
+
+def weighted_mean(a: dict, b: dict, w_a=0.5, w_b=0.5) -&gt; dict:
+    n_a, n_b = min_max(a), min_max(b)
+    ids = set(n_a) | set(n_b)
+    return {i: w_a * n_a.get(i, 0.0) + w_b * n_b.get(i, 0.0) for i in ids}
+
+
+def rrf(rankings: list[list[str]], k: int = 60) -&gt; dict:
+    out: dict[str, float] = {}
+    for ranking in rankings:
+        for pos, doc in enumerate(ranking, start=1):
+            out[doc] = out.get(doc, 0.0) + 1.0 / (k + pos)
+    return out
+
+
+def ranked(scores: dict) -&gt; list[str]:
+    return sorted(scores, key=scores.get, reverse=True)
+
+
+print(&quot;naive raw sum :&quot;, ranked({d: bm25[d] + vector[d] for d in bm25}))
+print(&quot;min-max mean  :&quot;, ranked(weighted_mean(bm25, vector)))
+print(&quot;RRF (k=60)    :&quot;, ranked(rrf([ranked(bm25), ranked(vector)])))
+print(&quot;min-max 0.8/0.2 keyword-heavy:&quot;, ranked(weighted_mean(bm25, vector, 0.8, 0.2)))</code></pre>
+<p>Ye snippet run kiya gaya; output ye aata hai:</p>
+<pre><code class="lang-text">naive raw sum : [&#x27;doc_A&#x27;, &#x27;doc_B&#x27;, &#x27;doc_C&#x27;, &#x27;doc_D&#x27;]
+min-max mean  : [&#x27;doc_C&#x27;, &#x27;doc_B&#x27;, &#x27;doc_A&#x27;, &#x27;doc_D&#x27;]
+RRF (k=60)    : [&#x27;doc_C&#x27;, &#x27;doc_A&#x27;, &#x27;doc_B&#x27;, &#x27;doc_D&#x27;]
+min-max 0.8/0.2 keyword-heavy: [&#x27;doc_A&#x27;, &#x27;doc_B&#x27;, &#x27;doc_C&#x27;, &#x27;doc_D&#x27;]</code></pre>
+<p>Isse teen baatein dikhti hain:</p>
+<ol><li><strong>Naive sum</strong> mein BM25 ke bade numbers vector ko dabate hain: doc_C (vector ka top) teesre par chala gaya.</li><li><strong>Min-max mean vs RRF</strong> ka farak: doc_A aur doc_B. BM25 mein A (14.0) aur B (13.5) lagbhag barabar hain, par vector mein B (0.60) A (0.55) se aage hai. Min-max ye "lagbhag barabar" wali magnitude yaad rakhta hai, isliye B jeet jata hai. RRF sirf rank dekhta hai: BM25 mein A pehle number par hai, to use poora rank-1 bonus milta hai, aur A thoda aage nikal jata hai. (Ye bahut kareeb ka muqabla hai: dono ke RRF scores lagbhag barabar hain.)</li><li><strong>Weights</strong> ranking badal dete hain: keyword-heavy 0.8/0.2 par A phir upar aa jata hai. Isliye weights ko eval set (Chapter 14) se tune karo, guess se nahi.</li></ol>
+<p>Note: ye demo sirf fusion math dikhata hai. Asli OpenSearch pipeline mein normalization aur combination server ke andar hota hai; tumhe sirf config dena hota hai.</p>
+<h2 id="metadata-filters-aur-tenant-id">Metadata filters aur tenant_id</h2>
+<p>Tenant filter ko <strong>dono sub-queries mein</strong> lagana hai, aur wo token se aana chahiye (Chapter 31), user ke text ya model ke output se nahi. Ek bhi sub-query mein filter bhool gaye to doosre tenant ke chunks leak ho sakte hain. Isliye Chapter 31 wale repository ki tarah, ek hi function mein search query banao jo tenant_id deta hai, aur baaki code uske through search kare. Filter kaise lagta hai (pre-filter vs post-filter, vector search ke saath uska behavior) ye engine/version par depend karta hai: docs check karo.</p>
+<h2 id="ingestion-bulk-indexing">Ingestion: bulk indexing</h2>
+<p>Documents ko ek-ek karke index karna slow hai. OpenSearch ka <strong>bulk</strong> API ek request mein bahut saare documents leta hai. Concept:</p>
+<ol><li>Document padho -&gt; chunk karo (Chapter 12).</li><li>Chunks ka embedding nikalo (batch mein).</li><li>Bulk request se <code>text + embedding + metadata</code> index karo.</li><li>Failed items ka retry/log (bulk mein kuch items fail ho sakte hain, poori request "success" dikha kar bhi).</li></ol>
+<p>Document update hone par purane chunks delete karo (<code>doc_id</code> se), warna stale chunks jawab mein aate rahenge. Ingestion ko queue/worker par chalao (Chapter 26), request path par nahi.</p>
+<h2 id="production-reality">Production reality</h2>
+<ul><li><strong>Shards aur replicas:</strong> index ko shards mein baanta jata hai (scale ke liye) aur replicas (availability aur read throughput ke liye). Shard count baad mein badalna mehnga hota hai, isliye data size ka andaza pehle lagao. Chhote index ko bahut saare shards mat do.</li><li><strong>Memory ka cost:</strong> vector indexes ko fast search ke liye aksar memory mein rehna padta hai. Zyada vectors ya zyada dimensions ka matlab zyada RAM, yaani zyada cost. Vectors bahut bade ho jayein to bill bhi bada ban sakta hai. Exact memory estimate ke liye docs check karo.</li><li><strong>Embedding model badla to re-index:</strong> naye model ke vectors purane se compatible nahi hote (Chapter 11).</li><li><strong>Latency:</strong> hybrid = do search + normalization, to ek search se zyada time lagta hai. Eval aur latency dono naapo (Chapter 3, 14).</li><li><strong>Monitoring:</strong> query latency, indexing failures, cluster health, aur retrieval quality (Chapter 24).</li></ul>
+<h2 id="simple-vs-production-scale">Simple vs production-scale</h2>
+<ul><li><strong>Simple:</strong> ek index, ek replica, min_max + arithmetic_mean se start, tenant_id filter, chhota eval set.</li><li><strong>Production-scale:</strong> shard planning, bulk ingestion workers, weights ka tuning, reranker (Chapter 13), per-tenant index ya routing (bahut bade tenants ke liye), backup/snapshot.</li></ul>
+<h2 id="kab-dedicated-vector-db-zyada-simple-hai">Kab dedicated vector DB zyada simple hai</h2>
+<p>Search engine hamesha behtar nahi hai. Dedicated vector DB (jaise Qdrant) aksar simple hota hai jab:</p>
+<ul><li>Tumhare paas pehle se OpenSearch nahi hai, aur sirf vector search chahiye.</li><li>Team chhoti hai aur ek managed/simple vector service se kaam chal jata hai.</li><li>Keyword/BM25 ki zaroorat nahi, ya bahut kam hai.</li></ul>
+<p>Aur OpenSearch tab acha hai jab: cluster pehle se chal raha hai, keyword + filters + vectors saath chahiye, ya AWS par managed service use karni hai. "Sabse acha" nahi, <strong>tumhare context mein sabse sasta aur simple</strong>.</p>
+<h2 id="trade-offs">Trade-offs</h2>
+<ul><li>Hybrid: recall behtar, par complexity aur latency badhti hai.</li><li>Ek system (OpenSearch): operations simple, par vector features dedicated DB jitne focused nahi ho sakte.</li><li>Normalize + mean: tunable, par weights tune karne ka kaam; RRF: simple, par tuning kam.</li><li>Zyada vectors: better coverage, par memory cost.</li></ul>
+<h2 id="common-galtiyan">Common galtiyan</h2>
+<ul><li>Bina normalize kiye BM25 aur cosine scores jod dena.</li><li>Tenant filter sirf ek sub-query mein lagana.</li><li>Sirf vector search par chalna aur exact codes/names ke miss hone par hairan hona.</li><li>Weights guess karna, eval set banaye bina.</li><li>Document update par purane chunks delete na karna.</li><li>Embedding model badal kar index na badalna.</li><li>API shapes yaad se likhna; version ke hisaab se docs check karo.</li></ul>
+<h2 id="connection">Connection</h2>
+<ul><li>Chapter 11: embeddings aur vector DB; yahan unhi vectors ko search engine mein rakhte hain.</li><li>Chapter 12: chunking decide karti hai ki document mein kya jata hai.</li><li>Chapter 13: hybrid search aur RRF; ye chapter score-based combination ka doosra raasta dikhata hai.</li><li>Chapter 14: weights aur pipeline ko eval se tune karo.</li><li>Chapter 31: tenant_id token se aata hai aur filter ek hi jagah banta hai.</li><li>Chapter 26: ingestion workers.</li></ul>
+<h3 id="phase-6-capstone-mein-kaise-use-hoga">Phase 6 capstone mein kaise use hoga</h3>
+<p>Phase 6 ka capstone project Qdrant ki jagah <strong>OpenSearch</strong> use karega, kyunki job description mein RAG with OpenSearch hai. Plan:</p>
+<ol><li>Local mein OpenSearch Docker container mein chalao (tum Docker jaante ho).</li><li>Chunk index banao: <code>text</code>, <code>embedding</code>, <code>tenant_id</code> aur metadata.</li><li>Pehle sirf keyword aur sirf vector query alag-alag chalao, phir hybrid query + search pipeline lagao.</li><li>Search function ko Chapter 31 ke tenant-scoped pattern ke saath likho (tenant_id token se).</li><li>Small eval set se pure-vector vs hybrid compare karo (Chapter 14).</li></ol>
+<p>Exact queries aur pipeline config tum khud docs padh kar likhoge; wahi is project ki seekh hai.</p>
+<h2 id="remember">Remember</h2>
+<blockquote>Vector meaning pakadta hai, BM25 exact words; hybrid dono chalata hai, aur alag scale ke scores ko normalize karke (ya RRF se rank par) hi milana chahiye.</blockquote>
+<h2 id="test-yourself">Test Yourself</h2>
+<ol><li>Story mein "ERR-4521" vector search se kyun miss hua? Hybrid ne kaise madad ki?</li><li>BM25 aur cosine scores seedha jodna galat kyun hai? Min-max normalization kya karta hai?</li><li>Demo mein min-max mean aur RRF ne doc_A aur doc_B ko alag order mein kyun rakha?</li><li>Tenant_id filter kahan aur kaise lagana chahiye, aur ek sub-query mein bhool jaane par kya hoga?</li><li>Kab tum OpenSearch ki jagah dedicated vector DB choose karoge?</li></ol>
+</section>
   </main>
 </div>
 <script>
