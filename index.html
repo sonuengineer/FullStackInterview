@@ -476,6 +476,7 @@
     <button id="btn-images" title="System design diagrams with notes">&#128444;&#65039; Images</button>
     <button id="btn-sd" title="Full system design study material">&#127959;&#65039; System Design</button>
     <button id="btn-cs" title="PDF cheat sheets and quick-revision notes">&#128196; Cheat Sheets</button>
+    <button id="btn-ebook" title="AI System Design ebook in Hinglish (30 chapters)">&#128214; AI Ebook</button>
     <button id="btn-net" title="15 network flows every backend dev should know">&#127760; Network Flows</button>
     <button id="btn-ai" title="AI / agent engineering questions">&#129302; AI</button>
     <button id="theme-sepia">Sepia</button>
@@ -11414,6 +11415,22 @@ readerEl.addEventListener('click', (e) => {
 });
 
 document.getElementById('btn-cs').addEventListener('click', renderCheatsheets);
+// ---- AI Ebook tab -------------------------------------------------------
+// The ebook is a self-contained page (ai-ebook/index.html, built from ai-switch/ebook/build.py)
+// shown in a frame, so index.html stays small.
+function renderAiEbook() {
+  currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null;
+  document.title = 'AI Ebook - Learning Dashboard';
+  progressEl.textContent = '30 chapters';
+  readerEl.innerHTML = '<h1>&#128214; AI System Design Ebook</h1>' +
+    '<p style="color:var(--muted)">30 chapters in Hinglish: tokens and inference, caching, RAG, agents, MCP, safety, cost, scaling and system design interviews. Pick a chapter on the left of the book; theme and font size are at the top.</p>' +
+    '<div class="cs-actions"><a href="ai-ebook/index.html" target="_blank" rel="noopener">Open full screen &#8599;</a></div>' +
+    '<iframe class="cs-frame" style="height:calc(100vh - 200px)" src="ai-ebook/index.html" title="AI System Design Ebook" loading="lazy"></iframe>';
+  buildSidebar(document.getElementById('search').value);
+  document.getElementById('reader-wrap').scrollTop = 0;
+  closeMobileSidebar();
+}
+document.getElementById('btn-ebook').addEventListener('click', renderAiEbook);
 
 // ---- System Design tab -------------------------------------------------
 // The list of systems/parts comes from the sd-manifest block (written by
