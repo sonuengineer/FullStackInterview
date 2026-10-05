@@ -86,6 +86,12 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 .page blockquote p{margin:.2em 0}
 .page hr{border:none;border-top:1px solid var(--line);margin:2.6em auto;width:60%}
 .page code{font-family:ui-monospace,'Cascadia Code',Consolas,monospace;font-size:.86em;background:var(--code-bg);padding:.15em .4em;border-radius:6px}
+/* Inline code has no spaces to break on, so a token like
+   base_url="https://api.groq.com/openai/v1" used to force the whole column
+   wider than a phone screen. "anywhere" also shrinks min-content width, so
+   the paragraph stops pushing the page sideways. Block code is excluded: it
+   keeps white-space:pre and scrolls inside its own box instead. */
+.page :not(pre) > code{overflow-wrap:anywhere}
 .page pre{background:var(--code-bg);border:1px solid var(--line);border-radius:14px;padding:18px 20px;overflow-x:auto;line-height:1.55;margin:0 0 1.4em;font-size:.85em}
 .page pre code{background:none;padding:0;font-size:1em}
 .page table{border-collapse:collapse;width:100%;margin:0 0 1.5em;font-size:.92em}

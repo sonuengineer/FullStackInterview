@@ -11511,7 +11511,9 @@ function renderAiTrackItem(key, idx) {
     (sub ? '<p style="color:var(--muted)">' + sub + '</p>' : '') +
     '<div class="cs-actions"><a href="' + src + '" target="_blank" rel="noopener">Open full screen &#8599;</a>' +
     '<button data-ait="home">All AI sections</button></div>' +
-    '<iframe class="cs-frame" style="height:calc(100vh - 230px)" src="' + src + '" title="' + escHtml(item.title) + '" loading="lazy"></iframe>' +
+    // No inline height: .cs-frame already sizes itself, and its max-width:760px
+    // media query switches to 70vh on phones. An inline style would beat that.
+    '<iframe class="cs-frame" src="' + src + '" title="' + escHtml(item.title) + '" loading="lazy"></iframe>' +
     '<div class="suggest-nav">' +
       (prev ? '<button data-ait="' + key + ':' + (i - 1) + '">&larr; ' + escHtml(prev.title) + '</button>'
             : '<button data-ait="home">&larr; All AI sections</button>') +
