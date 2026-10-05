@@ -2,6 +2,8 @@
 
 *Behavioural round ka sabse zyada under-prepared sawaal. Technical round ke liye log mahine lagate hain, is sawaal par 5 minute bhi nahi.*
 
+> **Connects to**: [[130-production-incident-story]] (incident answer) | [[128-star-method-from-your-own-incidents]] (STAR structure)
+
 ---
 
 ## 1. Sawaal Ke Peeche Ka Asli Sawaal

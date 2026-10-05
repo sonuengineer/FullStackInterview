@@ -2,6 +2,8 @@
 
 *Ye sawaal trick nahi hai. Ye ek **free chance** hai self-awareness dikhane ka -- aur log use "main perfectionist hoon" bolkar barbaad kar dete hain.*
 
+> **Connects to**: [[131-disagreement-with-teammate-or-manager]] (feedback and conflict)
+
 ---
 
 ## 1. "Main Perfectionist Hoon" Kyun Fail Hota Hai

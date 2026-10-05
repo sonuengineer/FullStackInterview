@@ -2,6 +2,8 @@
 
 *Do sawaal, ek hi trap. Dono mein interviewer check kar raha hai ki aap kisi cheez se **bhaag** rahe ho ya kisi cheez ki **taraf** jaa rahe ho.*
 
+> **Connects to**: [[127-tell-me-about-yourself]] (opening answer)
+
 ---
 
 ## 1. Ek Rule Jo Dono Sawaalon Par Lagta Hai

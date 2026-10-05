@@ -14785,6 +14785,2773 @@ Interview se pehle likh lo (bolkar practice karo):
 5. Aapka 3-saal jawab aur aapka "why this company" jawab -- same direction mein hain?
 </script>
 
+<script type="text/markdown" class="lesson-data" data-id="137" data-title="Event Loop Phases and Microtasks" data-category="Node.js Internals" data-order="137">
+# Event Loop Ke Phases Aur Microtasks (Asli Order)
+
+> **Connects to**: [[01-concurrency-vs-parallelism]] (ek core, kai tasks), [[109-cluster-worker-threads-child-process-hinglish]] (jab ek loop kaafi na ho) aur [[58-less-traffic-more-cpu]] (ek sync block poore server ko kaise girata hai).
+
+## 1. Ye Sawaal Har Interview Mein Aata Hai, Aur Galat Jaata Hai
+
+"Event loop kaise kaam karta hai?" -- 90% log jawab dete hain: *"Node single-threaded hai, async kaam queue mein jaata hai, loop uthata rehta hai."*
+
+Ye galat nahi hai, par ye **ek queue** ka model hai. Asli Node mein **kai queues** hain, ek fixed order mein, aur unke beech ek alag microtask queue hai jo har baar drain hoti hai. Jab tak ye picture clear nahi hai, aap `setTimeout` vs `setImmediate` vs `nextTick` ka output guess karte reh jaayenge.
+
+## 2. Chhe Phases, Isi Order Mein
+
+Ek loop iteration (libuv ise "tick" bolta hai) in phases se guzarta hai:
+
+| # | Phase | Isme kya chalta hai |
+|---|---|---|
+| 1 | **timers** | `setTimeout` / `setInterval` ke callbacks jinka time poora ho gaya |
+| 2 | **pending callbacks** | OS-level deferred callbacks, jaise TCP error (`ECONNREFUSED`) |
+| 3 | **idle, prepare** | Sirf libuv ka internal kaam -- aapka code yahan nahi aata |
+| 4 | **poll** | **Naya I/O** -- socket readable, file read done, incoming HTTP request. Loop yahan **block** ho ke wait karta hai |
+| 5 | **check** | `setImmediate` ke callbacks |
+| 6 | **close callbacks** | `socket.on('close')`, `server.close()` wale callbacks |
+
+Yaad rakhne ka sentence: **T-P-I-P-C-C** -- *timers, pending, idle, poll, check, close.*
+
+Sabse zyada time **poll** mein jaata hai, kyunki ek HTTP server ka 99% kaam yahi hai: naye requests aur DB responses ka intezaar.
+
+```mermaid
+flowchart LR
+  T[timers] --> P[pending]
+  P --> I[idle/prepare]
+  I --> PO[poll]
+  PO --> C[check: setImmediate]
+  C --> CL[close]
+  CL --> T
+```
+
+## 3. Microtask Queue -- Yahi Interview Decide Karta Hai
+
+Phases **macrotasks** hain. Inke beech mein, aur **har ek callback ke baad**, Node do microtask queues poori drain karta hai, isi priority mein:
+
+1. **`process.nextTick` queue** -- sabse pehle, poori khaali hone tak.
+2. **Promise microtask queue** -- `.then` / `.catch` / `.finally` / `await` ke resume points.
+
+Important: microtasks "beech mein" nahi, **beech mein aur pehle bhi** chalte hain. Synchronous code khatam hone ke turant baad, loop ke kisi bhi phase mein ghusne se pehle, ye queues drain hoti hain.
+
+Mental model:
+
+> Phases ek chaar manzil ki building ke floors hain. Microtask queue woh seedhi hai jise aapko **har floor change par poori** utarna padta hai. Jab tak seedhi khaali nahi hogi, agla floor shuru nahi hoga.
+
+## 4. Pehle Predict Karo, Phir Chalao
+
+```javascript
+// file: order.js  -- chalane se pehle output likh lo
+console.log('1 sync start');
+
+setTimeout(() => console.log('5 setTimeout 0'), 0);
+setImmediate(() => console.log('6 setImmediate'));
+
+process.nextTick(() => {
+  console.log('3 nextTick');
+  process.nextTick(() => console.log('3.5 nested nextTick'));
+});
+
+Promise.resolve().then(() => console.log('4 promise then'));
+
+console.log('2 sync end');
+```
+
+Output:
+
+```
+1 sync start
+2 sync end
+3 nextTick
+3.5 nested nextTick      <- nested nextTick bhi promise se PEHLE
+4 promise then
+5 setTimeout 0           <- ya 6 pehle, neeche padho
+6 setImmediate
+```
+
+Do seekh:
+
+- `3.5` promise se pehle aaya kyunki nextTick queue **recursively** drain hoti hai -- jo naye nextTick us dauran add hue, wo bhi usi drain mein nikal jaate hain. Promise queue ko turn hi baad mein milta hai.
+- **Honest baat**: main module mein `setTimeout(0)` aur `setImmediate` ka order **guaranteed nahi** hai. `0` ko Node `1` ms bana deta hai, aur process startup ka time 1 ms se kam ya zyada ho sakta hai -- isliye race hai. Node docs isi ko "non-deterministic" kehte hain.
+
+Deterministic version: kisi bhi I/O callback ke **andar** `setImmediate` hamesha pehle chalega, kyunki hum poll phase mein hain aur **check** usi iteration mein agla phase hai, jabki timers ko next iteration ka wait karna padega.
+
+```javascript
+const fs = require('node:fs');
+fs.readFile(__filename, () => {       // hum ab poll phase ke andar hain
+  setTimeout(() => console.log('timeout'), 0);
+  setImmediate(() => console.log('immediate'));
+});
+// Output: immediate, phir timeout -- hamesha.
+```
+
+## 5. Do Naam Jo Jhooth Bolte Hain
+
+**`setTimeout(fn, 0)` 0 ms nahi hai.** Node ise minimum `1` ms banata hai, aur wo bhi "at least 1 ms" hai, "exactly" nahi. Callback tab chalega jab loop **timers phase tak pahunchega** aur usse pehle koi lamba sync kaam ya poll block na ho. 10 ms ka timer load ke time 300 ms baad bhi fire ho sakta hai -- timers **deadline** nahi, **earliest eligible time** dete hain.
+
+**`setImmediate` immediate nahi hai.** Wo check phase mein chalta hai, yaani **current poll phase khatam hone ke baad**. Naam ulta hai: `setImmediate` deta hai *"abhi wale I/O cycle ke baad"*, aur `process.nextTick` deta hai *"literally agle instruction ke baad"*. Node ke docs khud kehte hain ki naam aapas mein badle hone chahiye the.
+
+## 6. nextTick Starvation -- Isko Chalao Aur Dekho
+
+Kyunki nextTick queue **poori** drain hoti hai aur usme add karna uske andar se allowed hai, ek recursive nextTick loop ko hamesha ke liye bhookha rakh sakta hai:
+
+```javascript
+setTimeout(() => console.log('main kabhi nahi chalunga'), 10);
+
+function spin() {
+  process.nextTick(spin);     // queue kabhi khaali nahi hogi
+}
+spin();
+// CPU 100%, timer kabhi fire nahi hota, HTTP server naye request accept nahi karega
+```
+
+Yahi code `setImmediate(spin)` ke saath likho -- server zinda rahega, timer bhi fire hoga, kyunki `setImmediate` har iteration mein **sirf ek round** chalta hai aur loop ko poll phase mein jaane deta hai.
+
+> Rule: lamba ya recursive kaam chahiye to `setImmediate` use karo, `process.nextTick` kabhi nahi.
+
+## 7. Production Reality: Ek Sync Block Sabko Rok Deta Hai
+
+Event loop ek hi thread par aapka JS chalata hai. Iska seedha matlab: ek request ka 400 ms ka synchronous kaam (bada `JSON.parse`, sync crypto, `readFileSync`, regex backtracking) us 400 ms mein **saare** connections ko rok deta hai -- jo requests queue mein hain unki latency 400 ms badh jaati hai. Yahi [[58-less-traffic-more-cpu]] aur [[13-hidden-latency-bottleneck]] wali kahani ka engine hai.
+
+Isko guess mat karo, **naapo**:
+
+```javascript
+const { monitorEventLoopDelay } = require('node:perf_hooks');
+const h = monitorEventLoopDelay({ resolution: 10 });   // ms
+h.enable();
+
+setInterval(() => {
+  // nanoseconds aate hain -> ms mein badlo
+  console.log({ p50: h.mean / 1e6, p99: h.percentile(99) / 1e6, max: h.max / 1e6 });
+  h.reset();
+}, 10_000).unref();
+```
+
+Interpretation:
+- p99 delay **< 10-20 ms**: loop healthy hai.
+- p99 **100 ms+**: koi handler CPU block kar raha hai. Ab `--cpu-prof` ya clinic/0x se flamegraph lo, ya kaam `worker_threads` mein bhejo ([[109-cluster-worker-threads-child-process-hinglish]]).
+
+Ye metric Prometheus mein export karna chahiye -- latency alert se pehle event loop delay chadhta hai, yaani ye ek **leading indicator** hai.
+
+## 8. Common Galtiyan
+
+- **"Node single-threaded hai to parallel kuch nahi hota"** -- aapka JS single-threaded hai, par file I/O, DNS aur `crypto.pbkdf2` libuv ke **thread pool** (default 4 threads, `UV_THREADPOOL_SIZE`) mein chalte hain.
+- **`process.nextTick` ko "thoda defer karna" samajhna** -- wo defer nahi, **priority jump** hai.
+- **Timer ko schedule guarantee maanna** -- cron-level accuracy ke liye event loop par bharosa mat karo.
+- **`async` lagane se CPU kaam non-blocking ho jaata hai** -- nahi. `await` tabhi yield karta hai jab neeche asli async operation ho; pure CPU loop par `async` sirf naam ka hai ([[01-concurrency-vs-parallelism]]).
+
+## 9. Interview Mein Kaise Bolna Hai
+
+*"Loop chhe phases mein ghoomta hai -- timers, pending callbacks, idle/prepare, poll, check, close. Mera server ka zyada time poll mein jaata hai. In phases ke beech aur har callback ke baad do microtask queues drain hoti hain: pehle `process.nextTick`, phir promises -- isliye `nextTick` hamesha `.then` se pehle chalta hai. `setTimeout(0)` actually 1 ms minimum hai aur deadline nahi deta, `setImmediate` check phase mein chalta hai yaani current I/O cycle ke baad. Main event loop delay `monitorEventLoopDelay` se monitor karta hoon, kyunki p99 delay latency se pehle chadhta hai."*
+
+## 🧠 Remember
+
+> Phases ek fixed circle mein ghoomte hain -- timers, pending, idle, poll, check, close -- aur har phase ke beech microtask queue poori khaali hoti hai: pehle `nextTick`, phir promises. Isi wajah se `nextTick` sabse jaldi chalta hai, `setTimeout(0)` kabhi 0 ms nahi hota, aur `setImmediate` kabhi immediate nahi hota.
+
+## Quick Self-Test
+
+1. Ek callback ke andar aap `process.nextTick` aur `Promise.resolve().then` dono register karte hain -- kaun pehle chalega aur kyun?
+2. `setImmediate` aur `setTimeout(fn, 0)` mein se kaun pehle chalega -- main module mein, aur `fs.readFile` callback ke andar? Dono jawab alag kyun hain?
+3. Recursive `process.nextTick` server ko kaise maar deta hai, aur `setImmediate` se wahi kaam safe kyun ho jaata hai?
+4. p99 event loop delay 250 ms aa raha hai par CPU sirf 40% hai -- aapka pehla shak kya hoga?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="138" data-title="Closures and Scope (Real Bugs)" data-category="Node.js Internals" data-order="138">
+# Closures Aur Scope: Woh Bugs Jo Production Mein Aate Hain
+
+> **Connects to**: [[22-nodejs-memory-leak-debugging]] (closure ek retainer hai), [[137-event-loop-phases-and-microtasks]] (callback baad mein chalta hai, isliye scope ka sawaal paida hota hai) aur [[16-synchronized-connection-pool-expiry]] (loop mein banaye gaye timers).
+
+## 1. Bug Pehle, Theory Baad Mein
+
+Ek retry utility. Teen attempts, badhte delay ke saath, aur log mein attempt number. Code 100% logical lagta hai:
+
+```javascript
+for (var i = 1; i <= 3; i++) {
+  setTimeout(() => console.log('attempt', i), i * 100);
+}
+```
+
+Expected: `attempt 1`, `attempt 2`, `attempt 3`.
+
+Actual:
+
+```
+attempt 4
+attempt 4
+attempt 4
+```
+
+Teen alag logs, teeno mein `4`. Ab socho ye `i` attempt number nahi, **array index** hota (`items[i]`) -- teeno callbacks ek hi (ya `undefined`) item process karte, aur production mein ye silently galat data likh deta.
+
+## 2. Hua Kya
+
+`var` ka scope **function** hai, block nahi. Poore loop mein `i` ka **ek hi** binding bana. Teeno arrow functions ne value copy nahi ki -- unhone us **ek variable ka reference** pakda. Callbacks tab chale jab loop khatam ho chuka tha aur `i` already `4` ho gaya tha (isi 4 ne loop todha).
+
+Timing ka point zaroori hai: callback event loop ke timers phase mein chalta hai, yaani sync loop ke **baad** ([[137-event-loop-phases-and-microtasks]]). Isliye wo "current" value dekhta hai, "us waqt ki" value nahi.
+
+`let` ise theek karta hai:
+
+```javascript
+for (let i = 1; i <= 3; i++) {
+  setTimeout(() => console.log('attempt', i), i * 100);
+}
+// attempt 1, attempt 2, attempt 3
+```
+
+Kyun? `let` loop mein JS **har iteration ke liye naya binding** banata hai. Teen callbacks, teen alag `i`. Ye ES6 ka specific rule hai -- magic nahi, spec mein likha hai.
+
+Pre-ES6 fix (interview mein poochha jaata hai) -- IIFE se apna scope banao:
+
+```javascript
+for (var i = 1; i <= 3; i++) {
+  (function (n) {                 // n = us iteration ki copy
+    setTimeout(() => console.log('attempt', n), n * 100);
+  })(i);
+}
+```
+
+## 3. Woh Definition Jo Yaad Reh Jaati Hai
+
+**Term: Closure** -- ek function apne saath wo scope leke chalta hai **jahan use banaya gaya tha**, us scope ka nahi jahan se use **call kiya jaata hai**.
+
+Yahi ek line poora topic hai. Lexical (likhne ki jagah) scope matter karta hai, dynamic (chalane ki jagah) nahi.
+
+```javascript
+const secret = 'outer';
+function make() {
+  const secret = 'inner';
+  return () => secret;            // banne ki jagah se uthayega
+}
+const fn = make();
+fn();                              // 'inner' -- hamesha, kahin se bhi call karo
+```
+
+Mental model:
+
+> Closure ek function + uska **backpack** hai. Backpack usi kamre mein pack hota hai jahan function paida hua. Function kahin bhi jaaye, backpack saath jaata hai -- aur jo cheez backpack mein hai wo garbage collect nahi hogi.
+
+Ye last line hi aage ka memory bug hai.
+
+## 4. Char Jagah Jahan Closure Aap Roz Use Karte Hain
+
+**(a) Module-scoped counter / cache -- private state bina class ke**
+
+```javascript
+function createIdGenerator(prefix) {
+  let n = 0;                            // bahar se touch nahi kar sakte
+  return () => `${prefix}-${++n}`;
+}
+const nextOrderId = createIdGenerator('ORD');
+nextOrderId();   // ORD-1
+nextOrderId();   // ORD-2
+```
+
+`n` par koi bahar se `= 500` nahi kar sakta. Ye asli encapsulation hai, `#private` fields se pehle isi se kaam chalta tha.
+
+**(b) `once()` wrapper -- idempotent cleanup**
+
+```javascript
+function once(fn) {
+  let called = false, result;
+  return (...args) => {
+    if (called) return result;
+    called = true;
+    return (result = fn(...args));
+  };
+}
+
+const shutdown = once(async () => {
+  await server.close();
+  await pool.end();
+});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);     // dono aa jaayein to bhi pool ek hi baar band
+```
+
+`called` kahin store nahi kiya -- closure mein hai.
+
+**(c) Per-request context -- middleware mein capture**
+
+```javascript
+app.use((req, res, next) => {
+  const requestId = req.headers['x-request-id'] ?? crypto.randomUUID();
+  // ye logger requestId ko capture karta hai -- aage har call mein wahi id
+  req.log = (msg, extra = {}) =>
+    console.log(JSON.stringify({ requestId, route: req.path, msg, ...extra }));
+  next();
+});
+
+// handler mein
+req.log('charging card', { amount });   // requestId automatically andar hai
+```
+
+Correlated logs isi pattern par bante hain ([[02-debugging-random-500-errors]] ka base).
+
+**(d) Factory -- configured functions**
+
+```javascript
+const withRetry = (attempts, baseMs) => async (task) => {
+  for (let i = 0; i < attempts; i++) {
+    try { return await task(); }
+    catch (err) {
+      if (i === attempts - 1) throw err;
+      await new Promise(r => setTimeout(r, baseMs * 2 ** i));   // i capture hua
+    }
+  }
+};
+
+const retryFast = withRetry(3, 50);     // ek hi logic, do config
+const retrySlow = withRetry(5, 500);
+```
+
+Dono functions **alag** closures hain, alag `attempts` aur `baseMs` ke saath.
+
+## 5. Production Cost Jo Koi Nahi Batata
+
+Interview articles closure ko "powerful" bata ke rok jaate hain. Production ka sach:
+
+> Ek closure apne **poore enclosing scope** ka context zinda rakhta hai, sirf us variable ka nahi jo use chahiye.
+
+Ek scope ke saare inner functions **ek hi context object** share karte hain. Agar unme se **koi ek** bade object ko reference karta hai, to us scope se bana koi bhi long-lived closure us bade object ko bhi zinda rakhta hai.
+
+```javascript
+const handlers = [];                    // long-lived -- yahi leak ka anchor hai
+
+function register(req) {
+  const body = req.body;                // maan lo 10 MB payload
+  const audit = () => body.length;      // sibling closure: body ko reference karta hai
+  handlers.push(() => 'ok');            // chhota lagta hai, par wahi context share karta hai
+  return audit;
+}
+
+// simulate
+for (let i = 0; i < 200; i++) register({ body: Buffer.alloc(10 * 1024 * 1024) });
+global.gc?.();
+console.log((process.memoryUsage().heapUsed / 1e6).toFixed(0), 'MB heapUsed');
+// node --expose-gc se chalao: heap chadha rahega, kyunki 200 buffers reachable hain
+```
+
+Fix seedha hai -- **capture sirf wo karo jo chahiye**:
+
+```javascript
+function register(req) {
+  const size = req.body.length;         // number nikal lo, buffer chhod do
+  const audit = () => size;
+  handlers.push(() => 'ok');
+  return audit;
+}
+```
+
+[[22-nodejs-memory-leak-debugging]] mein jo "retainer chain" dekhte hain, heap snapshot mein ye leak `(closure)` / `system / Context` naam se dikhta hai. Isi liye wahan ka rule tha: leak dhoondho **retainers** se, code padh ke nahi.
+
+Jahan bada data `await` ke aage bhi nahi chahiye, wahan explicitly `body = null` kar dena bilkul valid hai -- hack nahi, intent hai.
+
+## 6. "Output Kya Hoga" -- Teen Snippets
+
+| Snippet | Output | Kyun |
+|---|---|---|
+| `for (var i=0;i<3;i++) setTimeout(()=>console.log(i))` | `3 3 3` | Ek shared `var` binding, callbacks loop ke baad chale |
+| `for (let i=0;i<3;i++) setTimeout(()=>console.log(i))` | `0 1 2` | Per-iteration binding |
+| `const fns=[]; for (var i=0;i<3;i++) fns.push(()=>i); fns.map(f=>f())` | `[3,3,3]` | Sync call bhi bachata nahi -- loop pehle hi khatam ho chuka |
+
+Bonus jo log galat karte hain:
+
+```javascript
+console.log(x);   // undefined  -- var hoisted, value nahi
+var x = 1;
+
+console.log(y);   // ReferenceError: Cannot access 'y' before initialization
+let y = 1;        // TDZ (Temporal Dead Zone)
+```
+
+**Term: TDZ** -- `let`/`const` hoist hote hain par declaration line tak "uninitialized" rehte hain, isliye `undefined` ke bajaye error milta hai. Ye feature hai: galti jaldi pakad lo.
+
+## 7. Common Galtiyan
+
+- Loop mein `var` ke saath async callback register karna -- 2026 mein bhi legacy code aur `forEach` ke bina likhe loops mein milta hai.
+- Closure ko "value copy" samajhna -- wo **reference** rakhta hai, snapshot nahi.
+- Request-scoped bada data (body, buffer, DB rows) long-lived callback/cache/emitter mein capture karna.
+- `this` ko closure samajhna -- `this` closure se **nahi** aata, wo call-time par decide hota hai ([[139-prototypes-this-call-apply-bind]]).
+
+## 🧠 Remember
+
+> Closure ka matlab: function apne saath wo scope leke chalta hai jahan wo **banaya** gaya tha, jahan se **call** hua wahan ka nahi -- aur wo poora scope zinda rehta hai, isliye closure jitni power deta hai utna hi memory ka bill bhi bana sakta hai.
+
+## Quick Self-Test
+
+1. `var` wale loop ko `let` theek kar deta hai -- exactly kya badal jaata hai, bina "block scope" shabd use kiye?
+2. Aapka `once()` wrapper `called` flag kahan store karta hai? Us flag ko bahar se kaise padha ja sakta hai?
+3. Ek closure jo sirf `body.length` chahta hai, 10 MB buffer kaise zinda rakh sakta hai -- aur ise heap snapshot mein kis naam se dhoondhenge?
+4. `console.log(x); var x = 1;` aur `console.log(y); let y = 1;` ka output alag kyun hai?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="139" data-title="Prototypes, this, call/apply/bind" data-category="Node.js Internals" data-order="139">
+# Prototypes, this, Aur call/apply/bind
+
+> **Connects to**: [[138-closures-and-scope-real-bugs]] (scope lexical hai, par `this` nahi -- yahi confusion ki jad hai) aur [[116-solid-principles-nodejs]] (class, inheritance, composition).
+
+## 1. Kahani: Service Class Jo Express Mein Phat Gayi
+
+Ek payment service, clean OOP style:
+
+```javascript
+class PaymentService {
+  constructor(gateway) { this.gateway = gateway; }
+
+  async charge(req, res) {
+    const result = await this.gateway.charge(req.body);   // <- yahan crash
+    res.json(result);
+  }
+}
+
+const service = new PaymentService(stripe);
+app.post('/charge', service.charge);     // dikhne mein bilkul theek
+```
+
+Production log:
+
+```
+TypeError: Cannot read properties of undefined (reading 'charge')
+```
+
+Class, constructor, gateway -- sab theek hai. Fir bhi `this.gateway` `undefined` hai. Kyunki Express ne method ko **object se alag karke** call kiya. JS mein `this` function ke saath attach nahi hota, **call ke tareeke** se decide hota hai.
+
+## 2. Char Binding Rules, Priority Order Mein
+
+Jab bhi `this` ka sawaal aaye, upar se neeche check karo. **Pehla jo match kare, wahi jeetega.**
+
+**Rule 1 -- `new` binding (sabse strong)**
+
+```javascript
+function User(name) { this.name = name; }
+const u = new User('Sonu');    // this = naya khaali object
+u.name;                        // 'Sonu'
+```
+
+**Rule 2 -- Explicit binding (`call` / `apply` / `bind`)**
+
+```javascript
+function greet(greeting, mark) { return `${greeting}, ${this.name}${mark}`; }
+const user = { name: 'Sonu' };
+
+greet.call(user, 'Hi', '!');        // args alag-alag
+greet.apply(user, ['Hi', '!']);     // args ek Array mein  (A = Array)
+const bound = greet.bind(user);     // naya function, this permanently fix
+bound('Hi', '!');
+```
+
+`call` vs `apply` ka farak sirf args ka shape hai. `bind` turant call nahi karta -- **naya function** return karta hai.
+
+**Rule 3 -- Implicit binding (dot ke left wala object)**
+
+```javascript
+const order = { id: 7, describe() { return `order ${this.id}`; } };
+order.describe();                   // 'order 7' -- this = order
+```
+
+Sirf **call site** ka dot matter karta hai, declaration ki jagah nahi.
+
+**Rule 4 -- Default binding (kuch nahi mila)**
+
+```javascript
+'use strict';
+function show() { return this; }
+show();            // undefined  (strict mode / ES module / class body)
+// non-strict CommonJS script mein: globalThis
+```
+
+Modern code mein (ESM, TypeScript, class bodies -- sab strict) default binding `undefined` hai. Isi liye upar wali error `Cannot read properties of undefined` thi, na ki chup-chaap global par kuch likh dena.
+
+## 3. Woh Bug Jo Sabke Saath Hota Hai: Method Nikal Lena
+
+Method ko reference ki tarah pass karte hi Rule 3 toot jaata hai aur Rule 4 lag jaata hai:
+
+```javascript
+class Counter {
+  constructor() { this.n = 0; }
+  inc() { this.n++; return this.n; }
+}
+const c = new Counter();
+
+c.inc();                 // 1 -- theek (dot hai)
+
+const fn = c.inc;        // sirf function nikala, object chhoda
+fn();                    // TypeError: Cannot read properties of undefined
+
+setTimeout(c.inc, 100);  // wahi problem -- setTimeout bina dot call karega
+emitter.on('tick', c.inc);   // aur yahan EventEmitter `this` ko emitter bana deta hai!
+```
+
+`EventEmitter` wala case extra gandha hai: wo listener ko emitter ke context mein call karta hai, to `this.n` crash nahi karta -- wo **chup-chaap emitter par** `n` bana deta hai. Code chalta hai, counter kabhi nahi badhta. Silent bug, jo crash se bura hai.
+
+### Teen Fix, Teen Trade-off
+
+```javascript
+// Fix 1: constructor mein bind -- har instance apna bound copy
+class A {
+  constructor() { this.inc = this.inc.bind(this); }
+  inc() { /* ... */ }
+}
+// + prototype par method rehta hai, subclass override kar sakta hai
+// - per-instance ek extra function object
+
+// Fix 2: arrow property -- sabse common React/handler style
+class B {
+  n = 0;
+  inc = () => { this.n++; };      // arrow ka this = banne ke waqt ka instance
+}
+// + pass karne par kabhi nahi tootega
+// - prototype par nahi, INSTANCE par hai: super.inc() nahi, spy/mock karna mushkil
+
+// Fix 3: wrapper lambda call site par
+app.post('/charge', (req, res) => service.charge(req, res));
+// + class saaf rehti hai, dot wapas aa jaata hai
+// - har call site par yaad rakhna padta hai
+```
+
+Mera default: **library/class code mein Fix 1 ya 3**, aur UI-style event handlers mein Fix 2. Express routes ke liye Fix 3 sabse readable hai.
+
+## 4. Arrow Functions: `this` Hi Nahi Hota
+
+Arrow function apna `this` **banata hi nahi**. Wo lexically bahar wale scope se uthata hai -- bilkul normal variable ki tarah ([[138-closures-and-scope-real-bugs]]). Isi se do rules nikalte hain:
+
+**Callbacks ke liye arrow sahi hai:**
+
+```javascript
+class Poller {
+  constructor() { this.hits = 0; }
+  start() {
+    setInterval(() => { this.hits++; }, 1000);   // this = Poller instance
+    // setInterval(function () { this.hits++; }, 1000) -- yahan this undefined/Timeout
+  }
+}
+```
+
+**Object methods ke liye arrow galat hai:**
+
+```javascript
+const bad = {
+  id: 7,
+  describe: () => `order ${this.id}`,   // this = module scope, NOT bad
+};
+bad.describe();      // 'order undefined'
+```
+
+Aur `obj.method.call(x)` ya `.bind(x)` arrow par **kaam hi nahi karta** -- bind karne ke liye apna `this` hona chahiye, arrow ke paas hai hi nahi. Isliye prototype methods arrow se kabhi mat likho.
+
+## 5. "Yahan this Kya Hai" -- Ek Table
+
+| Call | `this` | Rule |
+|---|---|---|
+| `new Foo()` | naya object | new |
+| `fn.call(o)` / `fn.apply(o)` / `fn.bind(o)()` | `o` | explicit |
+| `obj.fn()` | `obj` | implicit |
+| `const f = obj.fn; f()` | `undefined` (strict) / global | default |
+| `setTimeout(obj.fn)` | `Timeout` object | default-ish, dot kho gaya |
+| `emitter.on('x', obj.fn)` | emitter | emitter khud call karta hai |
+| `arr.map(obj.fn)` | `undefined` | dot kho gaya |
+| `arr.map(obj.fn, obj)` | `obj` | `map` ka 2nd arg thisArg |
+| arrow, kahin se bhi | jahan likha gaya wahan ka `this` | arrow ka apna nahi hota |
+| class method, strict | call site par depend | class body strict hai |
+
+Interview line: *"`this` function ki property nahi, call site ki property hai. Main char rules priority mein check karta hoon: new, explicit, implicit, default."*
+
+## 6. Prototypes: `class` Actually Kya Hai
+
+`class` JavaScript mein **syntax sugar** hai. Andar ab bhi prototypes hi hain.
+
+```javascript
+class Animal {
+  constructor(name) { this.name = name; }
+  speak() { return `${this.name} makes a sound`; }
+}
+
+// lagbhag barabar:
+function Animal2(name) { this.name = name; }
+Animal2.prototype.speak = function () { return `${this.name} makes a sound`; };
+```
+
+Ek important baat: `speak` **har object mein copy nahi** hota. Wo ek hi baar `Animal.prototype` par rehta hai, aur saare instances usi ko share karte hain -- isliye 1 lakh objects banane par memory nahi phatti.
+
+**Lookup chain:**
+
+```
+dog.speak()
+  -> dog ke own properties mein hai?            nahi
+  -> Object.getPrototypeOf(dog) = Dog.prototype?  nahi
+  -> Animal.prototype?                          mil gaya -> call, this = dog
+  -> Object.prototype?                          (warna yahan tak jaata)
+  -> null -> undefined
+```
+
+```javascript
+class Dog extends Animal {
+  speak() { return `${super.speak()} -- woof`; }   // super = Animal.prototype
+}
+const d = new Dog('Bruno');
+Object.getPrototypeOf(d) === Dog.prototype;              // true
+Object.getPrototypeOf(Dog.prototype) === Animal.prototype; // true
+d.hasOwnProperty('speak');                                // false -- prototype par hai
+d.hasOwnProperty('name');                                 // true  -- own property
+```
+
+Class aur `function` constructor mein do asli farak: class body **hamesha strict mode** hai, aur class methods **non-enumerable** hain (`for...in` mein nahi aayenge).
+
+## 7. `Array.prototype` Mein Mat Chhedo
+
+```javascript
+// kabhi mat karo
+Array.prototype.last = function () { return this[this.length - 1]; };
+
+for (const key in [10, 20]) console.log(key);   // '0', '1', 'last'  <- aa gaya
+```
+
+Kyun bura hai:
+- Built-in prototype par likhi property **enumerable** hoti hai, to `for...in` aur purane library loops usme ghus jaate hain.
+- Aapka `last` kal ECMAScript mein aa gaya (jaise `at()` aaya) to aap spec ke behaviour ko overwrite kar rahe honge -- aur **saari** dependencies aapka version dekhengi.
+- Debug karna narak hai: bug kisi third-party package mein dikhega, aapke code mein nahi.
+
+Safe alternative: plain helper (`const last = (a) => a.at(-1)`) ya apni subclass. Modern TS/JS mein utility function hi right answer hai.
+
+## 8. Common Galtiyan
+
+- `this` ko closure samajhna. Scope lexical hai, `this` **dynamic** hai -- do alag mechanism.
+- `bind` ko mutating samajhna. `fn.bind(o)` original ko nahi badalta, **naya** function deta hai; `fn.bind(a).bind(b)` mein `a` hi jeetega.
+- `new (fn.bind(o))()` -- `new` jeet jaata hai, bound `this` ignore ho jaata hai (Rule 1 > Rule 2).
+- Prototype methods arrow se likhna -- `super` aur `bind` dono mar jaate hain.
+- Render/hot path mein har baar `.bind()` call karna -- naya function object banta hai; constructor mein ek baar bind karo.
+
+## 🧠 Remember
+
+> `this` function ke saath nahi, **call site** ke saath aata hai -- priority: new > call/apply/bind > object ke dot > default (strict mein `undefined`). Arrow ka apna `this` hota hi nahi, aur `class` sirf prototype chain ka sundar naam hai.
+
+## Quick Self-Test
+
+1. `app.post('/x', service.charge)` crash karta hai par `service.charge(req, res)` chalta hai -- exactly kaunsa rule toota?
+2. `emitter.on('tick', c.inc)` crash kyun nahi karta, aur ye crash hone se bura kyun hai?
+3. Constructor-bind aur arrow-property fix mein testing/inheritance ke hisaab se kya trade-off hai?
+4. `new (greet.bind(user))()` mein `this` kaun hoga aur kyun?
+5. `d.hasOwnProperty('speak')` `false` kyun hai jabki `d.speak()` chalta hai?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="140" data-title="Promises Internals and async/await" data-category="Node.js Internals" data-order="140">
+# Promises Andar Se Aur async/await Ka Asli Matlab
+
+> **Connects to**: [[137-event-loop-phases-and-microtasks]] (`await` microtask queue mein resume hota hai), [[54-notify-5000-users-10x-faster]] (serial vs parallel fan-out), [[103-n-plus-1-vs-connection-pool-hinglish]] aur [[16-synchronized-connection-pool-expiry]] (pool ko kaise maarte hain).
+
+## 1. Teen States, Aur Ek Niyam
+
+Ek promise sirf teen haalaton mein ho sakta hai:
+
+| State | Matlab |
+|---|---|
+| **pending** | kaam chal raha hai |
+| **fulfilled** | value mil gayi |
+| **rejected** | error aa gaya |
+
+Niyam: **pending -> fulfilled** ya **pending -> rejected**, bas. Ek baar **settled** (fulfilled ya rejected) ho gaya, to wo **kabhi** nahi badalta.
+
+```javascript
+const p = new Promise((resolve, reject) => {
+  resolve('first');
+  resolve('second');     // ignore
+  reject(new Error('x')); // ignore -- throw bhi nahi hoga
+});
+p.then(console.log);     // 'first'
+```
+
+Isi immutability ki wajah se promise ek **reliable value handle** hai: aap use 10 jagah pass kar sakte hain, 10 baar `.then` laga sakte hain, sabko same result milega. Callback mein ye guarantee nahi thi -- ek buggy library callback do baar call kar deti thi aur aapka order double charge ho jaata tha. Promise spec ne isi class ke bug ko mitaya.
+
+Ek aur cheez jo log bhool jaate hain: **executor function synchronous chalta hai**. `new Promise(...)` likhte hi andar ka code turant chal jaata hai; sirf `.then` wala part baad mein (microtask mein) chalta hai.
+
+## 2. async/await = Wahi Promise, Naya Kapda
+
+Ek hi function, do tareeke:
+
+```javascript
+// promise style
+function getOrder(id) {
+  return db.orders.findById(id)
+    .then((order) => api.getUser(order.userId)
+      .then((user) => ({ ...order, user })))
+    .catch((err) => { logger.error({ err, id }); throw err; });
+}
+
+// async/await style -- bilkul same cheez
+async function getOrder(id) {
+  try {
+    const order = await db.orders.findById(id);
+    const user = await api.getUser(order.userId);
+    return { ...order, user };
+  } catch (err) {
+    logger.error({ err, id });
+    throw err;
+  }
+}
+```
+
+Teen baatein saaf kar lo:
+
+1. **`async` function hamesha promise return karta hai** -- `return 5` likho to caller ko `Promise<5>` milega. Sync return bhi promise hai.
+2. **`await` thread block nahi karta.** Wo function ko wahan **pause** karta hai, control event loop ko wapas de deta hai, aur promise settle hone par function ko **microtask queue** mein resume karta hai. Isi dauran doosri 500 requests chalti rehti hain ([[137-event-loop-phases-and-microtasks]]).
+3. `await` non-promise par bhi ek microtask tick leta hai -- `await 5` turant aage nahi badhta.
+
+Ye dekho:
+
+```javascript
+console.log('A');
+(async () => { console.log('B'); await null; console.log('D'); })();
+console.log('C');
+// A B C D  -- 'D' microtask mein gaya, 'C' sync tha
+```
+
+> Mental model: `await` ek bookmark hai. Function ruk jaata hai, kitaab **band nahi** hoti, aur thread doosre kaam par chala jaata hai.
+
+## 3. Galti #1: Loop Mein `await` -- N Serial Round Trips
+
+Sabse mehnga ek-line bug:
+
+```javascript
+// SLOW: 200 users x 40 ms = ~8000 ms
+const users = [];
+for (const id of ids) {
+  users.push(await api.getUser(id));   // ek khatam, phir dusra
+}
+
+// FAST: ek wave, ~40-60 ms
+const users = await Promise.all(ids.map((id) => api.getUser(id)));
+```
+
+Farak kyun? Pehle version mein har `await` **next request start hone se pehle** pichhle ka response maangta hai. Doosre mein `.map` pehle **saare** promises bana deta hai (yaani saare requests nikal jaate hain), aur `Promise.all` sirf unke settle hone ka wait karta hai.
+
+Naap lo:
+
+```javascript
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const task = (i) => sleep(100).then(() => i);
+
+console.time('serial');
+for (let i = 0; i < 10; i++) await task(i);
+console.timeEnd('serial');     // ~1000 ms
+
+console.time('parallel');
+await Promise.all(Array.from({ length: 10 }, (_, i) => task(i)));
+console.timeEnd('parallel');   // ~100 ms
+```
+
+Yahi [[54-notify-5000-users-10x-faster]] ka core hai. **Par**: serial loop kabhi-kabhi sahi hota hai -- jab order matter karta ho, jab rate limit ho, ya jab downstream nazuk ho. Default parallel, lekin soch ke.
+
+## 4. Galti #2: `forEach` Ke Saath `async`
+
+```javascript
+// BUG: ye function instantly return ho jaata hai, kaam adhoora chhod ke
+async function saveAll(rows) {
+  rows.forEach(async (row) => { await db.insert(row); });   // forEach promise ignore karta hai
+  console.log('saved');     // jhoot -- ek bhi insert pura nahi hua
+}
+
+// FIX
+async function saveAll(rows) {
+  await Promise.all(rows.map((row) => db.insert(row)));
+  console.log('saved');     // ab sach
+}
+```
+
+`forEach` return value phenk deta hai, to andar ke promises **floating** reh jaate hain. Agar inme se koi reject hua, to niche wala crash wala case ban jaata hai.
+
+## 5. Galti #3: `Promise.all` Ka Fail-Fast vs `allSettled`
+
+```javascript
+await Promise.all([a(), b(), c()]);   // ek bhi reject -> poora reject, pehli error ke saath
+```
+
+Do important baatein:
+- `Promise.all` **short-circuit** karta hai par baaki promises **cancel nahi** hote -- wo background mein chalte rehte hain. Agar unme se koi reject hua aur uska handler nahi bacha, aapko unhandled rejection mil sakta hai.
+- Batch kaam mein ye galat semantics hai: 5000 notifications mein 1 fail hua to aap baaki 4999 ka result phenk dete hain.
+
+```javascript
+const results = await Promise.allSettled(tasks.map((t) => t()));
+const failed = results.filter((r) => r.status === 'rejected');
+logger.warn({ ok: results.length - failed.length, failed: failed.length });
+```
+
+| Combinator | Kab use karo |
+|---|---|
+| `Promise.all` | Sab chahiye, ek bhi fail hua to aage badhna bekaar (e.g. page ka core data) |
+| `Promise.allSettled` | Batch jobs, notifications, partial success acceptable |
+| `Promise.race` | Timeout lagana (`race([work, timeout(2000)])`) |
+| `Promise.any` | Kai mirrors/replicas, pehla success chahiye |
+
+## 6. Galti #4: Floating Promise -> Process Crash
+
+```javascript
+app.post('/order', async (req, res) => {
+  sendEmail(req.body.email);      // await nahi, .catch nahi
+  res.json({ ok: true });
+});
+```
+
+Agar `sendEmail` reject hua: **unhandled rejection**. Node 15 se iska default behaviour `throw` hai -- yaani **poora process gir jaata hai**, aur uske saath wo saari in-flight requests bhi. Ek email failure ne 200 users ka request tod diya.
+
+Teen sahi tareeke, intent ke hisaab se:
+
+```javascript
+await sendEmail(req.body.email);                       // user ko result chahiye
+// ya
+sendEmail(...).catch((err) => logger.error({ err }));  // fire-and-forget, par handled
+// ya (best for real work)
+await queue.add('send-email', { email });              // background kaam queue mein
+```
+
+Safety net rakho, par ise fix mat samjho:
+
+```javascript
+process.on('unhandledRejection', (err) => {
+  logger.fatal({ err }, 'unhandled rejection');
+  process.exit(1);                 // crash karo, par log ke saath
+});
+```
+
+TypeScript mein `@typescript-eslint/no-floating-promises` lint rule on karo -- ye class of bug compile time par pakda jaa sakta hai.
+
+## 7. Galti #5: `try/catch` Jo Kuch Nahi Pakadta
+
+```javascript
+try {
+  setTimeout(() => { throw new Error('boom'); }, 10);   // try block kab ka khatam
+} catch (err) {
+  console.log('never runs');    // uncaughtException -> crash
+}
+
+try {
+  doAsyncThing();               // await bhool gaye
+} catch (err) {
+  console.log('never runs');    // rejection try block ke baad aayi
+}
+```
+
+`try/catch` **synchronous stack** ko pakadta hai. Jab tak `await` nahi hai, callback ka error aapke `try` block se bahar, bilkul alag event loop turn mein phekta hai. Rule: *jo promise aapke `try` mein hai hi nahi, uska error aap catch nahi kar sakte.*
+
+## 8. `Promise.all` Par 10,000 Items = Khud Ka Banaya Outage
+
+```javascript
+await Promise.all(tenThousandIds.map((id) => db.getUser(id)));   // mat karo
+```
+
+Kya tootega:
+- **Connection pool khatam** -- 10,000 queries, pool size 10. Baaki 9,990 queue mein, timeout hona shuru ([[16-synchronized-connection-pool-expiry]], [[103-n-plus-1-vs-connection-pool-hinglish]]).
+- **Memory** -- 10,000 pending promises + 10,000 results heap mein, ek saath.
+- **Downstream DDoS** -- aapne apni hi API/DB par traffic spike bana diya; wo 429/503 dene lagega.
+- **Event loop pressure** -- 10,000 microtask resumes ek saath.
+
+Sahi jawab: **bounded concurrency**. Ek baar mein N, na 1 na 10,000.
+
+```javascript
+function pLimit(limit) {
+  let active = 0;
+  const queue = [];
+
+  const next = () => {
+    if (active >= limit || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject).finally(() => { active--; next(); });
+  };
+
+  return (fn) => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    next();
+  });
+}
+
+// use
+const limit = pLimit(10);                       // pool size se match karo
+const users = await Promise.all(
+  tenThousandIds.map((id) => limit(() => db.getUser(id)))
+);
+```
+
+Dhyan do: `map` ab bhi 10,000 promises banata hai, par **kaam** sirf 10 ek waqt par chalta hai -- baaki queue mein intezaar karte hain. Production mein `p-limit` ya `p-map` package use karna theek hai; concept same hai.
+
+Aur agar ye 10,000 DB rows ek-ek karke laane ki baat hai, to asli fix concurrency nahi -- **ek query** hai (`WHERE id IN (...)` ya join). Ye [[103-n-plus-1-vs-connection-pool-hinglish]] ka point hai: pehle N+1 hatao, phir jo bacha use bounded parallel karo.
+
+## 9. Common Galtiyan (Checklist)
+
+- `new Promise` mein `async` executor dena -- uske andar ki rejection kho jaati hai.
+- Promise wapas lapetna: `return new Promise((res) => db.query().then(res))` -- `db.query()` already promise hai, seedha return karo (error path bhi bacha lo).
+- `await` ko "blocking" samajh ke CPU-heavy kaam ke aage lagana -- `await` I/O ke liye hai, CPU ke liye `worker_threads` ([[109-cluster-worker-threads-child-process-hinglish]]).
+- Timeout na lagana -- `Promise.race` se hamesha upper bound do, warna ek atka downstream aapka pool kha jaayega.
+- `.catch` lagane ke baad `throw` na karna -- error nigal gaye, caller ko "success" mil gaya.
+
+## 🧠 Remember
+
+> Promise ek **settle hone ke baad na badalne wala** value handle hai, aur `async/await` usi ka syntax hai -- `await` thread block nahi karta, wo function ko microtask queue tak bookmark kar deta hai. Isliye loop mein `await` serial round trips banata hai, `Promise.all` poore batch ko ek fail par gira deta hai, aur 10,000 par `Promise.all` chalane se behtar hai bounded concurrency.
+
+## Quick Self-Test
+
+1. `for (const id of ids) await get(id)` aur `Promise.all(ids.map(get))` mein latency ka farak **kyun** aata hai -- request kab nikalti hai?
+2. `rows.forEach(async r => await save(r))` ke baad `console.log('done')` jhoot kyun bolta hai?
+3. Ek un-awaited promise reject ho gaya -- modern Node par kya hota hai, aur usme kitne doosre users affect honge?
+4. `Promise.all` first rejection par baaki promises ka kya hota hai?
+5. 10,000 IDs ke liye bounded concurrency ka limit aap kis number se match karenge, aur usse bhi pehle kya check karenge?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="141" data-title="Streams and Backpressure" data-category="Node.js Internals" data-order="141">
+# Streams Aur Backpressure: Memory Bachane Ka Asli Tareeka
+
+> **Connects to**: [[64-500mb-video-upload-memory]] (bada upload buffer karne par memory kyun phatti hai), [[48-huge-json-payloads]] (bade payload ka same rule), [[87-2gb-upload-direct-to-s3]] (bytes ko API se bahar rakhna) aur [[125-lld-file-upload-client]] (client side chunking). | [[145-libuv-thread-pool-what-is-really-async]] (file I/O thread pool)
+
+## 1. Kahani: 2 GB Ki File Ne Pod Gira Diya
+
+Ek reporting service hai. Kaam simple lagta hai -- S3 se ek CSV uthao, process karo, response bhejo:
+
+```js
+const data = fs.readFileSync('/tmp/export.csv');   // 2 GB file
+res.send(transform(data.toString()));
+```
+
+Dev machine par 10 MB ki sample file thi -- sab chalta tha. Production mein file 2 GB ho gayi. Result:
+
+```
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+```
+
+Pod `OOMKilled`. Aur mazedaar baat: **usi machine par** `cat export.csv | gzip > out.gz` aaram se chalta hai, 5 MB memory mein. Kyun?
+
+Kyunki `cat` file ko **poori** memory mein nahi laata. Wo **64 KB ka chunk** padhta hai, aage bhejta hai, agla chunk padhta hai. Bas yahi stream hai.
+
+## 2. Problem Ki Jad
+
+| Approach | Memory | 2 GB file |
+|---|---|---|
+| `readFileSync` / `await fs.readFile` | poori file | 2 GB RAM, OOM |
+| Stream | ek chunk + buffer | ~5-10 MB, chalta hai |
+
+Node ka default heap `--max-old-space-size` ke hisaab se hota hai (aksar 1.5-4 GB). Buffer bhi `buffer.constants.MAX_LENGTH` se bada nahi ho sakta. To "bas RAM badha do" ek deewar par ja kar rukta hai -- aur 100 concurrent requests par wo deewar 100x pehle aa jaati hai ([[64-500mb-video-upload-memory]] wali ganit).
+
+## 3. Chaar Stream Types Ek Table Mein
+
+| Type | Kya karta hai | Example |
+|---|---|---|
+| **Readable** | bytes/objects **deta** hai | `fs.createReadStream`, HTTP `req`, DB cursor |
+| **Writable** | bytes/objects **leta** hai | `fs.createWriteStream`, HTTP `res`, socket |
+| **Duplex** | dono -- independent read aur write side | TCP `net.Socket` |
+| **Transform** | Duplex jisme output input se **banta** hai | `zlib.createGzip()`, CSV parser, crypto cipher |
+
+Mental model:
+
+```
+Readable  --(chunks)-->  Transform  --(chunks)-->  Writable
+  source                  processing                 sink
+```
+
+Transform hi 90% custom code hai jo aap likhenge.
+
+## 4. Backpressure -- Poora Concept Ek Line Mein
+
+> Producer tez hai, consumer dheema hai. Backpressure wo mechanism hai jisse dheema consumer tez producer ko kehta hai: **"ruk ja, main bhar gaya hoon."**
+
+Technically: `writable.write(chunk)` **boolean** return karta hai.
+
+- `true` -> internal buffer mein jagah hai, aur bhejo.
+- `false` -> buffer `highWaterMark` (default 16 KB) cross kar gaya. **Ab rukna chahiye** aur `'drain'` event ka wait karna chahiye.
+
+Yahan asli bug hai: `write()` ka `false` sirf ek **salah** hai. Ignore kar do to Node crash nahi karega -- wo chupchap chunks **memory mein queue** karta rahega. Aapka 2 GB disk se nikal kar 2 GB RAM mein aa jaayega, bas dhire-dhire.
+
+### Galat: naive `on('data')` loop
+
+```js
+// BUG: write() ka return value ignore -- backpressure hi nahi hai
+const src = fs.createReadStream('export.csv');
+const dst = fs.createWriteStream('/mnt/slow-nfs/out.csv');
+
+src.on('data', (chunk) => {
+  dst.write(chunk);          // false aaye to bhi padhte rehte hain
+});
+src.on('end', () => dst.end());
+```
+
+Disk (ya S3, ya slow NFS) 20 MB/s leta hai, read 400 MB/s deta hai. Farak `dst` ke buffer mein jama hota hai -> RSS chadhta hai -> OOM.
+
+### Sahi (manual): pause/resume
+
+```js
+src.on('data', (chunk) => {
+  if (!dst.write(chunk)) src.pause();    // bhar gaya -> padhna rok do
+});
+dst.on('drain', () => src.resume());     // khaali hua -> phir padho
+```
+
+### Sahi (asli tareeka): `pipeline`
+
+```js
+const { pipeline } = require('node:stream/promises');
+
+await pipeline(
+  fs.createReadStream('export.csv'),
+  zlib.createGzip(),
+  fs.createWriteStream('export.csv.gz')
+);
+// memory: do-teen highWaterMark buffers, bas
+```
+
+`pipe` aur `pipeline` **khud** pause/resume karte hain. Backpressure manually likhne ki zaroorat hi nahi -- isliye production code mein hamesha yahi.
+
+## 5. `pipeline` Kyun, `.pipe()` Chain Kyun Nahi
+
+`.pipe()` **errors forward nahi karta** aur fail hone par **upstream destroy nahi karta**.
+
+```js
+// BUG: gzip error aaya to readStream khula reh gaya -> fd leak
+src.pipe(gzip).pipe(dst);
+```
+
+Agar `dst` fail hua (disk full), `src` ka file descriptor khula rehta hai. Ek request par ye dikhta nahi; 10,000 requests baad `EMFILE: too many open files` aata hai -- aur stack trace upload code ki taraf ishaara bhi nahi karega.
+
+`pipeline` guarantee deta hai:
+- koi bhi stream error ho -> **sab** streams destroy, saare fds band.
+- promise version `await` hota hai, to `try/catch` aur HTTP error handling natural hai.
+
+```js
+app.get('/export', async (req, res) => {
+  try {
+    await pipeline(db.queryStream(sql), toCsv(), res);   // client disconnect bhi handle
+  } catch (err) {
+    req.log.error({ err }, 'export failed');
+    if (!res.headersSent) res.status(500).end();         // headers ja chuke to bas socket band
+  }
+});
+```
+
+Note: streaming response mein **headers pehle** chale jaate hain. Beech mein error aaya to aap status code badal nahi sakte -- isliye `headersSent` check zaroori hai.
+
+## 6. Pattern 1: Line-By-Line Transform
+
+CSV ko line-wise process karna, poori file memory mein lae bina:
+
+```ts
+import { Transform, TransformCallback } from 'node:stream';
+
+class LineSplitter extends Transform {
+  private tail = '';
+  constructor() { super({ readableObjectMode: true }); }   // bahar objects/strings
+
+  _transform(chunk: Buffer, _enc: string, cb: TransformCallback) {
+    const parts = (this.tail + chunk.toString('utf8')).split('\n');
+    this.tail = parts.pop() ?? '';        // aakhri tukda adhoori line ho sakti hai
+    for (const line of parts) this.push(line);
+    cb();
+  }
+  _flush(cb: TransformCallback) {         // stream khatam -- bacha hua tail bhejo
+    if (this.tail) this.push(this.tail);
+    cb();
+  }
+}
+```
+
+Do cheezein jo log bhoolte hain:
+1. **`tail`** -- chunk boundary line ke beech mein kat sakti hai. Isko sambhalna hi pure code ka core hai (same problem multi-byte characters ke saath -- [[142-buffers-and-binary-data]] mein `StringDecoder`).
+2. **`_flush`** -- aakhri line ka `\n` nahi hota; `_flush` ke bina wo line chup-chaap gayab ho jaati hai.
+
+## 7. Pattern 2: DB Result Set -> CSV Response (Array Banaye Bina)
+
+Ye sabse common real bug hai: 5 lakh rows ka report.
+
+```js
+// BUG: 500k rows ka array, phir ek bada string -- do baar memory
+const rows = await pg.query('SELECT * FROM orders WHERE created_at > $1', [from]);
+res.send(rows.map(toCsvLine).join('\n'));
+```
+
+Streaming version -- memory rows ki ginti se independent:
+
+```js
+const QueryStream = require('pg-query-stream');
+const { pipeline } = require('node:stream/promises');
+const { Transform } = require('node:stream');
+
+app.get('/orders.csv', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=orders.csv');
+
+    // batchSize: cursor se 1000 rows ek baar -- poora result set nahi
+    const query = new QueryStream('SELECT id, total, created_at FROM orders', [], { batchSize: 1000 });
+    const toCsv = new Transform({
+      objectMode: true,
+      transform(row, _e, cb) { cb(null, `${row.id},${row.total},${row.created_at}\n`); },
+    });
+
+    await pipeline(client.query(query), toCsv, res);
+  } finally {
+    client.release();                        // pool connection wapas, hamesha
+  }
+});
+```
+
+Asli mechanism: `res` (socket) dheema hai -> backpressure gzip/transform se hoke **DB cursor tak** pahunchta hai -> Postgres se agli batch tabhi maangi jaati hai jab client ne pichhli consume kar li. Poora chain khud ko regulate karta hai.
+
+## 8. Pattern 3: `Readable.from` Aur `for await`
+
+Koi bhi async iterable ko stream bana dena:
+
+```js
+const { Readable } = require('node:stream');
+
+async function* paginate(cursor = null) {           // API pagination
+  do {
+    const page = await api.list({ cursor, limit: 100 });
+    for (const item of page.items) yield JSON.stringify(item) + '\n';
+    cursor = page.nextCursor;
+  } while (cursor);
+}
+
+await pipeline(Readable.from(paginate()), fs.createWriteStream('items.ndjson'));
+```
+
+Aur ulta -- stream ko loop ki tarah padhna:
+
+```js
+for await (const line of lineStream) {      // backpressure automatic
+  await handle(line);                       // jitna slow await, utna slow read
+}
+```
+
+`for await` ki khoobi: loop body `await` karti hai, to Readable apne aap paused rehta hai. Readable side ka backpressure **free** mil jaata hai. Error handling bhi normal `try/catch` -- isliye naya code likhte waqt `on('data')` se behtar hai. Dhyan: loop se `break` karne par stream destroy ho jaata hai -- jo aksar aap chahte bhi hain.
+
+## 9. Production Reality
+
+- **`highWaterMark` tune karo, blindly nahi.** Default 64 KB (file) / 16 KB (socket). Bada karne se throughput thoda badhta hai par per-connection memory bhi -- 5,000 connections x 1 MB = 5 GB.
+- **Object mode mein `highWaterMark` = object count** (default 16), bytes nahi. 16 bade objects bhi GB ban sakte hain.
+- **Client disconnect**: `res` par `'close'`/`'error'` aata hai; `pipeline` upstream DB cursor destroy kar dega. Iske bina abandoned queries DB par chalti rehti hain.
+- **Timeouts**: slow consumer streaming response ko ghanton khula rakh sakta hai. Idle timeout rakho.
+- **Monitoring**: `process.memoryUsage().rss` streaming endpoints par flat hona chahiye, request size ke saath proportional nahi. Yahi aapka test hai.
+- **Gzip CPU**: `createGzip` CPU kharch karta hai; bahut concurrent streams par ye event loop dabata hai ([[58-less-traffic-more-cpu]] jaisa pattern).
+
+## 10. Trade-offs
+
+| Streaming | Buffering |
+|---|---|
+| Memory constant | Memory input ke saath badhti hai |
+| Pehla byte jaldi (TTFB achha) | Pehla byte poora kaam hone ke baad |
+| Beech mein error -> status code badla nahi ja sakta | Error -> clean 500 bhej sakte ho |
+| Code zyada (chunk boundaries, flush) | Code 2 line |
+| Random access nahi -- sirf aage | Poora data haath mein, kuch bhi karo |
+
+Chhoti, bounded cheez (10 KB JSON, 100 rows) ke liye streaming **overengineering** hai. Rule: agar size **user input se** badh sakti hai, stream karo.
+
+## 11. Common Galtiyan
+
+- `write()` ka return value ignore karna -- "kaam kar raha hai" par memory chupchap chadh rahi hai.
+- `.pipe()` chain par error handler na lagana -> fd leak, `EMFILE`.
+- Transform mein `cb()` call bhool jaana -> stream hamesha ke liye hang (koi error nahi, bas chup).
+- `_flush` na likhna -> aakhri adhoora chunk gayab.
+- Bade upload ko `express.json()`/`multer` memory storage se guzaarna -- parser poora body buffer kar leta hai, stream ka faida khatam ([[48-huge-json-payloads]]).
+- Streaming response par pehle `res.status(500)` bhejne ki koshish jab headers already ja chuke.
+
+## 🧠 Remember
+
+> Stream ka matlab hai "poora data memory mein mat lao" aur backpressure ka matlab hai "dheema consumer tez producer ko rok sake" -- `write()` ka `false` wahi brake hai, aur `stream.pipeline` us brake ko plus error cleanup ko aapke liye handle kar deta hai, isliye production mein `.pipe()` chain ki jagah hamesha `pipeline`.
+
+## Quick Self-Test
+
+1. `src.on('data', c => dst.write(c))` crash nahi karta par memory chadhti hai -- exactly kahan jama ho raha hai?
+2. `.pipe()` chain mein ek stream fail hone par kaunsa resource leak hota hai, aur wo error kis exception ke roop mein hafton baad dikhta hai?
+3. CSV ko line-wise parse karne wale Transform mein `tail` variable aur `_flush` kyun chahiye?
+4. DB cursor -> CSV -> HTTP response chain mein slow client Postgres ki query ko dheema kaise karta hai?
+5. Object mode mein `highWaterMark: 16` ka matlab bytes hai ya objects -- aur ye kaise OOM de sakta hai?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="142" data-title="Buffers and Binary Data" data-category="Node.js Internals" data-order="142">
+# Buffers Aur Binary Data Node Mein
+
+> **Connects to**: [[141-streams-and-backpressure]] (streams chunks Buffer mein hi deti hain) aur [[48-huge-json-payloads]] (body size limits Buffer bytes par lagti hain, characters par nahi).
+
+## 1. Kahani: "Max 500 Characters" Wala Bug
+
+Ek comment API hai. Validation ek line ki:
+
+```js
+if (comment.length > 500) return res.status(422).json({ error: 'Too long' });
+```
+
+QA pass. Launch. Hindi users aate hain -- aur DB se error:
+
+```
+ERROR: value too long for type character varying(500)
+```
+
+Comment mein 500 "characters" hi the. Phir column kaise overflow hua?
+
+Kyunki DB column ne **bytes** naape, JS ne **UTF-16 code units** naape. `"namaste"` Devanagari mein likha jaaye to har akshar UTF-8 mein **3 bytes** leta hai. Ek 500-character Hindi comment ~1500 bytes ka hai.
+
+Yahin se Buffer ki kahani shuru hoti hai.
+
+## 2. Buffer Kyun Exist Karta Hai
+
+JavaScript ki `String` **text** hai -- UTF-16 code units ka sequence. Par network aur disk ko text nahi pata; unke paas sirf **bytes** hain.
+
+| Cheez | Unit |
+|---|---|
+| JS String | UTF-16 code units (character nahi, code unit) |
+| TCP socket, file, image, PDF, zip, AES output | raw bytes (0-255) |
+
+Browser mein ye kaam `Uint8Array`/`ArrayBuffer` karte hain. Node ne 2009 mein, `TypedArray` se bhi pehle, apna `Buffer` banaya -- ab wo **`Uint8Array` ka subclass** hai, plus encoding/slicing helpers.
+
+> **Term: Buffer** -- V8 heap ke **bahar** allocate ki gayi fixed-length raw bytes ki jagah, jisme aap bytes ko padh/likh sakte ho aur kisi bhi encoding mein interpret kar sakte ho.
+
+Bahar allocate hone ka natija: Buffer `heapUsed` mein nahi dikhta, `external` mein dikhta hai ([[144-garbage-collection-and-memory]] mein poora).
+
+## 3. Buffer Banane Ke Teen Tareeke
+
+```js
+Buffer.from('hello');                   // existing data se (string/array/buffer)
+Buffer.from([0xde, 0xad, 0xbe, 0xef]);
+Buffer.alloc(16);                       // 16 bytes, SAB zero
+Buffer.allocUnsafe(16);                 // 16 bytes, purana kachra andar
+```
+
+`new Buffer(...)` **deprecated aur Node 22+ mein hata diya gaya** hai. Wajah security thi: `new Buffer(n)` number ke saath uninitialized memory deta tha, par `new Buffer(str)` string se data. Agar koi JSON se aaye value seedha de de --
+
+```js
+// PURANA BUG: body { "data": 1024 } bheja to 1024 bytes ka kachra
+const buf = new Buffer(req.body.data);
+```
+
+-- to attacker number bhej kar purani process memory (passwords, tokens, dusre users ka data) response mein nikaal sakta tha. Isliye API do hisson mein tod di: `Buffer.from` (data) aur `Buffer.alloc` (size).
+
+### `alloc` vs `allocUnsafe`
+
+| | Speed | Content |
+|---|---|---|
+| `Buffer.alloc(n)` | dheema (zero-fill karta hai) | sab 0 |
+| `Buffer.allocUnsafe(n)` | tez | **recycled memory**, purana data |
+
+`allocUnsafe` ki "unsafe" asli hai: wo memory pehle kisi aur cheez ne use ki thi. Agar aapne saare n bytes **overwrite nahi kiye** aur poora buffer bhej diya, to purana content leak ho gaya.
+
+```js
+const buf = Buffer.allocUnsafe(64);
+const written = buf.write(payload);     // maan lo 10 bytes likhe
+socket.write(buf);                      // BUG: 54 bytes purana kachra bheja
+socket.write(buf.subarray(0, written)); // SAHI: sirf jo likha
+```
+
+Rule: `allocUnsafe` sirf tab jab aap **turant poora buffer bhar** rahe ho (jaise hot path mein read loop). Baaki hamesha `alloc`.
+
+## 4. `buf.length` Bytes Hai -- Aur Yahi Bug Tha
+
+```js
+const s = 'hello';
+s.length;                       // 5
+Buffer.byteLength(s, 'utf8');   // 5  (ASCII -> 1 byte each)
+```
+
+Ab Devanagari. "namaste" ka Devanagari spelling 6 code points ka hai (na + maatra + ma + s + t + e jaisa), aur UTF-8 mein **har** Devanagari code point 3 bytes leta hai:
+
+```js
+const hi = devanagariNamaste;           // 6 code points
+hi.length;                              // 6   <- JS yahi dekhta hai
+Buffer.byteLength(hi, 'utf8');          // 18  <- disk/DB/network yahi dekhte hain
+```
+
+To 500-character limit = **1500 bytes** tak. Emoji aur bura: ek emoji 4 bytes UTF-8 **aur** JS mein `length === 2` (surrogate pair). Flag emoji 8 bytes aur `length === 4`.
+
+```js
+// SAHI validation -- jo cheez fail hoti hai usi unit mein naapo
+const bytes = Buffer.byteLength(comment, 'utf8');
+if (bytes > 2000) return res.status(422).json({ error: 'Too long', bytes, max: 2000 });
+```
+
+Aur user ko dikhane wali ginti ke liye `[...str].length` (code points) use karo, `str.length` nahi.
+
+## 5. Encodings Aur Base64 Ka 33% Tax
+
+```js
+const buf = Buffer.from('hi');
+buf.toString('utf8');    // 'hi'
+buf.toString('hex');     // '6869'    -> 2x size
+buf.toString('base64');  // 'aGk='    -> ~1.33x size
+```
+
+| Encoding | Size factor | Kab |
+|---|---|---|
+| `utf8` | 1x (ASCII), 2-4x (non-Latin) | normal text |
+| `base64` | **~1.33x** | binary ko text channel (JSON, email, data URI) mein bhejna |
+| `base64url` | ~1.33x | JWT, URL-safe tokens (`+/` ki jagah `-_`) |
+| `hex` | 2x | hashes, HMAC signatures, debugging |
+| `latin1` | 1x | legacy byte-per-char protocols |
+
+Ganit: base64 **3 bytes ko 4 characters** banata hai -> 4/3 = 1.333. Iska practical matlab: ek 6 MB image ko JSON mein base64 bhejoge to body **8 MB** ki ho jaayegi, aur aapka `express.json({ limit: '6mb' })` reject kar dega. Mobile apps ka ye classic bug hai -- fix: `multipart/form-data` ya presigned URL ([[87-2gb-upload-direct-to-s3]]), base64-in-JSON nahi.
+
+Ek aur: base64 **encryption nahi hai**. Ye sirf representation hai, koi bhi decode kar sakta hai.
+
+## 6. Multi-Byte Character Chunk Boundary Par Kat Jaata Hai
+
+Streaming padhte waqt chunk boundary character ke beech aa sakti hai:
+
+```js
+// BUG: har chunk ko alag se decode kar rahe hain
+let text = '';
+stream.on('data', (chunk) => { text += chunk.toString('utf8'); });
+```
+
+Maan lo ek 3-byte Devanagari character ke 2 bytes chunk 1 ke aakhir mein gaye, 3rd byte chunk 2 mein. Chunk 1 ka `toString('utf8')` adhoore bytes ko valid nahi padh paata -> `U+FFFD` replacement character (wo "?" wala box). Data **permanently corrupt**, aur sirf non-English input par -- isliye test mein kabhi nahi pakda jaata.
+
+Do fixes:
+
+```js
+// Fix A: StringDecoder -- adhoore bytes agle chunk tak hold karta hai
+const { StringDecoder } = require('node:string_decoder');
+const decoder = new StringDecoder('utf8');
+
+let text = '';
+stream.on('data', (chunk) => { text += decoder.write(chunk); });  // safe
+stream.on('end', () => { text += decoder.end(); });               // bacha hua flush
+
+// Fix B: pehle saare bytes jodo, decode baad mein (chhote payload ke liye)
+const buf = Buffer.concat(chunks);
+const text2 = buf.toString('utf8');
+```
+
+Ya bas `stream.setEncoding('utf8')` -- wo andar StringDecoder hi lagata hai. Yahi `tail` wali problem ka byte-level bhai hai jo [[141-streams-and-backpressure]] ke line splitter mein thi.
+
+## 7. Asli Backend Kaam #1: Webhook HMAC Ko Raw Body Chahiye
+
+Stripe/Razorpay/GitHub webhook ka signature **exact bytes** par banta hai jo unhone bheje. JSON parse karke dobara stringify karna un bytes ko **badal** deta hai (key order, spacing, unicode escaping, number formatting). Signature fail -> aapke saare webhooks 400.
+
+```js
+// GALAT: body parser ne original bytes kha liye
+app.use(express.json());
+app.post('/webhook', (req, res) => {
+  const expected = hmac(JSON.stringify(req.body));   // ye wo bytes nahi hain
+});
+```
+
+Sahi: us **ek route** par raw Buffer rakho, baaki app ke liye JSON parser rehne do.
+
+```js
+const express = require('express');
+const crypto = require('node:crypto');
+const app = express();
+
+// raw parser SIRF webhook route par, json parser se PEHLE
+app.post('/webhooks/stripe',
+  express.raw({ type: 'application/json', limit: '1mb' }),   // req.body = Buffer
+  (req, res) => {
+    const signature = Buffer.from(req.get('X-Signature') ?? '', 'hex');
+    const expected = crypto
+      .createHmac('sha256', process.env.WEBHOOK_SECRET)
+      .update(req.body)                                     // Buffer, exact bytes
+      .digest();                                            // Buffer, hex nahi
+
+    if (signature.length !== expected.length ||
+        !crypto.timingSafeEqual(signature, expected)) {
+      return res.status(401).end();
+    }
+    const event = JSON.parse(req.body.toString('utf8'));     // verify ke BAAD parse
+    res.status(202).end();
+  }
+);
+
+app.use(express.json());    // baaki routes normal
+```
+
+Teen cheezein jo yahan deliberate hain:
+1. **`express.raw` pehle** -- order matter karta hai; `express.json()` pehle lag gaya to raw bytes gaye.
+2. **`timingSafeEqual`** -- `===` ya `a.equals(b)` pehle mismatch par turant return karta hai; timing se attacker byte-by-byte signature guess kar sakta hai. `timingSafeEqual` constant time leta hai.
+3. **Length check pehle** -- `timingSafeEqual` **alag length** par `RangeError` **throw** karta hai (false return nahi karta). Length compare na karo to attacker chhota header bhej kar 500 giraa sakta hai. Isliye: length check -> phir timingSafeEqual.
+
+## 8. Asli Backend Kaam #2: Uploads, Hashing, Comparisons
+
+```js
+// File ka SHA-256 -- poori file memory mein laaye bina
+const hash = crypto.createHash('sha256');
+await pipeline(fs.createReadStream(path), hash);
+const digest = hash.digest('hex');       // upload integrity check ([[125-lld-file-upload-client]])
+```
+
+```js
+// Magic bytes se file type check -- extension aur Content-Type dono jhooth bol sakte hain
+const head = buffer.subarray(0, 4);
+const isPng = head.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
+```
+
+```js
+// subarray vs copy -- bada farak
+const view = big.subarray(0, 10);   // SAME memory, 1 GB buffer zinda rehta hai
+const copy = Buffer.from(view);     // alag 10 bytes, bada buffer GC ho sakta hai
+```
+
+Wo doosri line kyun zaroori hai: `subarray` (aur purana `slice`) **view** deta hai, copy nahi. 1 GB buffer ka 10-byte view cache mein rakh diya to **poora 1 GB** reachable rehta hai -- ek silent `external` memory leak ([[144-garbage-collection-and-memory]]).
+
+## 9. Production Reality
+
+- Buffers `external` memory hain -- heap limit (`--max-old-space-size`) unpar lagti hi nahi. Container memory limit lagti hai. To `heapUsed` normal dikhte hue bhi pod `OOMKilled` ho sakta hai.
+- `Buffer.concat` poora naya buffer allocate karta hai. Bade data ke liye streaming ([[141-streams-and-backpressure]]) hi raasta hai.
+- `buffer.constants.MAX_LENGTH` ek hard ceiling hai (~4 GB 64-bit par) -- usse bada single buffer possible hi nahi.
+- Secrets Buffer mein rakh ke `buf.fill(0)` kar sakte ho; String immutable hai, use wipe nahi kar sakte. (GC ki guarantee nahi hai, par behtar hai.)
+- Logs mein Buffer kabhi `JSON.stringify` mat karo -- `{"type":"Buffer","data":[72,101,...]}` megabytes mein log bhar dega.
+
+## 10. Common Galtiyan
+
+- `str.length` se byte limit lagana -> non-English input par DB overflow (ye lesson ki kahani).
+- `allocUnsafe` ka poora buffer bheja bina poora bhare -> purani memory leak.
+- Webhook verify karne se pehle body JSON parse kar dena -> signature mismatch, hamesha.
+- Signature compare mein `===` -> timing attack; aur `timingSafeEqual` bina length check -> `RangeError` crash.
+- Image ko base64 karke JSON mein bhejna -> 33% bada payload + double memory.
+- Chunks ko alag-alag `toString()` karna -> multi-byte character corrupt.
+- Bade buffer ka `subarray` long-lived cache mein rakhna -> poora parent buffer zinda.
+
+## 🧠 Remember
+
+> String text hai, Buffer bytes hai -- aur jo cheez fail hoti hai (DB column, network, HMAC) wo hamesha **bytes** naapti hai, isliye `str.length` ki jagah `Buffer.byteLength`, `new Buffer` ki jagah `Buffer.from`/`alloc`, naive chunk decode ki jagah `StringDecoder`, aur webhook verify karte waqt raw body ke bina signature kabhi match nahi karega.
+
+## Quick Self-Test
+
+1. 500-character Hindi comment `varchar(500)` column mein kyun nahi ghusta, aur validation kis function se likhoge?
+2. `Buffer.allocUnsafe(64)` mein 10 bytes likh kar poora buffer bhej dene se exactly kya leak hota hai?
+3. `express.json()` lagane ke baad webhook signature verify kyun fail hoga, aur fix mein middleware order kya hoga?
+4. `crypto.timingSafeEqual` ko different-length buffers dene par kya hota hai -- `false` ya kuch aur?
+5. 6 MB image base64 karke JSON mein bhejne par body size kitni hogi aur kyun?
+6. 1 GB buffer ka `subarray(0, 10)` cache mein rakhne se memory par kya asar?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="143" data-title="CommonJS vs ESM and Module Resolution" data-category="Node.js Internals" data-order="143">
+# CommonJS vs ESM Aur Module Resolution
+
+> **Connects to**: [[109-cluster-worker-threads-child-process-hinglish]] (Node ka runtime model) aur [[02-debugging-random-500-errors]] (jo error startup par aata hai aur stack trace jhooth bolta hai).
+
+## 1. Kahani: `node-fetch` Update Ne Build Toda
+
+Shaam 6 baje ek routine dependency bump. `node-fetch@2` -> `node-fetch@3`. Test pass, deploy, aur production boot hi nahi hua:
+
+```
+Error [ERR_REQUIRE_ESM]: require() of ES Module
+/app/node_modules/node-fetch/src/index.js from /app/src/http.js not supported.
+Instead change the require of index.js to a dynamic import() which is
+available in all CommonJS modules.
+```
+
+Developer ne Google kiya, Stack Overflow ne kaha `"type": "module"` daal do. Daal diya. Ab:
+
+```
+ReferenceError: require is not defined in ES module scope
+ReferenceError: __dirname is not defined in ES module scope
+```
+
+Ek line ki dependency bump 3 ghante ka migration ban gaya. Ye lesson us 3 ghante ko 10 minute mein badalne ke liye hai.
+
+## 2. Do Module Systems, Ek Runtime
+
+| | CommonJS (CJS) | ES Modules (ESM) |
+|---|---|---|
+| Syntax | `require` / `module.exports` | `import` / `export` |
+| Load time | **runtime**, synchronous | **parse time**, static |
+| Load kaise | file padho, wrap karo, chalao | graph banao, phir chalao |
+| Order | line par jab pahunche | **hoisted** -- sab imports pehle |
+| Dynamic path | `require(varName)` chalega | `import` nahi; `await import(varName)` chalega |
+| Top-level await | nahi | **haan** |
+| `__dirname` | hai | nahi |
+| Cached | haan (singleton) | haan (singleton) |
+| File extension | optional (`./util`) | **zaroori** (`./util.js`) |
+
+Dono hi cache karte hain -- ye common misconception hai ki sirf CJS karta hai.
+
+## 3. `require` Synchronous Hai -- Aur Cached
+
+```js
+const config = require('./config');   // ye line DISK I/O karti hai, blocking
+```
+
+Pehli baar: file padhi, function mein wrap ki, chalai, `module.exports` cache mein daala. Doosri baar: **sirf cache lookup** -- file dobara chalti hi nahi.
+
+Isi cache ki wajah se module **effectively singleton** hai:
+
+```js
+// counter.js
+let count = 0;
+module.exports = { inc: () => ++count, get: () => count };
+
+// a.js -> require('./counter').inc();
+// b.js -> require('./counter').inc();
+// index.js
+require('./a'); require('./b');
+console.log(require('./counter').get());   // 2, NOT 1 -- same instance
+
+// isi par DB pool/logger/config bante hain:
+// db.js -> module.exports = new Pool({ connectionString: process.env.DATABASE_URL });
+```
+
+Ye feature hai, bug nahi. Par do jagah kaat deta hai:
+1. **Tests** -- module ki state test ke beech leak hoti hai. Fix: `jest.resetModules()`, ya factory function export karo, instance nahi.
+2. **Duplicate copies** -- `node_modules` mein ek hi package ke do versions (nested install) = **do alag singletons**. "Mera `instanceof` check fail kyun ho raha hai" ka 90% yahi hai.
+
+ESM mein bhi exactly yahi behaviour hai -- module **specifier** se cache hota hai.
+
+## 4. `import` Static Aur Hoisted Hai
+
+```js
+console.log('start');
+import { setup } from './setup.js';    // ye PEHLE chalega
+```
+
+Output: pehle `setup.js` ka poora code, phir `'start'`. Kyunki ESM mein engine **chalane se pehle** poora dependency graph parse karta hai -- imports hoist ho jaate hain.
+
+Iska practical natija:
+
+```js
+// BUG: process.env load hone se pehle hi module chal gaya
+import dotenv from 'dotenv';
+dotenv.config();                       // ye line baad mein chalti hai
+import { db } from './db.js';          // par db.js PEHLE chal gaya -> env undefined
+```
+
+CJS mein ye code sahi kaam karta tha (line order = execution order). ESM mein fix: env ko module graph ke **bahar** load karo -- `node --env-file=.env src/index.js` (Node 20+) ya `node --import ./load-env.js src/index.js`.
+
+Bonus: static hona hi **tree-shaking** possible banata hai -- bundler compile time par dekh sakta hai kya use nahi hua. `require(someVar)` ke saath wo analysis impossible hai.
+
+## 5. `"type": "module"` Kya Flip Karta Hai
+
+package.json mein ek line -- `{ "type": "module" }` -- aur `.js` ka matlab badal jaata hai:
+
+| | `"type"` absent (default `commonjs`) | `"type": "module"` |
+|---|---|---|
+| `.js` file | CJS | **ESM** |
+| `.cjs` | CJS | CJS |
+| `.mjs` | ESM | ESM |
+
+To `.cjs`/`.mjs` extension se aap per-file override kar sakte ho. Ye escape hatch migration mein kaam aata hai: poore repo ko `"type": "module"` karo, aur jo ek purani file nahi chal rahi usko `.cjs` kar do.
+
+## 6. Kyun `require()` Se ESM Package Load Nahi Hota
+
+Asli wajah **synchronous vs asynchronous** hai, syntax nahi.
+
+ESM graph resolve karna async hai (loader hooks, network imports, top-level await). `require()` ko ek value **turant, synchronously** return karni hai. Async graph ka wait sync function ke andar possible nahi -- isliye `ERR_REQUIRE_ESM`.
+
+Teen raaste:
+
+```js
+// 1. Dynamic import() -- CJS ke andar chalta hai, par function async ban jaata hai
+async function getFetch() {
+  const { default: fetch } = await import('node-fetch');
+  return fetch;
+}
+
+// 2. Problem hi hata do -- Node 18+ mein global fetch hai, dependency ki zaroorat nahi
+const res = await fetch(url);
+
+// 3. Package ke CJS version par ruk jao -- "node-fetch": "^2.7.0"
+```
+
+**Naya (Node 22.12+ / 20.19+)**: `require(esm)` **ab kaam karta hai** -- par sirf tab jab ESM module mein **top-level await na ho**. TLA hai to wahi purana error. To ab bhi aap isko sirf tab assume kar sakte ho jab aapka minimum Node version pata ho.
+
+Ulta case bilkul theek hai: **ESM se CJS import kar sakte ho.**
+
+```js
+import express from 'express';         // express CJS hai, chalta hai
+import pkg from './legacy.cjs';
+const { helper } = pkg;                // CJS se named imports reliably nahi milte
+```
+
+Node CJS ke named exports static analysis se guess karta hai aur aksar fail ho jaata hai. Safe pattern: default import karo, phir destructure.
+
+## 7. Top-Level Await Aur `__dirname`
+
+```js
+// ESM: top level par await -- CJS mein ye SyntaxError hai
+const config = await loadConfigFromVault();
+export const db = createPool(config);
+```
+
+Useful hai (startup par secrets, migrations), par catch: aapka module ab tab tak **block** karta hai jab tak TLA resolve na ho -- aur usko import karne wala har module bhi. Vault timeout hua to app boot hi nahi hoga, aur error bahut generic aayega.
+
+ESM mein ye CJS globals **exist nahi karte**: `require`, `module`, `exports`, `__dirname`, `__filename`.
+
+```js
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const here = import.meta.dirname;      // Node 20.11+ -- seedha replacement
+const file = import.meta.filename;
+
+// CJS ka `require.main === module` check:
+if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+```
+
+## 8. Dual-Package Hazard (Short Mein)
+
+Ek library dono formats ship karti hai:
+
+```json
+{
+  "exports": {
+    ".": { "import": "./dist/index.mjs", "require": "./dist/index.cjs" }
+  }
+}
+```
+
+Agar app mein ek jagah `import 'lib'` hai aur doosri jagah `require('lib')`, to **dono copies load** hongi -- do alag instances, do alag module-level states. Dikhta aise hai: `instanceof MyError` false aata hai (do alag class objects), library ka internal registry/singleton aadha-aadha bhar jaata hai, aur `Symbol` identity match nahi karti.
+
+Bachne ka tareeka: **ek app mein ek format par raho** -- ya CJS, ya ESM, mix nahi.
+
+## 9. Resolution Order -- Node Module Dhoondta Kaise Hai
+
+`require('lodash')` ya `import 'lodash'` par:
+
+```
+1. Node builtin? ('fs', 'node:fs', 'http') -> turant wahi, disk touch nahi
+2. './' ya '../' se start? -> relative path, exact file
+   (CJS: extension optional -> .js, .json, .node try karta hai
+    ESM: extension ZAROORI, warna ERR_MODULE_NOT_FOUND)
+3. Warna bare specifier -> node_modules walk UP:
+     /app/src/services/node_modules/lodash
+     /app/src/node_modules/lodash
+     /app/node_modules/lodash         <- aksar yahan milta hai
+     /node_modules/lodash
+4. Mil gaya -> package.json ka "exports" (modern) ya "main"/"module" dekho
+5. Nahi mila -> MODULE_NOT_FOUND
+```
+
+Do practical cheezein:
+- **Builtin ko `node:` prefix se likho** (`require('node:fs')`). Ye guarantee deta hai ki koi `fs` naam ka npm package hijack na kar le.
+- `"exports"` field **encapsulation** deta hai -- jo path listed nahi hai, use import nahi kar sakte. Isliye `require('some-lib/lib/internal/helper')` purane versions mein chalta tha aur upgrade par `ERR_PACKAGE_PATH_NOT_EXPORTED` de deta hai.
+
+## 10. Circular Dependency -- Woh `undefined is not a function`
+
+```js
+// user.service.js
+const orderService = require('./order.service');
+exports.getUser = (id) => ({ id, orders: orderService.listByUser(id) });
+
+// order.service.js
+const userService = require('./user.service');
+exports.listByUser = (uid) => { userService.getUser(uid); return []; };
+```
+
+Startup par:
+
+```
+TypeError: userService.getUser is not a function
+```
+
+Kyun? CJS cache **module chalne se pehle** entry daalta hai (warna infinite loop):
+
+```
+1. index.js -> require('./user.service')
+2. user.service cache mein daala: exports = {}   (KHAALI)
+3. user.service line 1 -> require('./order.service')
+4. order.service cache mein daala, uski line 1 -> require('./user.service')
+5. cache mein HAI -> wahi KHAALI {} milta hai -- ADHOORA object
+6. order.service ne us adhoore {} ka reference rakh liya
+7. order.service poora hua, phir user.service ne getUser add kiya -- bahut late
+```
+
+Debug mushkil kyun: error **jo module galat hai usme nahi** aata, usme aata hai jo use call karta hai -- aur sirf **ek** import direction par; files ka order badal do to error gayab.
+
+ESM mein behaviour better hai -- bindings **live** hote hain (hoisted `function` declarations circular case mein bhi mil jaate hain) -- par `const`/`class` par `ReferenceError: Cannot access 'X' before initialization` milega. Dono case mein asli fix **design** hai:
+
+```js
+// Fix 1: lazy require -- call ke waqt resolve, tab tak module bhara hua hai
+exports.getUser = (id) => {
+  const orderService = require('./order.service');
+  return { id, orders: orderService.listByUser(id) };
+};
+
+// Fix 2 (behtar): cycle hi tod do -- shared logic teesre module mein,
+// ya dependency injection: function makeOrderService({ userRepo }) { ... }
+```
+
+Cycle dhoondhne ke liye: `npx madge --circular src/`.
+
+## 11. Decision Table
+
+| Situation | Choose | Kyun |
+|---|---|---|
+| **Naya service** (Node 20+) | **ESM** (`"type": "module"`) | ecosystem idhar ja raha hai, TLA milta hai, `import.meta.dirname` ab hai, naye packages ESM-only ship ho rahe hain |
+| **Library jo aap publish karte ho** | TS likho, **dono** ship karo (`"exports"` map), ya sirf ESM agar Node 20+ target hai | consumers dono tarah ke hain; par dual-package hazard ke liye state-less rakho |
+| **Existing bada CJS codebase** | **CJS par raho** | migration ka ROI kam hai; ESM-only dependency aaye to usi jagah `await import()` -- poore repo ko chhedna nahi |
+| **TypeScript project** | `module: "nodenext"` + jo target chuna | TS ka output `"type"` se match hona zaroori hai, warna runtime par mismatch |
+| **CLI tool, scripts** | ESM theek hai | TLA se code saaf hota hai |
+
+Important honesty: **CJS "dead" nahi hai.** npm ka bahut bada hissa aaj bhi CJS hai aur Node use kabhi nahi hatayega. Migration tabhi karo jab koi concrete cheez block kar rahi ho -- bas trend ke liye nahi.
+
+## 12. Common Galtiyan
+
+- `ERR_REQUIRE_ESM` par aankh band kar ke `"type": "module"` daal dena -> aur 10 naye errors.
+- ESM mein `import './util'` likhna (extension ke bina) -> `ERR_MODULE_NOT_FOUND`.
+- ESM mein `dotenv.config()` import ke baad likhna aur expect karna ki env load ho gaya.
+- TS mein `module: "commonjs"` par package.json mein `"type": "module"` -- compile pass, runtime fail.
+- Module-level mutable state ko shared cache ki tarah use karna, aur cluster/multiple pods par confuse hona ki sync kyun nahi ho raha ([[109-cluster-worker-threads-child-process-hinglish]]).
+- Circular dependency ko `try/catch` se chhupana, design theek karne ke bajay.
+
+## 🧠 Remember
+
+> `require` synchronous aur cached hai -- isliye module ek singleton hai aur isliye wo async ESM graph ko load nahi kar sakta; `import` static aur hoisted hai -- isliye tree-shaking aur top-level await milte hain par `dotenv.config()` apni jagah par nahi chalta; aur circular `require` ka `undefined is not a function` isliye aata hai ki cache mein module **chalne se pehle** aadha-khaali daal diya jaata hai.
+
+## Quick Self-Test
+
+1. Do alag files se `require('./counter')` karne par counter 1 dikhega ya 2 -- aur kyun?
+2. `require()` ESM package ko load nahi kar sakta -- asli technical wajah syntax hai ya kuch aur?
+3. ESM mein `dotenv.config()` ke baad bhi `process.env` khaali kyun milta hai?
+4. `__dirname` ESM mein kaise banate ho, aur Node 20.11+ mein shortcut kya hai?
+5. Circular require mein error us module mein kyun nahi aata jisme cycle shuru hui?
+6. Ek hi library ke CJS aur ESM dono copies load ho gayi -- symptom kya dikhega?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="144" data-title="Garbage Collection and Memory" data-category="Node.js Internals" data-order="144">
+# Garbage Collection Aur Memory Node Mein
+
+> **Connects to**: [[22-nodejs-memory-leak-debugging]] (leak dhoondhne ka step-by-step process), [[93-cpu-spike-every-night-217am]] (GC pauses CPU graph mein kaise dikhte hain), [[64-500mb-video-upload-memory]] (bade buffers aur memory) aur [[119-lld-lru-cache]] (bounded cache ka design). | [[146-eventemitter-and-listener-leaks]] (listener leaks)
+
+## 1. Kahani: "Memory 300 MB Se 1.9 GB, Phir Restart"
+
+Ek Node API hai. Deploy ke baad RSS 300 MB. 6 ghante baad 900 MB. 14 ghante baad `OOMKilled`, pod restart, aur wahi curve dobara.
+
+Pehli reaction team ki: **"heap chhota hai, badha do."**
+
+```
+node --max-old-space-size=4096 server.js
+```
+
+Ab crash 14 ghante ki jagah **38 ghante** baad hota hai. Leak waisa hi hai -- bas baalti badi ho gayi. Aur crash ab zyada bura hai: 4 GB heap par GC pause lamba hota hai, to marne se pehle latency bhi kharab ho jaati hai.
+
+Ye lesson samjhane ke liye hai ki **GC kya karta hai**, isliye leak kya hota hai, aur usko dhoondhne ka sahi kram kya hai.
+
+## 2. V8 Memory Ka Layout (Interview Jitna Deep)
+
+```
++------------------------------------------------------+
+|  V8 Heap  (--max-old-space-size isi par lagta hai)   |
+|                                                      |
+|  New Space (Young Gen)   | Old Space (Old Gen)       |
+|  chhota: 1-16 MB         | bada: GBs                 |
+|  "from" + "to" halves    | ek bada region            |
+|  Scavenge (minor GC)     | Mark-Sweep-Compact (major)|
+|  bahut tez, ms se kam    | dheema, 10-100+ ms        |
++------------------------------------------------------+
+|  Bahar: Buffers, ArrayBuffers, sockets, zlib ("external") |
+|  heap limit INME lagti hi nahi -- container limit lagti hai |
++------------------------------------------------------+
+```
+
+### Naya object kahan banta hai
+
+Har naya object **New Space** mein banta hai. New Space do halves mein bata hai: `from` aur `to`.
+
+**Scavenge (minor GC)**: jab `from` bhar jaata hai, V8 **sirf zinda** objects ko `to` mein copy karta hai aur `from` ko ek jhatke mein khaali maan leta hai. Lagat zinda objects ke proportional hai, kachre ke nahi.
+
+Yahi poore mental model ki jad hai: typical request handler mein 99% objects (parsed JSON, temp strings, intermediate arrays) response ke baad **mar** jaate hain. Unko free karne ki lagat ~**zero** hai -- V8 ne unhe copy hi nahi kiya.
+
+### Promotion aur major GC
+
+Jo object **do scavenges survive** kar leta hai, V8 use **Old Space** mein promote kar deta hai. Logic: "jo ab tak zinda hai wo aage bhi zinda rahega."
+
+**Mark-Sweep-Compact (major GC)** Old Space ke liye hai:
+- **Mark**: roots (globals, stack, active closures, timer list, listener arrays) se chal kar jo reachable hai usko mark karo.
+- **Sweep**: jo unmarked hai wo jagah free list mein.
+- **Compact**: fragmentation hatane ke liye objects ko paas-paas sarka do.
+
+Ye **poore** Old Space par chalta hai. 2 GB Old Space = ghanta bhar ka kachra scan karna. Isliye lamba pause.
+
+> **Natija ek line mein**: short-lived objects **sasta** hain, long-lived objects **mehnga**. Request-scoped garbage se darne ki zaroorat nahi; module-level jama hone wale data se darne ki zaroorat hai.
+
+(V8 ye kaam concurrent/incremental marking aur background threads se baantta hai, par major GC ke chhote "stop-the-world" hisse rehte hain -- wahi aapke p99 latency spikes hain.)
+
+## 3. GC Language Mein "Leak" Kya Hota Hai
+
+C mein leak = aapne `free()` call nahi kiya. JS mein `free()` hi nahi hai. To leak kya hai?
+
+> **Leak = ek reference jo aap bhool gaye.** Memory free nahi hoti kyunki wo **technically reachable** hai -- GC bilkul sahi kaam kar raha hai, aapka code hi use reachable rakhe baitha hai.
+
+Iska ek bahut practical matlab hai: **"GC ko force karo"** kabhi fix nahi hota. `global.gc()` / `--expose-gc` sirf proof ke liye hai (pause ke baad bhi `heapUsed` wapas na aaye -> confirmed leak). Reachable object ko koi GC free nahi karega.
+
+## 4. Chaar Usual Culprits
+
+### a) Module-level Map/array jo sirf badhta hai
+
+```js
+// LEAK: har naya userId ek permanent entry
+const sessionCache = new Map();
+app.use((req, res, next) => {
+  sessionCache.set(req.user.id, { ...req.user, at: Date.now() });   // delete kahin nahi
+  next();
+});
+```
+
+Traffic ke saath badhta hai, aur kabhi ghatta nahi. 50k unique users/din = 50k entries/din, hamesha ke liye.
+
+### b) Event listeners jo remove nahi hote
+
+```js
+// LEAK: har request par naya listener, closure res ko pakde rehta hai
+app.get('/stream', (req, res) => {
+  bus.on('update', (d) => res.write(JSON.stringify(d)));
+});
+
+// FIX: handler named rakho aur cleanup par hata do
+app.get('/stream', (req, res) => {
+  const onUpdate = (d) => res.write(JSON.stringify(d));
+  bus.on('update', onUpdate);
+  res.on('close', () => bus.off('update', onUpdate));
+});
+```
+
+Listener **do** cheezein zinda rakhta hai: closure, aur us closure ke andar ka `res` -> socket -> buffers. Signal: logs mein `MaxListenersExceededWarning`.
+
+### c) Closures jo bada object capture karte hain
+
+```js
+// LEAK: callback ko sirf id chahiye, par closure POORA 50 MB buffer pakad leta hai
+function register(file) {                        // file.buffer = 50 MB
+  cleanupTasks.push(() => notify(file.id));      // `file` poora captured
+}
+
+// FIX: sirf zaroori value nikaal lo -- 50 MB free ho sakta hai
+function register(file) {
+  const { id } = file;
+  cleanupTasks.push(() => notify(id));
+}
+```
+
+V8 closure ke liye ek context object rakhta hai; scope mein bada variable hai aur closure usko reference karta hai, to poora object zinda rehta hai.
+
+### d) Timers jo clear nahi hote
+
+```js
+// LEAK: per-socket interval, disconnect ke baad bhi chalta rehta hai
+io.on('connection', (socket) => {
+  const t = setInterval(() => socket.emit('ping'), 5000);
+  socket.on('disconnect', () => clearInterval(t));   // ye line hi fix hai
+});
+```
+
+Timers GC roots hain -- active timer apna callback, aur callback ka poora closure, zinda rakhta hai. Yahi wo leak hai jo **traffic se independent** dikhta hai ([[22-nodejs-memory-leak-debugging]] ki kahani).
+
+## 5. `--max-old-space-size` Kya Karta Hai (Aur Kya Nahi)
+
+```
+node --max-old-space-size=2048 server.js    # Old Space ceiling 2 GB
+```
+
+| Situation | Badhane ka asar |
+|---|---|
+| Genuinely bada **working set** (bada legit cache, bada dataset) | **sahi fix** |
+| Leak | crash **postpone**, GC pause lamba, bas |
+
+Ek cheez jo log galat karte hain: **container limit se kam rakho.** Heap limit `external` memory, Buffers, aur native allocations ko count nahi karti. Pod limit 2 GB aur `--max-old-space-size=2048` = pod OOM hoga **pehle** ki V8 apna major GC trigger kare. Thumb rule: heap limit ~ container limit ka 75%.
+
+## 6. Diagnose Step 1: `process.memoryUsage()` Ko Padhna
+
+```js
+setInterval(() => {
+  const m = process.memoryUsage();
+  logger.info({
+    rss: Math.round(m.rss / 1e6),
+    heapTotal: Math.round(m.heapTotal / 1e6),
+    heapUsed: Math.round(m.heapUsed / 1e6),
+    external: Math.round(m.external / 1e6),
+    arrayBuffers: Math.round(m.arrayBuffers / 1e6),
+  }, 'mem_mb');
+}, 30_000);
+```
+
+| Field | Matlab | Badhe to shaq |
+|---|---|---|
+| **rss** | OS ne process ko di gayi **total** physical memory (code, stack, heap, native, sab) | ye hi cheez container ko OOMKill karwaati hai |
+| **heapTotal** | V8 ne OS se **reserve** ki hui heap | normal sawtooth, isko chase mat karo |
+| **heapUsed** | heap ka actually **use** ho raha hissa | JS object leak (Map, closures, listeners) |
+| **external** | V8 se jude **heap ke bahar** ke allocations -- Buffers, zlib, sockets | **Buffer/stream leak** |
+| **arrayBuffers** | `external` ka wo hissa jo ArrayBuffer/Buffer hai | upload, crypto, binary code path |
+
+Padhne ka tareeka:
+- **Sawtooth `heapUsed`, flat baseline** -> normal. GC kaam kar raha hai.
+- **`heapUsed` ka baseline har GC ke baad upar** -> JS-side leak. Heap snapshot lo.
+- **`heapUsed` flat par `rss`/`external` chadh raha** -> **Buffer leak**, aur heap snapshot mein ye **dikhega hi nahi**. Dekho: streams jo destroy nahi hote, `Buffer.concat` loops, bade buffers ke `subarray` views cache mein ([[142-buffers-and-binary-data]]).
+
+Ye aakhri point hi sabse mehnga debugging mistake hai: ghanton heap snapshot mein kuch nahi milta kyunki leak JS heap mein hi nahi hai.
+
+## 7. Diagnose Step 2: Do Heap Snapshots Compare Karo
+
+Ek snapshot bekaar hai -- usme sab kuch dikhega aur kuch pata nahi chalega. **Do** chahiye.
+
+```js
+// SIGUSR2 par snapshot -- prod-safe switch
+const v8 = require('node:v8');
+process.on('SIGUSR2', () => {
+  const file = v8.writeHeapSnapshot();     // blocking, heap ke size ke barabar file
+  logger.warn({ file }, 'heap snapshot written');
+});
+```
+
+`kill -SIGUSR2 <pid>` se baseline lo, 1-2 ghante normal traffic chalne do, phir doosra lo. Chrome DevTools -> Memory -> dono `.heapsnapshot` load karo -> second select karo -> **Comparison** view, baseline ke against.
+
+Dekhna kya hai:
+
+| Column | Kya batata hai |
+|---|---|
+| **# Delta** | kitne objects **extra** bane (positive aur badhta = suspect) |
+| **Size Delta** | un objects ne kitni memory li |
+| **Retained Size** | is object ke marne par kitni memory **actually** free hogi |
+
+**Retained size** hi asli number hai. Ek `Map` ka shallow size 100 bytes ho sakta hai par retained size 800 MB -- kyunki wo 800 MB ko zinda rakhe hui hai.
+
+Phir us constructor par click karo aur **Retainers** panel dekho -- wo exact reference chain hai root se object tak: `(GC roots) -> global -> sessionCache -> Map -> entries`. Yahi aapka answer hai, line number ke saath.
+
+Prod note: snapshot **stop-the-world** hai (GB heap = seconds ka freeze) aur disk par heap ke barabar file likhta hai. Ek instance ko load balancer se nikaal kar lo, ya staging par load replay karo.
+
+## 8. Leaking Cache Aur Uska Bounded Fix
+
+```js
+// LEAK: unbounded. 100k products x 40 KB JSON = 4 GB.
+const cache = new Map();
+async function getProduct(id) {
+  if (cache.has(id)) return cache.get(id);
+  const p = await db.product.findById(id);
+  cache.set(id, p);                      // eviction NAHI, TTL NAHI
+  return p;
+}
+```
+
+```ts
+// FIX: bounded + TTL. Memory ab ek CEILING ke andar hai.
+import { LRUCache } from 'lru-cache';
+
+const cache = new LRUCache<string, Product>({
+  max: 5_000,                            // entry cap
+  maxSize: 200 * 1024 * 1024,            // byte cap -- entry sizes vary karti hain
+  sizeCalculation: (p) => Buffer.byteLength(JSON.stringify(p)),
+  ttl: 10 * 60 * 1000,                   // stale data ka bound (alag concern)
+});
+
+export async function getProduct(id: string): Promise<Product> {
+  const hit = cache.get(id);
+  if (hit) return hit;
+  const p = await db.product.findById(id);
+  cache.set(id, p);                      // 5001st entry par LRU evict karega
+  return p;
+}
+```
+
+LRU ka internal design -- HashMap + doubly linked list, O(1) get/put -- [[119-lld-lru-cache]] mein hai. Yahan point ek hai: **entry count se nahi, bytes se bound karo** jab entries ka size wildly different ho. 5,000 entries ka cap bekaar hai agar ek entry 40 KB hai aur doosri 4 MB.
+
+Aur `WeakMap`/`WeakRef` ke chakkar mein padne se pehle socho ki cache **process ke bahar** (Redis) hona chahiye tha kya -- multi-pod setup mein in-process cache ki hit rate anyway kharab hoti hai.
+
+## 9. Production Reality
+
+- **GC spikes = latency spikes.** `--trace-gc` ya `perf_hooks` ke `gc` observer se major GC ki duration measure karo. 2 GB heap par 200 ms pause aapke p99 mein saaf dikhega -- aur ye "slow query" jaisa dikhta hai jabki DB ka koi dosh nahi ([[93-cpu-spike-every-night-217am]] wala "pattern pehchano" sabak).
+
+```js
+const { PerformanceObserver } = require('node:perf_hooks');
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) {
+    if (e.duration > 50) logger.warn({ ms: e.duration, kind: e.detail?.kind }, 'long_gc');
+  }
+}).observe({ entryTypes: ['gc'] });
+```
+
+- **Alert `rss` par karo**, `heapUsed` par nahi. OOMKill `rss` dekhta hai.
+- **Restart ek mitigation hai, fix nahi.** PM2/Kubernetes ka auto-restart symptom chhupa deta hai jabki leak waisa hi rehta hai.
+- Jo **sahi** `heapUsed` metric alert karna hai: GC ke **baad** ka baseline, average nahi. Average sawtooth se smooth ho jaata hai.
+- Request-scoped allocation se mat daro. "Object creation avoid karo" wali micro-optimization New Space ke saamne bekaar hai. Jo cheez rakhi jaa rahi hai usko dekho.
+
+## 10. Common Galtiyan
+
+- Leak par `--max-old-space-size` badhana aur use fix maanna.
+- `global.gc()` call karke socha ki leak theek ho gaya -- reachable object GC nahi hota.
+- Sirf ek heap snapshot lena -- compare bina kuch nahi milta.
+- Buffer/stream leak ko JS heap snapshot mein dhoondhna (wo `external` mein hai, heap mein nahi).
+- `heapTotal` ko leak ka proof maanna -- wo reserve hai, use nahi.
+- Container limit ke **barabar** heap limit set karna -> V8 ko GC ka mauka milne se pehle pod OOM.
+- Cache ko entry-count se bound karna jab entry sizes 1 KB se 5 MB tak hain.
+
+## 🧠 Remember
+
+> GC kabhi galti nahi karta -- leak ka matlab hai ek reference jo aap bhool gaye, isliye heap badhane se crash sirf **postpone** hota hai; `heapUsed` chadhe to JS-side leak (Map, listener, closure, timer) aur heap snapshots compare karke retainer chain pakdo, par `external`/`rss` chadhe aur `heapUsed` flat ho to leak **JS heap mein hi nahi** hai -- wo Buffer hai, aur snapshot usko dikhayega bhi nahi.
+
+## Quick Self-Test
+
+1. Scavenge aur Mark-Sweep-Compact mein kya farak hai, aur isse ye kyun nikalta hai ki short-lived objects sasta hain?
+2. C ke leak aur JS ke leak mein conceptual farak kya hai -- aur isliye `global.gc()` kyun fix nahi karta?
+3. `heapUsed` flat hai par `rss` 400 MB chadh gaya -- aap kahan dhoondhoge, aur heap snapshot kaam karega ya nahi?
+4. `--max-old-space-size` ko container memory limit ke barabar set karne par kya galat hoga?
+5. Heap snapshot comparison mein "Retained Size" kyun "Shallow Size" se zyada useful hai?
+6. Cache ko `max: 5000` entries se bound kiya aur phir bhi OOM hua -- kya chhoot gaya?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="145" data-title="libuv Thread Pool: What Is Really Async" data-category="Node.js Internals" data-order="145">
+# libuv Thread Pool: Node Mein Actually Async Kya Hai
+
+> **Connects to**: [[01-concurrency-vs-parallelism]] (I/O-bound vs CPU-bound), [[109-cluster-worker-threads-child-process-hinglish]] (jab 4 threads kaafi nahi), [[58-less-traffic-more-cpu]] (same traffic, zyada cost), [[13-hidden-latency-bottleneck]] (latency wahan nahi hoti jahan aap dhoondh rahe ho). | [[137-event-loop-phases-and-microtasks]] (event loop phases)
+
+## 1. Story
+
+Monday subah 9:30 baje. Office login time. Aapka `POST /login` p99 400ms se 2.8s par chala gaya -- theek hai, login spike hai, samajh aata hai.
+
+Par ek cheez samajh nahi aa rahi: `GET /health` bhi 1.2s le raha hai. Aur `GET /invoice/:id/pdf` timeout de raha hai. In dono ka login se **koi lena-dena nahi** hai. Ek sirf ek JSON return karta hai, dusra disk se file padhta hai.
+
+Aapne DB dashboard khola. DB bilkul relaxed -- 4% CPU, koi slow query nahi. Aapne Node ka CPU dekha -- 70%, poora pin nahi hua. Event loop lag check kiya -- 12ms, bura nahi.
+
+To phir ek unrelated endpoint kahan atka hua hai?
+
+## 2. The Problem: "Node Toh Async Hai Na?"
+
+Yahi sabse bada Node misconception hai:
+
+> "Node non-blocking hai, sab kuch async hai, isliye ek slow kaam dusre kaam ko affect nahi karta."
+
+Aadha sach hai. Asli picture ye hai -- Node ke andar **do bilkul alag mechanism** hain, aur log dono ko "async" keh dete hain:
+
+| Kaam | Kaise hota hai | Thread lagta hai? | Limit |
+|---|---|---|---|
+| TCP/HTTP socket read-write | OS event notification (`epoll` Linux, `kqueue` BSD/macOS, IOCP Windows) | **Nahi** | OS fd limit (hazaaron) |
+| DB query, Redis call, outbound HTTP | wahi -- ye sab socket hain | **Nahi** | wahi |
+| `fs.readFile`, `fs.stat`, `fs.writeFile` | libuv **thread pool** | Haan | **4 by default** |
+| `dns.lookup` (`getaddrinfo`) | libuv thread pool | Haan | **4** |
+| `zlib.gzip` async | libuv thread pool | Haan | **4** |
+| `crypto.pbkdf2`, `scrypt`, `randomBytes`, `generateKeyPair`, `bcrypt` addon | libuv thread pool | Haan | **4** |
+
+Ye hi aapka bug hai. 10,000 concurrent DB queries bilkul theek chalengi. Par **5 concurrent password hashes** mein se ek queue mein khada rahega -- aur uske peeche aapka PDF ka `fs.readFile` bhi.
+
+## 3. Why Network I/O Ko Thread Nahi Chahiye
+
+Socket ke liye OS khud ek "mujhe batana jab data aaye" API deta hai. Node ek hi thread se OS ko kehta hai: "in 5000 sockets par nazar rakho, jo ready ho uska naam bata do." Ye `epoll_wait()` ek call hai, aur poll phase mein return karti hai ready fd ki list. Isliye 5000 connections ke liye 5000 threads nahi chahiye -- **zero extra threads** chahiye.
+
+File read ke liye POSIX aisa koi bharosemand interface deta hi nahi (`O_NONBLOCK` regular file par mostly jhooth bolta hai -- padhne ke liye block hi karega). To libuv ke paas ek hi option bacha: **ek real thread lo, usme blocking `pread()` maaro, khatam hone par event loop ko batao.** Aur CPU-heavy crypto ka to sawal hi nahi -- KDF ka matlab hi hai ki CPU jalana hai, to wo bhi usi pool par bhej diya gaya.
+
+```
+                   +-- socket? --> epoll/kqueue (OS) -- no thread, bahut saare parallel
+   aapka await ----|
+                   +-- fs/dns/zlib/crypto? --> libuv thread pool [T1][T2][T3][T4]
+                                                        ^
+                                                 sirf 4 -- baaki queue mein
+```
+
+## 4. Demo: 4 Threads Ko Aankhon Se Dekho
+
+Ye file chalao. 8 `pbkdf2` ek saath firing, par pool mein 4 hi seat hain.
+
+```javascript
+// threadpool-demo.js
+const crypto = require('node:crypto');
+
+const N = 8;
+const start = Date.now();
+
+for (let i = 1; i <= N; i++) {
+  crypto.pbkdf2('password', 'salt', 300000, 64, 'sha512', () => {
+    console.log(`task ${i} done at ${Date.now() - start}ms`);
+  });
+}
+```
+
+```
+$ node threadpool-demo.js
+task 2 done at 431ms
+task 1 done at 436ms
+task 3 done at 438ms
+task 4 done at 440ms      <-- pehla batch, 4 tasks
+task 5 done at 861ms
+task 6 done at 869ms
+task 7 done at 871ms
+task 8 done at 874ms      <-- dusra batch, exact double time
+```
+
+**Dekho kya hua:** task 5 ka kaam 0ms par submit hua tha, par usne 431ms **queue mein khade** hoke bitaye. Aapke code mein kahin bhi `pbkdf2` 431ms slow nahi hua -- sirf uske shuru hone ka wait tha.
+
+Ab pool bada karo:
+
+```bash
+# Linux/macOS
+UV_THREADPOOL_SIZE=8 node threadpool-demo.js
+# Windows PowerShell
+$env:UV_THREADPOOL_SIZE=8; node threadpool-demo.js
+```
+
+```
+task 3 done at 452ms
+task 1 done at 455ms
+... saare 8 ~455ms par
+```
+
+Aath tasks, ek hi batch. Shape badal gaya.
+
+> **Catch:** ye sirf tab hua kyunki machine par 8+ cores the. 4-core machine par 8 threads banane se bhi total time wahi rahega -- 8 threads 4 cores ke liye ladengi. Thread pool badhane se **CPU paida nahi hota**. Ye exactly [[01-concurrency-vs-parallelism]] ka farak hai: concurrency badh gayi, parallelism nahi.
+
+## 5. Production Trap: Login Spike PDF Ko Tod Deta Hai
+
+Ab story ka asli mechanism:
+
+```javascript
+// auth.service.js -- bcrypt bhi usi pool par chalta hai
+const bcrypt = require('bcrypt');
+app.post('/login', async (req, res) => {
+  const user = await users.findByEmail(req.body.email);    // socket -- pool free
+  const ok = await bcrypt.compare(req.body.password, user.hash); // POOL SEAT, ~120ms
+  res.json({ token: ok ? sign(user) : null });
+});
+
+// invoice.service.js
+app.get('/invoice/:id/pdf', async (req, res) => {
+  const tpl = await fs.promises.readFile('./templates/invoice.html'); // POOL SEAT
+  res.type('pdf').send(await render(tpl, req.params.id));
+});
+```
+
+Do alag files, do alag teams, do alag features -- **ek shared resource jiska naam kisi code mein likha hi nahi hai.**
+
+9:30 baje 40 logins/second aate hain. Har ek 120ms pool seat kha raha hai. Capacity = 4 threads / 0.12s = ~33 hash per second. Demand 40. Queue banna shuru -- aur queue **FIFO** hai, usme aapka invoice template read bhi lag gaya.
+
+```mermaid
+flowchart LR
+  L["40 logins/sec<br/>bcrypt 120ms"] --> Q
+  P["/invoice PDF<br/>fs.readFile 2ms"] --> Q
+  H["outbound API<br/>dns.lookup"] --> Q
+  Q["libuv queue (FIFO)"] --> T["4 threads"]
+```
+
+### Isko Misdiagnose Kyun Kiya Jaata Hai
+
+Symptom bilkul "slow database" jaisa dikhta hai, isliye 2 ghante DB par waste hote hain:
+
+| Aap dekhte ho | Aap sochte ho | Sach |
+|---|---|---|
+| `await` 400ms le raha hai | DB/API slow hai | kaam shuru hi 400ms baad hua |
+| CPU 100% pin nahi hai | "CPU problem nahi hai" | 4 threads 8 cores par 50% hi dikhayenge |
+| event loop lag normal hai | "event loop block nahi hai" | sahi -- block *pool* mein hai, loop mein nahi |
+| ek endpoint slow, baaki bhi slow | "poora server down ja raha hai" | ek shared pool |
+| DB metrics clean | "to code slow hai" | code fast hai, wait upar hai |
+
+**Ye signature yaad rakho:** DB bolta hai "main fast hoon", Node bolta hai "mera event loop free hai", phir bhi latency hai -> **pool dekho**. Yahi [[13-hidden-latency-bottleneck]] ka point hai -- latency us layer mein thi jiska koi dashboard hi nahi tha.
+
+## 6. Kaise Confirm Karein
+
+Guess mat karo, naap lo. Sabse saaf signal: queue wait time.
+
+```javascript
+// pool-probe.js -- ek sasta canary
+const { performance } = require('node:perf_hooks');
+const fs = require('node:fs');
+
+setInterval(() => {
+  const t = performance.now();
+  fs.stat(__filename, () => {
+    const waited = performance.now() - t;
+    // stat 1ms ka kaam hai. 1ms se bahut zyada = queue wait.
+    if (waited > 50) console.warn(`[threadpool] stat took ${waited.toFixed(0)}ms -- pool saturated`);
+  });
+}, 1000);
+```
+
+Behtar: proper observability. `perf_hooks` ka `PerformanceObserver` `'fs'`/`'dns'` entries de deta hai, aur `--cpu-prof` ya `0x` flame graph mein aap `pbkdf2`/`bcrypt` ko threads par baithe dekh lenge. Checklist ke tarah soche to ye [[20-sudden-latency-spike-checklist]] mein "shared resource saturation" bucket hai.
+
+## 7. Fixes -- Order Mein
+
+**1. Pool ko cores ke barabar karo (5 minute ka fix).**
+
+```javascript
+// server.js -- SABSE PEHLI line, kisi bhi require se pehle
+process.env.UV_THREADPOOL_SIZE = String(require('node:os').availableParallelism());
+// ya behtar: shell/Dockerfile/k8s env mein set karo
+```
+
+Important: pool **pehle use par ek hi baar** banta hai. Agar kisi module ne already ek `fs` async call kar diya, aapka change ignore ho jaayega. Isliye env variable hi safest hai (`ENV UV_THREADPOOL_SIZE=8` Dockerfile mein). Max 1024, par cores se zyada CPU-bound kaam ke liye bekaar hai.
+
+**2. Hashing ko request path se hata do (asli fix).** Login par bcrypt se bacha nahi ja sakta -- par aap cost control kar sakte ho: bcrypt rounds ko naapo (10-12 typical, 14 nahi), aur login ke aage [[106-rate-limiting-at-the-edge-hinglish]] jaisa throttle lagao taaki credential-stuffing bot aapka pool na kha jaaye. Bulk hashing (migration, seed script) kabhi API process mein mat chalao -- alag worker service.
+
+**3. Agar hashing hi aapka core kaam hai, to pool ke bajaye `worker_threads`.** Pool shared hai aur aapke control mein nahi; worker pool (e.g. `piscina`) aapka hai -- usme aap size, queue limit aur backpressure decide karte ho. Ye [[109-cluster-worker-threads-child-process-hinglish]] ka natural next step hai.
+
+**4. DNS ko pool se nikaalo.** Har outbound HTTP call `dns.lookup` karta hai -> `getaddrinfo` -> **thread pool**. Ek slow DNS server aapke saare fs reads ko bhookha rakh sakta hai.
+
+```javascript
+const dns = require('node:dns');
+// c-ares, UDP socket par -- thread pool ko chhuta hi nahi
+dns.promises.resolve4('api.payments.com').then(console.log);
+
+// Node 22+: default resolver ko c-ares par bhej do
+dns.setDefaultResultOrder('ipv4first');
+```
+
+Practical mein: ek **DNS cache** lagao (`cacheable-lookup`) -- isse lookups 99% kam ho jaate hain, jo pool ke liye `dns.resolve` se bhi bada fayda hai.
+
+**5. Sync API ko API process mein mat chalao.** `fs.readFileSync`, `crypto.pbkdf2Sync`, `zlib.gzipSync` pool use hi nahi karte -- wo seedha **event loop** block karte hain, jo isse bhi bura hai. Config boot par sync padh lena theek hai; per-request kabhi nahi.
+
+## 8. Trade-offs
+
+| Decision | Fayda | Keemat |
+|---|---|---|
+| `UV_THREADPOOL_SIZE` = cores | fs/crypto queueing khatam | cores se zyada rakha to context switching, memory per thread (~1MB stack) |
+| `dns.resolve` over `dns.lookup` | pool bacha | `/etc/hosts` ignore hota hai -- local/k8s DNS setup mein surprise |
+| worker pool (piscina) | isolation, apna backpressure | message passing ka copy cost, extra code |
+| bcrypt rounds kam karna | sasta hash | kamzor hash -- security trade-off, halka mat lo |
+
+## 9. Common Mistakes
+
+- **`UV_THREADPOOL_SIZE=128` likh dena** "zyada better hai" sochkar. CPU-bound kaam ke liye cores se zyada threads sirf sabko equally slow karti hain.
+- Isko runtime par `process.env` se set karna **pehle async fs/crypto call ke baad** -- chup-chaap ignore.
+- Yakeen karna ki "DB fast hai, to problem DB nahi hai." Aapka `await` DB ke *paas pahunchne* se pehle hi ruk sakta hai.
+- `worker_threads` lagana jab problem sirf 4-thread pool thi -- ek env variable kaafi tha.
+- Yeh maan lena ki thread pool HTTP concurrency bhi limit karta hai. Nahi -- aapke 10,000 sockets epoll par hain, mazey mein hain.
+
+## 10. Interview Mein Kaise Bole
+
+*"Node mein 'async' ke do matlab hain. Network I/O genuinely OS-level async hai -- epoll/kqueue, koi thread nahi, isliye hazaaron connections sasta hain. Par filesystem, `dns.lookup`, zlib aur crypto KDFs libuv ke thread pool par chalte hain jo default 4 hai. Isliye ek login spike, jisme har request bcrypt kar rahi hai, un endpoints ko slow kar sakta hai jo sirf file padhte hain -- ek shared pool, FIFO queue. Isko main `fs.stat` jaise sasta operation time karke confirm karta hoon: agar 1ms ka kaam 300ms le raha hai to wait queue mein hai. Fix: pool ko cores ke barabar karo, DNS cache lagao, aur heavy CPU kaam ko apne worker pool mein bhejo."*
+
+## 🧠 Remember
+
+> Network I/O Node mein sach mein async hai -- OS dekhta hai, koi thread nahi lagti. Par `fs`, `dns.lookup`, `zlib` aur `crypto` KDFs sirf **4 shared threads** par chalte hain, aur unka queue wait bilkul "slow database" jaisa dikhta hai -- isliye jab DB clean ho aur event loop free ho, phir bhi latency ho, to thread pool dekho.
+
+## Quick Self-Test
+
+1. 5000 concurrent DB queries theek chalti hain par 8 concurrent `pbkdf2` queue ban jaati hai -- kyun? Dono to `await` hi hain.
+2. Aapka `/health` endpoint sirf `res.json({ok:true})` karta hai. Login spike mein ye slow kaise ho sakta hai?
+3. `UV_THREADPOOL_SIZE=64` 4-core machine par kya kar dega, aur kyun fayda nahi hoga?
+4. `dns.lookup` aur `dns.resolve4` mein thread pool ke hisaab se kya farak hai, aur `resolve` apnane ki ek keemat kya hai?
+5. Event loop lag metric normal dikh raha hai par requests slow hain. Isse aap kya **rule out** kar sakte ho, aur kya nahi?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="146" data-title="EventEmitter and Listener Leaks" data-category="Node.js Internals" data-order="146">
+# EventEmitter Aur Listener Leaks
+
+> **Connects to**: [[22-nodejs-memory-leak-debugging]] (`MaxListenersExceededWarning` wahan ek clue tha -- yahan uska poora mechanism hai) aur [[02-debugging-random-500-errors]] (wo 500 jo sirf traffic ke saath aata hai). | [[144-garbage-collection-and-memory]] (GC and retained memory)
+
+## 1. Story
+
+Ek order service hai. Team ne "decoupling" ke liye ek in-process EventEmitter lagaya: order create ho, to email bhejo, analytics ko batao, warehouse ko batao -- controller ko in teeno ke baare mein jaanne ki zaroorat nahi.
+
+Design sabko achha laga. Deploy ho gaya. Do ghante baad logs mein ye aaya:
+
+```
+(node:4812) MaxListenersExceededWarning: Possible EventEmitter memory leak detected.
+11 order.created listeners added to [EventEmitter]. Use emitter.setMaxListeners() to increase limit
+```
+
+Senior dev ne commit kiya:
+
+```javascript
+bus.setMaxListeners(100);   // "warning gaya"
+```
+
+Warning chala gaya. Chaar ghante baad process 1.8GB par OOM-kill ho gaya. Aur usse pehle ek aur mazedaar cheez hui: **ek hi order ka email 60 baar gaya.**
+
+## 2. Pehle Basics -- Par Us Hisse Par Jo Interview Mein Poocha Jaata Hai
+
+```javascript
+const { EventEmitter } = require('node:events');
+const bus = new EventEmitter();
+
+const onCreated = (order) => console.log('created', order.id);
+
+bus.on('order.created', onCreated);     // har emit par chalega
+bus.once('order.created', onCreated);   // sirf ek baar, phir khud hat jaata hai
+bus.off('order.created', onCreated);    // hatao -- WAHI function reference chahiye
+bus.emit('order.created', { id: 'o_1' }); // true agar koi listener tha, warna false
+```
+
+| | Kab use karo | Leak ka risk |
+|---|---|---|
+| `on` | lambi umar ka subscriber (boot par ek baar) | **Haan** -- aapko hataana padega |
+| `once` | ek specific jawab ka intezaar | Nahi -- fire hone par khud hat jaata hai |
+| `off` / `removeListener` | cleanup | -- |
+
+**Sabse common bug yahan hai:** `off` ko **exactly wahi function reference** chahiye jo `on` ko diya tha.
+
+```javascript
+bus.on('tick', () => doWork());
+bus.off('tick', () => doWork());   // ye kuch nahi hataata -- naya anonymous function hai
+```
+
+Anonymous arrow `on` mein daalne ka matlab hai: **aap us listener ko ab kabhi hata nahi sakte.**
+
+## 3. `emit` Synchronous Hai -- Aur Ye Logon Ko Chaunkata Hai
+
+`emit` kaam queue nahi karta. Ye listeners ko **usi call stack par, usi order mein jisme add hue the**, seedha call kar deta hai. Sochne ka tareeka: `emit` ek `for` loop hai jisme function calls hain -- bas.
+
+```javascript
+const bus = new EventEmitter();
+bus.on('ping', () => { for (let i = 0; i < 2e9; i++); console.log('slow listener done'); });
+
+console.log('before');
+bus.emit('ping');          // yahan blocking -- poora event loop ruka hua
+console.log('after');
+// before -> slow listener done -> after
+```
+
+Iske do bade natije:
+
+**(a) Ek slow listener aapki request ko slow karta hai.** Log sochte hain "event emit kar diya, ab fire-and-forget ho gaya." Nahi. Agar listener ne 200ms CPU khaya, aapka HTTP handler 200ms slow hua.
+
+**(b) Async listener ki rejection kahin nahi jaati.**
+
+```javascript
+bus.on('order.created', async (order) => {
+  await sendEmail(order);     // SMTP down -> reject
+});
+bus.emit('order.created', o); // emit ko promise dikhta hi nahi -> unhandledRejection
+```
+
+`emit` listener ka return value ignore karta hai. To ye ek silent failure hai: email gaya nahi, koi error log nahi, response 200. Yahi wo category hai jisse [[02-debugging-random-500-errors]] wale "kuch requests chup-chaap galat behave karti hain" paida hote hain.
+
+Fix do hain -- listener ke andar khud try/catch, ya emitter ko bolo ki rejections pakad le:
+
+```javascript
+const bus = new EventEmitter({ captureRejections: true });
+// async listener reject hua -> 'error' event fire hoga
+bus.on('error', (err) => logger.error({ err }, 'bus listener failed'));
+```
+
+## 4. Asli Leak: Long-Lived Emitter + Per-Request Listener
+
+Story ka bug exactly ye tha:
+
+```javascript
+// bus.js -- module-level, poore process ki umar tak zinda
+const { EventEmitter } = require('node:events');
+module.exports = new EventEmitter();
+
+// orders.controller.js
+const bus = require('./bus');
+
+app.post('/orders', async (req, res) => {
+  const order = await orders.create(req.body);
+
+  // BUG: har request ek naya listener add karti hai, kabhi hataya nahi jaata
+  bus.on('order.created', (o) => {
+    if (o.id === order.id) res.json(o);     // closure mein `res` aur `order` phanse hue
+  });
+
+  bus.emit('order.created', order);
+});
+```
+
+Yahan **do** problem ek saath hain:
+
+**1. Memory leak.** `bus` kabhi garbage collect nahi hoga (module-level hai), aur uska internal listener array har request par ek entry badhata hai. Har closure apne `res` ko capture karti hai -- aur `res` socket, headers, buffers sab pakdta hai. Ye bilkul [[22-nodejs-memory-leak-debugging]] ka Step 3 hai: heap snapshot ka retainer chain `EventEmitter._events['order.created']` -> array -> closure -> `ServerResponse` dikhayega.
+
+**2. O(n^2) behaviour.** 60th request ke `emit` par 60 listeners chalte hain. Har purana listener bhi call hota hai (bas `if` fail karta hai) -- aur agar `if` guard na hota, ek order ka email 60 baar jaata. Story mein wahi hua.
+
+**Warning ka asli matlab:**
+
+> `MaxListenersExceededWarning` ye nahi keh raha ki "10 listeners bahut zyada hain." Ye keh raha hai: **"ek long-lived emitter par listener count badh raha hai, shayad aap add kar rahe ho aur hata nahi rahe."** 10 ek heuristic hai, limit nahi.
+
+Isliye `setMaxListeners(100)` fix nahi, **smoke detector ki battery nikaalna** hai. Ha, legit cases hote hain (ek genuine 30-subscriber bus) -- tab number badhana theek hai, par **tab** jab aapne verify kar liya ho ki count boot par stable hota hai, request ke saath nahi badhta.
+
+### Rule
+
+> **Jisne listener add kiya, wahi usse hataane ka maalik hai.** Agar add karne ki life (ek request) emitter ki life (poora process) se chhoti hai, to cleanup likhna aapka kaam hai -- warna leak pakka hai.
+
+### Fix 1: Yahan EventEmitter hi galat tool tha
+
+```javascript
+app.post('/orders', async (req, res) => {
+  const order = await orders.create(req.body);
+  bus.emit('order.created', order);   // emit karo, sunno mat
+  res.json(order);                    // response seedha
+});
+
+// listeners boot par, ek hi baar register hote hain
+bus.on('order.created', emailSubscriber);
+bus.on('order.created', analyticsSubscriber);
+```
+
+Listeners **boot-time, fixed count**. Yahi normal shape hai.
+
+### Fix 2: Agar sach mein per-request intezaar karna hai -- `once` promise
+
+```javascript
+const { once } = require('node:events');
+
+// `once` ek promise deta hai aur fire/reject par listener khud hata deta hai
+const [payment] = await once(bus, `payment.${orderId}`);
+```
+
+### Fix 3: `AbortSignal` se guaranteed cleanup
+
+```javascript
+const { once } = require('node:events');
+
+app.get('/orders/:id/stream', async (req, res) => {
+  const ac = new AbortController();
+  // client ne connection kaat diya -> listener hat jaayega
+  res.on('close', () => ac.abort());
+
+  try {
+    const [update] = await once(bus, `order.${req.params.id}`, { signal: ac.signal });
+    res.json(update);
+  } catch (err) {
+    if (err.name === 'AbortError') return;    // normal -- client chala gaya
+    throw err;
+  }
+});
+```
+
+Plain `emitter.on` `signal` option support nahi karta, to manual listener ke liye ye pattern likhna padta hai:
+
+```javascript
+const handler = (o) => push(o);
+bus.on('order.created', handler);
+signal.addEventListener('abort', () => bus.off('order.created', handler), { once: true });
+```
+
+## 5. `error` Event: Koi Listener Nahi = Process Crash
+
+Ye Node ka ek deliberate design choice hai, bug nahi:
+
+```javascript
+const bus = new EventEmitter();
+bus.emit('error', new Error('boom'));
+// Uncaught Error: boom  -> process exit code 1
+```
+
+`EventEmitter` ka `'error'` special-cased hai: agar us event ka koi listener nahi hai, emitter error ko **throw** karta hai -- uncaughtException -> process khatam.
+
+**Kyun?** Kyunki chup-chaap ignore kiya gaya I/O error se bura kuch nahi hai. Ek socket ya stream jisne error diya aur kisi ne na suna, wo corrupt state mein aage chalti rahegi. Node ne decide kiya: **loud crash > silent corruption**.
+
+Practically iska matlab:
+
+```javascript
+// har stream/socket/emitter par error listener lagao -- warna wo aapka process gira sakta hai
+const rs = fs.createReadStream('big.csv');
+rs.on('error', (err) => logger.error({ err }, 'read failed'));
+
+// Express mein: response stream bhi error de sakti hai
+res.on('error', (err) => logger.warn({ err }, 'client gaya'));
+```
+
+Aur `process.on('uncaughtException')` ko "fix" ki tarah use mat karo -- us point par aapka state unknown hai. Log karo, metric badhao, **graceful exit** karo, process manager restart kar dega.
+
+## 6. Jab In-Process EventEmitter Bilkul Galat Tool Hai
+
+EventEmitter ek **function call ka alternate syntax** hai -- message broker nahi. Wo ye sab **nahi** karta:
+
+| Chahiye | EventEmitter deta hai? |
+|---|---|
+| Durability (restart ke baad event bacha rahe) | **Nahi** -- sab memory mein, process mara to gaya |
+| Retry / dead-letter | **Nahi** |
+| Cross-process / cross-pod delivery | **Nahi** -- 3 pods hain to emit sirf us ek pod mein hua |
+| Backpressure | **Nahi** -- emit sync hai, queue hi nahi hai |
+| At-least-once guarantee | **Nahi** -- listener throw kiya, event gaya |
+| Observability (lag, depth) | **Nahi** |
+
+To ye line kaafi bolti hai:
+
+> Agar event ka kho jaana **business problem** hai, to EventEmitter galat tool hai. Aapko ek real queue chahiye (BullMQ/Redis, SQS, Kafka) -- ya kam se kam DB mein ek outbox row jo background worker padhe.
+
+Aur ek bahut common production trap: cluster/k8s mein aap `bus.emit('cache.invalidate')` likhte ho aur **sirf ek pod** ka cache saaf hota hai -- baaki pods stale data serve karte rehte hain ([[109-cluster-worker-threads-child-process-hinglish]] wali "workers memory share nahi karte" seekh). Us kaam ke liye Redis pub/sub chahiye, local emitter nahi.
+
+### Decision
+
+```mermaid
+flowchart TD
+  A{Event kho jaaye to kya hoga?} -->|Kuch nahi -- metric, debug log| E[EventEmitter theek hai]
+  A -->|Paisa/email/order affect hoga| Q{Dusre process ko sunna hai?}
+  Q -->|Nahi, same process| O[DB outbox + worker]
+  Q -->|Haan| K[Real queue: BullMQ / SQS / Kafka]
+```
+
+## 7. Common Mistakes
+
+- `setMaxListeners` se warning dabana, root cause dhoondhne ke bajaye.
+- `on` mein anonymous arrow function daalna, phir realize karna ki use hata hi nahi sakte.
+- Request handler ke andar module-level emitter par listener add karna.
+- Ye maan lena ki `emit` async/fire-and-forget hai -- wo seedha synchronous function call hai.
+- `async` listener likhna bina try/catch ya `captureRejections` ke -- failures chup-chaap gayab.
+- Streams/sockets par `error` listener na lagana, phir "random crash" se confused hona.
+- EventEmitter ko microservice-style event bus samajh lena -- wo ek process ke bahar jaata hi nahi.
+
+## 🧠 Remember
+
+> `emit` ek synchronous function call hai, message send nahi -- aur jisne listener add kiya usi ko hataana padta hai, warna ek long-lived emitter par per-request `on` memory aur duplicate work dono leak karta hai. `MaxListenersExceededWarning` leak ka alarm hai, badhane wala number nahi.
+
+## Quick Self-Test
+
+1. `bus.on('x', () => f())` ke baad `bus.off('x', () => f())` kyun kuch nahi hataata?
+2. Ek handler `bus.emit('order.created', o)` karke turant `res.json()` karta hai. Response slow kaise ho sakta hai?
+3. `MaxListenersExceededWarning` actually kya bata rahi hai, aur `setMaxListeners(100)` kab sach mein sahi jawab hai?
+4. `error` event ka koi listener na ho to Node process kyun giraata hai -- aur wo design choice better kaise hai?
+5. Aapka app 4 pods par chal raha hai aur `bus.emit('cache.invalidate')` karta hai. Kya hoga, aur sahi tool kya hai?
+</script>
+
+<script type="text/markdown" class="lesson-data" data-id="147" data-title="TypeScript at the Runtime Boundary" data-category="Node.js Internals" data-order="147">
+# TypeScript Runtime Boundary Par: Types Jhooth Bol Sakte Hain
+
+> **Connects to**: [[02-debugging-random-500-errors]] (wo 500 jo sirf kuch requests mein aata hai -- yahan uski ek badi wajah hai) aur [[50-slow-query-500m-rows]] (DB se jo wapas aata hai, usko aap maante ho -- yahan wo maan hi tod rahe hain).
+
+## 1. Story
+
+Interview mein ek line bahut sunne ko milti hai:
+
+> "Humne TypeScript use kiya, isliye type errors production mein aate hi nahi."
+
+Aapke paas ek clean TS Express API hai. Full `strict` mode. Zero `any`. CI green. Phir Sentry par ye aata hai:
+
+```
+TypeError: Cannot read properties of undefined (reading 'toLowerCase')
+  at createUser (/app/dist/users.service.js:14:31)
+```
+
+Aap us line par jaate ho:
+
+```typescript
+async function createUser(body: unknown) {
+  const user = body as CreateUserDto;      // line 11
+  const email = user.email.toLowerCase();  // line 14 -- yahan crash
+  ...
+}
+```
+
+Compiler ne ek shabd nahi bola. Kyunki aapne usse jhooth bolne ko kaha, aur usne maan liya.
+
+## 2. The Problem: Types Erased Ho Jaate Hain
+
+TypeScript ka pehla principle yahi hai, aur ye teen mein se do candidates miss karte hain: **compile ke baad types ka namo-nishaan nahi bachta.**
+
+```typescript
+// TS -- ye likhte ho
+interface User { id: number; email: string; }
+const user = req.body as User;
+```
+
+```javascript
+// JS -- ye chalta hai
+const user = req.body;      // bas. koi check nahi.
+```
+
+`as User` ek **runtime check nahi** hai. Wo compiler se ek vaada hai: *"tu mat poochh, main guarantee deta hoon ki ye User hai."* Compiler aapka poora code us vaade ke bharose check karta hai -- aur agar vaada jhootha nikla, wo bachaane nahi aayega, kyunki usne apna kaam program chalne se pehle khatam kar diya tha.
+
+To itna bhejna kaafi hai:
+
+```bash
+curl -X POST localhost:3000/users -H 'content-type: application/json' -d '{"emial":"a@b.com"}'
+```
+
+Typo `emial`. `user.email` -> `undefined` -> 500. Ye [[02-debugging-random-500-errors]] ka classic pattern hai: 99% requests theek, ek galat shaped client crash karta rehta hai, aur error **jahan paida hua wahan nahi, teen line baad** dikhta hai.
+
+> **Yaad rakho:** TypeScript ek **compile-time** tool hai. Runtime data ke saamne wo bilkul bebas hai.
+
+## 3. Chaar Boundaries Jahan Types Jhooth Hote Hain
+
+Apne system ko do hisson mein baanto: **andar** (aapka code, jahan compiler sach jaanta hai) aur **bahar** (duniya). Jahan data andar aata hai, wahan type ek *umeed* hai, fact nahi.
+
+```mermaid
+flowchart LR
+  subgraph Bahar["bahar -- types yahan jhooth hain"]
+    H["1. HTTP body / query / params"]
+    J["2. JSON.parse / env / config file"]
+    D["3. DB rows"]
+    A["4. 3rd-party API response"]
+  end
+  Bahar --> V["validate -- runtime check"]
+  V --> In["andar -- typed, bharosemand"]
+```
+
+**1. HTTP body, query, params.** Express mein `req.body` ka type `any` hai. Aur `req.query.page` **kabhi `number` nahi hota** -- wo `string | string[] | undefined` hai, chahe aapka interface `page: number` likhe:
+
+```typescript
+const page = req.query.page as unknown as number;
+const offset = (page - 1) * 20;   // "?page=abc" -> NaN -> OFFSET NaN -> DB error
+```
+
+**2. `JSON.parse`.** Signature `JSON.parse(text: string): any` hai, aur `any` zeher ki tarah failta hai -- jahan jaayega, checking band. Config file, Redis se padha cached object, Kafka message -- sab yahi.
+
+**3. DB rows.** `db.query<User>(...)` mein `<User>` sirf ek **generic label** hai, validation nahi -- driver ne jo diya wo waise hi aa jaata hai.
+
+**4. Third-party API.** Unka gateway kal `amount` ko number se string kar dega, aur aapko release notes padhne ka mauka nahi milega.
+
+## 4. The Fix: Boundary Par Runtime Validation (zod)
+
+Rule simple hai: **data jahan andar ghusta hai, wahan ek hi baar validate karo. Uske baad compiler par bharosa karo.**
+
+```typescript
+// users.schema.ts
+import { z } from 'zod';
+
+export const CreateUserSchema = z.object({
+  email: z.string().email(),
+  age: z.coerce.number().int().min(13).max(120),   // "25" -> 25, string se aata hai na
+  role: z.enum(['admin', 'editor', 'viewer']).default('viewer'),
+  name: z.string().trim().min(1).max(100),
+});
+
+// SINGLE SOURCE OF TRUTH: TS type schema se nikla hai, alag se likha nahi
+export type CreateUser = z.infer<typeof CreateUserSchema>;
+```
+
+`z.infer` wala hissa sabse zaroori hai. Agar aap `interface CreateUser` alag likhte aur schema alag, to dono kabhi drift kar jaate aur aap wapas wahi jhooth bolne lagte. Ek jagah, dono kaam.
+
+Ek hi reusable middleware, taaki ye 40 handlers mein copy na ho (422 = shape theek tha, values galat -- [[18-http-status-codes-400-404-409-422]]):
+
+```typescript
+// validate.ts
+import { ZodSchema } from 'zod';
+import { RequestHandler } from 'express';
+
+export const validateBody = <T>(schema: ZodSchema<T>): RequestHandler => (req, res, next) => {
+  const r = schema.safeParse(req.body);
+  if (!r.success) {
+    return res.status(422).json({
+      error: 'validation_failed',
+      details: r.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
+    });
+  }
+  req.body = r.data;          // sanitized + coerced data aage jaata hai
+  next();
+};
+
+app.post('/users', validateBody(CreateUserSchema), createUser);
+// controller ke andar req.body sach mein CreateUser hai -- naam ka nahi, check kiya hua
+```
+
+`safeParse` vs `parse`: `parse` throw karta hai (global error handler pakdega), `safeParse` result object deta hai. Boundary par `safeParse` behtar -- response shape aapke control mein rehta hai.
+
+Yahi cheez **outbound** aur **config** par bhi karo, warna third-party ka breaking change aapke andar 5 layer gehra crash karega:
+
+```typescript
+const charge = ChargeResponseSchema.parse(await (await fetch(url)).json());
+export const env = Env.parse(process.env);   // galat config = boot par crash, 3 ghante baad nahi
+```
+
+## 5. Ek Gotcha Jo Interview Mein Impress Karta Hai: `pg` + BIGINT
+
+Ye wala yaad rakho, kyunki bahut log phaste hain:
+
+```typescript
+interface Order { id: string; total_cents: number; item_count: number; }
+
+const { rows } = await pool.query<Order>('SELECT id, total_cents, COUNT(*) AS item_count FROM ... ');
+const total = rows[0].total_cents * 2;
+```
+
+Agar `total_cents` Postgres mein `BIGINT` (int8) hai, to `pg` use **string** deta hai -- `"4500"`, `4500` nahi. `COUNT(*)` bhi `bigint` hai, wo bhi string. `NUMERIC`/`DECIMAL` bhi string.
+
+```javascript
+"4500" * 2        // 9000  -- chalega, aapko lagega sab theek hai
+"4500" + 100      // "4500100"  <-- aur yahan silently galat paisa
+```
+
+**Kyun?** JS ka `number` IEEE-754 double hai -- 2^53 se bade integer safely represent nahi kar sakta. `pg` ne decide kiya: chup-chaap precision todne se behtar hai string dena, aap khud decide karo. Ye honest design hai -- aur aapka `interface Order` ise chhupa deta hai.
+
+```typescript
+// (a) string maano aur BigInt se kaam karo -- paise ke liye yahi sahi
+const total = BigInt(rows[0].total_cents);
+
+// (b) driver ko parser do -- par 2^53 se bada aaya to precision chup-chaap gayab
+import pgTypes from 'pg-types';
+pgTypes.setTypeParser(20, (v) => parseInt(v, 10));   // 20 = int8 OID
+
+// (c) row ko bhi boundary maano aur validate karo
+const OrderRow = z.object({ id: z.string().uuid(), total_cents: z.coerce.number().int() });
+```
+
+## 6. TS Features Jo Backend Interview Mein Actually Kaam Aate Hain
+
+### `unknown` vs `any` -- aur `catch (e: unknown)`
+
+```typescript
+const a: any = JSON.parse(s);
+a.foo.bar.baz;          // compiler chup -- checking band ho gayi
+
+const u: unknown = JSON.parse(s);
+u.foo;                  // compile error -- sahi! pehle narrow karo
+```
+
+`any` kehta hai "check karna band kar do." `unknown` kehta hai "mujhe pata nahi, **tu saabit kar.**" Boundary par hamesha `unknown`. Isi wajah se `catch` mein bhi `unknown` correct hai (`useUnknownInCatchVariables`, `strict` ke saath on) -- kyunki JS mein kuch bhi throw ho sakta hai, `Error` hona guarantee nahi:
+
+```typescript
+try {
+  await charge(order);
+} catch (e: unknown) {
+  if (e instanceof PaymentDeclinedError) return res.status(402).json({ reason: e.code });
+  if (e instanceof Error) logger.error({ err: e }, 'charge failed');
+  else logger.error({ raw: String(e) }, 'non-Error thrown');   // string/null bhi throw ho sakta hai
+  throw e;
+}
+```
+
+`catch (e: any)` likhke `e.response.data.message` padhna wo bug hai jo *error handler ke andar* crash karta hai -- aur phir aap asli error kabhi nahi dekh paate.
+
+### Discriminated unions -- state machines aur result types
+
+```typescript
+type OrderState =
+  | { status: 'draft'; items: Item[] }
+  | { status: 'paid'; items: Item[]; paymentId: string; paidAt: Date }
+  | { status: 'cancelled'; reason: string; cancelledAt: Date };
+
+function receipt(o: OrderState) {
+  switch (o.status) {
+    case 'paid':      return o.paymentId;      // sirf is branch mein exist karta hai
+    case 'cancelled': return o.reason;         // o.paymentId likhte to compile error
+    case 'draft':     return null;
+  }
+}
+```
+
+Ye bahut powerful hai: **impossible state likhna hi mushkil ho jaata hai.** Ek flat interface jisme `paymentId?: string` aur `cancelReason?: string` dono optional hain, "paid + cancelled" ko allow kar deta hai -- union nahi karta. `default: assertNever(o)` lagao, phir naya status add karne par compiler khud saari jagah dhoondh ke dikha dega. Result type bhi isi shape se banta hai -- `{ ok: true; value: T } | { ok: false; error: E }`, jisme caller ko `ok` check karna **padta** hai.
+
+### `strictNullChecks` -- sabse zyada paisa yahi bachata hai
+
+```typescript
+const u = await repo.findById(id);   // strictNullChecks off: type `User`, prod mein crash
+return u.email;                      // strictNullChecks on: "'u' is possibly 'null'" -- compile error
+
+const u2 = await repo.findById(id);  // User | null
+if (!u2) throw new NotFoundError(id);
+return u2.email;                     // ab narrow hoke User hai
+```
+
+Node backend ka top runtime error "undefined ki property padhna" hai -- `strictNullChecks` usi class ko compile-time par le aata hai. Legacy codebase migrate kar rahe ho to `strict: true` pehla target.
+
+### Type guards -- apna narrowing khud likho
+
+```typescript
+function isAdmin(u: User): u is AdminUser {        // return type hi guard hai
+  return u.role === 'admin';
+}
+if (isAdmin(user)) user.permissions.forEach(...);  // yahan AdminUser hai
+```
+
+Dhyan: `u is AdminUser` bhi ek **vaada** hai -- function ka logic galat ho to compiler phir jhooth maan lega. Guard chhota aur obvious rakho.
+
+## 7. Trade-offs -- Honestly
+
+| | Fayda | Keemat |
+|---|---|---|
+| Har boundary par zod | runtime safety, ek source of truth, saaf 422 errors | thoda CPU per request, schema maintain karna |
+| `as` cast | fast, zero code | compiler se jhooth -- crash boundary se door hoga |
+| `pg` type parser override | code saaf | 2^53 se bade value par silent precision loss |
+| Bahut deep nested schema | sab validate | hot path par naapo -- bade payload par parse cost dikhta hai |
+
+Overengineering se bacho: **internal function ke beech** har call par validate karne ki zaroorat nahi -- wahan compiler sach jaanta hai. Validate wahan karo jahan data **system mein ghusta** hai. Yahi poori lesson ka budget hai.
+
+## 8. Common Mistakes
+
+- `req.body as CreateUserDto` -- type assertion ko validation samajh lena; `JSON.parse()` ka result seedha typed variable mein daal dena.
+- `req.query.page` ko `number` maan lena. Wo hamesha string ya undefined hai.
+- Interface aur zod schema alag-alag maintain karna -- drift pakka. `z.infer` use karo.
+- `catch (e: any)` phir `e.response.data.message` -- non-Error throw hua to error handler khud crash.
+- `pool.query<User>()` ke generic ko runtime guarantee samajhna, ya `BIGINT`/`NUMERIC` ko number maan ke `+` se paisa concatenate kar dena.
+- `strictNullChecks` ko "bahut shor karta hai" bolke off karna.
+
+## 9. Interview Mein Kaise Bole
+
+*"TypeScript compile-time tool hai -- types erase ho jaate hain, to `as` ya `JSON.parse` koi runtime check nahi deta. Isliye main chaar boundaries par runtime validation lagata hoon: HTTP input, JSON.parse/env, DB rows, aur third-party responses. zod se schema likhta hoon aur TS type `z.infer` se nikaalta hoon, taaki ek hi source of truth ho. Uske andar compiler par poora bharosa -- discriminated unions se state machine, `unknown` boundary par, `strictNullChecks` on. Simple rule: TypeScript meri apni galtiyan pakadta hai, duniya ka bheja hua data nahi."*
+
+## 🧠 Remember
+
+> Types compile par mit jaate hain, to `as User` ek vaada hai jise runtime kabhi check nahi karta -- TypeScript aapke andar ki galtiyan pakadta hai, duniya ka bheja hua data nahi. Boundary par validate karo (HTTP, JSON.parse, DB rows, 3rd-party), `z.infer` se ek source of truth rakho, aur andar compiler par bharosa karo.
+
+## Quick Self-Test
+
+1. `const u = req.body as User` compile hone ke baad JS mein kya banta hai, aur isse kya guarantee milti hai?
+2. Aapka interface `page: number` kehta hai par `?page=abc` aaya. Error kahan par dikhega, aur wo asli jagah se kitni door hogi?
+3. `any` aur `unknown` mein practical farak kya hai, aur `catch (e: unknown)` kyun correct choice hai?
+4. `pool.query<Order>()` ke baad `rows[0].total_cents + 100` galat jawab de sakta hai -- kyun?
+5. Ek flat interface jisme `paymentId?` aur `cancelReason?` dono optional hain, uske mukable discriminated union kya extra rok leta hai?
+</script>
+
 <!-- ======================= END LESSON DATA ======================= -->
 
 <script>
