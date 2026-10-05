@@ -21,3 +21,9 @@ systemdesginchectsheet/*prompt*.md
 /ai-switch/
 /ai-system-design/
 /ai-system-design-guide/
+
+# Vercel project links: the AI track folders came from standalone deployments
+.vercel/
+
+# Separate parallel project (Vite+React app, 200+ MB with node_modules)
+/sd-roadmap/

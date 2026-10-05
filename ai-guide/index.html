@@ -1,0 +1,1251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How AI Thinks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<nav class="topnav" aria-label="Parts">
+  <div class="reading-progress" aria-hidden="true"><span id="reading-progress-fill"></span></div>
+  <div class="topnav-inner">
+    <a class="brand" href="#top">How AI Thinks</a>
+    <div class="navlinks">
+      <a href="#kinds">1. Kinds of AI</a>
+      <a href="#language">2. Human language</a>
+      <a href="#inside">3. Inside the model</a>
+      <a href="#apps">4. AI in real apps</a>
+      <a href="#trust">5. Build AI you can trust</a>
+      <a href="#words">6. Words to know</a>
+    </div>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to dark theme" aria-pressed="false">
+      <span aria-hidden="true">◐</span><span class="theme-label">Theme</span>
+    </button>
+  </div>
+</nav>
+
+<div class="wrap" id="top">
+  <header class="hero">
+    <div>
+      <div class="eyebrow">A plain-words guide you can play with</div>
+      <h1>How <span class="tok a">AI</span> <span class="tok b">Thinks</span></h1>
+      <p class="lede">Kinds of AI, how human language works, what happens inside a model, how real apps use it, and how to build AI you can trust. Every idea is explained in simple words, and almost every box lets you try it yourself.</p>
+    </div>
+    <div class="bigidea">
+      <span class="label">The whole idea in one sentence</span>
+      <p>An AI chat model cuts your words into small pieces, then guesses the next piece again and again until the answer is done.</p>
+    </div>
+  </header>
+
+  <section class="facts" aria-label="Key facts">
+    <div class="fact"><strong>4 letters = 1 token</strong><span>About. AI reads pieces of words, not whole words.</span></div>
+    <div class="fact"><strong>No real memory</strong><span>The app sends the chat again every time.</span></div>
+    <div class="fact"><strong>Temperature = creativity</strong><span>Low is safe and same. High is wild and different.</span></div>
+    <div class="fact"><strong>Can be wrong</strong><span>It sounds sure even when it is guessing.</span></div>
+  </section>
+
+  <!-- ================================================= PART 1 -->
+  <section class="part" id="kinds">
+    <div class="part-head">
+      <span class="part-num">Part 1 of 6</span>
+      <h2>Kinds of AI</h2>
+      <p class="part-intro">From bots that only follow rules, to machine learning, to LLMs, to AI agents that do work on their own. See what makes each kind different.</p>
+      <nav class="topic-links" aria-label="Topics in part 1">
+        <a href="#family">AI family</a>
+        <a href="#rulebot">Rule-based chatbot</a>
+        <a href="#ml">ML algorithms</a>
+        <a href="#general">Narrow vs general-purpose</a>
+        <a href="#genai">Generative AI</a>
+        <a href="#rawllm">Raw LLM vs chat model</a>
+        <a href="#agents">AI agents and agentic AI</a>
+      </nav>
+    </div>
+
+    <div class="grid">
+      <!-- AI family -->
+      <section class="panel span-5" id="family">
+        <div class="panel-head">
+          <span class="kicker">The AI family</span>
+          <h3 class="panel-title">Where does each kind fit?</h3>
+        </div>
+        <p class="simple">AI is a big family. Each box sits <b>inside</b> the bigger one. A chat AI (LLM) is the smallest box, deep inside. Click a box.</p>
+        <div class="map">
+          <svg viewBox="0 0 360 300" role="group" aria-label="Nested map of AI types">
+            <g class="layer" data-k="ai" tabindex="0" role="button" aria-label="Artificial Intelligence">
+              <rect x="6" y="6" width="348" height="288" rx="16"></rect>
+              <text x="22" y="30">Artificial Intelligence</text>
+              <text class="sub" x="22" y="46">computers that act smart</text>
+            </g>
+            <g class="layer" data-k="rules" tabindex="0" role="button" aria-label="Rule-based AI">
+              <rect x="214" y="12" width="132" height="42" rx="8"></rect>
+              <text x="226" y="30">Rule-based AI</text>
+              <text class="sub" x="226" y="45">fixed if-then rules</text>
+            </g>
+            <g class="layer" data-k="ml" tabindex="0" role="button" aria-label="Machine Learning">
+              <rect x="26" y="62" width="308" height="222" rx="14"></rect>
+              <text x="42" y="86">Machine Learning</text>
+              <text class="sub" x="42" y="102">learns from examples</text>
+            </g>
+            <g class="layer" data-k="dl" tabindex="0" role="button" aria-label="Deep Learning">
+              <rect x="46" y="114" width="268" height="160" rx="12"></rect>
+              <text x="62" y="138">Deep Learning</text>
+              <text class="sub" x="62" y="154">big neural networks</text>
+            </g>
+            <g class="layer" data-k="gen" tabindex="0" role="button" aria-label="Generative AI">
+              <rect x="66" y="168" width="228" height="96" rx="10"></rect>
+              <text x="82" y="192">Generative AI</text>
+              <text class="sub" x="82" y="208">creates new things</text>
+            </g>
+            <g class="layer active" data-k="llm" tabindex="0" role="button" aria-label="Large Language Model">
+              <rect x="86" y="218" width="188" height="38" rx="8"></rect>
+              <text x="102" y="242">LLM (chat AI)</text>
+            </g>
+          </svg>
+        </div>
+        <div class="detail" id="family-detail" aria-live="polite"></div>
+      </section>
+
+      <!-- Rule-based chatbot -->
+      <section class="panel span-7" id="rulebot">
+        <div class="panel-head">
+          <span class="kicker">Rule-based chatbot</span>
+          <h3 class="panel-title">Old chatbots match keywords. LLMs understand meaning.</h3>
+        </div>
+        <p class="simple">A <b>rule-based chatbot</b> only checks your message for keywords a person wrote in advance: "if the message contains X, reply Y". It understands nothing. Try the examples, especially the last three.</p>
+        <div class="picks" id="rb-examples"></div>
+        <div class="row">
+          <label class="note" for="rb-input">Or type your own:</label>
+          <input class="text-input" id="rb-input" type="text" placeholder="e.g. how much does it cost?">
+          <button class="btn primary" id="rb-send" type="button">Ask both bots</button>
+        </div>
+        <div class="compare">
+          <div class="box">
+            <span class="box-label">Rule-based bot</span>
+            <div class="answer" id="rb-rule-answer" aria-live="polite"></div>
+            <p class="lesson" id="rb-lesson"></p>
+          </div>
+          <div class="box">
+            <span class="box-label">LLM chatbot</span>
+            <div class="answer" id="rb-llm-answer" aria-live="polite"></div>
+            <p class="note" id="rb-llm-note"></p>
+          </div>
+        </div>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th>Rule</th><th>If the message contains</th><th>Reply</th></tr></thead>
+            <tbody id="rb-rules"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ML algorithms -->
+      <section class="panel span-12" id="ml">
+        <div class="panel-head">
+          <span class="kicker">Machine learning algorithms</span>
+          <h3 class="panel-title">Learning from examples instead of rules</h3>
+        </div>
+        <p class="simple">In <b>machine learning (ML)</b>, nobody writes the rules. You give the computer many examples with the right answers, and an <b>algorithm</b> (a method) finds the pattern by itself. Below are emails already marked spam or not spam. <b>Click anywhere on the chart</b> to drop a new email and see what each algorithm predicts.</p>
+        <div class="ml-layout">
+          <div class="ml-plot stack-v">
+            <svg id="ml-svg" viewBox="0 0 420 340" role="img" aria-label="Scatter chart of emails. Click to add a new email."></svg>
+            <div class="legend">
+              <span><i class="sw ham"></i> not spam (example)</span>
+              <span><i class="sw spam"></i> spam (example)</span>
+              <span><i class="sw new"></i> your new email</span>
+            </div>
+          </div>
+          <div class="stack-v">
+            <div id="ml-algo"></div>
+            <div class="step-detail" id="ml-explain" aria-live="polite"></div>
+            <div class="scroll-x">
+              <table class="data-table">
+                <thead><tr><th>Algorithm</th><th>Prediction</th><th>Why</th></tr></thead>
+                <tbody id="ml-results"></tbody>
+              </table>
+            </div>
+            <p class="note" id="ml-agree"></p>
+            <div class="row">
+              <button class="btn" id="ml-reset" type="button">Put the email back on the border</button>
+            </div>
+          </div>
+        </div>
+        <h4 class="sub-title">Common ML algorithms</h4>
+        <div class="algo-grid" id="ml-algos"></div>
+        <div class="cols-3">
+          <div class="box soft"><span class="pill info">Supervised</span><p>Learns from examples <b>with answers</b> (this email is spam). Most common type.</p></div>
+          <div class="box soft"><span class="pill warn">Unsupervised</span><p>Gets data <b>without answers</b> and finds groups or patterns by itself.</p></div>
+          <div class="box soft"><span class="pill good">Reinforcement</span><p>Learns by <b>trying things</b> and getting rewards or penalties, like training a pet.</p></div>
+        </div>
+      </section>
+
+      <!-- Narrow vs general-purpose -->
+      <section class="panel span-6" id="general">
+        <div class="panel-head">
+          <span class="kicker">Narrow vs general-purpose AI</span>
+          <h3 class="panel-title">One job, or many jobs?</h3>
+        </div>
+        <p class="simple"><b>Narrow AI</b> is trained for one task only. <b>General-purpose AI</b> (like an LLM) does many different tasks with the same model, just by changing the instructions. Pick a model.</p>
+        <div id="gp-models"></div>
+        <div class="row"><strong id="gp-kind"></strong><span class="note" id="gp-count"></span></div>
+        <div class="task-list" id="gp-tasks"></div>
+        <p class="note"><b>AGI</b> (Artificial General Intelligence) means AI that can do any thinking task as well as a human. Today's LLMs are general-purpose, but most experts say they are not AGI yet, and they disagree about when (or if) it will happen.</p>
+      </section>
+
+      <!-- Generative AI -->
+      <section class="panel span-6" id="genai">
+        <div class="panel-head">
+          <span class="kicker">Generative AI</span>
+          <h3 class="panel-title">Sorting things vs making new things</h3>
+        </div>
+        <p class="simple">Classic AI mostly <b>sorts or predicts</b>: spam or not, a price, yes or no. <b>Generative AI</b> <b>creates something new</b>: text, images, sound, video or code. Click each button a few times and watch which output changes.</p>
+        <div class="box soft">
+          <span class="box-label">Customer review</span>
+          <p>"The food was cold, but the staff were really kind."</p>
+        </div>
+        <div class="row">
+          <button class="btn" id="gen-classify" type="button">Classify it (classic AI)</button>
+          <button class="btn primary" id="gen-generate" type="button">Write a reply (generative AI)</button>
+        </div>
+        <ul class="out-list" id="gen-out" aria-live="polite"></ul>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th>Creates</th><th>Example tools</th></tr></thead>
+            <tbody>
+              <tr><td>Text and chat</td><td>Gemini, Claude, ChatGPT</td></tr>
+              <tr><td>Images</td><td>Imagen, Midjourney, DALL-E</td></tr>
+              <tr><td>Video</td><td>Veo, Sora</td></tr>
+              <tr><td>Music</td><td>Lyria, Suno</td></tr>
+              <tr><td>Code</td><td>GitHub Copilot, Gemini Code Assist</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Raw LLM vs chat model -->
+      <section class="panel span-12" id="rawllm">
+        <div class="panel-head">
+          <span class="kicker">Raw LLM vs chat model</span>
+          <h3 class="panel-title">A raw LLM does not answer. It only continues text.</h3>
+        </div>
+        <p class="simple">A <b>raw LLM</b> (also called a <b>base model</b>) comes straight out of training on internet text. It has one skill: continue text in the most likely way. It does not know it should answer you. Extra training turns it into a helpful <b>chat model</b>. Pick a prompt and compare.</p>
+        <div class="picks" id="raw-prompts"></div>
+        <div class="compare">
+          <div class="box">
+            <span class="box-label">Raw (base) model</span>
+            <div class="rawtext" id="raw-base" aria-live="polite"></div>
+            <p class="note">Grey = your prompt. Yellow = what the model added.</p>
+          </div>
+          <div class="box">
+            <span class="box-label">Chat model</span>
+            <div class="rawtext" id="raw-chat" aria-live="polite"></div>
+            <label class="toggle" for="raw-template">
+              <input type="checkbox" id="raw-template">
+              Show what the chat model really receives
+            </label>
+          </div>
+        </div>
+        <p class="note">Example outputs, written to show typical behavior of each kind of model.</p>
+        <h4 class="sub-title">How a raw LLM becomes a chat model</h4>
+        <div class="flow-steps">
+          <div class="flow-step">
+            <span class="n">Step 1</span>
+            <h4>Pre-training</h4>
+            <p>The model reads trillions of tokens of text (websites, books, code) and learns to guess the next token.</p>
+            <span class="result">Result: raw LLM (base model)</span>
+          </div>
+          <div class="flow-step">
+            <span class="n">Step 2</span>
+            <h4>Instruction tuning</h4>
+            <p>It trains on many example conversations written by people: a question, then a good answer. Also called SFT.</p>
+            <span class="result">Result: it learns to answer, not just continue</span>
+          </div>
+          <div class="flow-step">
+            <span class="n">Step 3</span>
+            <h4>Preference tuning</h4>
+            <p>People (or other AIs) compare two answers and pick the better one. The model learns to be helpful, honest and safe. Also called RLHF.</p>
+            <span class="result">Result: chat model</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- AI agents and agentic AI -->
+      <section class="panel span-12" id="agents">
+        <div class="panel-head">
+          <span class="kicker">AI agents and agentic AI</span>
+          <h3 class="panel-title">From answering to doing</h3>
+        </div>
+        <p class="simple">A <b>chatbot</b> answers, then you do the work. An <b>AI agent</b> is an LLM working in a loop: it thinks, uses a tool, looks at the result, and repeats until the job is done. <b>Agentic AI</b> is the bigger idea: AI systems that plan and act on their own toward a goal, often with several agents working together and asking you only for important choices.</p>
+        <div class="box soft">
+          <span class="box-label">The goal</span>
+          <p>"Book a table for 2 near my office tomorrow at 7 pm, and add it to my calendar."</p>
+        </div>
+        <div class="row">
+          <div id="agent-modes"></div>
+          <button class="btn" id="agent-replay" type="button">Replay step by step</button>
+        </div>
+        <div class="mini-stats" id="agent-stats"></div>
+        <ol class="trace" id="agent-trace" aria-live="polite"></ol>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th></th><th>Chatbot</th><th>AI agent</th><th>Agentic AI</th></tr></thead>
+            <tbody>
+              <tr><td>Who decides the next step?</td><td>You</td><td>The agent</td><td>A planner and a team of agents</td></tr>
+              <tr><td>Uses tools?</td><td>No</td><td>Yes</td><td>Yes, many</td></tr>
+              <tr><td>How long does it work?</td><td>One reply</td><td>Until one task is done</td><td>Long goals with many tasks</td></tr>
+              <tr><td>Example</td><td>Asking Gemini a question</td><td>A coding agent that finds and fixes a bug</td><td>A system that handles a customer refund from start to end</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ================================================= PART 2 -->
+  <section class="part" id="language">
+    <div class="part-head">
+      <span class="part-num">Part 2 of 6</span>
+      <h2>Human language</h2>
+      <p class="part-intro">Language is the hardest thing for computers, because people mean much more than the words they say. This is what NLP and LLMs are trying to handle.</p>
+      <nav class="topic-links" aria-label="Topics in part 2">
+        <a href="#nlp">Natural language processing</a>
+        <a href="#hard">Why language is hard</a>
+      </nav>
+    </div>
+
+    <div class="grid">
+      <!-- NLP -->
+      <section class="panel span-12" id="nlp">
+        <div class="panel-head">
+          <span class="kicker">Natural Language Processing (NLP)</span>
+          <h3 class="panel-title">Teaching computers to understand language</h3>
+        </div>
+        <p class="simple"><b>NLP</b> is the part of AI that works with human language: reading it, understanding it, translating it and writing it. Older NLP systems did this in <b>separate steps</b>, one tool per step. Pick a sentence and click through the steps. Today one LLM does all of these inside a single model.</p>
+        <div class="picks" id="nlp-sentences"></div>
+        <div id="nlp-steps"></div>
+        <div class="tab-panel" id="nlp-output" aria-live="polite"></div>
+        <div class="chips">
+          <span class="note">NLP is used for:</span>
+          <span class="chip">Translation</span>
+          <span class="chip">Spam detection</span>
+          <span class="chip">Voice assistants</span>
+          <span class="chip">Search engines</span>
+          <span class="chip">Grammar checkers</span>
+          <span class="chip">Summaries</span>
+          <span class="chip">Chatbots</span>
+        </div>
+      </section>
+
+      <!-- Why language is hard -->
+      <section class="panel span-12" id="hard">
+        <div class="panel-head">
+          <span class="kicker">Why human language is hard</span>
+          <h3 class="panel-title">People understand more than words</h3>
+        </div>
+        <p class="simple">To understand a sentence, people use <b>context</b>, <b>grammar</b>, <b>word order</b>, the speaker's <b>real intention</b>, <b>culture</b>, <b>tone</b>, and <b>what was said earlier</b>. Many words also have <b>several meanings</b>. A computer gets only the text. Pick a topic and try it.</p>
+        <div class="tab-list" id="hard-tabs" role="tablist" aria-label="Language challenges"></div>
+        <div class="tab-panel" id="hard-panel" role="tabpanel" aria-live="polite"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ================================================= PART 3 -->
+  <section class="part" id="inside">
+    <div class="part-head">
+      <span class="part-num">Part 3 of 6</span>
+      <h2>Inside the model</h2>
+      <p class="part-intro">What happens between pressing Send and seeing the answer: tokens, meaning as numbers, the old RNN and the new transformer, attention with Q, K and V, and how the next word is picked.</p>
+      <nav class="topic-links" aria-label="Topics in part 3">
+        <a href="#journey">Message journey</a>
+        <a href="#tokens">Tokens</a>
+        <a href="#bpe">How a tokenizer is built</a>
+        <a href="#meaning">Embeddings</a>
+        <a href="#rnn">RNN</a>
+        <a href="#transformer">Transformer</a>
+        <a href="#qkv">Q, K, V</a>
+        <a href="#decoding">Greedy vs sampling</a>
+        <a href="#learn">How models learn</a>
+        <a href="#multimodal">Multimodal AI</a>
+      </nav>
+    </div>
+
+    <div class="grid">
+      <!-- Journey -->
+      <section class="panel span-12" id="journey">
+        <div class="panel-head">
+          <span class="kicker">One message, start to end</span>
+          <h3 class="panel-title">What happens when you press Send?</h3>
+        </div>
+        <p class="simple">Your message goes through <b>7 steps</b>. Steps 5 and 6 repeat many times, one token each time. That is why the answer appears word by word. The rest of this part explains each step up close.</p>
+        <div class="row">
+          <button class="btn primary" id="journey-play" type="button">Play all steps</button>
+          <span class="note">or click any step</span>
+        </div>
+        <div class="journey">
+          <ol class="steps" id="journey-steps"></ol>
+          <div class="step-detail" id="journey-detail" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- Tokens -->
+      <section class="panel span-6" id="tokens">
+        <div class="panel-head">
+          <span class="kicker">Tokenizer</span>
+          <h3 class="panel-title">AI reads pieces, not words</h3>
+        </div>
+        <p class="simple">A <b>tokenizer</b> cuts text into small pieces called <b>tokens</b>, and gives each one an ID number. Short common words are one token. Long or rare words are cut into parts. You pay per token, and all limits are counted in tokens.</p>
+        <label class="note" for="token-input">Type anything:</label>
+        <textarea id="token-input">Hi! Can you explain how React components work in simple words?</textarea>
+        <div class="token-box" id="token-box" aria-label="Tokens"></div>
+        <label class="toggle" for="token-numbers">
+          <input type="checkbox" id="token-numbers">
+          Show what the AI really sees (ID numbers)
+        </label>
+        <div class="stats">
+          <div class="stat"><b id="stat-chars">0</b><span>characters</span></div>
+          <div class="stat"><b id="stat-words">0</b><span>words</span></div>
+          <div class="stat"><b id="stat-tokens">0</b><span>tokens</span></div>
+        </div>
+        <p class="note">A simplified cutter to show the idea. Each AI company has its own tokenizer with its own vocabulary (often 30,000 to over 250,000 tokens). Rule of thumb: 100 tokens is about 75 English words.</p>
+      </section>
+
+      <!-- BPE -->
+      <section class="panel span-6" id="bpe">
+        <div class="panel-head">
+          <span class="kicker">How a tokenizer is built</span>
+          <h3 class="panel-title">Glue the most common pair, again and again</h3>
+        </div>
+        <p class="simple">Most LLM tokenizers are built with <b>BPE</b> (Byte Pair Encoding). Start with single letters. Count which <b>pair</b> of neighbors appears most often in the training text, glue it into one new token, and repeat. Common words become one token; rare words stay in pieces. Press the button.</p>
+        <div class="row">
+          <button class="btn primary" id="bpe-merge" type="button">Glue the most common pair</button>
+          <button class="btn" id="bpe-reset" type="button">Start again</button>
+          <span class="note" id="bpe-count"></span>
+        </div>
+        <div class="box">
+          <span class="box-label">Training text (word x how often) and current pieces</span>
+          <div class="stack-v" id="bpe-words"></div>
+        </div>
+        <div class="cols-2">
+          <div class="box">
+            <span class="box-label">Most common pairs now</span>
+            <div class="bars" id="bpe-pairs"></div>
+          </div>
+          <div class="box">
+            <span class="box-label">New tokens learned</span>
+            <div class="chips" id="bpe-vocab"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Embeddings -->
+      <section class="panel span-5" id="meaning">
+        <div class="panel-head">
+          <span class="kicker">Embeddings</span>
+          <h3 class="panel-title">Words become places on a map</h3>
+        </div>
+        <p class="simple">Inside the AI, every token becomes a list of numbers, like <b>map coordinates</b>. Words with similar meaning land close together. That is how AI knows "puppy" is like "dog". Click a word.</p>
+        <div class="meaning">
+          <svg viewBox="0 0 440 300" id="meaning-svg" role="group" aria-label="Map of word meanings"></svg>
+        </div>
+        <p id="meaning-info" aria-live="polite"></p>
+        <p class="note">Real embeddings have hundreds or thousands of numbers per token, not 2. The same idea powers "search by meaning" in vector databases.</p>
+      </section>
+
+      <!-- RNN -->
+      <section class="panel span-7" id="rnn">
+        <div class="panel-head">
+          <span class="kicker">RNN (Recurrent Neural Network)</span>
+          <h3 class="panel-title">The old way: read one word at a time</h3>
+        </div>
+        <p class="simple">Before transformers, language AI mostly used <b>RNNs</b>. An RNN reads words <b>one by one</b> and keeps a small <b>memory</b> that it rewrites after every word. Old words slowly fade. Read the sentence and watch what happens to <b>"keys"</b>.</p>
+        <div class="rnn-words" id="rnn-words" aria-live="polite"></div>
+        <div class="row">
+          <button class="btn primary" id="rnn-next" type="button">Read next word</button>
+          <button class="btn" id="rnn-all" type="button">Read all</button>
+          <button class="btn" id="rnn-reset" type="button">Start again</button>
+          <label class="toggle" for="rnn-compare">
+            <input type="checkbox" id="rnn-compare">
+            Compare with a transformer
+          </label>
+        </div>
+        <div class="box">
+          <span class="box-label">RNN memory after this word (8 numbers, darker = bigger)</span>
+          <div class="cells" id="rnn-cells"></div>
+        </div>
+        <div class="meter">
+          <div class="meter-top"><span id="rnn-keys-label">How much the memory still holds "keys"</span><span id="rnn-keys-pct">0%</span></div>
+          <div class="meter-track"><div class="meter-fill" id="rnn-keys-fill"></div></div>
+        </div>
+        <div class="answer" id="rnn-result" aria-live="polite"></div>
+        <p class="note"><b>LSTM</b> and <b>GRU</b> are improved RNNs with better memory, but they still read one word at a time. That makes them slow to train on huge amounts of text.</p>
+      </section>
+
+      <!-- Transformer -->
+      <section class="panel span-12" id="transformer">
+        <div class="panel-head">
+          <span class="kicker">Transformer</span>
+          <h3 class="panel-title">The new way: read everything at once and pay attention</h3>
+        </div>
+        <p class="simple">The <b>transformer</b> was introduced by Google researchers in 2017 in the paper "Attention Is All You Need". It is the design inside Gemini, Claude, GPT and Llama. It reads <b>all tokens at the same time</b> and uses <b>attention</b> to decide which other words matter for each word. <b>Click a word</b> to see where it looks, then change the last word.</p>
+        <div class="tf-layout">
+          <div class="stack-v">
+            <div class="row">
+              <span class="note">Last word:</span>
+              <div id="tf-variant"></div>
+            </div>
+            <div class="attn-scroll">
+              <svg id="tf-svg" role="group" aria-label="Attention between words"></svg>
+            </div>
+            <div class="box">
+              <span class="box-label" id="tf-focus-label">Where the word looks</span>
+              <div class="bars" id="tf-bars"></div>
+            </div>
+            <p class="note">Weights are made up to show the idea, but real models show this exact pattern for this famous example sentence.</p>
+          </div>
+          <div class="stack-v">
+            <span class="box-label">Inside a transformer (read from bottom to top)</span>
+            <div class="tf-stack" id="tf-stack"></div>
+            <div class="step-detail" id="tf-stack-detail" aria-live="polite"></div>
+          </div>
+        </div>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th></th><th>RNN (old)</th><th>Transformer (today)</th></tr></thead>
+            <tbody>
+              <tr><td>How it reads</td><td>One word after another</td><td>All words at the same time</td></tr>
+              <tr><td>Far-away words</td><td>Fade from memory</td><td>Looks at them directly with attention</td></tr>
+              <tr><td>Training speed</td><td>Slow, cannot split the work</td><td>Fast, runs in parallel on GPUs</td></tr>
+              <tr><td>Used in big LLMs today</td><td>Rarely</td><td>Almost all of them</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Q K V -->
+      <section class="panel span-12" id="qkv">
+        <div class="panel-head">
+          <span class="kicker">Query, Key, Value (Q, K, V)</span>
+          <h3 class="panel-title">How attention decides where to look</h3>
+        </div>
+        <p class="simple">Attention works like searching a library. Every word makes <b>three lists of numbers</b>. Its Query is compared with every word's Key; a good match means more attention, and the word then takes in more of that word's Value.</p>
+        <div class="cols-3">
+          <div class="box soft qkv-card"><span class="letter q">Q</span><div><b>Query</b><p class="note">What am I looking for? Like your search words.</p></div></div>
+          <div class="box soft qkv-card"><span class="letter k">K</span><div><b>Key</b><p class="note">What do I contain? Like the label on a book.</p></div></div>
+          <div class="box soft qkv-card"><span class="letter v">V</span><div><b>Value</b><p class="note">What I give if picked. Like the content of the book.</p></div></div>
+        </div>
+        <p class="note">Toy example with 2 numbers per word. Key numbers mean [food word, describing word]. Value numbers mean [color info, taste info].</p>
+        <div class="row">
+          <span class="note">Word asking the question:</span>
+          <div id="qkv-words"></div>
+        </div>
+        <div class="cols-2">
+          <div class="slider-row">
+            <label for="qkv-q1">Q: wants food</label>
+            <input type="range" id="qkv-q1" min="-3" max="3" step="0.1" value="0.6">
+            <span class="val" id="qkv-q1-val">0.6</span>
+          </div>
+          <div class="slider-row">
+            <label for="qkv-q2">Q: wants describing</label>
+            <input type="range" id="qkv-q2" min="-3" max="3" step="0.1" value="3">
+            <span class="val" id="qkv-q2-val">3.0</span>
+          </div>
+        </div>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th>Word</th><th>Key</th><th>Q x K (match)</th><th>Attention</th><th>Value</th></tr></thead>
+            <tbody id="qkv-table"></tbody>
+          </table>
+        </div>
+        <div class="answer" id="qkv-output" aria-live="polite"></div>
+        <div class="formula">attention = softmax( Q . K / sqrt(d) )    new word meaning = sum of ( attention x V )</div>
+        <p class="note">In real models, Q, K and V come from multiplying each token's embedding by three learned tables of numbers (weight matrices). They have hundreds of numbers each, and many attention "heads" run side by side, each looking for different things like grammar, names or topic.</p>
+      </section>
+
+      <!-- Decoding -->
+      <section class="panel span-12" id="decoding">
+        <div class="panel-head">
+          <span class="kicker">Greedy vs sampling, temperature, top-k, top-p</span>
+          <h3 class="panel-title">How the next word is picked</h3>
+        </div>
+        <p class="simple">The model gives every possible next token a <b>chance</b>. Then a picking method chooses one. <b>Greedy</b> always takes the top token, so you get the same answer every time. <b>Sampling</b> rolls a weighted dice, shaped by <b>temperature</b> (how wild), <b>top-k</b> (only the k best words) and <b>top-p</b> (only the best words that add up to p).</p>
+        <div class="cols-2">
+          <div class="stack-v">
+            <label class="note" for="prompt-select">Start of sentence:</label>
+            <select id="prompt-select"></select>
+            <p class="sentence" id="sentence" aria-live="polite"></p>
+            <div class="bars" id="bars"></div>
+            <div class="row">
+              <button class="btn primary" id="gen-one" type="button">Pick one word</button>
+              <button class="btn" id="gen-twenty" type="button">Pick 20 times</button>
+              <button class="btn" id="gen-clear" type="button">Clear</button>
+            </div>
+            <div class="tally" id="tally" aria-live="polite"></div>
+          </div>
+          <div class="stack-v">
+            <div id="dec-mode"></div>
+            <div class="slider-row" id="row-temp">
+              <label for="temp">Temperature</label>
+              <input type="range" id="temp" min="0.1" max="2" step="0.1" value="1">
+              <span class="val" id="temp-value">1.0</span>
+            </div>
+            <div class="slider-row" id="row-topk">
+              <label for="topk">Top-k</label>
+              <input type="range" id="topk" min="1" max="6" step="1" value="6">
+              <span class="val" id="topk-value">6</span>
+            </div>
+            <div class="slider-row" id="row-topp">
+              <label for="topp">Top-p</label>
+              <input type="range" id="topp" min="0.1" max="1" step="0.05" value="1">
+              <span class="val" id="topp-value">1.00</span>
+            </div>
+            <p class="hint" id="dec-hint"></p>
+            <div class="box">
+              <span class="box-label">Write whole sentences with these settings</span>
+              <div class="row">
+                <button class="btn" id="lm-write" type="button">Write 3 sentences</button>
+                <button class="btn" id="lm-clear" type="button">Clear</button>
+              </div>
+              <ol class="gen-list" id="lm-out" aria-live="polite"></ol>
+              <p class="note">With greedy, every sentence is the same. With sampling, they differ.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- How models learn -->
+      <section class="panel span-12" id="learn">
+        <div class="panel-head">
+          <span class="kicker">How models learn</span>
+          <h3 class="panel-title">Training: guess, measure the mistake, adjust, repeat</h3>
+        </div>
+        <p class="simple">A new model is only random numbers (<b>weights</b>) and knows nothing. Training shows it an example, lets it guess, and measures how wrong the guess was: the <b>loss</b>. Then it works out how much each number caused the mistake (<b>backpropagation</b>) and nudges every number a little in the better direction (<b>gradient descent</b>). One full pass over all the training data is an <b>epoch</b>. Below, a tiny model with just 2 numbers learns how study hours affect test scores.</p>
+        <div class="row">
+          <button class="btn primary" id="learn-one" type="button">Train on 1 example</button>
+          <button class="btn" id="learn-epoch" type="button">Train 1 epoch (8 examples)</button>
+          <button class="btn" id="learn-ten" type="button">Train 10 epochs</button>
+          <button class="btn" id="learn-reset" type="button">Reset to random</button>
+        </div>
+        <div class="row">
+          <span class="note">Learning rate (size of each nudge):</span>
+          <div id="learn-rate"></div>
+        </div>
+        <div class="mini-stats" id="learn-stats"></div>
+        <div class="cols-2">
+          <div class="box">
+            <span class="box-label">Data (dots) and what the model believes (line)</span>
+            <div class="chart"><svg id="learn-fit" viewBox="0 0 380 256" role="img" aria-label="Study hours and test scores, with the model's current line"></svg></div>
+          </div>
+          <div class="box">
+            <span class="box-label">Loss curve: average error after each example</span>
+            <div class="chart"><svg id="learn-loss" viewBox="0 0 380 256" role="img" aria-label="Loss curve going down as the model trains"></svg></div>
+          </div>
+        </div>
+        <div class="answer" id="learn-status" aria-live="polite"></div>
+        <div class="box soft">
+          <span class="box-label">What happened in the last training step</span>
+          <ol class="learn-steps" id="learn-step"></ol>
+        </div>
+        <div class="cols-3">
+          <div class="box">
+            <h4>Training data</h4>
+            <p>LLMs train on trillions of tokens: web pages, books, code and conversations. The data is cleaned (duplicates, spam and unsafe text removed). Some is kept aside as <b>test data</b> the model never trains on, to check it learned patterns instead of memorizing (<b>overfitting</b>).</p>
+          </div>
+          <div class="box">
+            <h4>GPU training</h4>
+            <p>Training is billions of simple multiplications, repeated over and over. A <b>GPU</b> does thousands of them at the same time. Big models train on thousands of GPUs (or Google TPUs) connected together, running day and night for weeks or months.</p>
+          </div>
+          <div class="box">
+            <h4>Why it costs so much</h4>
+            <p>The work grows with model size times amount of data. On top of the final run come failed runs, experiments, electricity, cooling, data preparation and expert salaries. Estimates for the biggest models run from tens to hundreds of millions of US dollars.</p>
+          </div>
+        </div>
+        <h4 class="sub-title">Training cost calculator</h4>
+        <p class="note">Rule of thumb: training needs about 6 x parameters x tokens calculations. This rough estimate assumes one modern data-center GPU does about 350 thousand billion useful calculations per second.</p>
+        <div class="picks" id="cost-presets"></div>
+        <div class="cols-2">
+          <div class="stack-v">
+            <div class="slider-row">
+              <label for="cost-params">Parameters</label>
+              <input type="range" id="cost-params" min="1" max="500" step="1" value="70">
+              <span class="val" id="cost-params-val">70B</span>
+            </div>
+            <div class="slider-row">
+              <label for="cost-tokens">Training tokens</label>
+              <input type="range" id="cost-tokens" min="0.1" max="20" step="0.1" value="15">
+              <span class="val" id="cost-tokens-val">15T</span>
+            </div>
+            <div class="slider-row">
+              <label for="cost-gpus">GPUs</label>
+              <input type="range" id="cost-gpus" min="0" max="9" step="1" value="7">
+              <span class="val" id="cost-gpus-val">8,192</span>
+            </div>
+            <div class="slider-row">
+              <label for="cost-price">$ per GPU-hour</label>
+              <input type="range" id="cost-price" min="1" max="5" step="0.25" value="2">
+              <span class="val" id="cost-price-val">$2.00</span>
+            </div>
+          </div>
+          <div class="kpis two" id="cost-out" aria-live="polite"></div>
+        </div>
+        <p class="note">For comparison, Meta reported about 31 million GPU-hours to train Llama 3.1 405B; the "Very large" preset estimates about 29 million. Real totals are much higher once failed runs, experiments, data work and salaries are added.</p>
+      </section>
+
+      <!-- Multimodal AI -->
+      <section class="panel span-12" id="multimodal">
+        <div class="panel-head">
+          <span class="kicker">Multimodal AI</span>
+          <h3 class="panel-title">Pictures, sound, PDFs and video become tokens too</h3>
+        </div>
+        <p class="simple">A <b>multimodal</b> model understands more than text. Each kind of input goes through an <b>encoder</b> that turns it into vectors, just like text tokens. Then one transformer reads everything together, so you can ask "what is wrong in this screenshot?" or "summarize this meeting recording". Pick an input type.</p>
+        <div id="mm-modes"></div>
+        <div class="tab-panel" id="mm-view" aria-live="polite"></div>
+        <p class="note">The image tab shows how patch counts work in vision transformers. PDF, audio and video use example rates close to the ones Google publishes for Gemini: about 258 tokens per page image or video frame, and 32 tokens per second of audio. Other models count differently.</p>
+      </section>
+    </div>
+  </section>
+
+  <!-- ================================================= PART 4 -->
+  <section class="part" id="apps">
+    <div class="part-head">
+      <span class="part-num">Part 4 of 6</span>
+      <h2>AI in real apps</h2>
+      <p class="part-intro">A model alone is not a product. Apps add memory, tools, safety checks, and a way to run it for real users.</p>
+      <nav class="topic-links" aria-label="Topics in part 4">
+        <a href="#architecture">Building an AI app</a>
+        <a href="#memory">Memory and context window</a>
+        <a href="#longchat">Long chats: summary and budget</a>
+        <a href="#tools">Tools in LLMs</a>
+        <a href="#models">Model choices</a>
+        <a href="#product">Framework, deploy, FDE</a>
+      </nav>
+    </div>
+
+    <div class="grid">
+      <!-- Building an AI app -->
+      <section class="panel span-12" id="architecture">
+        <div class="panel-head">
+          <span class="kicker">Building an AI app</span>
+          <h3 class="panel-title">User, UI, server, model and tools, checked answer</h3>
+        </div>
+        <p class="simple">A real AI app is more than one model call. The <b>server</b> sits in the middle: it checks the request, loads data, calls the model and tools, <b>checks the answer</b>, and only then replies. Pick a request and press Play, or click any box to see its job and where it lives in your ai_chat app.</p>
+        <div class="row">
+          <div id="arch-scenarios"></div>
+          <button class="btn primary" id="arch-play" type="button">Play this request</button>
+        </div>
+        <div class="scroll-x">
+          <div class="arch" id="arch"></div>
+        </div>
+        <div class="cols-2">
+          <ol class="arch-log" id="arch-log"></ol>
+          <div class="step-detail" id="arch-node" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- Memory -->
+      <section class="panel span-5" id="memory">
+        <div class="panel-head">
+          <span class="kicker">Memory + context window</span>
+          <h3 class="panel-title">AI forgets what does not fit</h3>
+        </div>
+        <p class="simple">The AI has <b>no memory</b>. Each time, the app sends the chat again. But the AI can only read a limited amount at once: the <b>context window</b>. Old messages that do not fit are simply not seen.</p>
+        <div class="row">
+          <label class="note" for="window-size">Window size (tiny, for this demo):</label>
+          <select id="window-size">
+            <option value="40">40 tokens</option>
+            <option value="80">80 tokens</option>
+          </select>
+        </div>
+        <div class="meter">
+          <div class="meter-top"><span>Window used</span><span id="meter-label">0 / 40 tokens</span></div>
+          <div class="meter-track"><div class="meter-fill" id="meter-fill"></div></div>
+        </div>
+        <div class="window" id="window" aria-live="polite"></div>
+        <div class="row">
+          <button class="btn primary" id="mem-next" type="button">Send next message</button>
+          <button class="btn" id="mem-reset" type="button">Start again</button>
+        </div>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th>Real window</th><th>About words</th><th>Like reading</th></tr></thead>
+            <tbody>
+              <tr><td class="num">8,000 tokens</td><td class="num">6,000</td><td>a long essay</td></tr>
+              <tr><td class="num">128,000 tokens</td><td class="num">96,000</td><td>a full novel</td></tr>
+              <tr><td class="num">1,000,000 tokens</td><td class="num">750,000</td><td>about 8 novels</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Long chats -->
+      <section class="panel span-7" id="longchat">
+        <div class="panel-head">
+          <span class="kicker">Long chats: summary + token budget</span>
+          <h3 class="panel-title">How apps remember long chats</h3>
+        </div>
+        <p class="simple">Good chat apps keep <b>every message in a database</b>, but send the AI only the <b>newest messages</b> as full text plus a short <b>summary</b> of older ones. Before each request they <b>count tokens</b>. If the total is over the <b>budget</b>, they <b>compact</b>: fold more old messages into the summary, count again, and repeat.</p>
+        <p class="note">Demo settings: newest 4 messages stay as text, summary updates when 6 are waiting, budget 100 tokens, summary max 40 tokens, the newest 2 are never folded.</p>
+        <div class="meter">
+          <div class="meter-top"><span id="lc-meter-label"></span><span id="lc-meter-state"></span></div>
+          <div class="meter-track" id="lc-track">
+            <div class="meter-fill sum" id="lc-fill-sum"></div>
+            <div class="meter-fill" id="lc-fill-msg"></div>
+            <div class="meter-line" id="lc-line"></div>
+          </div>
+          <div class="legend">
+            <span><i class="sw sum"></i> summary</span>
+            <span><i class="sw msg"></i> full-text messages</span>
+            <span>black line = budget</span>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn primary" id="lc-send" type="button">Send next message</button>
+          <button class="btn" id="lc-long" type="button">Paste a long file</button>
+          <button class="btn" id="lc-reset" type="button">Start again</button>
+        </div>
+        <div class="cols-2">
+          <div class="box">
+            <span class="box-label">Database: every message</span>
+            <div class="db-list" id="lc-db"></div>
+          </div>
+          <div class="stack-v">
+            <div class="box">
+              <span class="box-label" id="lc-sum-label">Summary</span>
+              <div class="summary-fields" id="lc-summary"></div>
+            </div>
+            <div class="box">
+              <span class="box-label">What happened on the last send</span>
+              <ul class="event-log" id="lc-log" aria-live="polite"></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tools -->
+      <section class="panel span-12" id="tools">
+        <div class="panel-head">
+          <span class="kicker">Tools in LLMs (function calling)</span>
+          <h3 class="panel-title">The AI asks. Your code does the work.</h3>
+        </div>
+        <p class="simple">An LLM cannot check live weather, do exact math or send an email by itself. With <b>tools</b> (also called <b>function calling</b>), your app tells the model which functions exist. The model replies "please call this function with these inputs". <b>Your code runs it</b> and sends the result back, and the model writes the final answer. Pick a question.</p>
+        <div class="picks" id="tool-questions"></div>
+        <div class="tool-flow" id="tool-flow" aria-live="polite"></div>
+        <p class="note">Simplified. Real APIs (Gemini, Claude, OpenAI) describe tool inputs with JSON Schema. Results shown are example data.</p>
+      </section>
+
+      <!-- Model choices -->
+      <section class="panel span-12" id="models">
+        <div class="panel-head">
+          <span class="kicker">Model choices</span>
+          <h3 class="panel-title">Small or large, local or cloud, open or closed</h3>
+        </div>
+        <p class="simple">There is no best model, only the best fit. <b>Bigger</b> models are usually smarter but slower and pricier. <b>Local</b> models run on your own machine, so data stays with you. <b>Open-weight</b> models can be downloaded and changed; <b>closed</b> models are only available through the company's API. Answer 4 questions.</p>
+        <div class="cols-2">
+          <div class="stack-v" id="choice-questions"></div>
+          <div class="stack-v" id="choice-out" aria-live="polite"></div>
+        </div>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th>Choice</th><th>Good</th><th>Watch out</th></tr></thead>
+            <tbody>
+              <tr><td>Small model</td><td>Fast, cheap, can run on a laptop</td><td>Weaker at hard reasoning, knows fewer facts</td></tr>
+              <tr><td>Large model</td><td>Best quality, handles hard tasks</td><td>Slower, costs much more per request</td></tr>
+              <tr><td>Local</td><td>Data stays with you, no per-request fee, works offline</td><td>You need the hardware; setup and updates are your job</td></tr>
+              <tr><td>Cloud</td><td>Nothing to install, newest models, scales easily</td><td>Data leaves your machines, pay per token, needs internet</td></tr>
+              <tr><td>Open-weight</td><td>Download, fine-tune and run anywhere, no lock-in</td><td>You host it; often a step behind the best closed models</td></tr>
+              <tr><td>Closed</td><td>Top quality, simple API, safety and updates handled for you</td><td>You cannot see or change the model; the company sets prices and rules</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h4 class="sub-title">Can I run it myself? Memory needed</h4>
+        <p class="note">All of a model's numbers must fit in memory. <b>Quantization</b> stores each number with fewer bits, so the model shrinks with only a small loss in quality.</p>
+        <div class="cols-2">
+          <div class="stack-v">
+            <div class="slider-row">
+              <label for="ram-params">Parameters</label>
+              <input type="range" id="ram-params" min="1" max="405" step="1" value="8">
+              <span class="val" id="ram-params-val">8B</span>
+            </div>
+            <div id="ram-bits"></div>
+            <div class="kpis">
+              <div class="kpi"><b><span id="ram-need">0</span> GB</b><span>memory needed (numbers plus about 20% extra)</span></div>
+            </div>
+          </div>
+          <div class="task-list" id="ram-devices" aria-live="polite"></div>
+        </div>
+        <p class="note">Tip: start with the smallest model that passes your test set (see Evaluating an AI app in Part 5), and move up only when it fails.</p>
+      </section>
+
+      <!-- Product -->
+      <section class="panel span-12" id="product">
+        <div class="panel-head">
+          <span class="kicker">From demo to real product</span>
+          <h3 class="panel-title">Framework, deploy and FDE</h3>
+        </div>
+        <p class="simple">A <b>framework</b> gives you a ready structure so you do not start from zero. To <b>deploy</b> means putting your app on a server so real people can use it. An <b>FDE</b> (Forward Deployed Engineer) works directly with a customer to make AI solve their real problem. Pick a tab.</p>
+        <div class="tab-list" id="product-tabs" role="tablist" aria-label="Product topics"></div>
+        <div class="tab-panel" id="product-panel" role="tabpanel"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ================================================= PART 5 -->
+  <section class="part" id="trust">
+    <div class="part-head">
+      <span class="part-num">Part 5 of 6</span>
+      <h2>Build AI you can trust</h2>
+      <p class="part-intro">Knowing how AI works is step one. This part is about using and building it responsibly: getting facts right, writing clear prompts, answering from your own documents, knowing when agents are worth the risk, keeping data safe, and measuring whether it really works.</p>
+      <nav class="topic-links" aria-label="Topics in part 5">
+        <a href="#limits">Limits</a>
+        <a href="#hallucinate">Why AI hallucinates</a>
+        <a href="#improve">4 ways to improve</a>
+        <a href="#promptlab">Prompting lab</a>
+        <a href="#rag">RAG in detail</a>
+        <a href="#agentfail">Agents: help or fail</a>
+        <a href="#safety">Safety and privacy</a>
+        <a href="#evals">Evaluating an AI app</a>
+      </nav>
+    </div>
+
+    <div class="grid">
+      <!-- Limits -->
+      <section class="panel span-12" id="limits">
+        <div class="panel-head">
+          <span class="kicker">Limits</span>
+          <h3 class="panel-title">What AI gets wrong, and what to do</h3>
+        </div>
+        <div class="legend">
+          <span><i class="pill bad">Check it</i> can hurt you if you trust it blindly</span>
+          <span><i class="pill warn">Know this</i> how it works, plan around it</span>
+          <span><i class="pill good">Easy fix</i> better input solves most of it</span>
+        </div>
+        <div class="limits" id="limits-list"></div>
+      </section>
+
+      <!-- Why AI hallucinates -->
+      <section class="panel span-12" id="hallucinate">
+        <div class="panel-head">
+          <span class="kicker">Why AI hallucinates</span>
+          <h3 class="panel-title">It predicts words that sound right, not facts that are checked</h3>
+        </div>
+        <p class="simple">An LLM is trained to write the <b>most likely next words</b>. When a fact appeared many times in its training text, the likely words are also true. When it does not know, it still writes words that <b>sound</b> right, in the same confident tone. Watch the chance of each word, then switch to web search or RAG.</p>
+        <div class="picks" id="hal-questions"></div>
+        <div id="hal-modes"></div>
+        <div class="row" id="hal-controls">
+          <button class="btn primary" id="hal-next" type="button">Next word</button>
+          <button class="btn" id="hal-all" type="button">Write it all</button>
+          <button class="btn" id="hal-reset" type="button">Start again</button>
+        </div>
+        <div class="stack-v" id="hal-out" aria-live="polite"></div>
+        <div class="cols-2">
+          <div class="box soft">
+            <span class="box-label">Why it happens</span>
+            <ul class="plain-list">
+              <li>It is trained to write fluent text, not to check it</li>
+              <li>There is no database of facts inside, only patterns stored as numbers</li>
+              <li>Rare facts (a small clinic, a new event) were seen rarely or never</li>
+              <li>Training often rewards giving an answer over saying "I don't know"</li>
+              <li>It knows nothing after its knowledge cutoff</li>
+            </ul>
+          </div>
+          <div class="box soft">
+            <span class="box-label">What reduces it</span>
+            <ul class="plain-list">
+              <li>Ground answers in sources: web search or RAG</li>
+              <li>Require citations and show them to users</li>
+              <li>Tell it to say "I don't know" when the sources don't answer</li>
+              <li>Use a low temperature for factual tasks</li>
+              <li>Check important facts, and measure the rate (see Evaluating)</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- Improve -->
+      <section class="panel span-12" id="improve">
+        <div class="panel-head">
+          <span class="kicker">Make it better</span>
+          <h3 class="panel-title">4 ways to make AI good at your task</h3>
+        </div>
+        <p class="simple">Try them <b>in this order</b>. Most problems are solved by a better prompt. Only move down when the one above is not enough. The next sections show prompting, RAG and agents up close.</p>
+        <div class="scroll-x">
+          <table class="data-table improve">
+            <thead><tr><th>Method</th><th>What it means</th><th>Effort</th><th>Cost</th><th>Use it when</th></tr></thead>
+            <tbody id="improve-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Prompting lab -->
+      <section class="panel span-12" id="promptlab">
+        <div class="panel-head">
+          <span class="kicker">Prompting practice lab</span>
+          <h3 class="panel-title">Turn a vague prompt into a great one</h3>
+        </div>
+        <p class="simple">A vague prompt gets a vague answer. Good prompts use up to 5 <b>building blocks</b>: a <b>role</b>, <b>context</b>, <b>constraints</b>, <b>examples</b> and an <b>output format</b>. Switch them on one at a time and compare the answers.</p>
+        <div class="row">
+          <span class="note">Task:</span>
+          <div id="lab-tasks"></div>
+        </div>
+        <div class="row">
+          <div class="block-toggles" id="lab-blocks"></div>
+          <button class="btn" id="lab-all" type="button">Add all</button>
+          <button class="btn" id="lab-none" type="button">Remove all</button>
+        </div>
+        <div class="meter">
+          <div class="meter-top"><span id="lab-score-label"></span></div>
+          <div class="meter-track"><div class="meter-fill" id="lab-score-fill"></div></div>
+        </div>
+        <div class="mini-stats" id="lab-stats"></div>
+        <div class="cols-2">
+          <div class="box">
+            <span class="box-label">Your prompt</span>
+            <pre class="code wrap prompt-view" id="lab-prompt"></pre>
+          </div>
+          <div class="box">
+            <span class="box-label">Example answer</span>
+            <pre class="code wrap" id="lab-output" aria-live="polite"></pre>
+          </div>
+        </div>
+        <ul class="event-log" id="lab-checklist"></ul>
+        <p class="note">Example answers written to show the typical effect of each block.</p>
+        <h4 class="sub-title">Check your own prompt</h4>
+        <div class="cols-2">
+          <div class="stack-v">
+            <label class="note" for="lab-own">Write a prompt:</label>
+            <textarea id="lab-own">Write a blog post about AI.</textarea>
+            <span class="note" id="lab-own-score"></span>
+          </div>
+          <ul class="event-log" id="lab-own-result" aria-live="polite"></ul>
+        </div>
+        <p class="note">The checker only looks for typical words, so treat it as a hint, not a grade.</p>
+      </section>
+
+      <!-- RAG in detail -->
+      <section class="panel span-12" id="rag">
+        <div class="panel-head">
+          <span class="kicker">RAG in detail (Retrieval-Augmented Generation)</span>
+          <h3 class="panel-title">Answer from your documents, with citations</h3>
+        </div>
+        <p class="simple">RAG lets an AI answer from <b>your documents</b> instead of its memory, in 5 steps: <b>chunk</b> the documents, turn each chunk into an <b>embedding</b>, embed the question and <b>search</b> for the closest chunks, put the best chunks into the <b>prompt</b>, and let the model <b>answer with citations</b>. Try the questions, then change the chunk size and top-k.</p>
+        <div class="picks" id="rag-questions"></div>
+        <div class="row">
+          <label class="note" for="rag-input">Or ask your own:</label>
+          <input class="text-input" id="rag-input" type="text">
+          <button class="btn primary" id="rag-ask" type="button">Search</button>
+        </div>
+        <div class="cols-2">
+          <div class="row">
+            <span class="note">Chunk size:</span>
+            <div id="rag-size"></div>
+          </div>
+          <div class="slider-row">
+            <label for="rag-topk">Top-k chunks</label>
+            <input type="range" id="rag-topk" min="1" max="4" step="1" value="2">
+            <span class="val" id="rag-topk-val">2</span>
+          </div>
+        </div>
+        <div class="rag-flow">
+          <div class="rag-step">
+            <span class="rag-num">1-2</span>
+            <div class="stack-v">
+              <h4>Chunk the documents and embed each chunk</h4>
+              <p class="note" id="rag-chunk-count"></p>
+              <div class="chunk-list" id="rag-chunks"></div>
+            </div>
+          </div>
+          <div class="rag-step">
+            <span class="rag-num">3</span>
+            <div class="stack-v">
+              <h4>Embed the question and search</h4>
+              <div class="qvec" id="rag-qvec"></div>
+              <div class="chunk-list" id="rag-results"></div>
+              <p class="note">Top 5 matches shown. Only chunks with a match of at least 0.30 can be used.</p>
+            </div>
+          </div>
+          <div class="rag-step">
+            <span class="rag-num">4</span>
+            <div class="stack-v">
+              <h4>Build the prompt <span class="pill plain" id="rag-prompt-tokens"></span></h4>
+              <pre class="code wrap" id="rag-prompt"></pre>
+            </div>
+          </div>
+          <div class="rag-step">
+            <span class="rag-num">5</span>
+            <div class="stack-v">
+              <h4>Answer with citations</h4>
+              <div class="stack-v" id="rag-answer" aria-live="polite"></div>
+            </div>
+          </div>
+        </div>
+        <p class="note">To keep this page offline, the "embeddings" here group similar words (food, meal and lunch count as one idea). Real embedding models capture meaning far better, but the steps are the same. Common tools: vector databases like pgvector, Pinecone or Chroma, and embedding models from Google, OpenAI or Cohere.</p>
+      </section>
+
+      <!-- Agents: help or fail -->
+      <section class="panel span-12" id="agentfail">
+        <div class="panel-head">
+          <span class="kicker">Agents: when they help and when they fail</span>
+          <h3 class="panel-title">Powerful loops need guardrails</h3>
+        </div>
+        <p class="simple">Agents help when a task has <b>many steps</b> and the path is <b>not known in advance</b>. They fail by <b>looping</b>, <b>retrying</b> too fast, repeating <b>risky actions</b> and <b>running up costs</b>. Below, an agent refunds an order while the systems are flaky. Start with no guardrails, then switch them on one by one.</p>
+        <div class="box soft">
+          <span class="box-label">The goal</span>
+          <p>"Refund order #1042 for the customer and email them."</p>
+          <p class="note">Tools: lookup_order (slow and flaky today), check_refund_policy, issue_refund (moves money), send_email.</p>
+        </div>
+        <div class="cols-2">
+          <div class="stack-v">
+            <span class="box-label">Guardrails</span>
+            <div class="stack-v tight" id="ag-guards"></div>
+            <div class="slider-row" id="ag-steps-row">
+              <label for="ag-steps">Max steps</label>
+              <input type="range" id="ag-steps" min="5" max="40" step="1" value="20">
+              <span class="val" id="ag-steps-val">20</span>
+            </div>
+            <div class="slider-row" id="ag-budget-row">
+              <label for="ag-budget">Max cost</label>
+              <input type="range" id="ag-budget" min="0.1" max="2" step="0.05" value="0.5">
+              <span class="val" id="ag-budget-val">$0.50</span>
+            </div>
+            <div class="row">
+              <button class="btn" id="ag-all-on" type="button">All guardrails on</button>
+              <button class="btn" id="ag-all-off" type="button">All off</button>
+            </div>
+          </div>
+          <div class="stack-v">
+            <div id="ag-stats"></div>
+            <div class="answer" id="ag-outcome" aria-live="polite"></div>
+          </div>
+        </div>
+        <ol class="trace scroll-trace" id="ag-trace"></ol>
+        <h4 class="sub-title">Workflow or agent?</h4>
+        <p>A <b>workflow</b> is a fixed list of steps you write in code, where AI does small parts (like writing the email). An <b>agent</b> decides the steps itself. When you already know the steps, a workflow is usually safer.</p>
+        <div class="cols-2">
+          <div class="box">
+            <span class="pill info">Workflow</span>
+            <pre class="code wrap">1. lookup_order (retry 3 times, with waiting)
+2. Policy check in code: delivered under 30 days?
+3. Under $100: refund with an idempotency key
+   Otherwise: ask a person
+4. AI writes a friendly email from a template</pre>
+            <div class="task-list">
+              <div class="task-row"><span>Predictable cost</span><span class="pill good">high</span></div>
+              <div class="task-row"><span>Easy to test</span><span class="pill good">easy</span></div>
+              <div class="task-row"><span>Handles surprises</span><span class="pill warn">limited</span></div>
+              <div class="task-row"><span>Easy to audit</span><span class="pill good">easy</span></div>
+            </div>
+          </div>
+          <div class="box">
+            <span class="pill warn">Autonomous agent</span>
+            <pre class="code wrap">Goal: "Refund order #1042"
+Tools: lookup_order, check_refund_policy,
+       issue_refund, send_email
+The model decides what to call, in what order,
+and when it is finished.</pre>
+            <div class="task-list">
+              <div class="task-row"><span>Predictable cost</span><span class="pill bad">low</span></div>
+              <div class="task-row"><span>Easy to test</span><span class="pill warn">harder</span></div>
+              <div class="task-row"><span>Handles surprises</span><span class="pill good">good</span></div>
+              <div class="task-row"><span>Easy to audit</span><span class="pill warn">needs logs</span></div>
+            </div>
+          </div>
+        </div>
+        <p class="note">A common middle way: a workflow for the fixed parts, a small agent step only where judgment is needed, plus step and budget limits.</p>
+      </section>
+
+      <!-- Safety and privacy -->
+      <section class="panel span-12" id="safety">
+        <div class="panel-head">
+          <span class="kicker">AI safety and privacy</span>
+          <h3 class="panel-title">Keep data, money and users safe</h3>
+        </div>
+        <p class="simple">Most AI incidents are not science fiction. They are ordinary mistakes: <b>secrets pasted</b> into a chatbot, an AI <b>tricked by hidden text</b>, private files <b>shown to the wrong person</b>, an assistant <b>allowed to do too much</b>, or an <b>API key</b> left in public code. Try each one.</p>
+        <div class="tab-list" id="safety-tabs" role="tablist" aria-label="Safety topics"></div>
+        <div class="tab-panel" id="safety-panel" role="tabpanel"></div>
+      </section>
+
+      <!-- Evaluating an AI app -->
+      <section class="panel span-12" id="evals">
+        <div class="panel-head">
+          <span class="kicker">Evaluating an AI app</span>
+          <h3 class="panel-title">Measure before you trust it</h3>
+        </div>
+        <p class="simple">You cannot improve what you do not measure. Build a <b>test set</b>: real questions with known good answers. Run every version of your app on it and compare <b>accuracy</b>, <b>usefulness</b>, <b>hallucination rate</b>, <b>latency</b> (speed), <b>cost per request</b> and <b>user feedback</b>. Below, 4 versions of a company HR bot answer the same 8 test questions.</p>
+        <div class="row">
+          <span class="note">Look closely at:</span>
+          <div id="eval-configs"></div>
+        </div>
+        <div class="scroll-x">
+          <table class="data-table eval-table" id="eval-compare"></table>
+        </div>
+        <p class="answer" id="eval-summary" aria-live="polite"></p>
+        <div class="scroll-x">
+          <table class="data-table">
+            <thead><tr><th>Test question</th><th>Expected</th><th>App answered</th><th>Result</th><th>Useful</th><th>Time</th></tr></thead>
+            <tbody id="eval-rows"></tbody>
+          </table>
+        </div>
+        <div class="cols-2">
+          <div class="box soft">
+            <span class="box-label">Accuracy vs usefulness</span>
+            <p>"Report it to IT right away." is correct, but less useful than "Report it to the IT helpdesk within 24 hours." Score both: an app can be right and still not help.</p>
+          </div>
+          <div class="box soft">
+            <span class="box-label">No single winner</span>
+            <p>Small model + RAG is about 12 times cheaper and 3 times faster than large model + RAG, but it made up 2 answers out of 8. For an HR bot that gives policy answers, is that acceptable? Evaluation turns this into a clear decision.</p>
+          </div>
+        </div>
+        <h4 class="sub-title">How to build a test set</h4>
+        <div class="flow-steps five">
+          <div class="flow-step"><span class="n">Step 1</span><h4>Collect real questions</h4><p>50 to 200 questions users really ask, from logs or interviews.</p></div>
+          <div class="flow-step"><span class="n">Step 2</span><h4>Write the ideal answer</h4><p>The expected answer and the key facts it must contain.</p></div>
+          <div class="flow-step"><span class="n">Step 3</span><h4>Add tricky cases</h4><p>Questions not in the documents, trick prompts, typos, other languages.</p></div>
+          <div class="flow-step"><span class="n">Step 4</span><h4>Run every change</h4><p>New prompt, model or chunk size? Run the whole set again.</p></div>
+          <div class="flow-step"><span class="n">Step 5</span><h4>Compare before shipping</h4><p>Ship only if it is better and no old question got worse.</p></div>
+        </div>
+        <p class="note">Scoring can be done by people, by code (for exact facts) or by another AI acting as a judge. AI judges are fast but should be checked against human scores. All numbers here are simulated.</p>
+      </section>
+    </div>
+  </section>
+
+  <!-- ================================================= PART 6 -->
+  <section class="part" id="words">
+    <div class="part-head">
+      <span class="part-num">Part 6 of 6</span>
+      <h2>Words to know</h2>
+      <p class="part-intro">Every term from this guide in one or two simple sentences. Search, or filter by part.</p>
+    </div>
+    <section class="panel">
+      <div class="row">
+        <label class="note" for="glossary-search">Search:</label>
+        <input class="search" id="glossary-search" type="search" placeholder="e.g. token, agent, RAG">
+        <span class="note" id="glossary-count"></span>
+      </div>
+      <div id="glossary-filter"></div>
+      <dl class="glossary" id="glossary"></dl>
+    </section>
+  </section>
+
+  <footer>
+    Simplified for learning. Numbers like window sizes, token counts and attention weights are typical or made-up values to show each idea, and they change between AI models.
+  </footer>
+</div>
+
+<button class="back-to-top" id="back-to-top" type="button" aria-label="Back to the top">↑ <span>Top</span></button>
+
+<script src="js/core.js"></script>
+<script src="js/part1-kinds.js"></script>
+<script src="js/part2-language.js"></script>
+<script src="js/part3-model.js"></script>
+<script src="js/part3-learning.js"></script>
+<script src="js/part4-apps.js"></script>
+<script src="js/part4-build.js"></script>
+<script src="js/part5-trust.js"></script>
+<script src="js/part5-safety.js"></script>
+<script src="js/glossary.js"></script>
+<script src="js/site-controls.js"></script>
+</body>
+</html>
