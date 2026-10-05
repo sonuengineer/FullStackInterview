@@ -1,8 +1,10 @@
 # System Design Prep (Hinglish, Node.js)
 
-Spec: [prompt.md](prompt.md). One system at a time; each system split into parts (.md = study note, .html = reading page).
+Spec: [prompt.md](prompt.md). One system at a time; each system split into parts. The `.md` files are the source of truth and the only thing committed.
 
-Rebuild HTML after editing any .md: `node systemdesign/build.mjs` (also rebuilds each system's `index.html` reader from `reader.template.html`)
+**Reading:** use the dashboard's **System Design** tab, which fetches these `.md` files directly.
+
+**Local reading pages:** `node systemdesign/build.mjs` generates a `.html` page per part plus a Kindle-style `index.html` reader per system (contents, themes, font size, notes, saved position). Those generated files are **gitignored on purpose** -- the dashboard never loads them, and the readers inline every part, which added about 8 MB to the deployed site. Run the build whenever you want them locally; links to them below are local-only.
 
 ## Progress
 
