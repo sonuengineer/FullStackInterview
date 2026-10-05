@@ -178,7 +178,11 @@ chroma = chromadb.PersistentClient(path="./chroma_db")
 embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
     model_name="all-MiniLM-L6-v2")
 
-memories = chroma.get_or_create_collection(name="memories", embedding_function=embedder)
+memories = chroma.get_or_create_collection(
+    name="memories",
+    embedding_function=embedder,
+    metadata={"hnsw:space": "cosine"}      # as on Day 6: the default is l2
+)
 
 
 def remember(text, kind="context", user="default"):
@@ -215,6 +219,10 @@ def recall(query, top_n=5, user="default"):
 ```
 
 **A separate collection from your documents.** They are different things with different lifetimes, and mixing them means a document chunk can be retrieved as if it were a fact about you.
+
+**`metadata={"hnsw:space": "cosine"}`, again.** New collection, so the choice has to be made again -- Chroma defaults to `l2`, and the space cannot be changed after creation. Without it, `1 - distance` is not a similarity and the `0.25` test below throws away perfectly good memories. **Every `get_or_create_collection` in this project sets the space explicitly.** If you leave it out of one collection and not another, the same threshold means two different things in two parts of your code, which is worse than having it wrong everywhere.
+
+**`score > 0.25` is the same cosine threshold as Day 6**, and it means the same thing here only because the space matches. Relevant memories usually land above 0.4; noise sits near 0.1.
 
 **`user` in the metadata, even though you are the only user.** Adding it later means migrating everything. Adding it now costs one line. On Day 20, when this runs as a service, you will be glad.
 
@@ -438,6 +446,8 @@ def forget(about):
 
 Register it as a tool so the user can say "forget that I live in Mumbai".
 
+**`0.5` here, not the `0.25` from `recall`, and the gap is deliberate.** Both are cosine similarities on the same scale, so they are directly comparable, and deleting is not symmetric with reading. Injecting a loosely-related memory into a prompt is a small cost; deleting one is permanent. So the delete bar sits well above the read bar: `recall` may show you a 0.3 match, `forget` will not act on it. **When two thresholds in one file read the same number, make sure they really are the same unit** -- that is the whole reason both collections pin `hnsw:space`.
+
 **Decay.** Track `used` in the metadata, bump it on every recall, and periodically delete `context`-kind facts that are old and never retrieved. Identity and preference facts should not decay.
 
 **A cap.** Above a few hundred memories, injection starts getting noisy -- the top 5 for any query becomes a loose collection of vaguely related things. Keep a ceiling and drop the least useful.
@@ -580,12 +590,19 @@ memory.py contains:
       returning [] for small talk is normal and common
 
   remember(text, kind, user)   - upsert into the "memories" collection
+      a SEPARATE collection from documents, also created with
+      metadata={"hnsw:space": "cosine"} - Chroma's default is l2 and the
+      space is fixed at creation, so every collection sets it explicitly
       metadata: kind, user, created (UTC iso), used counter
       "user" is stored from day one even with a single user, so Day 20
       does not require a migration
 
   recall(query, top_n=5, user)  - vector search, filters by user,
-      drops anything scoring below 0.25, returns text/kind/score
+      drops anything scoring below 0.25 (cosine similarity, same scale and
+      same meaning as Day 6), returns text/kind/score
+
+  forget(about)  - deletes only above 0.5, a deliberately higher bar than
+      recall's 0.25: reading a loose match is cheap, deleting is permanent
 
   remember_carefully(text, kind, user)
       looks up similar existing facts, asks the model whether the new one

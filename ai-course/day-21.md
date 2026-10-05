@@ -197,7 +197,8 @@ Then make retrieval user-aware. In `vector_store.py`:
 def get_collection(user_id):
     return chroma.get_or_create_collection(
         name=f"docs_{user_id}",
-        embedding_function=embedder
+        embedding_function=embedder,
+        metadata={"hnsw:space": "cosine"}      # same space for every user
     )
 
 
@@ -207,6 +208,8 @@ def search(question, user_id, top_n=3):
         return []
     ...
 ```
+
+**`hnsw:space` matters more here than anywhere else so far.** This function creates a collection per user, so the space is chosen once per signup instead of once in your whole program. Leave it out and Chroma uses `l2`, and because the space is fixed at creation, you end up with some users on cosine and some on L2 depending on which version of the code was deployed when they joined -- the same relevance threshold silently meaning two different things for two different accounts. **Anything created per-tenant must have its settings pinned in code, not inherited from a library default.**
 
 **Then thread `user_id` all the way down** -- `sources.py`, `pipeline.py`, `research()`. It is tedious, mechanical, and the single most important correctness change in the whole capstone.
 
@@ -406,6 +409,8 @@ function runResearch(question) {
 Add the SSE proxy in `server.js`:
 
 ```javascript
+const { Readable } = require("node:stream");
+
 app.get("/api/jobs/:id/stream", async (req, res) => {
   const upstream = await fetch(`${AI_URL}/jobs/${req.params.id}/stream`, {
     headers: { "X-API-Key": AI_KEY },
@@ -415,9 +420,27 @@ app.get("/api/jobs/:id/stream", async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("X-Accel-Buffering", "no");
 
-  upstream.body.pipe(res);
+  // upstream.body is a WEB ReadableStream; res is a NODE stream.
+  Readable.fromWeb(upstream.body).pipe(res);
+  req.on("close", () => upstream.body.cancel().catch(() => {}));
 });
 ```
+
+**That `Readable.fromWeb` is not decoration, and it is worth understanding.** Node's global `fetch` is undici, which follows the web standard, so `response.body` is a **Web `ReadableStream`** -- the kind a browser gives you, with `getReader()` and no `.pipe()`. Express's `res` is a **Node stream**, with `.pipe()` and `.write()`. The two families are not interchangeable: writing `upstream.body.pipe(res)` throws `upstream.body.pipe is not a function` on the very first request. `Readable.fromWeb()` is the adapter between them.
+
+If you prefer to see the chunks, write the loop by hand instead -- same result, and you can log or filter events on the way through:
+
+```javascript
+  const reader = upstream.body.getReader();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    res.write(value);          // value is a Uint8Array
+  }
+  res.end();
+```
+
+**`req.on("close", ...)` matters more than it looks.** When the browser tab closes, nothing cancels the upstream request by itself, and you leak an open connection to the Python service for every abandoned stream.
 
 **`X-Accel-Buffering: no` is a small line that saves an afternoon.** Some proxies buffer responses, so your events all arrive at once at the end -- which looks exactly like SSE not working at all.
 
@@ -692,6 +715,9 @@ Ingestion:
 
 Dashboard:
   switched from polling to the SSE endpoint built on Day 20
+  proxy uses Readable.fromWeb(upstream.body).pipe(res), because fetch gives
+  a WEB ReadableStream and res is a NODE stream -- .pipe() does not exist on
+  the web one
   X-Accel-Buffering: no on the proxy, or events arrive all at once at the end
   onerror falls back to polling, because SSE connections drop
   report renders WITH its uncertainty: unverified citations, unavailable

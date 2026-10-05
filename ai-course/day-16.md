@@ -82,11 +82,13 @@ A state machine is fixed structure, and agents need to be dynamic. LangGraph's a
 cd research-assistant/ai
 source venv/bin/activate
 
-pip install langgraph langchain-openai
+pip install langgraph langchain langchain-openai
 pip freeze > requirements.txt
 
 touch graph_agent.py
 ```
+
+**Why `langchain` as well as `langchain-openai`.** LangChain is split into several packages: `langchain-core` (the base types), `langchain-openai` (the provider), `langgraph` (today's graph runtime), and `langchain` itself (the top-level package). Stage 6 uses `langchain.globals`, which lives in that last one, and nothing else installs it for you.
 
 **Groq works unchanged**, because of the decision you made on Day 1:
 
@@ -322,12 +324,28 @@ def route(state: State) -> Literal["model", "quick"]:
 
 def quick_answer(state: State):
     return {"messages": [llm.invoke(state["messages"])]}
-
-
-builder.add_node("quick", quick_answer)
-builder.add_conditional_edges(START, route, {"model": "model", "quick": "quick"})
-builder.add_edge("quick", END)
 ```
+
+**Stage 5 replaces the Stage 1 wiring, so build a fresh graph.** Do not add the conditional edge to the builder you already used: Stage 1 put a plain `START -> model` edge on it, and adding `add_conditional_edges(START, ...)` on top leaves you with two conflicting routes out of `START`. A graph also has to be compiled *after* every node and edge is on the builder -- the `graph` object from Stage 1 was compiled before `quick` existed, so it does not contain it.
+
+Build the whole thing in one place, start to finish:
+
+```python
+builder = StateGraph(State)                   # a NEW builder, deliberately
+
+builder.add_node("model", call_model)
+builder.add_node("tools", ToolNode(TOOLS))
+builder.add_node("quick", quick_answer)
+
+builder.add_conditional_edges(START, route, {"model": "model", "quick": "quick"})
+builder.add_conditional_edges("model", tools_condition)
+builder.add_edge("tools", "model")
+builder.add_edge("quick", END)
+
+graph = builder.compile(checkpointer=memory)  # recompile, with quick included
+```
+
+The only line removed from Stage 1 is `builder.add_edge(START, "model")`; the conditional edge now owns that decision. Everything else is the same wiring you already read, written out once so there is no doubt about which version is compiled.
 
 Now "what is the capital of France" costs one call with no tools, and "what do my documents say about deadlines" goes through the full agent.
 
@@ -350,10 +368,13 @@ The anti-magic stage. Do not skip it.
 **See the actual prompt:**
 
 ```python
-import langchain
-langchain.debug = True
+from langchain.globals import set_debug
+
+set_debug(True)
 graph.invoke({"messages": [("user", "What time is it in Tokyo?")]})
 ```
+
+**Not `langchain.debug = True`.** You will see that in every older tutorial. Setting the module attribute directly is deprecated -- `set_debug(True)` is the supported switch, and `set_debug(False)` turns it off again. Same output, and it is a small live example of Trap 2 later in this file.
 
 Read what it sends. Compare it against the message list you built by hand on Day 4. **Note any extra text the framework added that you did not write** -- framework prompt wrappers cost tokens on every single call, and you are paying for them.
 
@@ -424,7 +445,7 @@ Make a graph that loops, and give it an impossible task. Watch your quota.
 *It teaches:* `max_steps` did not stop mattering because you changed library.
 
 **4. Read the raw prompt.**
-`langchain.debug = True`, then compare to your Day 4 messages.
+`from langchain.globals import set_debug` then `set_debug(True)`, and compare to your Day 4 messages.
 *You will see:* extra wrapping you did not write.
 *It teaches:* frameworks cost tokens. Know how many.
 
@@ -506,7 +527,9 @@ Folders:
       runs/, notes/, documents/, chroma_db/
     dashboard/             (still empty)
 
-Libraries: langgraph, langchain-openai (NEW)
+Libraries: langgraph, langchain, langchain-openai (NEW)
+  langchain itself is needed for langchain.globals.set_debug; the provider
+  package does not pull it in
 
 Groq works unchanged:
   ChatOpenAI(model="llama-3.3-70b-versatile",
@@ -554,6 +577,9 @@ Branching:
   a route() conditional edge from START sends simple questions to a "quick"
   node with no tools. This is Day 15 model routing, made visible in the
   graph instead of buried in a function.
+  the branching version is built on a FRESH builder: the plain START->model
+  edge is dropped (two edges out of START conflict), and compile() runs
+  after the "quick" node is added, or the compiled graph will not contain it
 
 Measured against Day 15 evals (hand-written vs graph):
   quality: about the same (same model, same work)
@@ -564,8 +590,9 @@ Measured against Day 15 evals (hand-written vs graph):
 Key decisions made:
   - only adopted a framework after building everything by hand
   - every concept mapped back to the equivalent hand-written code
-  - langchain.debug = True used to read the ACTUAL prompt sent, and the
-    framework's added wrapper text counted as a cost
+  - set_debug(True) from langchain.globals used to read the ACTUAL prompt
+    sent, and the framework's added wrapper text counted as a cost
+    (langchain.debug = True is the deprecated form seen in old tutorials)
   - recursion_limit set explicitly on every invoke
 
 Known problems, left for later:

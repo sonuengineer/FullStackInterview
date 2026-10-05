@@ -115,14 +115,14 @@ That is nineteen days of an empty folder, finally used.
 `ai/api.py`:
 
 ```python
-import os, uuid, time, threading
+import os, json, uuid, time, threading
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from research.pipeline import research
-from observability import new_trace
+from observability import new_trace, LOG_FILE
 
 app = FastAPI(title="Research Agent")
 
@@ -187,6 +187,24 @@ def start_research(body: ResearchRequest,
     return {"job_id": job_id, "status": "queued"}
 
 
+def estimate_cost(result):
+    """What this job cost, in USD: sum the logged cost of its model calls."""
+    trace = result.get("trace")
+    if not trace:
+        return 0.0
+
+    total = 0.0
+    try:
+        with open(LOG_FILE) as f:
+            for line in f:
+                row = json.loads(line)
+                if row.get("trace") == trace:
+                    total += row.get("usd", 0.0)
+    except (FileNotFoundError, ValueError):
+        return 0.0
+    return round(total, 6)
+
+
 def do_research(job_id, question, user):
     def update(**fields):
         with JOBS_LOCK:
@@ -226,7 +244,7 @@ uvicorn api:app --reload --port 8000
 
 Open `http://localhost:8000/docs`. FastAPI generates a full interactive page from your type hints. Try an endpoint from there.
 
-**Four things worth noticing.**
+**Five things worth noticing.**
 
 **`def`, not `async def`.** This is the trap from section 2. Your `research()` function is synchronous and takes minutes. In an `async def` endpoint it would block the entire event loop and freeze the server for every other user. Declared as plain `def`, FastAPI runs it in a thread pool automatically. **Get this wrong and your server appears to work perfectly with one user and collapses with two.**
 
@@ -235,6 +253,16 @@ Open `http://localhost:8000/docs`. FastAPI generates a full interactive page fro
 **The ownership check** on `/jobs/{job_id}`. Without it, anyone with any valid key can read anyone's report by guessing an id. Job ids are not secrets.
 
 **Budget checked before starting, spend recorded after.** Not perfect -- a single very expensive job can overshoot -- but it stops the runaway case.
+
+**`estimate_cost` is Day 15's log, read back.** You are not inventing a new number. Every model call already writes a line to `logs/calls.jsonl` with its `trace` and its `usd`, computed from `PRICING` by `cost_of()`. A job's cost is just the sum of the rows carrying that job's trace id, and `research()` already returns its `trace`. That is the whole function.
+
+Three honest limits, worth saying out loud:
+
+- It only counts what `tracked_call` logged. Embeddings run locally and cost nothing, but a paid embedding API or a reranker you forgot to wrap would be invisible here. **A cost meter is only as complete as your instrumentation.**
+- Pricing in `PRICING` is a copy of someone's rate card at a point in time. It drifts. This is an *estimate*, which is why the function is not called `exact_cost`.
+- Re-reading the whole JSONL for every job is fine at demo scale and bad later. When the file gets big, either keep a running per-trace total in memory as calls are logged, or put the rows in the SQLite store from Stage 5.
+
+It is also worth checking: run one job, note the number, and compare it against `report()` from Day 15 for the same trace. If they disagree, something is calling the model outside `tracked_call`.
 
 ---
 
@@ -762,6 +790,9 @@ Other deployment details that matter:
   JOBS_LOCK around the shared jobs dict - background tasks are threads
   ownership check on /jobs/{id} - job ids are not secrets
   budget checked BEFORE starting, spend recorded after
+  estimate_cost(result) sums the "usd" of every logs/calls.jsonl row sharing
+    the job's trace id - Day 15's log read back, not a new number. Only as
+    complete as the instrumentation, and PRICING drifts, so it is an estimate
   input length capped at 500 chars
   CORS restricted to ALLOWED_ORIGINS, never "*"
   on startup, any job left "running" or "queued" is marked failed with

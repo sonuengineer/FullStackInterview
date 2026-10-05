@@ -251,7 +251,7 @@ You have now found your optimisation target with evidence instead of intuition.
 `evals.py`:
 
 ```python
-import json, time
+import os, json, time
 from autonomous import run, Budget
 from observability import new_trace
 
@@ -311,6 +311,8 @@ def run_evals(repeats=3):
     print(f"\noverall: {overall:.0%}")
     return scores
 ```
+
+**The `file_exists` and `file_contains` assertions are the honest ones**, which is why `os` is in the import line. Everything else inspects the model's own words; these two go and look at the disk. An agent that *says* it saved the note and did not is exactly the failure a text-matching assertion waves through.
 
 **`repeats=3` is the whole point of this stage.**
 

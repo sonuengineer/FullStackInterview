@@ -100,13 +100,17 @@ That is a real cost of adoption, not a complaint. **Pin your versions**, prefer 
 cd research-assistant/ai
 source venv/bin/activate
 
-pip install langchain-community langchain-text-splitters pypdf
+pip install langchain langchain-community langchain-text-splitters pypdf
 pip freeze > requirements.txt
 
 touch lc_compare.py
 ```
 
-You already have `langchain-openai` from Day 16. Install the pieces you are testing, not the whole ecosystem.
+You already have `langchain` and `langchain-openai` from Day 16; they are listed again so this day stands alone. Install the pieces you are testing, not the whole ecosystem.
+
+**`langchain` itself is not optional today.** Stage 3 imports from `langchain.retrievers`, and Stage 6 uses `langchain.globals`. Neither lives in `langchain-community` or `langchain-core`, so without the top-level package you get `ModuleNotFoundError: No module named 'langchain'`.
+
+> **Expect the import paths to have moved.** LangChain has reorganised where retrievers and compressors live more than once across major versions -- things have shifted between `langchain`, `langchain-core` and `langchain-community`, and some have moved into their own packages. If an import in this day fails, that is the most likely reason: look the class up in the current LangChain docs rather than assuming you mistyped it. This is not a side note, it is Trap 2 and experiment 5 of today, arriving early.
 
 ---
 
@@ -284,10 +288,13 @@ results = chain.batch([{"question": q} for q in twenty_questions])
 **Now open the box:**
 
 ```python
-import langchain
-langchain.debug = True
+from langchain.globals import set_debug
+
+set_debug(True)
 chain.invoke({"question": "test"})
 ```
+
+**`set_debug(True)`, not `langchain.debug = True`.** The module attribute is the deprecated form you will find in older tutorials; `langchain.globals` is the supported one, and `set_debug(False)` switches it back off when the output gets too loud.
 
 Read the actual prompt. The format instructions are there -- fine, you generated those. **Look for anything else you did not write.**
 
@@ -404,7 +411,7 @@ Find a LangChain agent tutorial from a year ago and run it.
 *It teaches:* deprecation churn is a real adoption cost, not a grumble.
 
 **6. Count the wrapper tokens.**
-`langchain.debug = True` on an output-parser chain. Count the format instructions.
+`set_debug(True)` on an output-parser chain. Count the format instructions.
 *You will see:* a few hundred tokens per call.
 *It teaches:* convenience has a token price. Sometimes worth it.
 
@@ -416,13 +423,13 @@ Find a LangChain agent tutorial from a year ago and run it.
 *Symptom:* your whole system is framework objects and you cannot find your own logic.
 *Fix:* the rule in section 3. Component by component, with measurements.
 
-**Trap 2 -- deprecated imports**
-*Symptom:* tutorials that do not run.
+**Trap 2 -- deprecated imports and moved ones**
+*Symptom:* tutorials that do not run. `ModuleNotFoundError`, `ImportError`, or a `DeprecationWarning` on something that still works for now -- `langchain.debug = True` is exactly this, replaced by `langchain.globals.set_debug()`. Retriever and compressor classes have also moved between `langchain`, `langchain-core` and `langchain-community` across major versions.
 *Fix:* pin versions, use current docs, check the API before assuming you made a mistake.
 
 **Trap 3 -- hidden prompts**
 *Symptom:* strange output from a component you did not write a prompt for.
-*Fix:* `langchain.debug = True` before adopting anything. If it contains a prompt you did not write, think hard.
+*Fix:* `set_debug(True)` before adopting anything. If it contains a prompt you did not write, think hard.
 
 **Trap 4 -- debugging through layers**
 *Symptom:* an hour spent finding where a value became wrong.
@@ -484,8 +491,11 @@ Folders:
     dashboard/             (STILL EMPTY - Node arrives tomorrow)
 
 Libraries: langchain-community, langchain-text-splitters (NEW).
-langchain-openai already present from Day 16. Versions PINNED - LangChain
-moves fast and breaks tutorials.
+langchain and langchain-openai already present from Day 16; langchain itself
+is REQUIRED here, for langchain.retrievers and langchain.globals.
+Versions PINNED - LangChain moves fast and breaks tutorials, and the
+retriever/compressor import paths have been reorganised more than once, so
+check the current docs when an import fails.
 
 THE RULE (the real deliverable of Day 19):
   ADOPT if it connects to something external, or performs a well-defined

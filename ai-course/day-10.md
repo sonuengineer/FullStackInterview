@@ -277,6 +277,7 @@ def run_plan(goal):
 
     steps = plan["steps"]
     results = {}
+    task_of = {}                      # step id -> task text, for the results block
 
     print("PLAN:")
     for step in steps:
@@ -287,11 +288,15 @@ def run_plan(goal):
     context = {
         "goal": goal,
         "results_text": lambda: "\n".join(
-            f"Step {i} ({steps[i-1]['task']}): {r}" for i, r in results.items()
+            f"Step {i} ({task_of[i]}): {r}" for i, r in results.items()
         ) or "Nothing yet."
     }
 
-    for step in steps:
+    index = 0
+    while index < len(steps):         # re-reads steps every pass, on purpose
+        step = steps[index]
+        index += 1
+
         missing = [d for d in step.get("depends_on", []) if d not in results]
         if missing:
             print(f"  ! step {step['id']} skipped, missing {missing}")
@@ -299,11 +304,18 @@ def run_plan(goal):
 
         print(f"  > step {step['id']}: {step['task']}")
         outcome = run_step(step, context)
+        task_of[step["id"]] = step["task"]
         results[step["id"]] = outcome
         print(f"    = {outcome[:140]}\n")
 
     return {"status": "finished", "plan": steps, "results": results}
 ```
+
+**Two small decisions here that both exist for the same reason: the plan is about to change while the loop is running.**
+
+`while index < len(steps)` instead of `for step in steps`. A `for` loop takes a single iterator from the list object it was given at the start. If you later rebind the name `steps` to a *new* list, the running loop does not notice -- it is still walking the old one. Since Stage 4 replaces the remaining plan mid-run, a `for` loop would print "revising plan" and then quietly execute the old steps anyway. The `while` re-reads `steps` and `len(steps)` on every pass, so a replacement list actually takes effect.
+
+`task_of[i]` instead of `steps[i-1]["task"]`. Step **ids** are not list **positions**. The planner is told to number from 1, but nothing enforces it, and after a revise the new steps carry their own ids. Indexing by position raises `IndexError` on any plan numbered differently, and silently mislabels results after a revise. Keyed on the id, it is always right.
 
 Run it on the deadlines goal. You get a visible plan, then each step running in order, each seeing what came before.
 
@@ -354,7 +366,7 @@ def replan(goal, steps, results, current_id):
     return json.loads(response.choices[0].message.content)
 ```
 
-Wire it into the runner, after each step completes:
+Wire it into the runner, at the bottom of the `while` body, after each step completes:
 
 ```python
         decision = replan(goal, steps, results, step["id"])
@@ -365,8 +377,14 @@ Wire it into the runner, after each step completes:
 
         if decision["action"] == "revise":
             print(f"  [revising plan: {decision['reason']}]")
-            steps = [s for s in steps if s["id"] <= step["id"]] + decision.get("steps", [])
+            steps = steps[:index] + decision.get("steps", [])
+            # index already points just past the step that finished,
+            # so the next pass runs the first revised step.
 ```
+
+**`steps[:index]`, not a filter on ids.** Everything up to and including the step that just finished is kept; everything after it is thrown away and replaced. Slicing by position is correct here even though lookups elsewhere go by id, because "what has already run" is a fact about the loop, not about the numbering.
+
+**Check that the revision really ran.** Print the step ids as they execute. If you see the revised ids appear in the output, the rebind took effect. If the run continues with the original plan after printing "revising plan", you are back on a `for` loop somewhere.
 
 **Test it by breaking reality.** Move your documents folder somewhere else so step 1 finds nothing, and run again.
 
@@ -568,14 +586,19 @@ planner.py contains:
                    how dependencies actually get satisfied
 
   run_plan(goal) - prints the plan before executing anything
+                 - a WHILE loop over an index, not a for loop, so a plan
+                   replaced mid-run is actually executed
                  - skips steps whose depends_on are not in results
                  - carries results forward via context["results_text"]()
+                 - results labelled from task_of[id], keyed on step id, never
+                   by list position
 
   replan(goal, steps, results, current_id)
                  - runs AFTER every step
                  - returns {"action": "continue"|"revise"|"stop", "reason",
                    "steps": [...new remaining steps...]}
-                 - "revise" replaces everything after the current step
+                 - "revise" replaces everything after the current step, via
+                   steps = steps[:index] + new_steps
 
   reflection pass at the end
                  - {"achieved", "gaps", "redo_step", "suggestion"}
@@ -586,6 +609,8 @@ Key decisions made:
   - the planner is only ever shown real tool names, and the executor still
     checks, because planners hallucinate capability anyway
   - each step gets its own small budget rather than sharing one big one
+  - the executor loop re-reads the plan list on every pass, because the
+    headline feature of the day is replacing that list while it runs
   - replanning is the point; planning alone was measured as barely better
     than ReAct
   - reflection improves work; it does NOT verify it. Day 9's

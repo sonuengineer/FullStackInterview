@@ -291,7 +291,8 @@ embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
 
 collection = client.get_or_create_collection(
     name="documents",
-    embedding_function=embedder
+    embedding_function=embedder,
+    metadata={"hnsw:space": "cosine"}      # NOT the default. Read on.
 )
 
 
@@ -336,7 +337,32 @@ if __name__ == "__main__":
 - `upsert` rather than `add` -- running it twice updates instead of creating duplicates. `add` would give you every chunk twice, and your search results would come back in pairs.
 - `ids=f"{name}::{number}"` -- stable ids. Re-index after editing a file and the chunks are replaced, not duplicated.
 - `metadatas` -- extra information travelling with each chunk. You are only storing the filename now; on Day 12 this is how you filter by date, author or document type.
-- `1 - distance` -- Chroma returns *distance* (smaller is closer), not similarity. Flipping it keeps the "higher is better" feel of Stage 3. Getting this backwards is a very common and very confusing bug.
+- `metadata={"hnsw:space": "cosine"}` -- **the most important line in this file, and the easiest to leave out.** See below.
+- `1 - distance` -- Chroma returns a *distance* (smaller is closer), never a similarity. With cosine space, `distance = 1 - cosine_similarity`, so `1 - distance` gives you back exactly the number your hand-written `similarity()` produced in Stage 3. Getting the direction backwards is a very common and very confusing bug.
+
+---
+
+**Now the line that deserves its own section: you have to choose the distance metric, and the default is probably not what you want.**
+
+`hnsw:space` tells Chroma how to measure "far apart". It takes `"cosine"`, `"l2"` (squared Euclidean) or `"ip"` (inner product), and **if you do not pass it, you get `l2`** -- not cosine, even though cosine is what the whole first half of today was about.
+
+That matters because `1 - distance` only means something under cosine:
+
+| space | what `distance` is | range | is `1 - distance` a similarity? |
+|---|---|---|---|
+| `cosine` | `1 - cosine_similarity` | 0 to 2 | **Yes.** 1.0 identical, 0.0 unrelated, negative for opposites |
+| `l2` (default) | squared straight-line distance | 0 to anything | **No.** It can be any size, so `1 - distance` goes arbitrarily negative |
+| `ip` | `1 - dot product` | unbounded | No |
+
+So with the default collection, `score = 1 - distance` is not a similarity at all. It is some unbounded number that happens to be ordered roughly the right way, which is exactly why this mistake survives so long: **the ranking still looks plausible, so nothing appears broken.** The damage shows up at the next stage, where a threshold compares that number against `0.25` and rejects nearly everything, and you spend an evening wondering why your retrieval "stopped working".
+
+This is the shape of mistake worth remembering from today, more than any API detail:
+
+> A silent default plus a number that still sorts correctly equals a bug you will not find by reading your own code.
+
+**Prove it to yourself.** Make a second collection with no `metadata=`, index the same documents, print the raw `distances` from both, and compare. The cosine ones sit between 0 and about 1; the L2 ones will not, and `1 - distance` on them will be negative for perfectly good matches.
+
+One more thing: `hnsw:space` is fixed when the collection is created. Changing it later means deleting the collection and re-indexing. If you already ran this file before adding the line, delete `chroma_db/` and index again -- `get_or_create_collection` will happily hand you the old L2 collection and ignore the metadata you passed.
 
 Add `chroma_db/` to your `.gitignore`.
 
@@ -371,7 +397,11 @@ Now update the tool description, because yesterday's had an apology built into i
 
 **Delete that old line** begging the model to use the document's own vocabulary. It is not needed any more. That deletion is the clearest possible sign of what you built today.
 
-**About that `0.25` threshold.** It is a guess, and you should treat it as one. Similarity scores are relative, not absolute -- there is no universal number above which a match is "good". The right threshold depends on your documents, your chunk size and your embedding model. Find yours by printing scores for questions you know the answers to, and questions you know are unanswerable, then picking a line between them. Doing this properly is part of Day 12.
+**About that `0.25` threshold.** It is a guess, and you should treat it as one.
+
+It is at least a guess in the right units. Because the collection uses cosine space, `score` is a cosine similarity: 1.0 is identical, around 0 is unrelated, negative means pointing the other way. With `all-MiniLM-L6-v2` a genuinely relevant chunk usually lands somewhere around 0.4 to 0.7, and noise sits near 0.1, so a line at 0.25 is a defensible starting point. **On a default L2 collection the same comparison would be meaningless**, and almost everything would be rejected -- that is the whole reason the `hnsw:space` line exists.
+
+But it is still your data that decides. Similarity scores are relative, not absolute -- there is no universal number above which a match is "good". The right threshold depends on your documents, your chunk size and your embedding model. Find yours by printing scores for questions you know the answers to, and questions you know are unanswerable, then picking a line between them. Doing this properly is part of Day 12.
 
 Run `chat.py` and ask about your documents using completely different wording from the files. It finds them.
 
@@ -469,8 +499,13 @@ Keep both `search_chunks` and `semantic_search`. Run ten questions through each 
 
 **Trap 2 -- distance read as similarity**
 *Symptom:* your worst results rank first.
-*Cause:* Chroma returns distance; small is good. If you sort as if bigger is better, you get it exactly backwards.
+*Cause:* Chroma always returns a *distance*, where small is good -- never a similarity. If you sort as if bigger is better, you get it exactly backwards.
 *Fix:* convert once, at the boundary, as in `search()`.
+
+**Trap 2b -- the distance is not the distance you assumed**
+*Symptom:* the ranking looks fine, but every `score` is negative, and your relevance threshold rejects correct answers.
+*Cause:* the collection was created without `metadata={"hnsw:space": "cosine"}`, so Chroma used its default, `l2` -- squared Euclidean, unbounded. `1 - distance` is only a cosine similarity when the space is cosine.
+*Fix:* set the space explicitly at creation time, every time. It cannot be changed afterwards -- you have to delete the collection and re-index.
 
 **Trap 3 -- duplicate chunks**
 *Symptom:* the same passage appears three times in your results, crowding out everything else.
@@ -500,6 +535,7 @@ Keep both `search_chunks` and `semantic_search`. Run ten questions through each 
 3. "I love this" and "I hate this" score 0.71. Why, and what does that tell you about what retrieval can and cannot do?
 4. Why is the embedding model run on your laptop rather than through the API?
 5. Yesterday's keyword search beats today's on one kind of question. Which kind, and why?
+6. You forget `metadata={"hnsw:space": "cosine"}`. The search results still come back in a sensible order. So what exactly is broken, and where does it bite you?
 
 ---
 
@@ -547,8 +583,11 @@ vector_store.py:
   chromadb.PersistentClient(path="./chroma_db")
   collection "documents" bound to the embedding function, so query and
   documents can never use different models
+  created with metadata={"hnsw:space": "cosine"} - Chroma's DEFAULT is l2
+  (squared Euclidean), and the space is fixed at creation time
   index_documents()  - upsert with stable ids "filename::chunknumber"
-  search(question)   - returns dicts with text, source, score (1 - distance)
+  search(question)   - returns dicts with text, source, score (1 - distance,
+  which is a cosine similarity ONLY because the space is cosine)
 
 tools.py:
   search_documents(query) now calls vector_store.search
@@ -563,6 +602,8 @@ Key decisions made:
   - relevance scores always shown, never hidden
   - upsert + stable ids so re-indexing never duplicates
   - distance converted to similarity at one boundary only
+  - the distance metric is CHOSEN EXPLICITLY, never left to the default.
+    A default plus a number that still sorts correctly is an invisible bug.
 
 Verified working:
   - the 5 synonym failures from Day 5 now all return the right chunk
@@ -574,7 +615,8 @@ Known problems, written down to re-test on Day 12:
   - negation fails ("which projects are NOT delayed")
   - counting fails ("how many times is X mentioned") - only 3 chunks seen
   - cross-document comparison is poor, top 3 often all from one file
-  - 0.25 threshold is a guess, not measured
+  - 0.25 threshold is a guess, not measured (it is at least in the right
+    units now: cosine similarity, 1.0 identical, ~0 unrelated)
   - opposites score high (love/hate 0.71); retrieval finds relevant text,
     not correct text
 ```
@@ -592,3 +634,5 @@ Known problems, written down to re-test on Day 12:
 **4.** Because indexing means embedding thousands of chunks, and an API would burn your entire free tier doing it. The embedding model is small enough to run on a normal CPU, so it is free, unlimited and instant after the first download.
 
 **5.** Exact strings: codes, ids, part numbers, precise names. Keyword search matches them perfectly. Meaning-search sees `INV-2024-8871` and `INV-2024-8872` as almost the same position, because they are almost the same text. Running both together is called hybrid search.
+
+**6.** The *ordering* is fine, which is why nothing looks wrong. What breaks is the *number*. Chroma's default space is `l2` -- squared Euclidean, with no upper bound -- so `1 - distance` is not a similarity in any range you can reason about, and on real data it goes well below zero. It bites the moment you compare that number against something: the `0.25` relevance threshold in `search_documents` rejects correct answers, and the "relevance" figure you print next to each source is nonsense. And because the space is fixed when the collection is created, you cannot patch it in place -- delete `chroma_db/` and re-index.
