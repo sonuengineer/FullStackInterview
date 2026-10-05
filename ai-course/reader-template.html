@@ -95,10 +95,11 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 .page pre{background:var(--code-bg);border:1px solid var(--line);border-radius:14px;padding:18px 20px;overflow-x:auto;line-height:1.55;margin:0 0 1.4em;font-size:.85em}
 .page pre code{background:none;padding:0;font-size:1em}
 .page table{border-collapse:collapse;width:100%;margin:0 0 1.5em;font-size:.92em}
-/* On a phone a 6-column table cannot shrink below its min-content width, so
-   width:100% is not enough and the table widens the whole article. Let it keep
-   its natural width and scroll inside its own box instead. */
-@media (max-width:760px){.page table{display:block;width:max-content;max-width:100%;overflow-x:auto}}
+/* Tables are wrapped in .table-wrap at render time (see open()). A 6-column
+   table cannot shrink below its min-content width, so on a phone it used to
+   widen the whole article; the wrapper scrolls it instead. */
+.page .table-wrap{max-width:100%;overflow-x:auto;margin:0 0 1.5em}
+.page .table-wrap table{margin:0;min-width:100%;width:max-content}
 .page th,.page td{border:1px solid var(--line);padding:9px 13px;text-align:left;vertical-align:top}
 .page th{background:var(--code-bg);font-weight:700}
 .page tr:nth-child(even) td{background:color-mix(in srgb,var(--code-bg) 45%,transparent)}
@@ -356,6 +357,17 @@ function open(i, anchor){
   el('bar-title').textContent = DATA[i].title;
   var page = el('page');
   page.innerHTML = marked.parse(DATA[i].md);
+  // Wrap each table in its own scroll box. A 6-column table cannot shrink
+  // below its min-content width, and setting overflow on the table itself does
+  // not contain its rows, so on a phone it widened the whole article. The
+  // wrapper is a plain block, which does contain them.
+  page.querySelectorAll('table').forEach(function(t){
+    if (t.parentElement && t.parentElement.classList.contains('table-wrap')) return;
+    var wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    t.parentNode.insertBefore(wrap, t);
+    wrap.appendChild(t);
+  });
   var hs = page.querySelectorAll('h2, h3');
   var toc = [];
   hs.forEach(function(h, hi){ h.id = 'h'+hi; toc.push({t:h.textContent, l:h.tagName, id:h.id}); });
