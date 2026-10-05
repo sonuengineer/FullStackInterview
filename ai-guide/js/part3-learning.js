@@ -423,7 +423,7 @@
     render();
 
     view.appendChild(examples([
-      ["Describe or answer questions about photos", "Gemini, Claude, GPT-4o; open: Gemma 3, Llama 3.2 Vision"],
+      ["Describe or answer questions about photos", "Gemini, Claude, GPT; open: Gemma, Llama Vision"],
       ["Read text in images (OCR), charts, screenshots", "Same vision models, or tools like Google Cloud Vision"],
       ["Create images (the reverse direction)", "Imagen, Midjourney, DALL-E"]
     ]));
@@ -580,7 +580,7 @@
       } else {
         out.appendChild(el("div", "answer good", "Best quality: exact text plus the look of each page. Most tokens."));
       }
-      if (perPage * n > 128000) out.appendChild(el("p", "note", "This is more than a 128,000-token context window. For big files, apps use RAG: split into chunks and send only the relevant parts (see Part 5)."));
+      if (perPage * n > 128000) out.appendChild(el("p", "note", "This is more than a 128,000-token window, which is what a mid-size model gives you. Current large models reach about a million tokens, but filling a window is slow and expensive, so for big files apps use RAG: split into chunks and send only the relevant parts (see Part 5)."));
     }
 
     seg(kindSeg, [{ value: "digital", label: "Digital (has text)" }, { value: "scanned", label: "Scanned (pictures)" }], kind, (v) => { kind = v; render(); });

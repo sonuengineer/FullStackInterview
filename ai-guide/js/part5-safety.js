@@ -467,7 +467,7 @@
       label: "In .env on the server",
       tone: "good",
       code: "# server/.env  (listed in .gitignore)\nGEMINI_API_KEY=your-key-here\n\n// server.js\nconst ai = new GoogleGenAI({\n  apiKey: process.env.GEMINI_API_KEY\n});",
-      text: "Safe. The key only lives on your server. The browser calls your server, and your server calls the AI. This is how your ai_chat app already works."
+      text: "Safe. The key only lives on your server. The browser calls your server, and your server calls the AI. This is how a small chat app should be wired: the browser never holds the key."
     }
   };
 
@@ -546,7 +546,7 @@
         [false, 1, true, 510, 0.0002, "After 3 days of sick leave."],
         [false, 2, true, 530, 0.0002, "Within 30 to 45 days."],
         [false, 1, true, 470, 0.0002, "Yes, you can book any hotel."],
-        [true, 3, false, 430, 0.0002, "Yes, MFA is recommended."]
+        [false, 2, false, 430, 0.0002, "Yes, MFA is recommended."]
       ]
     },
     large: {

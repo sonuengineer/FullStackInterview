@@ -387,7 +387,7 @@
   /* ====================================================== Limits */
   const LIMITS = [
     ["bad", "Check it", "It makes things up", "When it does not know, it can invent facts, links, names or code functions, and still sound 100% sure. This is called a \"hallucination\".", "Check important facts. Ask for sources. Test the code."],
-    ["warn", "Know this", "It has no memory", "Every request starts fresh. It only \"remembers\" because the app sends old messages again inside the context window.", "Save chat history in your app and send it (or a summary) with each request."],
+    ["warn", "Know this", "It has no memory", "Every request starts fresh: the model itself keeps nothing between requests. It only \"remembers\" because the app sends old messages again inside the context window. Some APIs now add server-side memory, stored sessions and prompt caching on top of that, but those are features around the model, not memory inside it.", "Save chat history in your app and send it (or a summary) with each request."],
     ["warn", "Know this", "Its knowledge has an end date", "It learned from text up to a certain date (the \"knowledge cutoff\"). It does not know news or new versions after that.", "Give it the fresh info in the prompt, or connect a search tool."],
     ["bad", "Check it", "Weak at exact math and counting", "It predicts text that looks right. It does not really calculate, so big numbers or counting letters can go wrong.", "Let it use a calculator tool, or ask it to write and run code."],
     ["good", "Easy fix", "Unclear question, unclear answer", "Small changes in how you ask can change the answer a lot. It cannot read your mind about format or level.", "Say who it is for, the format you want, and give an example."],

@@ -24,7 +24,7 @@
       <a href="#words">6. Words to know</a>
     </div>
     <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to dark theme" aria-pressed="false">
-      <span aria-hidden="true">◐</span><span class="theme-label">Theme</span>
+      <span aria-hidden="true"><svg width="12" height="12" viewBox="0 0 12 12" style="display:block"><circle cx="6" cy="6" r="5" fill="none" stroke="currentColor" stroke-width="1.4"></circle><path d="M6 1.7a4.3 4.3 0 0 0 0 8.6z" fill="currentColor"></path></svg></span><span class="theme-label">Theme</span>
     </button>
   </div>
 </nav>
@@ -44,7 +44,7 @@
 
   <section class="facts" aria-label="Key facts">
     <div class="fact"><strong>4 letters = 1 token</strong><span>About. AI reads pieces of words, not whole words.</span></div>
-    <div class="fact"><strong>No real memory</strong><span>The app sends the chat again every time.</span></div>
+    <div class="fact"><strong>No real memory</strong><span>The model keeps nothing between requests, so the app sends the chat again. Some APIs add memory and caching on top.</span></div>
     <div class="fact"><strong>Temperature = creativity</strong><span>Low is safe and same. High is wild and different.</span></div>
     <div class="fact"><strong>Can be wrong</strong><span>It sounds sure even when it is guessing.</span></div>
   </section>
@@ -504,7 +504,7 @@
               <span class="box-label" id="tf-focus-label">Where the word looks</span>
               <div class="bars" id="tf-bars"></div>
             </div>
-            <p class="note">Weights are made up to show the idea, but real models show this exact pattern for this famous example sentence.</p>
+            <p class="note">Weights are made up to show the idea. Real models do show patterns like this in some attention heads, though not every head behaves so cleanly: most heads are busy with something else, and the famous published pictures of this sentence show one head picked because it was easy to read.</p>
           </div>
           <div class="stack-v">
             <span class="box-label">Inside a transformer (read from bottom to top)</span>
@@ -572,6 +572,7 @@
           <h3 class="panel-title">How the next word is picked</h3>
         </div>
         <p class="simple">The model gives every possible next token a <b>chance</b>. Then a picking method chooses one. <b>Greedy</b> always takes the top token, so you get the same answer every time. <b>Sampling</b> rolls a weighted dice, shaped by <b>temperature</b> (how wild), <b>top-k</b> (only the k best words) and <b>top-p</b> (only the best words that add up to p).</p>
+        <p class="note">Good to know: some newer models no longer let you set temperature, top-k or top-p at all. They manage sampling themselves and reject these settings, so you shape the answer with other controls instead, such as how much thinking or reasoning effort to spend and how many tokens it may use. The mechanism below is still what is happening inside the model; you just may not be holding the dials.</p>
         <div class="cols-2">
           <div class="stack-v">
             <label class="note" for="prompt-select">Start of sentence:</label>
@@ -731,7 +732,7 @@
           <span class="kicker">Building an AI app</span>
           <h3 class="panel-title">User, UI, server, model and tools, checked answer</h3>
         </div>
-        <p class="simple">A real AI app is more than one model call. The <b>server</b> sits in the middle: it checks the request, loads data, calls the model and tools, <b>checks the answer</b>, and only then replies. Pick a request and press Play, or click any box to see its job and where it lives in your ai_chat app.</p>
+        <p class="simple">A real AI app is more than one model call. The <b>server</b> sits in the middle: it checks the request, loads data, calls the model and tools, <b>checks the answer</b>, and only then replies. Pick a request and press Play, or click any box to see its job and where it lives in a typical chat app.</p>
         <div class="row">
           <div id="arch-scenarios"></div>
           <button class="btn primary" id="arch-play" type="button">Play this request</button>
@@ -770,11 +771,11 @@
         </div>
         <div class="scroll-x">
           <table class="data-table">
-            <thead><tr><th>Real window</th><th>About words</th><th>Like reading</th></tr></thead>
+            <thead><tr><th>Typical of</th><th>Real window</th><th>About words</th><th>Like reading</th></tr></thead>
             <tbody>
-              <tr><td class="num">8,000 tokens</td><td class="num">6,000</td><td>a long essay</td></tr>
-              <tr><td class="num">128,000 tokens</td><td class="num">96,000</td><td>a full novel</td></tr>
-              <tr><td class="num">1,000,000 tokens</td><td class="num">750,000</td><td>about 8 novels</td></tr>
+              <tr><td>a small open model</td><td class="num">8,000 tokens</td><td class="num">6,000</td><td>a long essay</td></tr>
+              <tr><td>a mid-size model</td><td class="num">128,000 tokens</td><td class="num">96,000</td><td>a full novel</td></tr>
+              <tr><td>a current large model</td><td class="num">1,000,000 tokens</td><td class="num">750,000</td><td>about 8 novels</td></tr>
             </tbody>
           </table>
         </div>
@@ -957,7 +958,7 @@
               <li>Ground answers in sources: web search or RAG</li>
               <li>Require citations and show them to users</li>
               <li>Tell it to say "I don't know" when the sources don't answer</li>
-              <li>Use a low temperature for factual tasks</li>
+              <li>Use a low temperature for factual tasks, on models that let you set it</li>
               <li>Check important facts, and measure the rate (see Evaluating)</li>
             </ul>
           </div>
@@ -1234,7 +1235,7 @@ and when it is finished.</pre>
   </footer>
 </div>
 
-<button class="back-to-top" id="back-to-top" type="button" aria-label="Back to the top">↑ <span>Top</span></button>
+<button class="back-to-top" id="back-to-top" type="button" aria-label="Back to the top"><svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true" style="vertical-align:-1px"><path d="M6 10.5V2.4M2.4 6L6 2.2 9.6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg> <span>Top</span></button>
 
 <script src="js/core.js"></script>
 <script src="js/part1-kinds.js"></script>

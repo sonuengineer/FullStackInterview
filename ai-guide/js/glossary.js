@@ -66,7 +66,7 @@
     ["Inference", "model", "Using a trained model to get an answer. Happens every time you send a message."],
     ["Greedy decoding", "model", "Always picking the most likely next token. Same output every time."],
     ["Sampling", "model", "Picking the next token randomly, weighted by the chances."],
-    ["Temperature", "model", "A setting that makes chances sharper (low) or flatter (high). Low = safe, high = creative."],
+    ["Temperature", "model", "A setting that makes chances sharper (low) or flatter (high). Low = safe, high = creative. Some newer models do not accept it and manage sampling themselves."],
     ["Top-k", "model", "Only the k most likely tokens can be picked."],
     ["Top-p", "model", "Only the most likely tokens whose chances add up to p (like 90%) can be picked."],
     ["Streaming", "model", "Sending the answer token by token as it is created, so you see it being typed."],

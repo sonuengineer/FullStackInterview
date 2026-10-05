@@ -145,7 +145,7 @@
         chip.textContent = String(fakeId(t));
       } else {
         const lead = t.match(/^\s*/)[0];
-        if (lead.length) chip.appendChild(el("span", "sp", lead.replace(/\n/g, "\\n").replace(/ /g, "\u00B7")));
+        if (lead.length) chip.appendChild(el("span", "sp", lead.replace(/\n/g, "\\n").replace(/ /g, "_")));
         chip.appendChild(document.createTextNode(t.slice(lead.length)));
       }
       chip.title = "Token " + (i + 1) + ": \"" + t + "\"";
