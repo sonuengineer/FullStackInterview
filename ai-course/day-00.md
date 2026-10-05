@@ -1,6 +1,6 @@
-# Day 0 — Start Here: The Syllabus
+# Day 0 -- Start Here: The Syllabus
 
-**Module:** 00 — Start Here
+**Module:** 00 -- Start Here
 **Time:** about 20 minutes
 **Purpose:** Your roadmap, your stack, and how to study. Read this once before Day 1.
 
@@ -39,7 +39,7 @@ That is the whole secret. The 21 days simply make each of those five words rich.
 
 Five modules. Each day has one real question it answers.
 
-### 01 — Build the Foundation (Days 1 to 5)
+### 01 -- Build the Foundation (Days 1 to 5)
 
 | Day | Topic | The question it answers |
 |---|---|---|
@@ -49,7 +49,7 @@ Five modules. Each day has one real question it answers.
 | 4 | AI Tools | How does a text model actually do things? |
 | 5 | Document AI: Read Files | How do I get my own data into the prompt? |
 
-### 02 — AI Agents (Days 6 to 9)
+### 02 -- AI Agents (Days 6 to 9)
 
 | Day | Topic | The question it answers |
 |---|---|---|
@@ -58,7 +58,7 @@ Five modules. Each day has one real question it answers.
 | 8 | Model Context Protocol (MCP) | How do tools become reusable everywhere? |
 | 9 | Autonomous AI Agent | How does it run without me approving each step? |
 
-### 03 — Advanced Agent Systems (Days 10 to 15)
+### 03 -- Advanced Agent Systems (Days 10 to 15)
 
 | Day | Topic | The question it answers |
 |---|---|---|
@@ -69,7 +69,7 @@ Five modules. Each day has one real question it answers.
 | 14 | Multi-Agent Systems and Orchestration | When are many agents better than one? |
 | 15 | Making AI Agent Production Ready | Cost, speed, failures, limits, testing. |
 
-### 04 — Frameworks (Days 16 to 19)
+### 04 -- Frameworks (Days 16 to 19)
 
 | Day | Topic | The question it answers |
 |---|---|---|
@@ -78,7 +78,7 @@ Five modules. Each day has one real question it answers.
 | 18 | Build Our AI Research Agent | A full build using a framework. |
 | 19 | LangChain for Agent Engineers | The glue layer, and when to avoid it. |
 
-### 05 — Deployment and Capstone (Days 20 to 21)
+### 05 -- Deployment and Capstone (Days 20 to 21)
 
 | Day | Topic | The question it answers |
 |---|---|---|

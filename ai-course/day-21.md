@@ -1,6 +1,6 @@
-# Day 21 — Capstone: Build the Research AI Agent Platform
+# Day 21 -- Capstone: Build the Research AI Agent Platform
 
-**Module:** 05 — Deployment and Capstone
+**Module:** 05 -- Deployment and Capstone
 **Time:** longer than an hour. Give it a weekend if you can.
 **Builds on:** all twenty days
 
@@ -8,7 +8,7 @@
 
 ## 1. Today in one line
 
-You turn yesterday's service into something another person could sign into, upload their own documents to, and get a cited report out of — and then you hand it to someone and watch.
+You turn yesterday's service into something another person could sign into, upload their own documents to, and get a cited report out of -- and then you hand it to someone and watch.
 
 ---
 
@@ -30,7 +30,7 @@ That last one matters more than it sounds. A research tool that quietly hides it
 
 > A capstone is judged on being finished, not on being large.
 
-A narrow thing that works completely, with its limits written down, is a far better piece of work — and a far better thing to show someone — than a broad thing with six half-features.
+A narrow thing that works completely, with its limits written down, is a far better piece of work -- and a far better thing to show someone -- than a broad thing with six half-features.
 
 ---
 
@@ -86,7 +86,7 @@ upload -> validate -> extract text -> chunk -> embed -> index -> confirm
 
 Validation is not optional: file type, size cap, and Day 13's content scan. Someone else's document is untrusted input by definition.
 
-**Make it idempotent.** Upload the same file twice and you should get one copy, not two — Day 6's stable ids, `{user}::{filename}::{chunk}`.
+**Make it idempotent.** Upload the same file twice and you should get one copy, not two -- Day 6's stable ids, `{user}::{filename}::{chunk}`.
 
 ---
 
@@ -109,7 +109,7 @@ touch users.py ingest.py LIMITATIONS.md README.md
 
 ---
 
-### Stage 1 — Scope it in writing, including what is out
+### Stage 1 -- Scope it in writing, including what is out
 
 Before any code. `README.md`:
 
@@ -148,7 +148,7 @@ See research/DECISIONS.md.
 
 ---
 
-### Stage 2 — Users and isolation
+### Stage 2 -- Users and isolation
 
 `ai/users.py`:
 
@@ -208,7 +208,7 @@ def search(question, user_id, top_n=3):
     ...
 ```
 
-**Then thread `user_id` all the way down** — `sources.py`, `pipeline.py`, `research()`. It is tedious, mechanical, and the single most important correctness change in the whole capstone.
+**Then thread `user_id` all the way down** -- `sources.py`, `pipeline.py`, `research()`. It is tedious, mechanical, and the single most important correctness change in the whole capstone.
 
 **Test it immediately and properly:**
 
@@ -225,7 +225,7 @@ key_b, user_b = create_user("Bob")
 
 ---
 
-### Stage 3 — Upload and ingest
+### Stage 3 -- Upload and ingest
 
 `ai/ingest.py`:
 
@@ -356,13 +356,13 @@ def delete_document(filename: str, x_api_key: str = Header(None)):
 
 **Ids are `filename::index`**, so re-uploading replaces rather than duplicates. Idempotent ingest.
 
-**Delete removes the chunks too.** A user deleting a document and still getting it in results is a real failure — and an important one, because it is also the mechanism by which someone can withdraw data they did not mean to share.
+**Delete removes the chunks too.** A user deleting a document and still getting it in results is a real failure -- and an important one, because it is also the mechanism by which someone can withdraw data they did not mean to share.
 
 **Flagged content is recorded, not blocked.** Day 13's scanner catches lazy injections. Blocking on it would reject legitimate documents that happen to discuss prompt injection. Recording lets you show the user a warning.
 
 ---
 
-### Stage 4 — The dashboard, properly
+### Stage 4 -- The dashboard, properly
 
 Extend `dashboard/public/index.html` to three panels: documents, ask, history. The key part is switching from polling to the SSE endpoint you built yesterday and never used:
 
@@ -419,7 +419,7 @@ app.get("/api/jobs/:id/stream", async (req, res) => {
 });
 ```
 
-**`X-Accel-Buffering: no` is a small line that saves an afternoon.** Some proxies buffer responses, so your events all arrive at once at the end — which looks exactly like SSE not working at all.
+**`X-Accel-Buffering: no` is a small line that saves an afternoon.** Some proxies buffer responses, so your events all arrive at once at the end -- which looks exactly like SSE not working at all.
 
 **And `stream.onerror` falling back to polling.** SSE connections drop. A product that breaks permanently on one dropped connection is not finished.
 
@@ -446,7 +446,7 @@ function renderReport(result) {
 
 ---
 
-### Stage 5 — Measure the finished thing
+### Stage 5 -- Measure the finished thing
 
 Run the whole system end to end, as a user would.
 
@@ -515,7 +515,7 @@ Median $0.021 per report at current rates. The daily cap is $1.00 per user.
 
 ---
 
-### Stage 6 — Hand it to someone
+### Stage 6 -- Hand it to someone
 
 The last stage, and the most useful one.
 
@@ -530,11 +530,11 @@ You will learn things no test told you:
 - they ask something your documents cannot possibly answer
 - they wait fifteen seconds and click Research again
 - they do not notice the source list at all
-- they ask "is this true?" — which is the correct question and the one your interface should answer better
+- they ask "is this true?" -- which is the correct question and the one your interface should answer better
 
 **Fix the top two things. Write the rest in a "next" list and stop.**
 
-Then finish the README with a short demo script — three questions that show it working, taken from your eval set — and a note saying what you would build next and why.
+Then finish the README with a short demo script -- three questions that show it working, taken from your eval set -- and a note saying what you would build next and why.
 
 **That is the capstone.** Not the largest thing you could build. The thing that works, whose limits you know and have written down, that someone else has actually used.
 
@@ -561,7 +561,7 @@ Then finish the README with a short demo script — three questions that show it
 **1. Two users, one secret word.**
 Upload a document containing a unique word as Alice, search for it as Bob.
 *You must see:* nothing.
-*It teaches:* the only test in this course that must pass. Run it twice — once now and once when you think you are finished.
+*It teaches:* the only test in this course that must pass. Run it twice -- once now and once when you think you are finished.
 
 **2. Upload something horrible.**
 A scanned PDF. A 40 MB file. A `.exe` renamed to `.pdf`. A file called `../../etc/passwd`.
@@ -592,28 +592,28 @@ Say nothing for ten minutes.
 
 ## 9. Traps
 
-**Trap 1 — scope creep**
+**Trap 1 -- scope creep**
 *Symptom:* day four of the capstone, building a settings page, core still rough.
 *Fix:* the "does NOT do" list, written first, defended.
 
-**Trap 2 — no isolation**
+**Trap 2 -- no isolation**
 *Symptom:* one user sees another's documents.
 *Cause:* a `user_id` not threaded all the way down to the Chroma collection.
 *Fix:* experiment 1, run twice. This is the one genuinely serious bug available today.
 
-**Trap 3 — duplicate ingest**
+**Trap 3 -- duplicate ingest**
 *Symptom:* re-uploading a file makes every search return it twice.
 *Fix:* stable `filename::index` ids and `upsert`.
 
-**Trap 4 — the invisible warning**
+**Trap 4 -- the invisible warning**
 *Symptom:* users trust a one-source report as much as a twelve-source one.
 *Fix:* show the uncertainty in the interface, not just in the JSON.
 
-**Trap 5 — a demo pretending to be a product**
+**Trap 5 -- a demo pretending to be a product**
 *Symptom:* it only works on your three questions.
 *Fix:* stage 5's numbers, and stage 6's stranger.
 
-**Trap 6 — no limitations document**
+**Trap 6 -- no limitations document**
 *Symptom:* the work looks naive rather than finished.
 *Fix:* `LIMITATIONS.md`. Knowing what your system cannot do is evidence that you understand it.
 
@@ -635,7 +635,7 @@ You have finished the twenty-one days.
 
 - Use it yourself, on real work, for two weeks. You will find things no test did.
 - Fix the top two things your friend hit. Ignore the rest for now.
-- Keep the eval set running. Every change gets measured — that habit is the most transferable thing you learned.
+- Keep the eval set running. Every change gets measured -- that habit is the most transferable thing you learned.
 
 The next file has a longer answer about what to do from here.
 
@@ -644,7 +644,7 @@ The next file has a longer answer about what to do from here.
 ## 12. PROJECT STATE
 
 ```
-PROJECT STATE after Day 21 — COURSE COMPLETE
+PROJECT STATE after Day 21 -- COURSE COMPLETE
 
 Folders:
   research-assistant/

@@ -1,14 +1,14 @@
-# Day 15 — Making AI Agent Production Ready
+# Day 15 -- Making AI Agent Production Ready
 
-**Module:** 03 — Advanced Agent Systems
+**Module:** 03 -- Advanced Agent Systems
 **Time:** about 1 hour
-**Builds on:** everything. Especially Day 9 — verification; Day 12 — measurement
+**Builds on:** everything. Especially Day 9 -- verification; Day 12 -- measurement
 
 ---
 
 ## 1. Today in one line
 
-You find out what your system actually costs, how often it actually works, and what happens when it breaks — because right now you do not know any of those three.
+You find out what your system actually costs, how often it actually works, and what happens when it breaks -- because right now you do not know any of those three.
 
 ---
 
@@ -30,7 +30,7 @@ There is one deeper problem, and it changes how you have to think.
 
 **Normal software is deterministic.** Same input, same output. A test passes or fails, and if it passes today it passes tomorrow.
 
-**Your system is statistical.** The same input can succeed today and fail tomorrow. There is no "it works". There is only a **rate** — 87% of tasks, 93% of retrievals, 2% of runs exceed budget.
+**Your system is statistical.** The same input can succeed today and fail tomorrow. There is no "it works". There is only a **rate** -- 87% of tasks, 93% of retrievals, 2% of runs exceed budget.
 
 Which means every single-run observation you have made in this course is close to worthless as evidence. Including the ones in Day 12's table.
 
@@ -67,36 +67,36 @@ That is today's sentence.
 
 **Five areas, in the order you should build them.**
 
-**1. Observability — know what happened**
+**1. Observability -- know what happened**
 
 Every model call logged as one line of structured data: trace id, which agent, model, tokens in and out, latency, success or failure. Structured, not prose, so you can aggregate it.
 
 A **trace id** ties one user request to every call it caused. Without it, a 15-call multi-agent run is 15 unrelated log lines.
 
-**2. Evals — know how often it works**
+**2. Evals -- know how often it works**
 
 Day 12 measured retrieval. Today you measure **answers**.
 
 Two kinds of check:
 
-- **Assertions** — did the file appear, does the answer contain "30 November", is it under 200 words. Cheap, exact, trustworthy.
-- **LLM-as-judge** — for things assertions cannot check, like whether a summary is actually good. Useful and biased: judges favour longer answers, favour confident ones, and favour text written by the same model family. Treat it as a weak signal you have calibrated, never as ground truth.
+- **Assertions** -- did the file appear, does the answer contain "30 November", is it under 200 words. Cheap, exact, trustworthy.
+- **LLM-as-judge** -- for things assertions cannot check, like whether a summary is actually good. Useful and biased: judges favour longer answers, favour confident ones, and favour text written by the same model family. Treat it as a weak signal you have calibrated, never as ground truth.
 
 **Regression is the real point.** Run the eval before and after a change. That is the only way to know whether your prompt edit helped.
 
-**3. Reliability — survive failure**
+**3. Reliability -- survive failure**
 
-You have retries. Missing: **timeouts** (a hanging call), **fallback models** (provider down), **output validation with repair** (bad JSON — try once more with the error), and **graceful degradation** (retrieval failed, so answer from general knowledge and say so).
+You have retries. Missing: **timeouts** (a hanging call), **fallback models** (provider down), **output validation with repair** (bad JSON -- try once more with the error), and **graceful degradation** (retrieval failed, so answer from general knowledge and say so).
 
-**4. Cost — know the number, then reduce it**
+**4. Cost -- know the number, then reduce it**
 
 Measure per task. Then the three levers, in order of payoff:
 
-- **Model routing** — send easy tasks to a small model. Usually the biggest win by far.
-- **Caching** — identical or near-identical requests answered from a store.
-- **Context trimming** — shorter tool results, fewer retrieved chunks, tighter prompts.
+- **Model routing** -- send easy tasks to a small model. Usually the biggest win by far.
+- **Caching** -- identical or near-identical requests answered from a store.
+- **Context trimming** -- shorter tool results, fewer retrieved chunks, tighter prompts.
 
-**5. Limits — bound the damage**
+**5. Limits -- bound the damage**
 
 Per-user rate limits, per-user daily budget caps, a circuit breaker that stops calling a failing provider instead of hammering it.
 
@@ -120,7 +120,7 @@ No new libraries. Everything today is standard library plus what you have.
 
 ---
 
-### Stage 1 — Log everything, structured
+### Stage 1 -- Log everything, structured
 
 `observability.py`:
 
@@ -192,13 +192,13 @@ def tracked_call(messages, tools=None, component="agent", model=MODEL):
 
 **`component`** is what makes the log readable: `"supervisor"`, `"researcher"`, `"critic"`, `"extraction"`, `"rewrite"`. You are about to discover that one of these costs far more than you expected.
 
-JSONL — one JSON object per line — because it appends safely and you can read it with anything.
+JSONL -- one JSON object per line -- because it appends safely and you can read it with anything.
 
 Run a few tasks, then look at the raw file. That is the Day 1 habit, applied to your own system.
 
 ---
 
-### Stage 2 — Aggregate it
+### Stage 2 -- Aggregate it
 
 ```python
 def report(log_file=LOG_FILE):
@@ -240,13 +240,13 @@ Run twenty varied tasks, then `report()`.
 
 **p95 is much worse than p50.** Median might be 900ms and p95 six seconds. Averages hide this completely, which is why nobody who runs a service quotes averages. Your users experience p95 regularly.
 
-**One component dominates the cost, and it is not the one you expected.** Very often it is memory extraction from Day 11 — a call on every single turn that you stopped thinking about. Or the multi-query rewrite from Day 12.
+**One component dominates the cost, and it is not the one you expected.** Very often it is memory extraction from Day 11 -- a call on every single turn that you stopped thinking about. Or the multi-query rewrite from Day 12.
 
 You have now found your optimisation target with evidence instead of intuition.
 
 ---
 
-### Stage 3 — Measure answers, not just retrieval
+### Stage 3 -- Measure answers, not just retrieval
 
 `evals.py`:
 
@@ -334,7 +334,7 @@ Flaky and always-failing need completely different responses. Always-failing is 
 
 ---
 
-### Stage 4 — The judge, and its bias
+### Stage 4 -- The judge, and its bias
 
 For things assertions cannot check:
 
@@ -369,13 +369,13 @@ def judge(question, answer, sources=""):
 
 Take ten answers. Grade them yourself, 1 to 5, before looking at anything. Then run the judge and compare.
 
-You will probably find it scores higher than you do, and that its errors lean in a consistent direction — usually rewarding length and confidence. `"Length is not quality"` and `"Do not reward confident tone"` are in the prompt precisely because that bias is well known.
+You will probably find it scores higher than you do, and that its errors lean in a consistent direction -- usually rewarding length and confidence. `"Length is not quality"` and `"Do not reward confident tone"` are in the prompt precisely because that bias is well known.
 
 **Use the judge for tracking change over time**, where a consistent bias cancels out. Do not use it as ground truth for whether something is good enough.
 
 ---
 
-### Stage 5 — Survive failure
+### Stage 5 -- Survive failure
 
 `reliability.py`:
 
@@ -433,21 +433,21 @@ def json_with_repair(messages, schema_hint, tries=2):
 
 **Three things doing real work.**
 
-`timeout=30` — the missing piece from Day 9. A hanging call now fails instead of freezing everything.
+`timeout=30` -- the missing piece from Day 9. A hanging call now fails instead of freezing everything.
 
 **The fallback is a different model, not just a retry.** Rate limit means wait and retry. Anything else means the primary model is not going to work, so switch. Retrying the same failing thing three times is how you turn a 5-second failure into a 30-second one.
 
-**JSON repair shows the model its own error.** This works remarkably well — far better than retrying with an identical prompt and hoping.
+**JSON repair shows the model its own error.** This works remarkably well -- far better than retrying with an identical prompt and hoping.
 
 **Test it properly.** Set `PRIMARY = "this-model-does-not-exist"` and run a task. It should fall back and complete. If it crashes, your error handling is decorative.
 
 ---
 
-### Stage 6 — Cut the cost, and prove it
+### Stage 6 -- Cut the cost, and prove it
 
 Now use Stage 2's report to target the right thing.
 
-**Model routing — usually the biggest win.**
+**Model routing -- usually the biggest win.**
 
 You built the classifier on Day 3. Use it:
 
@@ -462,7 +462,7 @@ def model_for(component, goal=""):
     return PRIMARY
 ```
 
-Look at the numbers: the 70b model costs roughly $0.59 per million input tokens, the 8b about $0.05. **Ten times cheaper.** Memory extraction, query rewriting and classification do not need a 70b model — they are narrow, structured jobs.
+Look at the numbers: the 70b model costs roughly $0.59 per million input tokens, the 8b about $0.05. **Ten times cheaper.** Memory extraction, query rewriting and classification do not need a 70b model -- they are narrow, structured jobs.
 
 **Caching.**
 
@@ -481,7 +481,7 @@ def cached_call(messages, component, ttl=3600):
     return value
 ```
 
-Only cache things that should be deterministic — classification, extraction, rewriting. **Never cache a conversational reply**, or a user will get someone else's answer.
+Only cache things that should be deterministic -- classification, extraction, rewriting. **Never cache a conversational reply**, or a user will get someone else's answer.
 
 **Now prove it worked.** Clear your logs, run the same twenty tasks, and compare:
 
@@ -490,7 +490,7 @@ before:  $0.0412 per task,  p50 1,240ms
 after:   $0.0121 per task,  p50   680ms
 ```
 
-**Then immediately re-run `run_evals()`.** Cost reductions cause quality regressions, and the small model may be worse at something. If your score dropped from 82% to 71%, you did not save money — you bought cheapness with quality, and now you can decide whether that trade is acceptable instead of discovering it from a user.
+**Then immediately re-run `run_evals()`.** Cost reductions cause quality regressions, and the small model may be worse at something. If your score dropped from 82% to 71%, you did not save money -- you bought cheapness with quality, and now you can decide whether that trade is acceptable instead of discovering it from a user.
 
 ---
 
@@ -550,27 +550,27 @@ Remove the escape hatch from Day 3. Re-run evals.
 
 ## 9. Traps
 
-**Trap 1 — measuring once**
+**Trap 1 -- measuring once**
 *Symptom:* confident conclusions from single runs.
 *Fix:* repeat everything at least three times. Report rates.
 
-**Trap 2 — trusting the judge**
+**Trap 2 -- trusting the judge**
 *Symptom:* scores of 4.6 and unhappy users.
 *Fix:* calibrate against your own grading, and keep hard assertions wherever a hard assertion is possible.
 
-**Trap 3 — an eval set that is too easy**
+**Trap 3 -- an eval set that is too easy**
 *Symptom:* 95% forever, no signal.
 *Fix:* include the unanswerable, the multi-step, and the ones you know are broken.
 
-**Trap 4 — optimising before measuring**
+**Trap 4 -- optimising before measuring**
 *Symptom:* a week spent on something that was 3% of the cost.
 *Fix:* Stage 2 first. The dominant component is usually not the obvious one.
 
-**Trap 5 — no trace id**
+**Trap 5 -- no trace id**
 *Symptom:* logs you cannot join up.
 *Fix:* `ContextVar`, set once per request.
 
-**Trap 6 — personal data in logs**
+**Trap 6 -- personal data in logs**
 *Symptom:* a permanent file of user questions and retrieved documents.
 *Fix:* log token counts, latency and ids. Do not log message contents by default. If you need contents for debugging, keep them separate, short-lived, and access-controlled.
 
@@ -588,7 +588,7 @@ Remove the escape hatch from Day 3. Re-run evals.
 
 ## 11. Where this goes
 
-- **Day 16 and 17** bring frameworks. Run today's evals against the framework version — that is how you find out whether it is actually better, rather than just newer.
+- **Day 16 and 17** bring frameworks. Run today's evals against the framework version -- that is how you find out whether it is actually better, rather than just newer.
 - **Day 18** builds the research agent. Today's eval set is how you know it works.
 - **Day 20** deploys it. Logging, tracing, timeouts and budget caps stop being good practice and become requirements.
 - **Day 21** is where cost per task becomes the number that decides whether the thing is viable.
@@ -686,9 +686,9 @@ Known problems, left for later:
 
 ## Answers
 
-**1.** Because the same input can produce a different result each time, so a single success proves almost nothing. It is replaced by rates measured over repeated runs — success rate, cost per task, p50 and p95 latency, failure rate.
+**1.** Because the same input can produce a different result each time, so a single success proves almost nothing. It is replaced by rates measured over repeated runs -- success rate, cost per task, p50 and p95 latency, failure rate.
 
-**2.** Always-failing is a deterministic bug you can find and fix. Flaky is a probability, and no amount of debugging removes it entirely — you either make it less likely or decide the rate is acceptable. Treating a flaky task as a bug leads to hours of chasing something that was never broken in a fixable way.
+**2.** Always-failing is a deterministic bug you can find and fix. Flaky is a probability, and no amount of debugging removes it entirely -- you either make it less likely or decide the rate is acceptable. Treating a flaky task as a bug leads to hours of chasing something that was never broken in a fixable way.
 
 **3.** Because averages are dragged toward the middle and hide the tail. p95 is what a meaningful share of your users actually experience, and it is where timeouts and abandonment happen.
 

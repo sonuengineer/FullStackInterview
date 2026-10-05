@@ -1,14 +1,14 @@
-# Day 2 — Build an AI Assistant That Remembers
+# Day 2 -- Build an AI Assistant That Remembers
 
-**Module:** 01 — Build the Foundation
+**Module:** 01 -- Build the Foundation
 **Time:** about 1 hour
-**Builds on:** Day 1 — `chat.py`, which forgets everything
+**Builds on:** Day 1 -- `chat.py`, which forgets everything
 
 ---
 
 ## 1. Today in one line
 
-Your assistant will remember the whole conversation — and you will find out that "memory" is not a feature you switch on, it is a bill you pay.
+Your assistant will remember the whole conversation -- and you will find out that "memory" is not a feature you switch on, it is a bill you pay.
 
 ---
 
@@ -51,7 +51,7 @@ Hold this sentence:
 
 > Memory is not stored. Memory is re-sent.
 
-Almost everything strange about AI apps — the cost, the slowness, the forgetting long chats, why Day 11 exists at all — comes out of that one sentence.
+Almost everything strange about AI apps -- the cost, the slowness, the forgetting long chats, why Day 11 exists at all -- comes out of that one sentence.
 
 ---
 
@@ -79,15 +79,15 @@ The model reads the whole thing top to bottom, sees the name sitting there in th
 
 **Two rules that follow from this, and matter for the next 19 days:**
 
-**Rule 1 — you must store the assistant's replies too, not just yours.** If you only append your own messages, the model sees a list of questions with no answers in between. It gets confused and often starts answering your old questions again.
+**Rule 1 -- you must store the assistant's replies too, not just yours.** If you only append your own messages, the model sees a list of questions with no answers in between. It gets confused and often starts answering your old questions again.
 
-**Rule 2 — the history is just text, and you control all of it.** You can edit it. You can delete parts. You can even write an assistant message it never actually said, and it will believe it completely. There is no protection, because there is nothing to protect — it is only a list.
+**Rule 2 -- the history is just text, and you control all of it.** You can edit it. You can delete parts. You can even write an assistant message it never actually said, and it will believe it completely. There is no protection, because there is nothing to protect -- it is only a list.
 
 That second rule sounds like a weakness. It is actually the source of enormous power, and you will use it deliberately on Days 7, 9 and 11.
 
 **The new problem this creates**
 
-Every model has a **context window** — the maximum amount of text it can read at once. Think of it as the size of the desk. Your conversation list is paper piling up on that desk. Two things go wrong as the pile grows:
+Every model has a **context window** -- the maximum amount of text it can read at once. Think of it as the size of the desk. Your conversation list is paper piling up on that desk. Two things go wrong as the pile grows:
 
 1. **It costs more and gets slower.** Every turn re-sends everything.
 2. **Eventually the pile does not fit**, and the call fails.
@@ -123,7 +123,7 @@ cp chat.py chat_day1_backup.py
 
 ---
 
-### Stage 1 — The four lines
+### Stage 1 -- The four lines
 
 Open `chat.py`. Right now your loop builds a fresh list each time. Change it so one list lives outside the loop and grows.
 
@@ -158,9 +158,9 @@ while True:
 **What changed, in plain words:**
 
 - `messages` now lives **outside** the loop. It survives from turn to turn. Yesterday's version was created fresh inside the loop, which is exactly why it forgot.
-- `messages.append({"role": "user", ...})` — add the human's question to the pile *before* sending.
-- `ask_model(messages)` — send the whole pile, not just the newest question.
-- `messages.append({"role": "assistant", ...})` — add the model's reply to the pile as well. **This line is the one everyone forgets.** Without it the model sees your questions but never its own answers.
+- `messages.append({"role": "user", ...})` -- add the human's question to the pile *before* sending.
+- `ask_model(messages)` -- send the whole pile, not just the newest question.
+- `messages.append({"role": "assistant", ...})` -- add the model's reply to the pile as well. **This line is the one everyone forgets.** Without it the model sees your questions but never its own answers.
 
 Run it and repeat yesterday's test:
 
@@ -178,7 +178,7 @@ Now ask it three or four follow-up questions without repeating any background. N
 
 ---
 
-### Stage 2 — Watch the bill grow
+### Stage 2 -- Watch the bill grow
 
 This stage is where today actually earns its hour.
 
@@ -191,7 +191,7 @@ Add one line, just after you get the response:
           f"history: {len(messages)} messages]")
 ```
 
-Now have a real conversation. Ten or twelve turns. Ask about anything — a topic you like, a plan, a problem.
+Now have a real conversation. Ten or twelve turns. Ask about anything -- a topic you like, a plan, a problem.
 
 Watch the first number.
 
@@ -219,7 +219,7 @@ Keep going to turn 20 or so. If you are on the free tier, you may well see your 
 
 ---
 
-### Stage 3 — Cut the pile down (sliding window)
+### Stage 3 -- Cut the pile down (sliding window)
 
 The simplest fix: keep only the recent messages and throw the old ones away.
 
@@ -239,7 +239,7 @@ def trim_history(messages):
     return [system_message] + conversation[-MAX_HISTORY:]
 ```
 
-Then use it when you send — but keep the full list for yourself:
+Then use it when you send -- but keep the full list for yourself:
 
 ```python
     response = ask_model(trim_history(messages))
@@ -249,10 +249,10 @@ Then use it when you send — but keep the full list for yourself:
 
 **Line by line:**
 
-- `messages[0]` — the system prompt. Always position zero. It must never be cut, or the assistant forgets its own rules mid-chat.
-- `messages[1:]` — everything except the system prompt.
-- `conversation[-MAX_HISTORY:]` — the last 8. Python's minus sign means "counting from the end".
-- `[system_message] + ...` — put the rules back on top.
+- `messages[0]` -- the system prompt. Always position zero. It must never be cut, or the assistant forgets its own rules mid-chat.
+- `messages[1:]` -- everything except the system prompt.
+- `conversation[-MAX_HISTORY:]` -- the last 8. Python's minus sign means "counting from the end".
+- `[system_message] + ...` -- put the rules back on top.
 
 Run it. Watch the token count now. It climbs, then **flattens**. Problem solved.
 
@@ -276,7 +276,7 @@ There is no setting that fixes this. Real memory means **deciding what matters**
 
 ---
 
-### Stage 4 — Survive a restart
+### Stage 4 -- Survive a restart
 
 Close your program and open it again. Everything is gone.
 
@@ -318,7 +318,7 @@ And save after each reply, just after the assistant append:
 
 **What is happening:**
 
-- `json.dump` writes your Python list into a text file. Your `messages` list is only dictionaries and strings, which is exactly what JSON handles — no conversion needed.
+- `json.dump` writes your Python list into a text file. Your `messages` list is only dictionaries and strings, which is exactly what JSON handles -- no conversion needed.
 - `indent=2` makes the file readable by a human. **Open `conversation.json` and look at it.** This is the clearest possible view of what memory really is: a text file full of roles and content. No magic anywhere.
 - `load_history` checks whether the file exists. First run, it does not, so we start fresh with the system prompt.
 
@@ -328,7 +328,7 @@ One thing to notice: `conversation.json` grows forever now. On Day 11 you will r
 
 ---
 
-### Stage 5 — Summarise the old part (optional, 10 minutes)
+### Stage 5 -- Summarise the old part (optional, 10 minutes)
 
 A smarter trick than cutting: when the pile gets big, ask the model to compress the old part into a few sentences, then keep the summary instead of the raw messages.
 
@@ -364,7 +364,7 @@ Call it when the list gets long:
 
 **Why this is better than cutting:** your name from turn 1 can survive into turn 50, because the summary carries it.
 
-**Why it is still not enough:** the summary is itself a guess. Details get dropped, and once dropped they are gone forever. It also costs an extra model call. And summaries of summaries slowly drift away from the truth — a bit like a story retold too many times.
+**Why it is still not enough:** the summary is itself a guess. Details get dropped, and once dropped they are gone forever. It also costs an extra model call. And summaries of summaries slowly drift away from the truth -- a bit like a story retold too many times.
 
 Day 11 handles this properly. Today you just need to see that both easy answers have real costs.
 
@@ -413,7 +413,7 @@ Change `trim_history` to return `conversation[-MAX_HISTORY:]` with no system mes
 *It teaches:* why the system prompt is pinned separately in every real chat app. This is trap 3 below, and it is genuinely hard to spot in the wild because it happens slowly.
 
 **5. Try to break the desk.**
-Paste a very long text — a few thousand words — as one message, then keep chatting.
+Paste a very long text -- a few thousand words -- as one message, then keep chatting.
 *You will see:* either a rate limit, or a "context length exceeded" error, or very slow replies.
 *It teaches:* there is a hard ceiling. Day 6 exists because of this ceiling.
 
@@ -426,26 +426,26 @@ Write down `prompt_tokens` for turns 1, 5, 10 and 15, first with trimming switch
 
 ## 9. Traps
 
-**Trap 1 — appending the object instead of the text**
+**Trap 1 -- appending the object instead of the text**
 *Wrong:* `messages.append({"role": "assistant", "content": response})`
 *Right:* `messages.append({"role": "assistant", "content": answer})`
 *Symptom:* a strange serialisation error, or the model starts talking about `ChatCompletion` objects. The `content` field must be a plain string.
 
-**Trap 2 — forgetting to append the assistant reply**
+**Trap 2 -- forgetting to append the assistant reply**
 *Symptom:* it half-remembers. It knows what you said but not what it said, so it repeats itself and re-answers old questions.
 *This is the single most common mistake on Day 2.* If your bot feels "almost right but confused", check this line first.
 
-**Trap 3 — the system prompt scrolling away**
+**Trap 3 -- the system prompt scrolling away**
 *Symptom:* the assistant behaves perfectly for ten turns and then slowly turns into a generic chatbot. Rules and personality fade.
 *Cause:* you sliced the list including position 0.
 *Fix:* always pull `messages[0]` out first, slice the rest, put it back on top. That is why `trim_history` is written the way it is.
 
-**Trap 4 — `context_length_exceeded`**
+**Trap 4 -- `context_length_exceeded`**
 *Symptom:* works fine, then suddenly fails after a long chat or one big pasted document.
 *Cause:* the pile is bigger than the model's desk.
 *Fix:* trimming or summarising. For real documents, the answer is Day 6, not a bigger window.
 
-**Trap 5 — a corrupt `conversation.json`**
+**Trap 5 -- a corrupt `conversation.json`**
 *Symptom:* `json.decoder.JSONDecodeError` on startup, and now nothing runs.
 *Cause:* the program was killed halfway through writing the file.
 *Fix:* delete the file and start fresh. To prevent it, wrap `load_history` in `try/except` and fall back to a new conversation.
@@ -468,7 +468,7 @@ If question 1 is not instant and obvious to you, re-read section 3 before Day 3.
 
 ## 11. Where this goes
 
-- **Day 3** takes the system prompt — the one message you have been carefully protecting today — and turns it into real control over behaviour.
+- **Day 3** takes the system prompt -- the one message you have been carefully protecting today -- and turns it into real control over behaviour.
 - **Day 5 and 6** exist because of the ceiling you hit in experiment 5. A document is too big for the desk, so you learn to send only the relevant pieces.
 - **Day 9** uses trap 2 in reverse: an agent's loop works by appending its own actions and results into the history, so it can see what it already tried.
 - **Day 11** is this day done properly. What is worth remembering forever, what belongs to this chat only, and how to store facts instead of transcripts.
@@ -530,6 +530,6 @@ Known problems, left on purpose for later days:
 
 **3.** Because you re-send the entire conversation every turn, so what you send keeps growing. What comes back is just one reply, which stays roughly the same size regardless of how long the chat is.
 
-**4.** Position 0 is the system prompt. Slice it away and the assistant's rules and personality vanish. It happens gradually, which makes it hard to notice — the bot just slowly becomes generic.
+**4.** Position 0 is the system prompt. Slice it away and the assistant's rules and personality vanish. It happens gradually, which makes it hard to notice -- the bot just slowly becomes generic.
 
 **5.** The sliding window loses old facts completely, even important ones, because it only knows what is recent. Summarising keeps the gist but loses detail permanently, costs an extra model call, and drifts further from the truth each time it is redone.

@@ -1,4 +1,4 @@
-// build-reader.js — bundles all day-*.md files into reader.html using reader-template.html
+// build-reader.js -- bundles all day-*.md files into reader.html using reader-template.html
 // Run: node build-reader.js
 const fs = require('fs');
 const path = require('path');
@@ -28,6 +28,6 @@ const modulesJs = JSON.stringify(modules);
 const out = template.replace('__DATA__', () => dataJs).replace('__MODULES__', () => modulesJs);
 
 fs.writeFileSync(path.join(__dirname, 'reader.html'), out);
-console.log(`Built reader.html — ${chapters.length} chapters, ${(out.length / 1024).toFixed(0)} KB`);
+console.log(`Built reader.html -- ${chapters.length} chapters, ${(out.length / 1024).toFixed(0)} KB`);
 chapters.forEach(c => console.log(`  ${c.title}  (${c.minutes} min, ${c.module})`));
 console.log(`Modules: ${modules.join(' | ')}`);

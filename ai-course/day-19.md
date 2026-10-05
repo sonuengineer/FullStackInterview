@@ -1,14 +1,14 @@
-# Day 19 — LangChain for Agent Engineers
+# Day 19 -- LangChain for Agent Engineers
 
-**Module:** 04 — Frameworks
+**Module:** 04 -- Frameworks
 **Time:** about 1 hour
-**Builds on:** Day 5, 6, 12 — the things you built by hand; Day 16 — LangGraph
+**Builds on:** Day 5, 6, 12 -- the things you built by hand; Day 16 -- LangGraph
 
 ---
 
 ## 1. Today in one line
 
-You look at the toolbox you have been ignoring, work out which parts are worth taking, and — more usefully — build a rule for deciding that yourself.
+You look at the toolbox you have been ignoring, work out which parts are worth taking, and -- more usefully -- build a rule for deciding that yourself.
 
 ---
 
@@ -28,7 +28,7 @@ But that leaves a real question, and it is today's actual subject:
 
 LangChain is huge, it changes fast, and it has a reputation for wrapping simple things in complicated ones. "Use it" and "avoid it" are both bad advice. What you need is a rule you can apply yourself, and a habit of measuring before you swap.
 
-One clarification, because it confuses people constantly: **LangChain and LangGraph are different things.** LangGraph (Day 16) is control flow — nodes, edges, state. LangChain is components — loaders, splitters, retrievers, output parsers. You can use either without the other.
+One clarification, because it confuses people constantly: **LangChain and LangGraph are different things.** LangGraph (Day 16) is control flow -- nodes, edges, state. LangChain is components -- loaders, splitters, retrievers, output parsers. You can use either without the other.
 
 ---
 
@@ -42,7 +42,7 @@ The shop does not distinguish. You have to.
 
 **Where this comparison breaks, and this is the part that matters:**
 
-A bad hand tool sits in a drawer. **A bad abstraction sits between you and your prompt.** Every wrapper is a layer, and layers are where debugging goes to die. When your retrieval returns nonsense, the question is always "what did it actually send" — and each layer makes that harder to answer.
+A bad hand tool sits in a drawer. **A bad abstraction sits between you and your prompt.** Every wrapper is a layer, and layers are where debugging goes to die. When your retrieval returns nonsense, the question is always "what did it actually send" -- and each layer makes that harder to answer.
 
 So the cost of a LangChain component is not just tokens. It is **visibility**.
 
@@ -52,7 +52,7 @@ So the cost of a LangChain component is not just tokens. It is **visibility**.
 >
 > Skip it if it contains a prompt, or controls flow you care about.
 
-Loaders connect to external formats — adopt. Splitters transform text deterministically — adopt if measured better. Retrievers are borderline: measure. Anything with a hidden prompt inside it — write your own, because that prompt is your product.
+Loaders connect to external formats -- adopt. Splitters transform text deterministically -- adopt if measured better. Retrievers are borderline: measure. Anything with a hidden prompt inside it -- write your own, because that prompt is your product.
 
 ---
 
@@ -114,7 +114,7 @@ You already have `langchain-openai` from Day 16. Install the pieces you are test
 
 ---
 
-### Stage 1 — Loaders: adopt without hesitation
+### Stage 1 -- Loaders: adopt without hesitation
 
 Your `read_any` handles `.txt` and `.pdf`. LangChain handles a hundred formats:
 
@@ -134,7 +134,7 @@ print(docs[0].page_content[:200])
 
 **This is a clear adopt**, and the reason is in the second print. `PyPDFLoader` returns one `Document` per page with `source` and `page` already in the metadata.
 
-You built that by hand on Day 5 — remember inserting `[Page N]` markers into the text so citations could work? This gives you the same thing as structured data instead of a string you have to parse back out.
+You built that by hand on Day 5 -- remember inserting `[Page N]` markers into the text so citations could work? This gives you the same thing as structured data instead of a string you have to parse back out.
 
 **Why this fits the rule:** a loader is a connector to an external format. No prompt, no flow control, and you would have written it the same way. Take it.
 
@@ -142,7 +142,7 @@ One caution: metadata keys differ between loaders. `CSVLoader` gives you `row`, 
 
 ---
 
-### Stage 2 — Splitters: measure, do not assume
+### Stage 2 -- Splitters: measure, do not assume
 
 Your `chunk_text` looks for paragraph breaks, then sentence breaks. `RecursiveCharacterTextSplitter` does the same idea with a priority list:
 
@@ -159,7 +159,7 @@ chunks = splitter.split_documents(docs)
 
 It tries each separator in order, falling back to the next when a chunk is still too large. Yours tried two levels; this tries five.
 
-**Now the important part — measure it**, using Day 12's golden set:
+**Now the important part -- measure it**, using Day 12's golden set:
 
 ```python
 # lc_compare.py
@@ -181,13 +181,13 @@ my splitter                      recall@5: 12/15 (80%)  MRR: 0.556
 RecursiveCharacterTextSplitter   recall@5: 13/15 (87%)  MRR: 0.601
 ```
 
-**A real improvement, measured.** Adopt it — and notice that you could only make that call because you built the golden set on Day 12.
+**A real improvement, measured.** Adopt it -- and notice that you could only make that call because you built the golden set on Day 12.
 
 Also try `MarkdownHeaderTextSplitter`, which splits on headings and keeps the heading in the metadata. If your documents have structure, that is often a bigger win than any retrieval tuning, because chunks stop straddling section boundaries.
 
 ---
 
-### Stage 3 — Retrievers: your Day 12, as objects
+### Stage 3 -- Retrievers: your Day 12, as objects
 
 ```python
 from langchain_community.retrievers import BM25Retriever
@@ -219,7 +219,7 @@ results = pipeline.invoke("what were the earnings last quarter")
 
 `EnsembleRetriever` is your RRF. `CrossEncoderReranker` is your cross-encoder stage. Same models, same algorithms.
 
-**One real difference:** `weights=[0.4, 0.6]` lets you favour one retriever. Your RRF weighted both equally. Try it — on documents heavy with codes and part numbers, pushing BM25 up often helps.
+**One real difference:** `weights=[0.4, 0.6]` lets you favour one retriever. Your RRF weighted both equally. Try it -- on documents heavy with codes and part numbers, pushing BM25 up often helps.
 
 **Measure it against yours** before switching. Same golden set, same numbers. You will probably find them equal, which makes it a maintenance decision rather than a quality one: nine lines you did not write versus eighty you fully control.
 
@@ -227,7 +227,7 @@ results = pipeline.invoke("what were the earnings last quarter")
 
 ---
 
-### Stage 4 — Output parsers: a quiet adopt
+### Stage 4 -- Output parsers: a quiet adopt
 
 ```python
 from langchain_core.output_parsers import PydanticOutputParser
@@ -256,13 +256,13 @@ print(plan.sub_questions)     # a real list, on a typed object
 
 **This is better than your Day 18 version**, and the reason is types. You get a validated object, not a dict you hope has the right keys. A missing field is an error at parse time rather than a `KeyError` three functions later.
 
-Wrap it in `OutputFixingParser` and a malformed response gets one automatic repair attempt — your Day 15 `json_with_repair`, already built.
+Wrap it in `OutputFixingParser` and a malformed response gets one automatic repair attempt -- your Day 15 `json_with_repair`, already built.
 
 **Why it fits the rule:** the format instructions are generated from your schema, and you can print them. No hidden prompt, and the transformation is well-defined.
 
 ---
 
-### Stage 5 — LCEL, and what it hides
+### Stage 5 -- LCEL, and what it hides
 
 Build the same thing three ways, then look at all three:
 
@@ -289,9 +289,9 @@ langchain.debug = True
 chain.invoke({"question": "test"})
 ```
 
-Read the actual prompt. The format instructions are there — fine, you generated those. **Look for anything else you did not write.**
+Read the actual prompt. The format instructions are there -- fine, you generated those. **Look for anything else you did not write.**
 
-Then try to debug it. Put a print between `prompt` and `llm`. You cannot, not directly — you need `RunnableLambda`:
+Then try to debug it. Put a print between `prompt` and `llm`. You cannot, not directly -- you need `RunnableLambda`:
 
 ```python
 from langchain_core.runnables import RunnableLambda
@@ -305,11 +305,11 @@ chain = prompt | RunnableLambda(peek) | llm | parser
 
 **That extra step is the tax.** In your own code you write `print()`. Here you wrap a function in a class to inspect your own data.
 
-**So use LCEL where composition is the point** — batching, streaming, parallel branches. Write plain code where the logic is the point.
+**So use LCEL where composition is the point** -- batching, streaming, parallel branches. Write plain code where the logic is the point.
 
 ---
 
-### Stage 6 — Write your own adoption table
+### Stage 6 -- Write your own adoption table
 
 The deliverable. Go through your project and decide, with evidence. `research/DECISIONS.md`:
 
@@ -395,7 +395,7 @@ Twenty questions through `chain.batch()` and through your own for-loop.
 
 **4. Weight the ensemble.**
 `[0.9, 0.1]` then `[0.1, 0.9]`. Measure both.
-*You will see:* different failures — exact codes versus paraphrases.
+*You will see:* different failures -- exact codes versus paraphrases.
 *It teaches:* Day 12's sparse-dense trade, now as a dial.
 
 **5. Follow a stale tutorial.**
@@ -412,27 +412,27 @@ Find a LangChain agent tutorial from a year ago and run it.
 
 ## 9. Traps
 
-**Trap 1 — adopting wholesale**
+**Trap 1 -- adopting wholesale**
 *Symptom:* your whole system is framework objects and you cannot find your own logic.
 *Fix:* the rule in section 3. Component by component, with measurements.
 
-**Trap 2 — deprecated imports**
+**Trap 2 -- deprecated imports**
 *Symptom:* tutorials that do not run.
 *Fix:* pin versions, use current docs, check the API before assuming you made a mistake.
 
-**Trap 3 — hidden prompts**
+**Trap 3 -- hidden prompts**
 *Symptom:* strange output from a component you did not write a prompt for.
 *Fix:* `langchain.debug = True` before adopting anything. If it contains a prompt you did not write, think hard.
 
-**Trap 4 — debugging through layers**
+**Trap 4 -- debugging through layers**
 *Symptom:* an hour spent finding where a value became wrong.
 *Fix:* keep the parts you debug most as plain code.
 
-**Trap 5 — confusing LangChain with LangGraph**
+**Trap 5 -- confusing LangChain with LangGraph**
 *Symptom:* looking for agent loops in the wrong library.
 *Fix:* components versus control flow. Different tools.
 
-**Trap 6 — metadata that leaks**
+**Trap 6 -- metadata that leaks**
 *Symptom:* code full of `doc.metadata.get("page") or doc.metadata.get("row")`.
 *Cause:* different loaders use different keys.
 *Fix:* normalise to your own shape at the boundary, once.
@@ -451,9 +451,9 @@ Find a LangChain agent tutorial from a year ago and run it.
 
 ## 11. Where this goes
 
-- **Day 20** deploys it. Fewer hand-written components means less to maintain in production — and the loaders make ingesting user-uploaded files far simpler.
+- **Day 20** deploys it. Fewer hand-written components means less to maintain in production -- and the loaders make ingesting user-uploaded files far simpler.
 - **Day 21** is the platform. Today's adoption table is part of the story you tell about why it is built the way it is.
-- **Beyond:** the rule from section 3 outlives LangChain. Every framework you meet gets the same two questions — does it contain a prompt, and does it control flow you care about.
+- **Beyond:** the rule from section 3 outlives LangChain. Every framework you meet gets the same two questions -- does it contain a prompt, and does it control flow you care about.
 
 ---
 
@@ -547,10 +547,10 @@ Known problems, left for later:
 
 **1.** Adopt it if it connects to something external or performs a well-defined transformation you would have written identically; skip it if it contains a prompt or controls flow you care about. Adopt: `PyPDFLoader`. Skip: LangChain's agent abstractions.
 
-**2.** LangChain is components — loaders, splitters, retrievers, parsers. LangGraph is control flow — nodes, edges, state, checkpointing. Either can be used without the other.
+**2.** LangChain is components -- loaders, splitters, retrievers, parsers. LangGraph is control flow -- nodes, edges, state, checkpointing. Either can be used without the other.
 
 **3.** It buys `.stream()`, `.batch()` and `.ainvoke()` for free on anything you compose, which makes concurrent batch runs one line. It costs visibility: inspecting a value mid-chain needs a `RunnableLambda` where plain code needs a `print`.
 
 **4.** Index your documents both ways and run the golden set against each. Adopt only if the numbers improve, or if they are equal and the maintenance saving is worth it.
 
-**5.** Citation verification, the budget system, and the permission model — plus the prompts. No framework provides them because they are specific to what you are building and what you consider unacceptable. Frameworks give plumbing; the product is yours.
+**5.** Citation verification, the budget system, and the permission model -- plus the prompts. No framework provides them because they are specific to what you are building and what you consider unacceptable. Frameworks give plumbing; the product is yours.

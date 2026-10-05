@@ -1,14 +1,14 @@
-# Day 17 — CrewAI
+# Day 17 -- CrewAI
 
-**Module:** 04 — Frameworks
+**Module:** 04 -- Frameworks
 **Time:** about 1 hour
-**Builds on:** Day 14 — multi-agent; Day 16 — LangGraph, for comparison
+**Builds on:** Day 14 -- multi-agent; Day 16 -- LangGraph, for comparison
 
 ---
 
 ## 1. Today in one line
 
-You rebuild your Day 14 team in CrewAI, and learn to tell an opinionated framework from a flexible one — because that choice matters more than either framework's feature list.
+You rebuild your Day 14 team in CrewAI, and learn to tell an opinionated framework from a flexible one -- because that choice matters more than either framework's feature list.
 
 ---
 
@@ -16,13 +16,13 @@ You rebuild your Day 14 team in CrewAI, and learn to tell an opinionated framewo
 
 Yesterday's LangGraph version required you to define state, nodes, edges and reducers. Full control, and a lot of scaffolding for something as common as "a researcher hands findings to a writer".
 
-That pattern is so standard it should not need a graph. CrewAI takes that view: describe a **team** — who they are, what they do, in what order — and it assembles the machinery.
+That pattern is so standard it should not need a graph. CrewAI takes that view: describe a **team** -- who they are, what they do, in what order -- and it assembles the machinery.
 
 Your Day 14 supervisor was about 120 lines. The CrewAI version is about 30.
 
 **The cost of that is control.** Yesterday you could see every edge. Today a great deal happens inside the framework, including prompts you did not write and cannot easily read. That is the trade, and today is about learning to feel it rather than being told about it.
 
-One practical note: **CrewAI is Python-only.** Which is fine — your AI side has been Python since Day 1, and Node is only doing the dashboard.
+One practical note: **CrewAI is Python-only.** Which is fine -- your AI side has been Python since Day 1, and Node is only doing the dashboard.
 
 ---
 
@@ -36,7 +36,7 @@ CrewAI: roles and responsibilities. You decide who does what, and hand over the 
 
 **Where this comparison breaks, and it is worth watching for:**
 
-**The org-chart metaphor invites you to anthropomorphise.** CrewAI has a field called `backstory`, and writing "You are a veteran analyst with 15 years in fintech" *feels* like creating a person. It is a string prepended to a prompt. Nothing more. Day 3 told you that role-setting shifts output style — that is real, and it is also all that is happening.
+**The org-chart metaphor invites you to anthropomorphise.** CrewAI has a field called `backstory`, and writing "You are a veteran analyst with 15 years in fintech" *feels* like creating a person. It is a string prepended to a prompt. Nothing more. Day 3 told you that role-setting shifts output style -- that is real, and it is also all that is happening.
 
 **Real teams get better because people learn.** Your crew does not. Every run starts from the same prompts. There is no accumulated judgement, no "she's good at that one", no growth. The org chart is a way of organising prompts, not an organisation.
 
@@ -48,13 +48,13 @@ Hold on to that and the framework is useful. Forget it and you will start attrib
 
 **Four concepts, and all four are things you already built.**
 
-**Agent** — a role, a goal, a backstory, tools, an LLM, and whether it may delegate. This is Day 14's specialist: `RESEARCHER` with its own system prompt and its own tool list.
+**Agent** -- a role, a goal, a backstory, tools, an LLM, and whether it may delegate. This is Day 14's specialist: `RESEARCHER` with its own system prompt and its own tool list.
 
-**Task** — a description, an `expected_output`, the agent responsible, and `context` (which earlier tasks feed it). This is one delegation call.
+**Task** -- a description, an `expected_output`, the agent responsible, and `context` (which earlier tasks feed it). This is one delegation call.
 
-**Crew** — the agents, the tasks, and a process: `sequential` (in order) or `hierarchical` (a manager delegates). This is your supervisor.
+**Crew** -- the agents, the tasks, and a process: `sequential` (in order) or `hierarchical` (a manager delegates). This is your supervisor.
 
-**Process** — `sequential` is Day 14's pipeline. `hierarchical` is Day 14's supervisor, with a manager LLM deciding who does what.
+**Process** -- `sequential` is Day 14's pipeline. `hierarchical` is Day 14's supervisor, with a manager LLM deciding who does what.
 
 **The field that matters most**
 
@@ -68,7 +68,7 @@ That is Day 3's format specification wearing a CrewAI name. Leave it vague and y
 
 **The field that matters second**
 
-`context=[previous_task]` is Day 14's handoff, made explicit. It controls what the next agent sees. You learned on Day 14 that the handoff is where context gets lost — this is the field where that loss happens, so it is the field to watch.
+`context=[previous_task]` is Day 14's handoff, made explicit. It controls what the next agent sees. You learned on Day 14 that the handoff is where context gets lost -- this is the field where that loss happens, so it is the field to watch.
 
 **What it does underneath**
 
@@ -105,7 +105,7 @@ llm = LLM(model="groq/llama-3.3-70b-versatile",
           api_key=os.environ["GROQ_API_KEY"])
 ```
 
-The `groq/` prefix matters — that is how the underlying router picks the provider.
+The `groq/` prefix matters -- that is how the underlying router picks the provider.
 
 ---
 
@@ -113,7 +113,7 @@ The `groq/` prefix matters — that is how the underlying router picks the provi
 
 ---
 
-### Stage 1 — Your Day 14 crew, in 30 lines
+### Stage 1 -- Your Day 14 crew, in 30 lines
 
 `crew_agent.py`:
 
@@ -177,7 +177,7 @@ if __name__ == "__main__":
     print(crew.kickoff())
 ```
 
-Run it. **Read the verbose output carefully** — this is the clearest view you will get of what the framework does.
+Run it. **Read the verbose output carefully** -- this is the clearest view you will get of what the framework does.
 
 **Then open `multi_agent.py` next to it.** Every idea maps:
 
@@ -190,11 +190,11 @@ Run it. **Read the verbose output carefully** — this is the clearest view you 
 | `supervise()` loop | `Crew` with `Process.sequential` |
 | "report what you could NOT find" | still yours, in the description |
 
-Note the last row. **That line was your discovery on Day 14** — without it, the writer treats silence as completeness and gaps vanish. No framework supplies it. The framework gives you structure; the quality lines are still yours to write.
+Note the last row. **That line was your discovery on Day 14** -- without it, the writer treats silence as completeness and gaps vanish. No framework supplies it. The framework gives you structure; the quality lines are still yours to write.
 
 ---
 
-### Stage 2 — Give it your tools
+### Stage 2 -- Give it your tools
 
 The researcher cannot search yet. Wire in your Day 12 pipeline:
 
@@ -228,7 +228,7 @@ researcher = Agent(
 
 ---
 
-### Stage 3 — Prove that `expected_output` is the lever
+### Stage 3 -- Prove that `expected_output` is the lever
 
 This is the stage that teaches the most about CrewAI.
 
@@ -254,13 +254,13 @@ Gaps: nothing found about the Q1 timeline."""
 
 The difference between A and C is large. Much larger than any change you could make to `backstory`.
 
-**That ratio is the lesson.** `backstory` feels like the important field because it reads like a character description. `expected_output` is the important field, because it is a format specification — Day 3, again, with a new name.
+**That ratio is the lesson.** `backstory` feels like the important field because it reads like a character description. `expected_output` is the important field, because it is a format specification -- Day 3, again, with a new name.
 
 If you are ever tuning a crew and getting nowhere, you are probably editing backstories. Go and edit the expected outputs.
 
 ---
 
-### Stage 4 — Hierarchical, and what it costs
+### Stage 4 -- Hierarchical, and what it costs
 
 ```python
 manager = LLM(model="groq/llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
@@ -294,7 +294,7 @@ Now agents can ask each other for help.
 
 ---
 
-### Stage 5 — Map it all back
+### Stage 5 -- Map it all back
 
 Fill this in yourself. It is the exercise, not the reference:
 
@@ -308,7 +308,7 @@ Fill this in yourself. It is the exercise, not the reference:
 | Orchestration | `supervise()` | edges | `Process` |
 | Tools | `TOOL_SCHEMAS` | `@tool` | `@tool` |
 | Step limit | `max_steps` | `recursion_limit` | `max_iter` |
-| Budget | `SharedBudget` | — | `max_rpm` |
+| Budget | `SharedBudget` | -- | `max_rpm` |
 
 **Look at the last two rows.** Neither framework gives you Day 9's three-way budget of steps, tokens and wall-clock time. You still have to build that yourself, and it is the thing that stops a runaway run costing real money.
 
@@ -316,7 +316,7 @@ Fill this in yourself. It is the exercise, not the reference:
 
 ---
 
-### Stage 6 — Open the box, and judge honestly
+### Stage 6 -- Open the box, and judge honestly
 
 **See what it actually sends:**
 
@@ -326,7 +326,7 @@ litellm.set_verbose = True
 crew.kickoff()
 ```
 
-Read the real prompts. You will find framework-written text around your descriptions — task wrappers, delegation instructions, output-format boilerplate. **Estimate how many tokens that adds per call**, then multiply by the number of calls in a run. That is your framework tax, and it is not small.
+Read the real prompts. You will find framework-written text around your descriptions -- task wrappers, delegation instructions, output-format boilerplate. **Estimate how many tokens that adds per call**, then multiply by the number of calls in a run. That is your framework tax, and it is not small.
 
 **Then run your Day 15 evals** against three implementations of the same task: hand-written Day 14, LangGraph, CrewAI.
 
@@ -409,27 +409,27 @@ Day 15's eval set against hand-written, LangGraph and CrewAI.
 
 ## 9. Traps
 
-**Trap 1 — the default OpenAI model**
+**Trap 1 -- the default OpenAI model**
 *Symptom:* an authentication error mentioning OpenAI when you configured Groq.
 *Fix:* pass `llm=` explicitly on every agent, with the `groq/` prefix.
 
-**Trap 2 — dependency conflicts**
+**Trap 2 -- dependency conflicts**
 *Symptom:* pip breaks your working environment.
 *Fix:* a separate virtual environment for CrewAI.
 
-**Trap 3 — the backstory trap**
+**Trap 3 -- the backstory trap**
 *Symptom:* hours spent writing richer personas, no improvement.
 *Fix:* edit `expected_output` and task descriptions instead.
 
-**Trap 4 — hierarchical by default**
+**Trap 4 -- hierarchical by default**
 *Symptom:* three times the cost for no gain.
 *Fix:* `sequential` unless the ordering genuinely cannot be decided in advance.
 
-**Trap 5 — delegation loops**
+**Trap 5 -- delegation loops**
 *Symptom:* agents delegating back and forth.
 *Fix:* `allow_delegation=False` unless needed, and set `max_iter`.
 
-**Trap 6 — assuming frameworks bring safety**
+**Trap 6 -- assuming frameworks bring safety**
 *Symptom:* your careful Day 9 budgets and Day 13 permission tiers quietly disappear when you port to a framework.
 *Fix:* keep them. `max_iter` and `max_rpm` are not a token budget, a wall-clock limit, or a permission model. Frameworks give structure, not operational safety.
 
@@ -448,7 +448,7 @@ Day 15's eval set against hand-written, LangGraph and CrewAI.
 ## 11. Where this goes
 
 - **Day 18** builds the research agent for real, and you choose your approach with the three-way eval numbers in hand.
-- **Day 19 (LangChain)** is the layer under LangGraph — document loaders, splitters, retrievers — some of which would have saved you time on Days 5 and 6, and some of which is a wrapper you do not need.
+- **Day 19 (LangChain)** is the layer under LangGraph -- document loaders, splitters, retrievers -- some of which would have saved you time on Days 5 and 6, and some of which is a wrapper you do not need.
 - **Day 20** deploys it. Framework choice matters here: LangGraph's checkpointing is built for it, CrewAI less so.
 - **Day 21** is the capstone, and cost per task is a real constraint. A framework tax of 60% more tokens is a business decision, not a detail.
 
@@ -542,12 +542,12 @@ Known problems, left for later:
 
 ## Answers
 
-**1.** `Agent` is your specialist worker with its own system prompt and tool list. `Task` is one delegation call. `context=[...]` is the `findings` string handed between agents. `Process` is the `supervise()` loop — sequential is your pipeline, hierarchical is your supervisor with a manager model.
+**1.** `Agent` is your specialist worker with its own system prompt and tool list. `Task` is one delegation call. `context=[...]` is the `findings` string handed between agents. `Process` is the `supervise()` loop -- sequential is your pipeline, hierarchical is your supervisor with a manager model.
 
-**2.** `expected_output` has the biggest effect, because it is a format specification that goes into the prompt. `backstory` only appears to matter — it reads like a character description but is a mild style nudge.
+**2.** `expected_output` has the biggest effect, because it is a format specification that goes into the prompt. `backstory` only appears to matter -- it reads like a character description but is a mild style nudge.
 
 **3.** Worth it when the order of work genuinely cannot be decided in advance, so a manager must assign it at runtime. Waste when you already know the sequence, because sequential does the same job at a fraction of the token cost.
 
 **4.** A real budget across steps, tokens and wall-clock time (Day 9), and a permission model separating read-only from write tools (Day 13). `max_iter` and `max_rpm` are not substitutes. You keep building these yourself.
 
-**5.** CrewAI, if it really is just research-then-write and you want it today — that is exactly the shape it is built for and it is about thirty lines. If it needs to persist across restarts, or branch, or pause for approval, LangGraph instead.
+**5.** CrewAI, if it really is just research-then-write and you want it today -- that is exactly the shape it is built for and it is about thirty lines. If it needs to persist across restarts, or branch, or pause for approval, LangGraph instead.

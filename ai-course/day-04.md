@@ -1,8 +1,8 @@
-# Day 4 — AI Tools: Teach Your AI Assistant to Use Tools
+# Day 4 -- AI Tools: Teach Your AI Assistant to Use Tools
 
-**Module:** 01 — Build the Foundation
+**Module:** 01 -- Build the Foundation
 **Time:** about 1 hour (this is the biggest day so far)
-**Builds on:** Day 3 — `prompts.py`, JSON output, `chat.py` with memory
+**Builds on:** Day 3 -- `prompts.py`, JSON output, `chat.py` with memory
 
 ---
 
@@ -22,7 +22,7 @@ You: What is 8472 multiplied by 391?
 You: Save this to a file called notes.txt
 ```
 
-Watch what happens. For the date, it either refuses or gives you a date from its training period as if it were today. For the multiplication, it produces a confident number that is very often wrong. For the file, it either refuses or — worse — says "Done! I've saved that for you." No file exists.
+Watch what happens. For the date, it either refuses or gives you a date from its training period as if it were today. For the multiplication, it produces a confident number that is very often wrong. For the file, it either refuses or -- worse -- says "Done! I've saved that for you." No file exists.
 
 **It is not lying.** It has no clock, no calculator and no hands. It is guessing what the answer would look like, because guessing what text comes next is the only thing it does. The answer to `8472 * 391` *looks* like a seven-digit number, so it produces a seven-digit number.
 
@@ -51,7 +51,7 @@ Two things follow, and both are mistakes people make on this exact day:
 
 **Every tool use needs at least two conversations with the model.** Once to receive the request. Once more, after you have the result, to get the actual answer. Two API calls for one question.
 
-**Where this comparison breaks:** a real consultant knows what is on the menu and knows what is not. The model will sometimes ignore an obvious tool, sometimes use the wrong one, and sometimes invent a value for a field you did not fill in. Choosing correctly is driven by your tool **descriptions** — which are prompts, which means everything from Day 3 applies here.
+**Where this comparison breaks:** a real consultant knows what is on the menu and knows what is not. The model will sometimes ignore an obvious tool, sometimes use the wrong one, and sometimes invent a value for a field you did not fill in. Choosing correctly is driven by your tool **descriptions** -- which are prompts, which means everything from Day 3 applies here.
 
 ---
 
@@ -61,7 +61,7 @@ Follow one question all the way through. This is the most important section of t
 
 **You ask:** "What time is it in Tokyo?"
 
-**Step 1 — you send messages plus a menu.**
+**Step 1 -- you send messages plus a menu.**
 
 Same call as always, one new parameter:
 
@@ -70,9 +70,9 @@ messages = [system, user: "What time is it in Tokyo?"]
 tools    = [ description of get_current_time, description of calculate ]
 ```
 
-The `tools` list is written in JSON Schema — a standard way to describe a function's name, purpose and inputs.
+The `tools` list is written in JSON Schema -- a standard way to describe a function's name, purpose and inputs.
 
-**Step 2 — the model replies with a request, not an answer.**
+**Step 2 -- the model replies with a request, not an answer.**
 
 ```
 finish_reason = "tool_calls"          <- not "stop"
@@ -92,7 +92,7 @@ Three things worth staring at:
 
 Notice the model turned "Tokyo" into `"Asia/Tokyo"` on its own. Nobody told it the timezone format. That kind of translation is what makes this feel like magic, and it is also where it silently gets things wrong.
 
-**Step 3 — your code runs the function.**
+**Step 3 -- your code runs the function.**
 
 ```
 result = get_current_time(timezone="Asia/Tokyo")
@@ -101,7 +101,7 @@ result = get_current_time(timezone="Asia/Tokyo")
 
 Plain Python. No AI involved. It is just a function call.
 
-**Step 4 — you send everything back.**
+**Step 4 -- you send everything back.**
 
 Now the history must contain **two** new messages:
 
@@ -116,7 +116,7 @@ messages = [
 
 The assistant message must be added even though it has no text. The API requires every `tool` message to follow the assistant message that requested it, matched by `tool_call_id`. Leave it out and you get a hard error.
 
-**Step 5 — second call, and now you get words.**
+**Step 5 -- second call, and now you get words.**
 
 ```
 finish_reason = "stop"
@@ -153,7 +153,7 @@ mkdir -p notes
 
 ---
 
-### Stage 1 — Write the functions first, with no AI at all
+### Stage 1 -- Write the functions first, with no AI at all
 
 Put this in `tools.py`. It is ordinary Python. Test it by itself before the model ever sees it.
 
@@ -236,7 +236,7 @@ Day 13 is largely about this. Today you just build the habit.
 
 ---
 
-### Stage 2 — Describe the tools for the model
+### Stage 2 -- Describe the tools for the model
 
 The model cannot see your code. It only sees descriptions. Add to `tools.py`:
 
@@ -302,15 +302,15 @@ AVAILABLE_TOOLS = {
 
 **This is Day 3 all over again.** Every description is a prompt. Look at what the good ones do:
 
-- `"Use this whenever the user asks..."` — tells it *when*, not just what. The most common weakness in tool descriptions is describing the function and forgetting to say when to reach for it.
-- `"even easy ones, because you cannot do arithmetic reliably yourself"` — tells it about its own weakness. Without this line, models confidently do arithmetic themselves and get it wrong.
+- `"Use this whenever the user asks..."` -- tells it *when*, not just what. The most common weakness in tool descriptions is describing the function and forgetting to say when to reach for it.
+- `"even easy ones, because you cannot do arithmetic reliably yourself"` -- tells it about its own weakness. Without this line, models confidently do arithmetic themselves and get it wrong.
 - The `timezone` description gives an actual format and examples. Without that, you get `"Tokyo"` or `"JST"` and your function fails.
 
 `AVAILABLE_TOOLS` is a plain dictionary mapping names to real functions. When the model asks for `"calculate"`, this is how your code finds the function to run. It is sometimes called a **registry** or **dispatcher**, and it is just a dict.
 
 ---
 
-### Stage 3 — Look at the request before running anything
+### Stage 3 -- Look at the request before running anything
 
 Do not wire it up yet. First, see what the model actually sends back.
 
@@ -358,7 +358,7 @@ Try `"What is 8472 * 391?"` and confirm it reaches for `calculate` rather than g
 
 ---
 
-### Stage 4 — Complete the loop
+### Stage 4 -- Complete the loop
 
 Now run the function and send the result back. Add to `tool_test.py`:
 
@@ -406,10 +406,10 @@ else:
 
 **The four lines that matter:**
 
-- `message.model_dump(exclude_none=True)` — turns the response object into a plain dictionary. **Do not skip this.** Your Day 2 code saves history with `json.dump`, and the raw object cannot be saved to JSON. This one line prevents a confusing crash later.
-- `json.loads(call.function.arguments)` — arguments arrive as a JSON **string**. Without this, `**arguments` fails.
-- `AVAILABLE_TOOLS[name](**arguments)` — look up the function, unpack the dictionary into keyword arguments. `{"timezone": "Asia/Tokyo"}` becomes `timezone="Asia/Tokyo"`.
-- `"tool_call_id": call.id` — links your result to the exact request. With several tools in one turn, this is how the model knows which result is which.
+- `message.model_dump(exclude_none=True)` -- turns the response object into a plain dictionary. **Do not skip this.** Your Day 2 code saves history with `json.dump`, and the raw object cannot be saved to JSON. This one line prevents a confusing crash later.
+- `json.loads(call.function.arguments)` -- arguments arrive as a JSON **string**. Without this, `**arguments` fails.
+- `AVAILABLE_TOOLS[name](**arguments)` -- look up the function, unpack the dictionary into keyword arguments. `{"timezone": "Asia/Tokyo"}` becomes `timezone="Asia/Tokyo"`.
+- `"tool_call_id": call.id` -- links your result to the exact request. With several tools in one turn, this is how the model knows which result is which.
 
 Run it. Something like:
 
@@ -418,11 +418,11 @@ Run it. Something like:
 It's currently 9:42 PM on Tuesday, 15 September 2026 in Tokyo.
 ```
 
-**Your AI just did something real.** Pause on that for a moment — it is a bigger step than it looks.
+**Your AI just did something real.** Pause on that for a moment -- it is a bigger step than it looks.
 
 ---
 
-### Stage 5 — Put it into the real assistant
+### Stage 5 -- Put it into the real assistant
 
 Now move it into `chat.py`, where memory lives.
 
@@ -495,7 +495,7 @@ And change the main loop:
     print(f"\nAssistant: {answer}\n")
 ```
 
-**Notice the error handling.** Every failure turns into a string that goes back to the model rather than crashing your program. The model can then recover — "that timezone wasn't recognised, did you mean Asia/Tokyo?" A crash gives the user nothing.
+**Notice the error handling.** Every failure turns into a string that goes back to the model rather than crashing your program. The model can then recover -- "that timezone wasn't recognised, did you mean Asia/Tokyo?" A crash gives the user nothing.
 
 **One line here has a bug waiting in it.** `trim_history` can cut the list between an assistant message with `tool_calls` and its matching `tool` message. The API rejects that with an error about an orphaned tool call. It will not happen in your first few tests, and it will happen eventually. Fix: raise `MAX_HISTORY` to 20 for now, and note it for Day 11, where history gets handled properly.
 
@@ -508,11 +508,11 @@ You: What time is it in Tokyo, and what is 8472 * 391?
 Assistant: It's 9:47 PM on Tuesday in Tokyo, and 8472 x 391 = 3,312,552.
 ```
 
-Two tools, one turn. The `for` loop over `message.tool_calls` already handled that — you did not write anything special for it.
+Two tools, one turn. The `for` loop over `message.tool_calls` already handled that -- you did not write anything special for it.
 
 ---
 
-### Stage 6 — The thing that is still missing
+### Stage 6 -- The thing that is still missing
 
 Try this:
 
@@ -520,7 +520,7 @@ Try this:
 You: Save a note with today's date in it.
 ```
 
-Watch carefully. It will usually call `get_current_time`, then stop, and tell you the time — without ever calling `save_note`.
+Watch carefully. It will usually call `get_current_time`, then stop, and tell you the time -- without ever calling `save_note`.
 
 **Why?** Your code runs tools exactly once, then asks for a final answer. It never gives the model a chance to say "good, now I need a second tool, using that result".
 
@@ -543,7 +543,7 @@ Removing that ceiling takes one `while` loop, and it is called an agent. **That 
 | **finish_reason** | Why the model stopped. `stop` = answered. `tool_calls` = asked for a tool. |
 | **Registry / dispatcher** | The dict mapping tool names to real functions. |
 | **Parallel tool calls** | Several tools requested in one turn. |
-| **Side effect** | A tool that changes something — writes a file, sends an email. Needs more care. |
+| **Side effect** | A tool that changes something -- writes a file, sends an email. Needs more care. |
 | **Hallucinated arguments** | The model inventing a value for something the user never said. |
 | **tool_choice** | A setting to force, forbid or free the use of tools. |
 
@@ -585,29 +585,29 @@ Delete the `messages.append(message.model_dump(...))` line. Run anything that us
 
 ## 9. Traps
 
-**Trap 1 — thinking the model runs your code**
+**Trap 1 -- thinking the model runs your code**
 *Symptom:* confusion about why nothing happened.
 *Reality:* the model only ever produces text describing a request. If your code does not run the function, nothing runs.
 
-**Trap 2 — arguments are a string, not a dict**
+**Trap 2 -- arguments are a string, not a dict**
 *Symptom:* `TypeError: argument after ** must be a mapping, not str`.
 *Fix:* `json.loads(call.function.arguments)`. Everyone hits this once.
 
-**Trap 3 — appending the raw object to history**
+**Trap 3 -- appending the raw object to history**
 *Symptom:* `TypeError: Object of type ChatCompletionMessage is not JSON serializable` when `save_history` runs. Confusing, because it happens in Day 2 code you have not touched.
 *Fix:* `message.model_dump(exclude_none=True)`.
 
-**Trap 4 — trimming that splits a tool pair**
+**Trap 4 -- trimming that splits a tool pair**
 *Symptom:* an API error about an assistant message with `tool_calls` not being followed by tool responses. Appears randomly in long chats.
 *Cause:* `trim_history` cut between the request and its result.
 *Fix:* keep more history for now; handle it properly on Day 11.
 
-**Trap 5 — trusting the arguments**
+**Trap 5 -- trusting the arguments**
 *Symptom:* nothing, for a long time. Then a file written where it should not be, or a query doing something unexpected.
 *Cause:* a tool argument used directly without checking.
 *Fix:* validate inside the function, always. `save_note` cleaning the title is not decoration.
 
-**Trap 6 — tool name not in the registry**
+**Trap 6 -- tool name not in the registry**
 *Symptom:* `KeyError` and a dead program.
 *Cause:* you added a schema but forgot the `AVAILABLE_TOOLS` entry. The model can request a name you never wired up.
 *Fix:* the `if name not in AVAILABLE_TOOLS` check above.
@@ -616,7 +616,7 @@ Delete the `messages.append(message.model_dump(...))` line. Run anything that us
 
 ## 10. Check yourself
 
-1. Who runs the function — the model or your code? What does the model actually produce?
+1. Who runs the function -- the model or your code? What does the model actually produce?
 2. Why does one tool question need at least two API calls?
 3. What is `tool_call_id` for, and when would things break without it?
 4. Your arithmetic tool is described as "A calculator." What goes wrong, and why is that a Day 3 problem?
@@ -701,10 +701,10 @@ Known problems, left on purpose for later:
 
 **1.** Your code runs it. The model only produces text: a request naming a function and giving arguments. It has no ability to execute anything.
 
-**2.** The first call returns a request, not an answer — `content` is empty. Only after you run the tool and send the result back can the model write a reply using it.
+**2.** The first call returns a request, not an answer -- `content` is empty. Only after you run the tool and send the result back can the model write a reply using it.
 
 **3.** It links each result to the request that asked for it. With several tools in one turn, without matching ids the model cannot tell which result belongs to which call. The API also rejects a `tool` message whose id does not match a preceding request.
 
 **4.** It stops telling the model *when* to use the tool, so the model falls back on doing arithmetic itself and gets it wrong. It is a Day 3 problem because a tool description is a prompt, and the same rules apply: be specific, say when, and name the model's weakness directly.
 
-**5.** Because your code runs tools once and then asks for a final answer. It gets the time, and never gets a second chance to call `save_note` with it. The fix is a `while` loop that keeps going until the model stops asking for tools — which is Day 7.
+**5.** Because your code runs tools once and then asks for a final answer. It gets the time, and never gets a second chance to call `save_note` with it. The fix is a `while` loop that keeps going until the model stops asking for tools -- which is Day 7.

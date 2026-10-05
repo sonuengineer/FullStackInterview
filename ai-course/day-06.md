@@ -1,8 +1,8 @@
-# Day 6 — Build Your First RAG System
+# Day 6 -- Build Your First RAG System
 
-**Module:** 02 — AI Agents
+**Module:** 02 -- AI Agents
 **Time:** about 1 hour, plus a slow first install
-**Builds on:** Day 5 — chunking, grounding, `search_documents`
+**Builds on:** Day 5 -- chunking, grounding, `search_documents`
 
 ---
 
@@ -14,7 +14,7 @@ You replace one function from yesterday, and your assistant starts finding thing
 
 ## 2. The problem
 
-Open the list of synonym failures you wrote down yesterday. If you skipped that, do it now — ask five questions using different words from the ones in your documents. You need these, because today is only satisfying if you watch them flip.
+Open the list of synonym failures you wrote down yesterday. If you skipped that, do it now -- ask five questions using different words from the ones in your documents. You need these, because today is only satisfying if you watch them flip.
 
 ```
 Document says: "revenue"        You asked: "earnings"       -> nothing found
@@ -26,7 +26,7 @@ Yesterday's search compares letters. `revenue` and `earnings` share no words, so
 
 What you need is a way to measure whether two pieces of text *mean* the same thing, without caring which words were used. That sounds like it should be hard. It turns out to be about thirty lines of code, and it is the single highest-value technique in this entire course.
 
-It is called **RAG** — Retrieval Augmented Generation. A long name for a simple idea: find the right text, then hand it to the model.
+It is called **RAG** -- Retrieval Augmented Generation. A long name for a simple idea: find the right text, then hand it to the model.
 
 ---
 
@@ -34,11 +34,11 @@ It is called **RAG** — Retrieval Augmented Generation. A long name for a simpl
 
 **Imagine a huge map, where every sentence ever written has a position on it.**
 
-Sentences about money sit in one region. Sentences about cooking sit far away. And crucially, "our revenue grew 12%" and "our earnings rose 12%" sit almost on top of each other — because the map is organised by meaning, not by spelling.
+Sentences about money sit in one region. Sentences about cooking sit far away. And crucially, "our revenue grew 12%" and "our earnings rose 12%" sit almost on top of each other -- because the map is organised by meaning, not by spelling.
 
 To search, you put your **question** on the same map and look at what is nearby.
 
-That is the entire idea. An **embedding** is just the coordinates of a piece of text on that map. Instead of two numbers like latitude and longitude, it uses a few hundred — but it is the same kind of thing: a position, where closeness means similarity.
+That is the entire idea. An **embedding** is just the coordinates of a piece of text on that map. Instead of two numbers like latitude and longitude, it uses a few hundred -- but it is the same kind of thing: a position, where closeness means similarity.
 
 **Where this comparison breaks, and it matters:**
 
@@ -46,7 +46,7 @@ That is the entire idea. An **embedding** is just the coordinates of a piece of 
 
 **The map was drawn by someone else.** The positions come from a model trained on a big pile of internet text. Your company's internal jargon may sit in a strange place. A product code means nothing to it.
 
-**Exact things get worse, not better.** Invoice number `INV-2024-8871` has a meaning-position, but so does `INV-2024-8872`, and they are nearly identical. Yesterday's keyword search finds an exact code perfectly. Today's cannot. This is why serious systems run both — which is Day 12.
+**Exact things get worse, not better.** Invoice number `INV-2024-8871` has a meaning-position, but so does `INV-2024-8872`, and they are nearly identical. Yesterday's keyword search finds an exact code perfectly. Today's cannot. This is why serious systems run both -- which is Day 12.
 
 ---
 
@@ -54,7 +54,7 @@ That is the entire idea. An **embedding** is just the coordinates of a piece of 
 
 Four steps. Only step 3 is new; the rest you built yesterday.
 
-**Step 1 — Turn text into numbers (embedding).**
+**Step 1 -- Turn text into numbers (embedding).**
 
 You run each chunk through an **embedding model**. It gives back a list of numbers:
 
@@ -64,13 +64,13 @@ You run each chunk through an **embedding model**. It gives back a list of numbe
 
 This is a different model from your chat model. It does not talk. It only converts text into a position. It is small, so it runs on your own laptop, free, with no rate limits at all. That matters: you may need to embed thousands of chunks, and doing that through an API would eat your whole free tier.
 
-The size — 384 numbers — is the **dimensions**. Think of it as a map with 384 directions instead of two. You cannot picture it, and you do not need to. The maths works the same.
+The size -- 384 numbers -- is the **dimensions**. Think of it as a map with 384 directions instead of two. You cannot picture it, and you do not need to. The maths works the same.
 
-**Step 2 — Store the numbers.**
+**Step 2 -- Store the numbers.**
 
 Embedding is slow-ish. You do it once and save the result. That store is a **vector store**.
 
-**Step 3 — Measure closeness (cosine similarity).**
+**Step 3 -- Measure closeness (cosine similarity).**
 
 Given two lists of numbers, how close are they? The standard measure is **cosine similarity**, which gives a number from -1 to 1:
 
@@ -81,9 +81,9 @@ Given two lists of numbers, how close are they? The standard measure is **cosine
 0.0   unrelated
 ```
 
-Here is what it does, in plain words: it ignores how *long* the two lists are and only asks whether they **point in the same direction**. That is why a one-line note and a whole paragraph about the same topic still score as similar — length does not distort it.
+Here is what it does, in plain words: it ignores how *long* the two lists are and only asks whether they **point in the same direction**. That is why a one-line note and a whole paragraph about the same topic still score as similar -- length does not distort it.
 
-**Step 4 — Send the closest chunks to the model.**
+**Step 4 -- Send the closest chunks to the model.**
 
 Exactly like yesterday. Same grounding prompt, same citations, same `I don't know.` rule. Nothing there changes.
 
@@ -118,7 +118,7 @@ pip freeze > requirements.txt
 
 ---
 
-### Stage 1 — Look at an embedding
+### Stage 1 -- Look at an embedding
 
 Make `embeddings.py`:
 
@@ -142,15 +142,15 @@ Run it. First time, it downloads the model. Then:
 [ 0.0213 -0.1184  0.3341 -0.0072  0.0918  0.1457 -0.2201  0.0339]
 ```
 
-**That is it.** That is what an embedding is. A list of 384 numbers. There is nothing hidden — no text stored inside, no dictionary, no magic. Just a position.
+**That is it.** That is what an embedding is. A list of 384 numbers. There is nothing hidden -- no text stored inside, no dictionary, no magic. Just a position.
 
 Look at those numbers for a moment. They mean nothing individually. No single number is "the money number". The meaning is spread across all 384, which is why you can never inspect them and understand why something matched. This is a real limitation, and it is worth knowing early.
 
-`all-MiniLM-L6-v2` is the standard starting model: small, fast, good enough, works on a plain laptop CPU. There are better ones and you can swap later — but if you swap, you must re-embed everything, because the map changes.
+`all-MiniLM-L6-v2` is the standard starting model: small, fast, good enough, works on a plain laptop CPU. There are better ones and you can swap later -- but if you swap, you must re-embed everything, because the map changes.
 
 ---
 
-### Stage 2 — Measure closeness yourself
+### Stage 2 -- Measure closeness yourself
 
 Before using a library that hides it, compute similarity by hand once.
 
@@ -190,13 +190,13 @@ Line 1: **0.81 between revenue and earnings.** Yesterday this scored zero. That 
 
 Line 3: 0.62 between a statement and a question that shares no meaningful words. The map understands what the question is *asking for*.
 
-Line 4: **0.71 between love and hate.** This is the warning from section 3, and here it is in your own terminal. Opposites are close, because they are about the same thing in the same shape. Retrieval finds relevant text — it does not find *correct* text. The model still has to read it and work out what it says.
+Line 4: **0.71 between love and hate.** This is the warning from section 3, and here it is in your own terminal. Opposites are close, because they are about the same thing in the same shape. Retrieval finds relevant text -- it does not find *correct* text. The model still has to read it and work out what it says.
 
-**The maths, briefly.** `np.dot(a, b)` multiplies the lists together and sums the result — big when they point the same way. Dividing by both lengths (`np.linalg.norm`) removes the effect of size, leaving only direction. Three lines, and it is the engine under every vector database on earth.
+**The maths, briefly.** `np.dot(a, b)` multiplies the lists together and sums the result -- big when they point the same way. Dividing by both lengths (`np.linalg.norm`) removes the effect of size, leaving only direction. Three lines, and it is the engine under every vector database on earth.
 
 ---
 
-### Stage 3 — Search your own documents by meaning
+### Stage 3 -- Search your own documents by meaning
 
 Now replace yesterday's keyword search. Add to `embeddings.py`:
 
@@ -257,8 +257,8 @@ if __name__ == "__main__":
 **The parts worth understanding:**
 
 - `encode(_chunks)` with a **list** embeds them all in one batch. Far faster than one at a time.
-- `np.dot(_vectors, question_vector)` — one line comparing your question against *every* chunk at once. `_vectors` is a grid of 384-number rows; numpy multiplies the whole grid in a single operation. This is why vector search stays fast with thousands of chunks.
-- `np.argsort(scores)[::-1][:top_n]` — sort positions by score, reverse for highest first, take the top few.
+- `np.dot(_vectors, question_vector)` -- one line comparing your question against *every* chunk at once. `_vectors` is a grid of 384-number rows; numpy multiplies the whole grid in a single operation. This is why vector search stays fast with thousands of chunks.
+- `np.argsort(scores)[::-1][:top_n]` -- sort positions by score, reverse for highest first, take the top few.
 - Returning the **score alongside the chunk**. Do not hide it. You want to see when your best match scored 0.21 and is probably rubbish.
 
 Run it, and **go through your five synonym failures from yesterday, one by one.**
@@ -268,11 +268,11 @@ Search: what were the earnings?
 [0.734] [From: report.pdf] [Page 2] Revenue for the quarter grew...
 ```
 
-There it is. Same document, same chunking, same everything — one function replaced, and the wall is gone.
+There it is. Same document, same chunking, same everything -- one function replaced, and the wall is gone.
 
 ---
 
-### Stage 4 — Stop re-embedding every time
+### Stage 4 -- Stop re-embedding every time
 
 Restart your script. It embeds everything again. With 500 chunks that is a minute of waiting, every single run.
 
@@ -331,18 +331,18 @@ if __name__ == "__main__":
 
 **What Chroma is doing for you:**
 
-- `PersistentClient(path="./chroma_db")` — writes to disk. Restart and your embeddings are still there.
-- `embedding_function` — Chroma calls the same model for you, so you pass text in and text out. **This is also a safety feature**: the collection remembers which model it was built with, so you cannot accidentally mix two maps.
-- `upsert` rather than `add` — running it twice updates instead of creating duplicates. `add` would give you every chunk twice, and your search results would come back in pairs.
-- `ids=f"{name}::{number}"` — stable ids. Re-index after editing a file and the chunks are replaced, not duplicated.
-- `metadatas` — extra information travelling with each chunk. You are only storing the filename now; on Day 12 this is how you filter by date, author or document type.
-- `1 - distance` — Chroma returns *distance* (smaller is closer), not similarity. Flipping it keeps the "higher is better" feel of Stage 3. Getting this backwards is a very common and very confusing bug.
+- `PersistentClient(path="./chroma_db")` -- writes to disk. Restart and your embeddings are still there.
+- `embedding_function` -- Chroma calls the same model for you, so you pass text in and text out. **This is also a safety feature**: the collection remembers which model it was built with, so you cannot accidentally mix two maps.
+- `upsert` rather than `add` -- running it twice updates instead of creating duplicates. `add` would give you every chunk twice, and your search results would come back in pairs.
+- `ids=f"{name}::{number}"` -- stable ids. Re-index after editing a file and the chunks are replaced, not duplicated.
+- `metadatas` -- extra information travelling with each chunk. You are only storing the filename now; on Day 12 this is how you filter by date, author or document type.
+- `1 - distance` -- Chroma returns *distance* (smaller is closer), not similarity. Flipping it keeps the "higher is better" feel of Stage 3. Getting this backwards is a very common and very confusing bug.
 
 Add `chroma_db/` to your `.gitignore`.
 
 ---
 
-### Stage 5 — Plug it into the assistant
+### Stage 5 -- Plug it into the assistant
 
 One function changes in `tools.py`. That is all.
 
@@ -371,13 +371,13 @@ Now update the tool description, because yesterday's had an apology built into i
 
 **Delete that old line** begging the model to use the document's own vocabulary. It is not needed any more. That deletion is the clearest possible sign of what you built today.
 
-**About that `0.25` threshold.** It is a guess, and you should treat it as one. Similarity scores are relative, not absolute — there is no universal number above which a match is "good". The right threshold depends on your documents, your chunk size and your embedding model. Find yours by printing scores for questions you know the answers to, and questions you know are unanswerable, then picking a line between them. Doing this properly is part of Day 12.
+**About that `0.25` threshold.** It is a guess, and you should treat it as one. Similarity scores are relative, not absolute -- there is no universal number above which a match is "good". The right threshold depends on your documents, your chunk size and your embedding model. Find yours by printing scores for questions you know the answers to, and questions you know are unanswerable, then picking a line between them. Doing this properly is part of Day 12.
 
 Run `chat.py` and ask about your documents using completely different wording from the files. It finds them.
 
 ---
 
-### Stage 6 — Find where it still fails
+### Stage 6 -- Find where it still fails
 
 You have built something genuinely useful. Now go and find its edges, before they find you.
 
@@ -397,9 +397,9 @@ Try these four:
 
 **None of these are bugs in your code.** They are the honest limits of simple RAG, and every one of them has a name and a fix:
 
-- Exact codes → **hybrid search**, running keyword and vector together (Day 12)
-- Counting and comparing → the **agent** deciding to search several times (Day 7, three days' work away)
-- Better ranking → **re-ranking** (Day 12)
+- Exact codes -> **hybrid search**, running keyword and vector together (Day 12)
+- Counting and comparing -> the **agent** deciding to search several times (Day 7, three days' work away)
+- Better ranking -> **re-ranking** (Day 12)
 
 Write these four failures down, the same way you wrote down the synonym failures yesterday. You will re-test them on Day 12.
 
@@ -462,33 +462,33 @@ Keep both `search_chunks` and `semantic_search`. Run ten questions through each 
 
 ## 9. Traps
 
-**Trap 1 — two maps, no error**
+**Trap 1 -- two maps, no error**
 *Symptom:* search returns confident nonsense.
 *Cause:* query and documents embedded with different models.
 *Fix:* one model, defined in one place. Let Chroma hold it.
 
-**Trap 2 — distance read as similarity**
+**Trap 2 -- distance read as similarity**
 *Symptom:* your worst results rank first.
 *Cause:* Chroma returns distance; small is good. If you sort as if bigger is better, you get it exactly backwards.
 *Fix:* convert once, at the boundary, as in `search()`.
 
-**Trap 3 — duplicate chunks**
+**Trap 3 -- duplicate chunks**
 *Symptom:* the same passage appears three times in your results, crowding out everything else.
 *Cause:* `add` instead of `upsert`, or unstable ids, run repeatedly.
 *Fix:* `upsert` with stable `filename::number` ids.
 
-**Trap 4 — re-embedding on every start**
+**Trap 4 -- re-embedding on every start**
 *Symptom:* a minute of waiting each run, and it gets worse as documents grow.
 *Fix:* `PersistentClient`. Index when documents change, not when the program starts.
 
-**Trap 5 — a threshold that does not travel**
+**Trap 5 -- a threshold that does not travel**
 *Symptom:* `0.25` works beautifully on your documents and badly on someone else's.
 *Cause:* scores are relative to your data and your model.
 *Fix:* measure it. Print scores for known-good and known-bad questions, and set the line between them. Re-measure whenever you change model or chunk size.
 
-**Trap 6 — assuming retrieval is the answer**
+**Trap 6 -- assuming retrieval is the answer**
 *Symptom:* a fluent, wrong answer, with a citation attached.
-*Cause:* the top chunk was about the right topic but said something different — see experiment 1.
+*Cause:* the top chunk was about the right topic but said something different -- see experiment 1.
 *Fix:* keep the grounding prompt from Day 5, keep the citations, and open the source occasionally to check. An unverified citation is decoration.
 
 ---
@@ -506,7 +506,7 @@ Keep both `search_chunks` and `semantic_search`. Run ten questions through each 
 ## 11. Where this goes
 
 - **Day 7 is tomorrow and it is the big one.** Right now your assistant searches *once* and answers. An agent can search, read the result, notice it is missing something, and search again with better words. Several of today's failures are fixed not by better retrieval but by *repeated* retrieval.
-- **Day 11** uses embeddings on conversation history — remembering what matters instead of what is recent. The exact problem you hit on Day 2.
+- **Day 11** uses embeddings on conversation history -- remembering what matters instead of what is recent. The exact problem you hit on Day 2.
 - **Day 12** is this day done properly: hybrid search, re-ranking, better chunking, metadata filtering, and measuring retrieval quality instead of guessing.
 - **Day 18 and 21** build the research platform on top of this. The vector store you created today is a real piece of the capstone.
 
@@ -583,11 +583,11 @@ Known problems, written down to re-test on Day 12:
 
 ## Answers
 
-**1.** A list of numbers — 384 of them with this model — describing where a piece of text sits on a map of meaning. Nothing is stored inside it: no words, no dictionary. Just a position, where closeness means similar meaning.
+**1.** A list of numbers -- 384 of them with this model -- describing where a piece of text sits on a map of meaning. Nothing is stored inside it: no words, no dictionary. Just a position, where closeness means similar meaning.
 
 **2.** Because each model draws its own map. A position on one map compared to a position on another is meaningless. It produces no error, just quietly wrong results, which makes it one of the nastier bugs to find.
 
-**3.** Because the map measures what text is *about* and how it is shaped, more than what it claims. Both sentences concern the same product in the same form. It tells you retrieval finds relevant passages, not correct ones — working out what the passage actually says is still the model's job.
+**3.** Because the map measures what text is *about* and how it is shaped, more than what it claims. Both sentences concern the same product in the same form. It tells you retrieval finds relevant passages, not correct ones -- working out what the passage actually says is still the model's job.
 
 **4.** Because indexing means embedding thousands of chunks, and an API would burn your entire free tier doing it. The embedding model is small enough to run on a normal CPU, so it is free, unlimited and instant after the first download.
 

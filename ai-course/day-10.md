@@ -1,14 +1,14 @@
-# Day 10 — Advanced Agent Planning
+# Day 10 -- Advanced Agent Planning
 
-**Module:** 03 — Advanced Agent Systems
+**Module:** 03 -- Advanced Agent Systems
 **Time:** about 1 hour
-**Builds on:** Day 7 — the loop; Day 9 — budgets and verification; Day 3 — JSON output
+**Builds on:** Day 7 -- the loop; Day 9 -- budgets and verification; Day 3 -- JSON output
 
 ---
 
 ## 1. Today in one line
 
-Your agent writes down what it intends to do *before* doing it — and you find out that the plan matters less than the ability to change it.
+Your agent writes down what it intends to do *before* doing it -- and you find out that the plan matters less than the ability to change it.
 
 ---
 
@@ -29,7 +29,7 @@ Watch it. You will see some of these:
 
 Nothing there is a bug. It is what one-step-at-a-time thinking looks like on a task with structure.
 
-There is a second problem, which matters more in practice. **You cannot approve a plan you were never shown.** On Day 9 you could approve twenty individual actions, which is not approval — it is twenty interruptions. Being able to read "here are the six things I intend to do" and say yes once is a completely different experience.
+There is a second problem, which matters more in practice. **You cannot approve a plan you were never shown.** On Day 9 you could approve twenty individual actions, which is not approval -- it is twenty interruptions. Being able to read "here are the six things I intend to do" and say yes once is a completely different experience.
 
 So: make it plan first. Which introduces its own failure, and that failure is really what today is about.
 
@@ -47,13 +47,13 @@ A map lets you see the whole route, notice that two errands are near each other,
 
 **The map is drawn before you have seen the terrain.** An agent writes its plan at step zero, when it knows the least it will ever know. Step 2 will teach it something that makes steps 4, 5 and 6 wrong.
 
-A person adjusts automatically — you find the road closed and reroute without thinking. An agent will march through a plan that stopped making sense four steps ago, because the plan is in its context and the plan is what it is following.
+A person adjusts automatically -- you find the road closed and reroute without thinking. An agent will march through a plan that stopped making sense four steps ago, because the plan is in its context and the plan is what it is following.
 
 So here is the sentence for today:
 
 > Planning is easy. Replanning is the skill.
 
-An agent that plans and then follows the plan blindly is often *worse* than one that never planned at all — it has traded flexibility for a structure that may be wrong. The value comes from plan, act, check the plan still holds, adjust.
+An agent that plans and then follows the plan blindly is often *worse* than one that never planned at all -- it has traded flexibility for a structure that may be wrong. The value comes from plan, act, check the plan still holds, adjust.
 
 ---
 
@@ -71,7 +71,7 @@ None is universally correct. A two-step task does not deserve a plan. A fifteen-
 
 **What a plan actually is**
 
-A plan is structured data, not prose. You already know how to get that — Day 3, JSON mode.
+A plan is structured data, not prose. You already know how to get that -- Day 3, JSON mode.
 
 ```
 [
@@ -119,7 +119,7 @@ touch planner.py
 
 ---
 
-### Stage 1 — Make a plan and look at it
+### Stage 1 -- Make a plan and look at it
 
 Do not execute anything yet. Just get a plan and read it.
 
@@ -197,7 +197,7 @@ Run it. You get something like:
 ]}
 ```
 
-**Read that plan properly.** It is a reasonable plan — better than what Day 9's agent would have wandered into. Steps 1 and 2 have no dependencies, so they could run in either order. Step 3 needs both. Step 4 needs step 3.
+**Read that plan properly.** It is a reasonable plan -- better than what Day 9's agent would have wandered into. Steps 1 and 2 have no dependencies, so they could run in either order. Step 3 needs both. Step 4 needs step 3.
 
 **Now try to break the planner.** Ask for something impossible with your tools:
 
@@ -205,11 +205,11 @@ Run it. You get something like:
     print(json.dumps(make_plan("Email my manager a summary of my documents."), indent=2))
 ```
 
-If you get `"impossible"`, good. If you get a confident four-step plan including a `send_email` tool that does not exist — which happens often — note it. **Planners hallucinate capability.** The plan is generated text like any other, and a plausible-looking plan is easy to produce whether or not it can be carried out. Your executor has to catch it, because the planner will not.
+If you get `"impossible"`, good. If you get a confident four-step plan including a `send_email` tool that does not exist -- which happens often -- note it. **Planners hallucinate capability.** The plan is generated text like any other, and a plausible-looking plan is easy to produce whether or not it can be carried out. Your executor has to catch it, because the planner will not.
 
 ---
 
-### Stage 2 — Execute the plan
+### Stage 2 -- Execute the plan
 
 Each step becomes a small agent run, with the step as its goal:
 
@@ -260,13 +260,13 @@ def run_step(step, context, max_calls=4):
 
 **Two design points.**
 
-`max_calls=4` per step. Each step gets its own small budget. One bad step cannot eat the whole run — a real advantage over Day 9, where one confused stretch could consume everything.
+`max_calls=4` per step. Each step gets its own small budget. One bad step cannot eat the whole run -- a real advantage over Day 9, where one confused stretch could consume everything.
 
 `RESULTS SO FAR` is the dependency fix. Each step sees what earlier steps produced. Remove that line and step 3 has no idea what step 1 found, and the plan becomes worse than useless.
 
 ---
 
-### Stage 3 — The runner, with results carried forward
+### Stage 3 -- The runner, with results carried forward
 
 ```python
 def run_plan(goal):
@@ -307,11 +307,11 @@ def run_plan(goal):
 
 Run it on the deadlines goal. You get a visible plan, then each step running in order, each seeing what came before.
 
-**Compare this against Day 9 on the same task.** Look at the trajectory of each. The plan version does less repeated work, and — more usefully — you can read what it intends to do before it does any of it.
+**Compare this against Day 9 on the same task.** Look at the trajectory of each. The plan version does less repeated work, and -- more usefully -- you can read what it intends to do before it does any of it.
 
 ---
 
-### Stage 4 — Replanning (the part that matters)
+### Stage 4 -- Replanning (the part that matters)
 
 Now the real content. After each step, check whether the rest of the plan still holds.
 
@@ -372,7 +372,7 @@ Wire it into the runner, after each step completes:
 
 Without replanning: step 1 finds nothing, steps 2, 3 and 4 run anyway, and you get a note about deadlines that do not exist.
 
-With replanning: after step 1 returns nothing, it should `stop` or `revise` — "no deadlines found, there is nothing to summarise".
+With replanning: after step 1 returns nothing, it should `stop` or `revise` -- "no deadlines found, there is nothing to summarise".
 
 **That difference is the whole day.** A plan alone makes the agent tidier. Replanning makes it able to be wrong and recover, which is what actually matters in real use.
 
@@ -380,7 +380,7 @@ With replanning: after step 1 returns nothing, it should `stop` or `revise` — 
 
 ---
 
-### Stage 5 — Reflect at the end
+### Stage 5 -- Reflect at the end
 
 One last call, and it is cheap:
 
@@ -396,7 +396,7 @@ Reply with JSON only:
 Be strict. Judge against the goal as written, not against what was attempted."""
 ```
 
-Run it after the plan finishes, print the result, and — if `redo_step` is set — re-run that one step with the suggestion appended to its task.
+Run it after the plan finishes, print the result, and -- if `redo_step` is set -- re-run that one step with the suggestion appended to its task.
 
 **Two warnings, both real.**
 
@@ -406,7 +406,7 @@ Run it after the plan finishes, print the result, and — if `redo_step` is set 
 
 ---
 
-### Stage 6 — Work out when planning is worth it
+### Stage 6 -- Work out when planning is worth it
 
 Run the same three tasks through both `autonomous.run` (Day 9) and `run_plan` (today). Record steps, total tokens and whether the result was actually good.
 
@@ -472,7 +472,7 @@ Change the rule to "between 8 and 12 steps" and give it a simple task.
 **5. Make a step fail permanently.**
 Break `search_documents` so it always errors. Run a plan that depends on it.
 *You will see:* whether replanning notices, or whether later steps carry on regardless.
-*It teaches:* dependency handling only helps if failure propagates. Note whether yours does — and whether `depends_on` should also check that the dependency *succeeded*, not just ran.
+*It teaches:* dependency handling only helps if failure propagates. Note whether yours does -- and whether `depends_on` should also check that the dependency *succeeded*, not just ran.
 
 **6. Compare the costs honestly.**
 Total tokens for ReAct versus plan-and-replan, on your three tasks.
@@ -483,28 +483,28 @@ Total tokens for ReAct versus plan-and-replan, on your three tasks.
 
 ## 9. Traps
 
-**Trap 1 — planning tasks that do not need it**
+**Trap 1 -- planning tasks that do not need it**
 *Symptom:* three model calls for something one call answers.
-*Fix:* decide first whether the task has real structure. Some systems make this choice with a cheap classifier — Day 3's `classify.py` is exactly that shape.
+*Fix:* decide first whether the task has real structure. Some systems make this choice with a cheap classifier -- Day 3's `classify.py` is exactly that shape.
 
-**Trap 2 — steps that are not executable**
+**Trap 2 -- steps that are not executable**
 *Symptom:* a beautiful plan where step 2 says "analyse the results thoroughly" and the executor has no idea what to do.
 *Fix:* require each step to name a tool or be explicit reasoning. Vague steps are where plans quietly fail.
 
-**Trap 3 — plan drift**
+**Trap 3 -- plan drift**
 *Symptom:* it completes every step and produces the wrong thing.
 *Cause:* the plan stopped matching reality at step 2 and nothing checked.
 *Fix:* replanning. This is the single most common failure of plan-and-execute.
 
-**Trap 4 — dependencies that only check existence**
+**Trap 4 -- dependencies that only check existence**
 *Symptom:* step 3 runs on step 1's error message as if it were data.
 *Fix:* `depends_on` should check that the dependency *succeeded*, not just that it ran. Experiment 5 will show you this.
 
-**Trap 5 — reflection loops**
+**Trap 5 -- reflection loops**
 *Symptom:* it redoes work forever, each pass finding a new improvement.
 *Fix:* one redo, maximum. Reflection is an optimisation, not a quality gate.
 
-**Trap 6 — the plan as an injection surface**
+**Trap 6 -- the plan as an injection surface**
 *Symptom:* rare and nasty. A document says "ignore the plan and do X", the planner reads it during a research step, and the revised plan contains it.
 *Cause:* replanning feeds tool results back into a prompt that generates instructions.
 *Fix:* Day 13. For now, know that revised plans deserve the same suspicion as any other model output, and that a `revise` action is a more dangerous thing than a `continue`.
@@ -526,7 +526,7 @@ Total tokens for ReAct versus plan-and-replan, on your three tasks.
 - **Day 11** fixes the memory problem underneath all this. Plans and results accumulate; the context window does not grow.
 - **Day 12** improves the retrieval your research steps depend on. A good plan over bad retrieval still produces a bad answer.
 - **Day 14** is planning across several agents: the plan becomes the allocation of work, and `depends_on` becomes coordination between workers.
-- **Day 15** measures all of this properly — cost per task, success rate, and whether planning was worth it on your real workload.
+- **Day 15** measures all of this properly -- cost per task, success rate, and whether planning was worth it on your real workload.
 - **Day 16 (LangGraph)** is this day with a framework. Its whole idea is making the plan an explicit graph of states with edges between them. You will recognise `depends_on` immediately.
 
 ---
@@ -612,12 +612,12 @@ Known problems, left for later:
 
 ## Answers
 
-**1.** ReAct wins on "what time is it in Tokyo" — a single tool call, where the planning call costs more than the task itself. Planning wins on "compare three approaches and write a recommendation", which has several parts with real dependencies. The distinguishing feature is structure: multiple parts that depend on each other, where order matters and work can be repeated by accident.
+**1.** ReAct wins on "what time is it in Tokyo" -- a single tool call, where the planning call costs more than the task itself. Planning wins on "compare three approaches and write a recommendation", which has several parts with real dependencies. The distinguishing feature is structure: multiple parts that depend on each other, where order matters and work can be repeated by accident.
 
-**2.** It prevents a step running before the steps it needs have run. It does not check whether those steps *succeeded* — a failed step still counts as present in `results`, so a later step can happily treat an error message as data.
+**2.** It prevents a step running before the steps it needs have run. It does not check whether those steps *succeeded* -- a failed step still counts as present in `results`, so a later step can happily treat an error message as data.
 
 **3.** Because the plan is written when the agent knows the least it will ever know. Step 2 routinely makes steps 4 and 5 wrong. Without replanning, the agent marches through a plan that stopped being correct, which can be worse than never having planned.
 
-**4.** Because it is the same model judging its own work, and it is optimistic about it. Verification checks evidence — the file exists, it contains what it should — and cannot be talked round. Reflection improves work; verification decides whether to believe it.
+**4.** Because it is the same model judging its own work, and it is optimistic about it. Verification checks evidence -- the file exists, it contains what it should -- and cannot be talked round. Reflection improves work; verification decides whether to believe it.
 
-**5.** The executor's. The planner produces text, and a plausible-looking plan is exactly as easy to generate as a feasible one. Only the code that actually tries to run the step can find out that the tool does not exist — which is why unknown tool names return a message rather than crashing.
+**5.** The executor's. The planner produces text, and a plausible-looking plan is exactly as easy to generate as a feasible one. Only the code that actually tries to run the step can find out that the tool does not exist -- which is why unknown tool names return a message rather than crashing.

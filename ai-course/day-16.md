@@ -1,14 +1,14 @@
-# Day 16 — LangGraph
+# Day 16 -- LangGraph
 
-**Module:** 04 — Frameworks
+**Module:** 04 -- Frameworks
 **Time:** about 1 hour
-**Builds on:** Day 7 — the agent loop; Day 9 — approval; Day 11 — state
+**Builds on:** Day 7 -- the agent loop; Day 9 -- approval; Day 11 -- state
 
 ---
 
 ## 1. Today in one line
 
-You rebuild your agent as an explicit graph — and recognise every single piece, because you already built all of them by hand.
+You rebuild your agent as an explicit graph -- and recognise every single piece, because you already built all of them by hand.
 
 ---
 
@@ -37,7 +37,7 @@ Your `agent.py` works. Here is what it cannot do.
 
 **Branching gets ugly.** Add "if the question is simple, skip research entirely" and you are nesting conditions inside a loop that already has three exit paths.
 
-**You have written the same loop five times** — `agent.py`, `autonomous.py`, `planner.py`, `multi_agent.py`, `mcp_agent.py`. Each slightly different. Fix a bug in one and the other four still have it.
+**You have written the same loop five times** -- `agent.py`, `autonomous.py`, `planner.py`, `multi_agent.py`, `mcp_agent.py`. Each slightly different. Fix a bug in one and the other four still have it.
 
 LangGraph addresses all five. It also hides things, which is why Stage 6 exists.
 
@@ -59,7 +59,7 @@ That is the entire idea. The framework does not add intelligence. It takes the s
 
 **Where this comparison breaks:**
 
-A state machine is fixed structure, and agents need to be dynamic. LangGraph's answer is **conditional edges** — functions that look at the state and decide where to go next. They do a lot of work, and a graph with many of them becomes just as hard to read as your nested `if` statements were. The structure helps until it does not.
+A state machine is fixed structure, and agents need to be dynamic. LangGraph's answer is **conditional edges** -- functions that look at the state and decide where to go next. They do a lot of work, and a graph with many of them becomes just as hard to read as your nested `if` statements were. The structure helps until it does not.
 
 **The translation table.** Keep this next to you today:
 
@@ -104,7 +104,7 @@ Same OpenAI-compatible client, pointed at Groq. That Day 1 choice is still payin
 
 ---
 
-### Stage 1 — Your Day 7 agent, as a graph
+### Stage 1 -- Your Day 7 agent, as a graph
 
 `graph_agent.py`:
 
@@ -186,17 +186,17 @@ model -> END   (if it answered)
 tools -> model
 ```
 
-That is your `while` loop, drawn. `tools -> model` is the cycle. `tools_condition` is your `if message.tool_calls:`. `ToolNode` is your dispatch code — the `json.loads`, the lookup, the `role: "tool"` append, all of it.
+That is your `while` loop, drawn. `tools -> model` is the cycle. `tools_condition` is your `if message.tool_calls:`. `ToolNode` is your dispatch code -- the `json.loads`, the lookup, the `role: "tool"` append, all of it.
 
 **Everything you wrote by hand is there, with names.** Nothing new is happening, and that is exactly what you should be checking for.
 
 ---
 
-### Stage 2 — State and reducers
+### Stage 2 -- State and reducers
 
 `Annotated[list, add_messages]` deserves a proper look, because it is the piece that confuses people.
 
-A node returns a **partial** state — just what it changed:
+A node returns a **partial** state -- just what it changed:
 
 ```python
 return {"messages": [new_message]}
@@ -204,7 +204,7 @@ return {"messages": [new_message]}
 
 A **reducer** decides how that merges into the existing state. `add_messages` appends rather than replaces, and also handles message ids so an update to an existing message replaces it rather than duplicating.
 
-Without a reducer, returning `{"messages": [x]}` would **overwrite** your whole history with a one-item list. Your agent would forget everything every step — exactly the Day 1 bug, reintroduced by a framework detail.
+Without a reducer, returning `{"messages": [x]}` would **overwrite** your whole history with a one-item list. Your agent would forget everything every step -- exactly the Day 1 bug, reintroduced by a framework detail.
 
 Add your own state fields:
 
@@ -227,7 +227,7 @@ def call_model(state: State):
 
 ---
 
-### Stage 3 — Persistence, and something your code cannot do
+### Stage 3 -- Persistence, and something your code cannot do
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
@@ -243,7 +243,7 @@ graph.invoke({"messages": [("user", "What's my name?")]}, config)
 
 The second call knows. The state was saved against `thread_id` and reloaded.
 
-**`thread_id` is the whole mechanism.** Different id, different conversation. This is how one deployed agent serves many users — and it is exactly the `user` field you put in your memory metadata on Day 11, now appearing as a first-class concept.
+**`thread_id` is the whole mechanism.** Different id, different conversation. This is how one deployed agent serves many users -- and it is exactly the `user` field you put in your memory metadata on Day 11, now appearing as a first-class concept.
 
 Inspect it:
 
@@ -262,7 +262,7 @@ for old in graph.get_state_history(config):
 
 ---
 
-### Stage 4 — Approval that does not block
+### Stage 4 -- Approval that does not block
 
 Day 9's approval called `input()` and froze the program. In a web app that is unusable.
 
@@ -302,7 +302,7 @@ Day 13's least privilege, as a routing decision.
 
 ---
 
-### Stage 5 — Branch
+### Stage 5 -- Branch
 
 Now the thing that was awkward in your code. Route simple questions past the whole agent:
 
@@ -343,7 +343,7 @@ print(graph.get_graph().draw_ascii())
 
 ---
 
-### Stage 6 — Open the box
+### Stage 6 -- Open the box
 
 The anti-magic stage. Do not skip it.
 
@@ -355,7 +355,7 @@ langchain.debug = True
 graph.invoke({"messages": [("user", "What time is it in Tokyo?")]})
 ```
 
-Read what it sends. Compare it against the message list you built by hand on Day 4. **Note any extra text the framework added that you did not write** — framework prompt wrappers cost tokens on every single call, and you are paying for them.
+Read what it sends. Compare it against the message list you built by hand on Day 4. **Note any extra text the framework added that you did not write** -- framework prompt wrappers cost tokens on every single call, and you are paying for them.
 
 **Watch it step by step:**
 
@@ -372,7 +372,7 @@ for event in graph.stream({"messages": [("user", "Find deadlines and save a note
 # in evals.py, swap the runner for the graph version
 ```
 
-Compare: success rate, tokens per task, latency. **The framework version is often slightly more expensive** because of its prompt wrapping, and roughly the same on quality — because it is the same model doing the same work.
+Compare: success rate, tokens per task, latency. **The framework version is often slightly more expensive** because of its prompt wrapping, and roughly the same on quality -- because it is the same model doing the same work.
 
 **So what did you actually buy?** Persistence, resumable interrupts, visible structure, streaming, and one loop instead of five. Those are real and worth having. What you did not buy is better answers, and anyone who implies otherwise is selling something.
 
@@ -382,7 +382,7 @@ Compare: success rate, tokens per task, latency. **The framework version is ofte
 graph.invoke(inputs, {"recursion_limit": 25, **config})
 ```
 
-Without it, a looping graph runs to LangGraph's own default and can burn your quota — the Day 7 lesson, in a new costume.
+Without it, a looping graph runs to LangGraph's own default and can burn your quota -- the Day 7 lesson, in a new costume.
 
 ---
 
@@ -442,27 +442,27 @@ Day 15's eval set, hand-written agent versus graph.
 
 ## 9. Traps
 
-**Trap 1 — reducer confusion**
+**Trap 1 -- reducer confusion**
 *Symptom:* state disappears or duplicates.
 *Fix:* `add_messages` for messages, `operator.add` for counters, nothing for last-write-wins.
 
-**Trap 2 — mutating state**
+**Trap 2 -- mutating state**
 *Symptom:* works in testing, breaks with checkpointing.
 *Fix:* always return a dict of changes.
 
-**Trap 3 — no recursion limit**
+**Trap 3 -- no recursion limit**
 *Symptom:* runaway cost.
 *Fix:* set it explicitly on every invoke.
 
-**Trap 4 — forgetting thread_id**
+**Trap 4 -- forgetting thread_id**
 *Symptom:* checkpointer configured, nothing persists.
 *Fix:* `config={"configurable": {"thread_id": ...}}` on every call, and a different id per user.
 
-**Trap 5 — MemorySaver in production**
+**Trap 5 -- MemorySaver in production**
 *Symptom:* state lost on restart.
 *Fix:* SQLite or Postgres checkpointer.
 
-**Trap 6 — version churn**
+**Trap 6 -- version churn**
 *Symptom:* tutorials from four months ago do not run.
 *Cause:* LangGraph and LangChain move quickly and rename things.
 *Fix:* pin versions in `requirements.txt`, and prefer the official docs over blog posts. When something does not exist any more, check the current API rather than assuming you made a mistake.
@@ -482,7 +482,7 @@ Day 15's eval set, hand-written agent versus graph.
 ## 11. Where this goes
 
 - **Day 17 (CrewAI)** is the same problem with a different shape: roles and tasks rather than nodes and edges. Comparing the two is the point of doing both.
-- **Day 18** builds the research agent, and you choose which framework — or none — with evidence from your evals.
+- **Day 18** builds the research agent, and you choose which framework -- or none -- with evidence from your evals.
 - **Day 19 (LangChain)** is the layer underneath. Some of it is useful, some is a thin wrapper you do not need.
 - **Day 20** is where checkpointing stops being a nice feature. Persistence and resumable interrupts are what let an agent survive a deployment.
 
@@ -586,6 +586,6 @@ Known problems, left for later:
 
 **3.** Save state and resume it later, including after the process has exited, and rewind to an earlier checkpoint to run forward again from there. Day 9's runs recorded what happened but could not continue or replay.
 
-**4.** Because `input()` blocks the process. `interrupt` saves a checkpoint and returns, so the approval can arrive minutes later, over HTTP, from a different machine — which is what a web application actually needs.
+**4.** Because `input()` blocks the process. `interrupt` saves a checkpoint and returns, so the approval can arrive minutes later, over HTTP, from a different machine -- which is what a web application actually needs.
 
-**5.** It gives persistence, resumable interrupts, visible structure, streaming, and one implementation of the loop instead of several copies. It does not give better answers — same model, same tools, same work — and it costs slightly more per call because of its own prompt wrapping.
+**5.** It gives persistence, resumable interrupts, visible structure, streaming, and one implementation of the loop instead of several copies. It does not give better answers -- same model, same tools, same work -- and it costs slightly more per call because of its own prompt wrapping.

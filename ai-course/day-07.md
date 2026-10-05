@@ -1,8 +1,8 @@
-# Day 7 — Build Your First AI Agent
+# Day 7 -- Build Your First AI Agent
 
-**Module:** 02 — AI Agents
+**Module:** 02 -- AI Agents
 **Time:** about 1 hour
-**Builds on:** Day 4 — tools; Day 6 — document search
+**Builds on:** Day 4 -- tools; Day 6 -- document search
 
 ---
 
@@ -28,9 +28,9 @@ Your code runs tools **once**, then asks for a final answer. The model never get
 
 That ceiling is everywhere once you notice it:
 
-- "Find what my notes say about the budget and save a summary" — needs search, then save.
-- "What time is it in Tokyo and how many hours ahead is that?" — needs time, then calculate.
-- "Look up the deadline, work out how many days are left" — needs search, then a date calculation.
+- "Find what my notes say about the budget and save a summary" -- needs search, then save.
+- "What time is it in Tokyo and how many hours ahead is that?" -- needs time, then calculate.
+- "Look up the deadline, work out how many days are left" -- needs search, then a date calculation.
 
 Every one is two or three steps. Your assistant can do one.
 
@@ -54,7 +54,7 @@ You are not directing each step. You set the goal and the boundaries; they choos
 
 **A person notices when they are going in circles.** After searching the same thing three times with no luck, a human stops and asks you for help. The model will happily search the same thing thirty times. It has no sense of "this is not working". You must supply that from outside, in code.
 
-**A person knows when they have actually finished.** The model can decide it is done while having done nothing at all — it will announce "I have saved your note" without ever calling `save_note`. Fluent text about success is exactly as easy to produce as success.
+**A person knows when they have actually finished.** The model can decide it is done while having done nothing at all -- it will announce "I have saved your note" without ever calling `save_note`. Fluent text about success is exactly as easy to produce as success.
 
 So the agent is the loop, but **the engineering is the stopping**. Any beginner can write the loop. Knowing when to cut it off, and how to tell success from a confident claim of success, is the actual skill. It runs through Days 9, 10 and 15.
 
@@ -86,7 +86,7 @@ That is the agent. Everything in Days 9, 10, 14 and 16 is a variation on those n
 
 **Three things worth understanding properly:**
 
-**The message list is the agent's working memory.** There is no other state anywhere. Every time round the loop, the model re-reads the entire list: the goal, every tool it called, every result it got back. That is how it knows what it has already tried. This is why Day 2 mattered so much — the agent's ability to reason about its own progress is built entirely on the conversation history.
+**The message list is the agent's working memory.** There is no other state anywhere. Every time round the loop, the model re-reads the entire list: the goal, every tool it called, every result it got back. That is how it knows what it has already tried. This is why Day 2 mattered so much -- the agent's ability to reason about its own progress is built entirely on the conversation history.
 
 Some people call it the **scratchpad**. Same thing, better name.
 
@@ -102,7 +102,7 @@ step 5:  sends 3,800
 
 One task, about 9,000 tokens. Your free minute is 6,000. **Agents are expensive in a way chatbots are not**, and this is the mechanism. Day 15 is largely about this graph.
 
-**You decide how much freedom it gets.** It is not on or off. `max_steps=3` is a short leash. `max_steps=20` with a file-writing tool is a long one. Which tools exist, how many steps are allowed, and whether a human approves anything — these are your dials, and choosing them badly is how agents cause damage.
+**You decide how much freedom it gets.** It is not on or off. `max_steps=3` is a short leash. `max_steps=20` with a file-writing tool is a long one. Which tools exist, how many steps are allowed, and whether a human approves anything -- these are your dials, and choosing them badly is how agents cause damage.
 
 ---
 
@@ -126,7 +126,7 @@ We build the agent as a new file rather than editing `chat.py`, so you can compa
 
 ---
 
-### Stage 1 — The loop
+### Stage 1 -- The loop
 
 `agent.py`:
 
@@ -226,7 +226,7 @@ That is your first agent. Look back at what changed from Day 4: the `if` became 
 
 ---
 
-### Stage 2 — Make it show its reasoning
+### Stage 2 -- Make it show its reasoning
 
 Right now the model acts without saying why. When something goes wrong, you cannot tell what it was thinking.
 
@@ -264,15 +264,15 @@ Run it again. Now you get a trail:
 
 **Two lines in that prompt are doing heavy lifting.**
 
-`"Never claim you have done something unless a tool actually returned success"` — this fights the failure from section 3. Without it, models regularly announce completed work they never did.
+`"Never claim you have done something unless a tool actually returned success"` -- this fights the failure from section 3. Without it, models regularly announce completed work they never did.
 
-`"If a tool fails twice in a row, stop"` — a stopping condition written in words. You will also add one in code, because words alone are not reliable enough. Belt and braces, like Day 3.
+`"If a tool fails twice in a row, stop"` -- a stopping condition written in words. You will also add one in code, because words alone are not reliable enough. Belt and braces, like Day 3.
 
 This "say what you will do, do it, say what you learned" shape has a name: **ReAct**, short for Reasoning and Acting. It is the most common agent pattern in use, and you have now built it.
 
 ---
 
-### Stage 3 — Watch the cost
+### Stage 3 -- Watch the cost
 
 Add token tracking, because agents are where cost stops being theoretical:
 
@@ -290,13 +290,13 @@ def run_agent(goal, max_steps=8):
 
 Run a task that takes four or five steps. Watch `prompt_tokens` climb each step.
 
-**This is Day 2's problem, amplified.** Every step re-sends everything from every previous step. Cost does not grow with steps — it grows faster than that, because each step is both longer and one more.
+**This is Day 2's problem, amplified.** Every step re-sends everything from every previous step. Cost does not grow with steps -- it grows faster than that, because each step is both longer and one more.
 
 On the free tier, a six-step task can consume your entire minute. That is not a bug; that is what agents cost. Every technique on Day 15 exists because of this number.
 
 ---
 
-### Stage 4 — Give it something worth doing
+### Stage 4 -- Give it something worth doing
 
 Now combine Day 6 with today. This is where it stops feeling like a demo:
 
@@ -322,17 +322,17 @@ One search could not do this. An agent searching twice can.
 
 ---
 
-### Stage 5 — Find the failure modes
+### Stage 5 -- Find the failure modes
 
 Break it deliberately. All three of these will happen to you in real use.
 
-**Failure A — the loop that never ends.**
+**Failure A -- the loop that never ends.**
 
 ```python
     run_agent("Find the current share price of Reliance Industries.", max_steps=20)
 ```
 
-You have no web tool. Watch what happens. Many models will search documents repeatedly, rephrase, search again, and keep going until your step limit cuts it off — burning your entire quota.
+You have no web tool. Watch what happens. Many models will search documents repeatedly, rephrase, search again, and keep going until your step limit cuts it off -- burning your entire quota.
 
 **Fix, in code, not in words:**
 
@@ -360,7 +360,7 @@ def run_agent(goal, max_steps=8):
 
 **Read what that does.** It does not crash or stop. It sends a *message back to the model* telling it to change approach. You are steering it with feedback rather than killing it, which usually leads to a graceful "I can't do this" instead of a hard failure.
 
-**Failure B — claiming success without doing the work.**
+**Failure B -- claiming success without doing the work.**
 
 Break `save_note` so it returns `"Error: disk full"`. Run a save task.
 
@@ -368,15 +368,15 @@ A well-prompted agent reports the failure. A poorly-prompted one says "Saved!" a
 
 **The real lesson:** never trust the agent's summary of what it did. Trust the tool results. Day 15 builds checks that verify outcomes instead of believing reports.
 
-**Failure C — running out of steps.**
+**Failure C -- running out of steps.**
 
-Set `max_steps=2` on a task needing four. It stops mid-way, having done half the work — a note created but empty, or a search done but nothing saved.
+Set `max_steps=2` on a task needing four. It stops mid-way, having done half the work -- a note created but empty, or a search done but nothing saved.
 
 **Partial completion is the dangerous state.** Not failure, not success. Half-done with no clean rollback. Worth knowing about before you give an agent a tool that sends email.
 
 ---
 
-### Stage 6 — Ask before doing damage (optional, 10 minutes)
+### Stage 6 -- Ask before doing damage (optional, 10 minutes)
 
 Your agent can write files on its own. Later it will send messages and call APIs. Add a pause:
 
@@ -404,7 +404,7 @@ This is called **human in the loop**, and it is the main dial between "useful" a
 | **Agent** | A model in a loop with tools, working towards a goal. |
 | **Step / iteration** | One trip round the loop: one model call plus any tools. |
 | **Scratchpad** | The growing message list. The agent's working memory. |
-| **Trajectory** | The full path an agent took — every step and result. |
+| **Trajectory** | The full path an agent took -- every step and result. |
 | **ReAct** | Reason, then act, then observe, then repeat. Today's pattern. |
 | **Stopping condition** | Any rule that ends the loop. |
 | **max_steps** | The hard limit. Your seatbelt. |
@@ -424,7 +424,7 @@ This is called **human in the loop**, and it is the main dial between "useful" a
 *It teaches:* `max_steps` is not a nicety. It is the difference between a bug and a bill.
 
 **2. Empty the scratchpad.**
-Stop appending tool results — keep only the goal each round.
+Stop appending tool results -- keep only the goal each round.
 *You will see:* it calls the same first tool forever, because from its point of view nothing has happened yet.
 *It teaches:* the message list *is* the agent. No history, no agent.
 
@@ -452,30 +452,30 @@ Run the same request through `chat.py` and through `run_agent`. Compare total to
 
 ## 9. Traps
 
-**Trap 1 — no step limit**
+**Trap 1 -- no step limit**
 *Symptom:* quota gone, or a program that never returns.
 *Fix:* `max_steps`, always, from the first version. Never "just for testing".
 
-**Trap 2 — forgetting to append the assistant message**
+**Trap 2 -- forgetting to append the assistant message**
 *Symptom:* an API error about tool messages without a matching assistant message, or an agent that repeats step 1 forever.
 *Cause:* Day 4's trap 3, now inside a loop where it is much more confusing.
 *Fix:* `messages.append(message.model_dump(exclude_none=True))` before running the tools.
 
-**Trap 3 — trimming that cuts a tool pair**
+**Trap 3 -- trimming that cuts a tool pair**
 *Symptom:* works for short tasks, fails on long ones with an orphaned-tool-call error.
 *Cause:* Day 2's `trim_history` slicing between a request and its result. Agents produce many such pairs, so it finally bites.
 *Fix:* for now, do not trim inside the agent loop. Proper fix on Day 11.
 
-**Trap 4 — believing the final answer**
+**Trap 4 -- believing the final answer**
 *Symptom:* "I've saved your note" and no file.
 *Fix:* check the tool results, not the summary. If it matters, verify in code.
 
-**Trap 5 — dangerous tools with no brakes**
+**Trap 5 -- dangerous tools with no brakes**
 *Symptom:* fine in testing, then an agent deletes something.
 *Cause:* a tool with side effects, no approval, a high step limit.
 *Fix:* Stage 6. Separate read-only tools from tools that change things, and treat them differently.
 
-**Trap 6 — the cost surprise**
+**Trap 6 -- the cost surprise**
 *Symptom:* constant rate limiting once you start using the agent properly.
 *Cause:* every step re-sends everything.
 *Fix:* fewer steps, fewer tools, shorter tool results. Day 15.
@@ -499,7 +499,7 @@ Run the same request through `chat.py` and through `run_agent`. Compare total to
 - **Day 10** adds planning: writing the whole plan first, then working through it, instead of deciding one step at a time.
 - **Day 11** fixes the scratchpad. Long tasks overflow the context window, and choosing what to keep is the job.
 - **Day 14** makes one of the tools *another agent*. That is genuinely all multi-agent is.
-- **Day 16 (LangGraph)** is today's loop drawn as an explicit map of states. You will recognise every piece — which is exactly why frameworks come after this and not before.
+- **Day 16 (LangGraph)** is today's loop drawn as an explicit map of states. You will recognise every piece -- which is exactly why frameworks come after this and not before.
 
 ---
 
@@ -580,7 +580,7 @@ Known problems, left for later:
 
 ## Answers
 
-**1.** A loop. Day 4 runs tools once and then asks for a final answer. The agent keeps going — calling the model, running tools, feeding results back — until the model replies without asking for a tool, or the step limit is reached.
+**1.** A loop. Day 4 runs tools once and then asks for a final answer. The agent keeps going -- calling the model, running tools, feeding results back -- until the model replies without asking for a tool, or the step limit is reached.
 
 **2.** In the message list. Every request and every result is appended, and the whole list is re-sent each step, so the model re-reads its own history to know what it has already tried. There is no other memory.
 
@@ -588,4 +588,4 @@ Known problems, left for later:
 
 **4.** The prompt rule ("stop if a tool fails twice") and the code limits (`max_steps` and loop detection). Trust the code. The prompt is steering and can be ignored; `max_steps` cannot.
 
-**5.** The tool results in the trajectory — did `save_note` actually return a success message? And ideally the file itself. Producing a fluent sentence about having saved something is exactly as easy for the model as saving something.
+**5.** The tool results in the trajectory -- did `save_note` actually return a success message? And ideally the file itself. Producing a fluent sentence about having saved something is exactly as easy for the model as saving something.

@@ -1,4 +1,4 @@
-# Day 22 — What Next
+# Day 22 -- What Next
 
 **Not in the syllabus.** The course is 21 days and you have finished it. This is the part nobody writes: where you actually stand, and what to do on Monday.
 
@@ -46,7 +46,7 @@ And three that matter as much:
 8. Why can prompt injection not be fixed the way SQL injection was? *(Day 13)*
 9. Why does a single test run tell you almost nothing? *(Day 15)*
 
-**Anything you fumbled, go back to that day and redo the experiments.** Not the reading — the experiments. That is where the understanding lives.
+**Anything you fumbled, go back to that day and redo the experiments.** Not the reading -- the experiments. That is where the understanding lives.
 
 ---
 
@@ -62,7 +62,7 @@ Not a demo. Something you actually use: your email triaged, your reading queue s
 
 **2. Something for one other person (two to three weeks)**
 
-Pick someone with a real repetitive problem — a teacher, a small business, a researcher — and build the narrow thing that solves it.
+Pick someone with a real repetitive problem -- a teacher, a small business, a researcher -- and build the narrow thing that solves it.
 
 This is harder than it sounds, and the difficulty is instructive: they do not know what an agent is, they do not care, and they will use it in ways you did not plan. Building for a real user teaches product judgement, which is the thing engineers in this field most often lack.
 
@@ -70,7 +70,7 @@ This is harder than it sounds, and the difficulty is instructive: they do not kn
 
 Choose one:
 
-- **An agent that writes and runs code**, in a sandbox, with tests as verification. Verification is easy here — the tests pass or they do not — which makes it an excellent place to study agent reliability properly.
+- **An agent that writes and runs code**, in a sandbox, with tests as verification. Verification is easy here -- the tests pass or they do not -- which makes it an excellent place to study agent reliability properly.
 - **A voice agent.** Real-time changes everything: latency budgets in hundreds of milliseconds, interruption handling, streaming throughout.
 - **An evaluation harness for agents**, properly. Less glamorous, in short supply, and the skill people actually pay for.
 - **A local-only agent.** Everything on your machine, no API. You will learn what the big models were doing for you.
@@ -97,8 +97,8 @@ The field produces enormous noise. Most of it will not matter in six months.
 
 **What actually matters:**
 
-- Model releases that change capability meaningfully — a few a year, not weekly
-- New primitives — tool use, MCP and structured output were real. Most named techniques are not.
+- Model releases that change capability meaningfully -- a few a year, not weekly
+- New primitives -- tool use, MCP and structured output were real. Most named techniques are not.
 - Cost changes. An order-of-magnitude price drop changes what is buildable.
 
 **What does not:**
@@ -133,16 +133,16 @@ If this goes on a CV or into an interview, most people describe what they built.
 
 **Weak:** "Built an AI research agent with RAG and multi-agent orchestration using LangGraph and CrewAI."
 
-**Strong:** "Built a research agent that produces cited reports. Measured retrieval at 87% recall@5 on a 15-question set, improving from 60% by adding hybrid search and cross-encoder reranking. Median cost $0.021 per report. Compared single-agent against multi-agent on the same eval set — multi-agent cost 70% more for no quality gain, so I kept the single agent."
+**Strong:** "Built a research agent that produces cited reports. Measured retrieval at 87% recall@5 on a 15-question set, improving from 60% by adding hybrid search and cross-encoder reranking. Median cost $0.021 per report. Compared single-agent against multi-agent on the same eval set -- multi-agent cost 70% more for no quality gain, so I kept the single agent."
 
 The second one says you can engineer. Anyone can list libraries.
 
 **Questions you should now be able to answer well:**
 
-- "How do you know your RAG is working?" — the golden set, recall@k, MRR, measured before and after each change
-- "How do you stop an agent doing something harmful?" — least privilege, budgets, approval gates, verification outside the agent
-- "When would you not use an agent?" — most of the time; one call is cheaper and more reliable when the task is one step
-- "How do you handle hallucination?" — grounding, an escape hatch with an exact phrase, citations verified in code, and accepting that the rate is never zero
+- "How do you know your RAG is working?" -- the golden set, recall@k, MRR, measured before and after each change
+- "How do you stop an agent doing something harmful?" -- least privilege, budgets, approval gates, verification outside the agent
+- "When would you not use an agent?" -- most of the time; one call is cheaper and more reliable when the task is one step
+- "How do you handle hallucination?" -- grounding, an escape hatch with an exact phrase, citations verified in code, and accepting that the rate is never zero
 
 **Have the failures ready too.** "The multi-agent version was worse and I removed it" is a better answer than any success story, because it shows you measured rather than assumed.
 
@@ -152,7 +152,7 @@ The second one says you can engineer. Anyone can list libraries.
 
 **What is real:** these systems do useful work today, tool use is genuinely transformative, RAG solves a real problem, costs are falling fast, and the gap between demo and production is where nearly all the difficulty lives.
 
-**What is oversold:** autonomy. Most "autonomous agents" are supervised pipelines with good marketing. Reliability is the binding constraint, not capability — and you now know exactly why, because you measured a task that passed twice out of three.
+**What is oversold:** autonomy. Most "autonomous agents" are supervised pipelines with good marketing. Reliability is the binding constraint, not capability -- and you now know exactly why, because you measured a task that passed twice out of three.
 
 **What is genuinely unsolved:** prompt injection. Reliable long-horizon autonomy. Evaluation of open-ended output. Knowing when a model does not know.
 
@@ -166,6 +166,6 @@ That is the specific thing you spent twenty-one days learning.
 
 You built an agent from scratch before touching a framework. Most people never do that, and it is the reason you can debug things they cannot.
 
-Keep the habit. When the next framework arrives — and it will, with a new vocabulary for the same six ideas — you will be able to read it in an afternoon and judge whether it is worth adopting, because you know what it is wrapping.
+Keep the habit. When the next framework arrives -- and it will, with a new vocabulary for the same six ideas -- you will be able to read it in an afternoon and judge whether it is worth adopting, because you know what it is wrapping.
 
 Now go and use the thing you built. On real work, for a fortnight. That is where the next set of lessons is.

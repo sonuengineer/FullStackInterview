@@ -1,14 +1,14 @@
-# Day 18 — Build Our AI Research Agent
+# Day 18 -- Build Our AI Research Agent
 
-**Module:** 04 — Frameworks
+**Module:** 04 -- Frameworks
 **Time:** about 1 hour, probably more
-**Builds on:** all seventeen days. Especially Day 15 — evals; Day 17 — the three-way comparison
+**Builds on:** all seventeen days. Especially Day 15 -- evals; Day 17 -- the three-way comparison
 
 ---
 
 ## 1. Today in one line
 
-You stop building components and build the **product** — one research agent, assembled from evidence, that produces a cited report you would actually send to someone.
+You stop building components and build the **product** -- one research agent, assembled from evidence, that produces a cited report you would actually send to someone.
 
 ---
 
@@ -28,7 +28,7 @@ And a research agent is more than a question-answering bot. A bot answers from o
 
 That last one is the difference between a report and a plausible essay. A research output nobody can verify is worse than no output, because it carries authority it has not earned.
 
-Today is less new theory and more **integration** — which sounds easy and is not. You have already met this: memory (Day 2) and documents (Day 5) each worked perfectly alone, and together they caused constant rate limits. Components interact. Today you find out where.
+Today is less new theory and more **integration** -- which sounds easy and is not. You have already met this: memory (Day 2) and documents (Day 5) each worked perfectly alone, and together they caused constant rate limits. Components interact. Today you find out where.
 
 ---
 
@@ -40,7 +40,7 @@ Every part exists. The work is choosing which parts, connecting them, and measur
 
 **Where this comparison breaks, and it is the whole risk of today:**
 
-**Integration is not additive.** Two components that each work can produce a system that does not. The token cost of your pipeline is the sum of every stage — retrieval, rewriting, memory extraction, agent steps, critic passes. Each was reasonable alone. Together they can make one report cost more than a hundred chat messages.
+**Integration is not additive.** Two components that each work can produce a system that does not. The token cost of your pipeline is the sum of every stage -- retrieval, rewriting, memory extraction, agent steps, critic passes. Each was reasonable alone. Together they can make one report cost more than a hundred chat messages.
 
 So today has a rule:
 
@@ -66,13 +66,13 @@ Days 10, 12, 14 and 9 respectively. Nothing new. The work is in the joins.
 
 **Decision one: single agent or a team?**
 
-Use your Day 17 table. If your numbers said the single agent matched the team at a third of the cost, build the single agent. A "research agent" does not require multiple agents — it requires multiple *searches*, which Day 7's loop already gives you.
+Use your Day 17 table. If your numbers said the single agent matched the team at a third of the cost, build the single agent. A "research agent" does not require multiple agents -- it requires multiple *searches*, which Day 7's loop already gives you.
 
 The one place a team clearly wins here is **parallel gathering** of independent sub-questions, which is Day 14's one genuine advantage.
 
 **Decision two: framework or not?**
 
-Same answer, same evidence. A sensible middle position, and the one this lesson takes: **your own pipeline code, calling your own components, with LangGraph only if you need persistence and resumable interrupts** — which you will, on Day 20.
+Same answer, same evidence. A sensible middle position, and the one this lesson takes: **your own pipeline code, calling your own components, with LangGraph only if you need persistence and resumable interrupts** -- which you will, on Day 20.
 
 **Decision three: where do citations come from?**
 
@@ -86,7 +86,7 @@ A citation the model produced is a claim. A citation your code verified is evide
 
 **Decision four: what does "done" mean?**
 
-A research report is done when every sub-question has been attempted, every claim has a verified source, and gaps are stated explicitly. Not when the model says it is finished — Day 9 settled that.
+A research report is done when every sub-question has been attempted, every claim has a verified source, and gaps are stated explicitly. Not when the model says it is finished -- Day 9 settled that.
 
 ---
 
@@ -106,7 +106,7 @@ touch research/__init__.py research/pipeline.py research/sources.py research/rep
 pip install ddgs
 ```
 
-It is unofficial and gets rate-limited, so treat it as a source that may fail — which is good practice anyway, since every real source does. If it is unreliable for you, skip it; everything below works with documents alone.
+It is unofficial and gets rate-limited, so treat it as a source that may fail -- which is good practice anyway, since every real source does. If it is unreliable for you, skip it; everything below works with documents alone.
 
 ---
 
@@ -114,7 +114,7 @@ It is unofficial and gets rate-limited, so treat it as a source that may fail �
 
 ---
 
-### Stage 1 — Write the decisions down
+### Stage 1 -- Write the decisions down
 
 Before code, ten minutes with a text file. `research/DECISIONS.md`:
 
@@ -143,11 +143,11 @@ sources were unavailable.
 Day 9's budget, applied to the whole pipeline rather than one agent.
 ```
 
-**This file is not ceremony.** In three weeks you will wonder why you did not use CrewAI, and this tells you — with numbers. Every real project has this document, usually written too late.
+**This file is not ceremony.** In three weeks you will wonder why you did not use CrewAI, and this tells you -- with numbers. Every real project has this document, usually written too late.
 
 ---
 
-### Stage 2 — Sources with provenance
+### Stage 2 -- Sources with provenance
 
 `research/sources.py`:
 
@@ -219,7 +219,7 @@ def gather(query):
 
 ---
 
-### Stage 3 — The pipeline
+### Stage 3 -- The pipeline
 
 `research/pipeline.py`:
 
@@ -289,11 +289,11 @@ def gather_all(sub_questions):
 
 **`plan` uses the small model.** Day 15's routing: breaking a question into parts is a narrow structured job. Ten times cheaper, no measurable quality loss. Check that on your own evals rather than taking my word.
 
-**The sub-questions must be independent** — the prompt says so explicitly — because Stage 3 runs them in parallel. Day 14's warning: splitting something that does not split gives you agents working with incomplete information.
+**The sub-questions must be independent** -- the prompt says so explicitly -- because Stage 3 runs them in parallel. Day 14's warning: splitting something that does not split gives you agents working with incomplete information.
 
 ---
 
-### Stage 4 — Synthesis with enforced citations
+### Stage 4 -- Synthesis with enforced citations
 
 Still in `pipeline.py`:
 
@@ -365,13 +365,13 @@ def verify_citations(report, chunks):
 
 **Run this on every report, and print the result.**
 
-`fabricated` should always be empty. When it is not, the model invented a source id that looks exactly like a real one — and without this check you would never have noticed, because `[D7b3f2]` looks entirely convincing.
+`fabricated` should always be empty. When it is not, the model invented a source id that looks exactly like a real one -- and without this check you would never have noticed, because `[D7b3f2]` looks entirely convincing.
 
 **This is the single most valuable function in today's file.** It is the difference between a report you can trust and one that merely looks trustworthy.
 
 ---
 
-### Stage 5 — Put it together
+### Stage 5 -- Put it together
 
 ```python
 def research(question, max_seconds=300):
@@ -428,7 +428,7 @@ Run it. You get a structured report with a Summary, Findings, Disagreements and 
 
 ---
 
-### Stage 6 — Measure the whole thing and fix the worst part
+### Stage 6 -- Measure the whole thing and fix the worst part
 
 Now the rule from section 3.
 
@@ -450,12 +450,12 @@ for q in QUESTIONS:
         print(f"  fabricated={c['fabricated']} uncited={len(c['uncited_claims'])} "
               f"sources used {c['sources_used']}/{c['sources_available']}")
 
-report()   # from observability.py — cost per component
+report()   # from observability.py -- cost per component
 ```
 
 **Three things to look at, in this order.**
 
-**Cost per report.** Add it up from the log. If one report costs more than a hundred chat messages, that is a product decision, not a bug — but you need the number before you can make it.
+**Cost per report.** Add it up from the log. If one report costs more than a hundred chat messages, that is a product decision, not a bug -- but you need the number before you can make it.
 
 **The dominant component.** Almost certainly synthesis, because it carries every chunk. The lever is `text[:900]`: trim it and re-measure quality.
 
@@ -517,27 +517,27 @@ Make the planner produce sub-questions where the third depends on the first.
 
 ## 9. Traps
 
-**Trap 1 — fabricated citations**
+**Trap 1 -- fabricated citations**
 *Symptom:* a report that looks perfectly sourced and is not.
 *Fix:* `verify_citations`, run every time, printed every time.
 
-**Trap 2 — integration cost surprise**
+**Trap 2 -- integration cost surprise**
 *Symptom:* each component was affordable; the pipeline is not.
 *Fix:* measure the whole pipeline. Trim the biggest contributor first.
 
-**Trap 3 — the single-source report**
+**Trap 3 -- the single-source report**
 *Symptom:* every claim cites the same file.
 *Fix:* check source diversity in `verify_citations` and say so in the report when it happens.
 
-**Trap 4 — confident emptiness**
+**Trap 4 -- confident emptiness**
 *Symptom:* a well-formatted report containing nothing that was actually found.
 *Fix:* if `sources_used` is very low relative to claims, say so instead of shipping it.
 
-**Trap 5 — no decision record**
+**Trap 5 -- no decision record**
 *Symptom:* rebuilding the same comparison in a month.
 *Fix:* `DECISIONS.md`, with the numbers.
 
-**Trap 6 — reports that outrun their evidence**
+**Trap 6 -- reports that outrun their evidence**
 *Symptom:* not a code bug. A report that reads as authoritative on a question it only partly answered.
 *Fix:* the Gaps section, and being willing to return "not enough sources" as a result. A tool that sometimes says "I could not answer this" is more useful than one that never does.
 

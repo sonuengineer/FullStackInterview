@@ -1,14 +1,14 @@
-# Day 3 — Prompt Engineering: Teach Your AI How to Behave
+# Day 3 -- Prompt Engineering: Teach Your AI How to Behave
 
-**Module:** 01 — Build the Foundation
+**Module:** 01 -- Build the Foundation
 **Time:** about 1 hour
-**Builds on:** Day 2 — `chat.py` with working memory and a pinned system prompt
+**Builds on:** Day 2 -- `chat.py` with working memory and a pinned system prompt
 
 ---
 
 ## 1. Today in one line
 
-Your assistant stops improvising and starts behaving the same way every time — and by the end it will return data your code can actually use.
+Your assistant stops improvising and starts behaving the same way every time -- and by the end it will return data your code can actually use.
 
 ---
 
@@ -36,13 +36,13 @@ Tomorrow you are going to write code that reads the model's output. On Day 6 you
 
 "Usually does the right thing" is not a foundation. Today we fix that.
 
-And there is a second, quieter problem. When your assistant does not know something, it does not say so. It produces a confident, fluent, completely invented answer. That behaviour is not a bug you can patch — it is what the model is. But it *can* be steered, and steering it is a prompt job.
+And there is a second, quieter problem. When your assistant does not know something, it does not say so. It produces a confident, fluent, completely invented answer. That behaviour is not a bug you can patch -- it is what the model is. But it *can* be steered, and steering it is a prompt job.
 
 ---
 
 ## 3. Mental model
 
-**The system prompt is a job description you hand to a brand new employee — on their first day — every single morning.**
+**The system prompt is a job description you hand to a brand new employee -- on their first day -- every single morning.**
 
 They are extremely capable and very well read. They are also completely new. They have never met you, do not know your company, and will never remember today.
 
@@ -72,7 +72,7 @@ Without that line, "I don't know" is a very unlikely-looking answer, so it almos
 
 **First, a correction that matters.**
 
-The three roles — `system`, `user`, `assistant` — feel like three separate channels. They are not. Underneath, everything is joined into one long piece of text and handed to the model. The roles are labels inside that text. Models are trained to take `system` seriously, so it carries more weight — but it is not a locked control panel. It is strong text in a strong position.
+The three roles -- `system`, `user`, `assistant` -- feel like three separate channels. They are not. Underneath, everything is joined into one long piece of text and handed to the model. The roles are labels inside that text. Models are trained to take `system` seriously, so it carries more weight -- but it is not a locked control panel. It is strong text in a strong position.
 
 This explains a lot:
 
@@ -88,13 +88,13 @@ Six things that shift the odds strongly:
 
 **1. A role.** "You are a research assistant who writes for busy people" pulls the whole answer toward a particular style.
 
-**2. Rules that are positive, not negative.** "Do not be verbose" is weak — the model has to imagine the thing and then avoid it. "Answer in at most 4 sentences" is strong, because it describes the target directly. Always say what to do, not what to avoid.
+**2. Rules that are positive, not negative.** "Do not be verbose" is weak -- the model has to imagine the thing and then avoid it. "Answer in at most 4 sentences" is strong, because it describes the target directly. Always say what to do, not what to avoid.
 
 **3. A format you spell out.** If you want three bullets and a one-line summary, say that exactly. Vague prompts produce vague shapes.
 
 **4. Examples.** One or two examples of a good answer teach more than a paragraph of description. This is called **few-shot prompting**, and it is the most under-used tool in the whole list.
 
-**5. Delimiters.** Wrapping input in clear markers — triple quotes, XML-style tags — tells the model where the data ends and the instructions begin. Without them, a pasted document blurs into your rules.
+**5. Delimiters.** Wrapping input in clear markers -- triple quotes, XML-style tags -- tells the model where the data ends and the instructions begin. Without them, a pasted document blurs into your rules.
 
 **6. An escape hatch.** Explicit permission to say "I don't know", plus a specific phrase to use.
 
@@ -131,7 +131,7 @@ rm conversation.json
 
 ---
 
-### Stage 1 — Get the prompts out of the way
+### Stage 1 -- Get the prompts out of the way
 
 Put this in `prompts.py`:
 
@@ -153,7 +153,7 @@ Run `chat.py` and check nothing broke. Same behaviour as yesterday.
 
 ---
 
-### Stage 2 — Write a prompt that actually controls something
+### Stage 2 -- Write a prompt that actually controls something
 
 Add this to `prompts.py`:
 
@@ -190,11 +190,11 @@ You should see: direct opening sentence, three points, consistent length, no "Gr
 
 **Things to notice in that prompt:**
 
-- Headings in capitals. Not decoration — they help the model see the structure.
+- Headings in capitals. Not decoration -- they help the model see the structure.
 - "at most 3", "maximum 120 words". Numbers, not adjectives.
-- `write exactly: "I don't know."` — an exact phrase. On Day 6 your code will check for that exact string, which only works if it is exact.
+- `write exactly: "I don't know."` -- an exact phrase. On Day 6 your code will check for that exact string, which only works if it is exact.
 - The word limit appears **twice**: once in the middle, once at the very end. That repetition is deliberate. The last line of a prompt is heavily weighted.
-- "ask one clarifying question instead of guessing" — turning guessing into an allowed alternative, rather than just forbidding it.
+- "ask one clarifying question instead of guessing" -- turning guessing into an allowed alternative, rather than just forbidding it.
 
 **Now test the escape hatch:**
 
@@ -206,7 +206,7 @@ It should say `I don't know.` With the Day 1 prompt, it would often produce a po
 
 ---
 
-### Stage 3 — Show it, do not tell it
+### Stage 3 -- Show it, do not tell it
 
 Some things are very hard to describe and very easy to demonstrate. Tone is the classic case.
 
@@ -232,13 +232,13 @@ Answer: I don't know.
 
 Switch to it and test both kinds of question.
 
-**Why this is so much stronger than describing the format:** the second example does not explain the "I don't know" rule, it *performs* it. The model now has a concrete pattern to copy, including what a good refusal looks like — which is much harder to get from a description.
+**Why this is so much stronger than describing the format:** the second example does not explain the "I don't know" rule, it *performs* it. The model now has a concrete pattern to copy, including what a good refusal looks like -- which is much harder to get from a description.
 
 Two or three examples is usually the sweet spot. Beyond about five you are paying tokens on every single call for shrinking returns.
 
 ---
 
-### Stage 4 — Make it return data, not prose
+### Stage 4 -- Make it return data, not prose
 
 This stage is the bridge to tomorrow. Everything in Day 4 depends on it.
 
@@ -300,9 +300,9 @@ if __name__ == "__main__":
 
 **Line by line on the important bits:**
 
-- `temperature=0` — we want the same input to give the same output. Randomness is useful for writing and harmful for classifying. On Day 1 you saw what temperature does; this is the first time you have a real reason to pin it down.
-- `response_format={"type": "json_object"}` — **JSON mode**. The provider forces the output to be valid JSON. One catch: the word "json" must appear somewhere in your prompt, or the API rejects the request. Ours says "JSON object", so we are fine.
-- `json.loads(raw)` — turns the JSON text into a real Python dictionary.
+- `temperature=0` -- we want the same input to give the same output. Randomness is useful for writing and harmful for classifying. On Day 1 you saw what temperature does; this is the first time you have a real reason to pin it down.
+- `response_format={"type": "json_object"}` -- **JSON mode**. The provider forces the output to be valid JSON. One catch: the word "json" must appear somewhere in your prompt, or the API rejects the request. Ours says "JSON object", so we are fine.
+- `json.loads(raw)` -- turns the JSON text into a real Python dictionary.
 
 Run it. You get dictionaries. Your code can now branch on `result["needs_web"]`.
 
@@ -322,7 +322,7 @@ Use `extract_json(raw)` instead of `json.loads(raw)`. Boring, and it will save y
 
 ---
 
-### Stage 5 — Test your prompt like it is code
+### Stage 5 -- Test your prompt like it is code
 
 A prompt is code. It has bugs. When you change it, it breaks in places you were not looking.
 
@@ -356,7 +356,7 @@ print(f"\n{passed}/{len(TESTS)} passed")
 
 Run it. Some will fail. That is the point.
 
-Now **change one line of `CLASSIFIER_PROMPT`** — remove the example, or drop a category — and run the tests again. Watch the score move.
+Now **change one line of `CLASSIFIER_PROMPT`** -- remove the example, or drop a category -- and run the tests again. Watch the score move.
 
 This is called an **eval**, and it is the difference between engineering a prompt and poking at one. You now have, on Day 3, the habit most people do not pick up until something breaks in front of a customer. Day 15 turns this into a proper harness.
 
@@ -390,7 +390,7 @@ Set a rule to "Do not write long answers". Ask three questions. Then change it t
 *It teaches:* describe the target, not the thing to avoid.
 
 **2. Remove the escape hatch.**
-Delete the `"I don't know."` rule. Ask about something that cannot be known — your neighbour's breakfast, next month's news.
+Delete the `"I don't know."` rule. Ask about something that cannot be known -- your neighbour's breakfast, next month's news.
 *You will see:* a confident invented answer, or a long polite non-answer.
 *It teaches:* refusing is an unlikely output unless you make it an allowed one.
 
@@ -418,30 +418,30 @@ Using yesterday's experiment 2, hand-insert an assistant message written in a co
 
 ## 9. Traps
 
-**Trap 1 — the polite prompt**
+**Trap 1 -- the polite prompt**
 "Please try to be accurate and helpful if possible." Sounds nice, controls nothing.
 *Symptom:* output that varies wildly between calls.
 *Fix:* every rule must be testable. If you cannot write a test that checks it, the model cannot follow it reliably either.
 
-**Trap 2 — JSON in markdown fences**
+**Trap 2 -- JSON in markdown fences**
 *Symptom:* `json.decoder.JSONDecodeError: Expecting value: line 1 column 1`.
 *Cause:* the model wrapped the JSON in ```` ```json ```` because that is how JSON usually appears in its training data.
 *Fix:* JSON mode, plus `extract_json` as backup. Belt and braces.
 
-**Trap 3 — the prompt that grew**
+**Trap 3 -- the prompt that grew**
 Prompts accumulate. After ten edits you have 400 lines with three rules quietly contradicting each other.
 *Symptom:* fixing one behaviour breaks another.
 *Fix:* re-read the whole prompt end to end whenever you edit it. Delete rules that your evals do not check. A rule nobody tests is usually a rule nobody needs.
 
-**Trap 4 — testing with one example**
+**Trap 4 -- testing with one example**
 *Symptom:* "I fixed it!" followed by the same bug two days later.
 *Cause:* one test passing is luck, not evidence.
 *Fix:* five fixed questions in `test_prompt.py`. Always run all of them.
 
-**Trap 5 — expecting 100 percent**
+**Trap 5 -- expecting 100 percent**
 *Symptom:* endless prompt tweaking to chase the last stubborn failure.
 *Reality:* prompts are steering, not commands. Some failure rate always remains.
-*Fix:* if the last few percent really matter, handle it in code — validate the output, retry once, fall back to something safe. Day 15 covers this properly.
+*Fix:* if the last few percent really matter, handle it in code -- validate the output, retry once, fall back to something safe. Day 15 covers this properly.
 
 ---
 
@@ -519,12 +519,12 @@ Known problems, left for later:
 
 ## Answers
 
-**1.** Because it describes the target directly. A negative instruction makes the model represent the unwanted thing first, and gives it no clear alternative. "At most 3 sentences" is also testable — you can count.
+**1.** Because it describes the target directly. A negative instruction makes the model represent the unwanted thing first, and gives it no clear alternative. "At most 3 sentences" is also testable -- you can count.
 
 **2.** Explicit permission, with an exact phrase, to admit it does not know. The wording matters because your code will later check for that exact string. "I don't know." and "I'm not sure about that" are different strings, and a check for one will miss the other.
 
-**3.** Classifying should be repeatable — the same question must always get the same category, or your program behaves differently on identical input. Chat benefits from variation, and identical phrasing every time feels robotic.
+**3.** Classifying should be repeatable -- the same question must always get the same category, or your program behaves differently on identical input. Chat benefits from variation, and identical phrasing every time feels robotic.
 
 **4.** First and last. The start and end of a prompt get the most attention; the middle gets the least. For a rule that really matters, state it in both places.
 
-**5.** A small fixed set of test inputs with expected outputs, run every time you change the prompt. Without it, prompt changes fail silently — you fix one behaviour, quietly break another, and only find out much later.
+**5.** A small fixed set of test inputs with expected outputs, run every time you change the prompt. Without it, prompt changes fail silently -- you fix one behaviour, quietly break another, and only find out much later.

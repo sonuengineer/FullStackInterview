@@ -1,14 +1,14 @@
-# Day 20 — AI Agent Deployment
+# Day 20 -- AI Agent Deployment
 
-**Module:** 05 — Deployment and Capstone
+**Module:** 05 -- Deployment and Capstone
 **Time:** about 1 hour, probably more
-**Builds on:** Day 18 — the research pipeline; Day 15 — observability and limits
+**Builds on:** Day 18 -- the research pipeline; Day 15 -- observability and limits
 
 ---
 
 ## 1. Today in one line
 
-Your agent becomes a service other people can use — and Node finally arrives, nineteen days after you made that empty folder.
+Your agent becomes a service other people can use -- and Node finally arrives, nineteen days after you made that empty folder.
 
 ---
 
@@ -20,7 +20,7 @@ Nobody else can use it. Close the lid and it stops. Your API key is in a file on
 
 And an agent service has a problem normal web services do not.
 
-**Your research pipeline takes two to four minutes.** A normal HTTP request finishes in milliseconds. If you hold the connection open for four minutes, something in the middle — a proxy, a load balancer, a browser — closes it first. The user sees an error and the work is lost.
+**Your research pipeline takes two to four minutes.** A normal HTTP request finishes in milliseconds. If you hold the connection open for four minutes, something in the middle -- a proxy, a load balancer, a browser -- closes it first. The user sees an error and the work is lost.
 
 This is the central design problem of deploying agents, and it has a standard answer: **do not make the user wait on the request.** Start the work, hand back a ticket, let them ask about it.
 
@@ -38,7 +38,7 @@ Same work. Completely different arrangement, because someone else is now involve
 
 **Where this comparison breaks, in three ways that shape today:**
 
-**Orders take minutes, not seconds.** So you need a ticket system — a receipt with a number, and a way to check on it.
+**Orders take minutes, not seconds.** So you need a ticket system -- a receipt with a number, and a way to check on it.
 
 **Every order costs you money.** A chat message is a fraction of a rupee. A research report is not. Without per-user limits, one person can spend your entire quota in an afternoon, by accident.
 
@@ -58,9 +58,9 @@ Node serves the pages and talks to the user. Python does the AI. They speak HTTP
 
 **Two kinds of endpoint**
 
-**Fast** — a chat message, a few seconds. Answer on the request.
+**Fast** -- a chat message, a few seconds. Answer on the request.
 
-**Slow** — a research report, minutes. Job pattern:
+**Slow** -- a research report, minutes. Job pattern:
 
 ```
 POST /research   -> {"job_id": "abc123", "status": "queued"}
@@ -72,7 +72,7 @@ The user gets a ticket immediately. The dashboard polls, or listens to a stream.
 
 **Streaming**
 
-Polling works and feels dead. **Server-Sent Events** keeps one connection open and pushes progress as it happens — "planning", "3 sub-questions", "gathering", "writing". A four-minute wait with visible progress is tolerable; four minutes of a spinner is not.
+Polling works and feels dead. **Server-Sent Events** keeps one connection open and pushes progress as it happens -- "planning", "3 sub-questions", "gathering", "writing". A four-minute wait with visible progress is tolerable; four minutes of a spinner is not.
 
 **Auth and budget**
 
@@ -110,7 +110,7 @@ That is nineteen days of an empty folder, finally used.
 
 ---
 
-### Stage 1 — The service
+### Stage 1 -- The service
 
 `ai/api.py`:
 
@@ -234,11 +234,11 @@ Open `http://localhost:8000/docs`. FastAPI generates a full interactive page fro
 
 **The ownership check** on `/jobs/{job_id}`. Without it, anyone with any valid key can read anyone's report by guessing an id. Job ids are not secrets.
 
-**Budget checked before starting, spend recorded after.** Not perfect — a single very expensive job can overshoot — but it stops the runaway case.
+**Budget checked before starting, spend recorded after.** Not perfect -- a single very expensive job can overshoot -- but it stops the runaway case.
 
 ---
 
-### Stage 2 — Stream the progress
+### Stage 2 -- Stream the progress
 
 Polling every two seconds works. This feels alive:
 
@@ -300,7 +300,7 @@ Make `do_research` report real progress, so there is something to stream:
 
 ---
 
-### Stage 3 — The Node dashboard
+### Stage 3 -- The Node dashboard
 
 `dashboard/server.js`:
 
@@ -344,7 +344,7 @@ app.listen(3000, () => console.log("Dashboard on http://localhost:3000"));
 
 **Node is a proxy, and that is the point.** The API key lives on the server. If the browser called Python directly, the key would be in the page source and anyone could take it.
 
-This also removes the CORS problem entirely — the browser only ever talks to its own origin.
+This also removes the CORS problem entirely -- the browser only ever talks to its own origin.
 
 `dashboard/public/index.html`:
 
@@ -451,7 +451,7 @@ Open `http://localhost:3000` and research something.
 
 ---
 
-### Stage 4 — Survive a restart
+### Stage 4 -- Survive a restart
 
 `JOBS` is a dict in memory. Restart and everyone's work vanishes.
 
@@ -481,7 +481,7 @@ def save_job(job_id, **fields):
                         fields.get("step"), fields.get("question"), time.time()))
 ```
 
-**On startup, mark anything still `running` as `failed`** — those jobs died with the old process and will never finish:
+**On startup, mark anything still `running` as `failed`** -- those jobs died with the old process and will never finish:
 
 ```python
 @app.on_event("startup")
@@ -509,7 +509,7 @@ def history(x_api_key: Optional[str] = Header(None)):
 
 ---
 
-### Stage 5 — Package it
+### Stage 5 -- Package it
 
 `ai/Dockerfile`:
 
@@ -555,11 +555,11 @@ docker run -e GROQ_API_KEY=$GROQ_API_KEY -e DEMO_KEY=$DEMO_KEY -p 8000:8000 rese
 
 **One thing the embeddings model makes awkward.** `sentence-transformers` downloads its model on first use, so your first container request is slow and needs network access. Either bake the model into the image at build time, or mount a cache volume. Find out which before you deploy, not after.
 
-`PYTHONUNBUFFERED=1` makes your logs appear immediately instead of sitting in a buffer — the single most annoying container problem to debug without it.
+`PYTHONUNBUFFERED=1` makes your logs appear immediately instead of sitting in a buffer -- the single most annoying container problem to debug without it.
 
 ---
 
-### Stage 6 — The pre-deployment checklist
+### Stage 6 -- The pre-deployment checklist
 
 Go through it honestly. Anything unticked is something you will find out about at a bad time.
 
@@ -593,7 +593,7 @@ Go through it honestly. Anything unticked is something you will find out about a
 **Test it under real conditions:**
 
 ```bash
-# two at once — does the server stay responsive?
+# two at once -- does the server stay responsive?
 curl -X POST localhost:8000/research -H "X-API-Key: demo-key-change-me" \
   -H "Content-Type: application/json" -d '{"question":"test one"}' &
 curl localhost:8000/health
@@ -663,28 +663,28 @@ Stop uvicorn, leave Node running, click Research.
 
 ## 9. Traps
 
-**Trap 1 — `async def` around sync work**
+**Trap 1 -- `async def` around sync work**
 *Symptom:* fine alone, frozen with two users.
 *Fix:* plain `def` for endpoints calling sync code. FastAPI thread-pools them.
 *This is the most common serious bug in deployed Python AI services.*
 
-**Trap 2 — holding the request open for minutes**
+**Trap 2 -- holding the request open for minutes**
 *Symptom:* gateway timeouts at 30 or 60 seconds, and lost work.
 *Fix:* the job pattern.
 
-**Trap 3 — secrets in the image**
+**Trap 3 -- secrets in the image**
 *Symptom:* silent. Then a leaked key.
 *Fix:* `.dockerignore`, and inject at run time.
 
-**Trap 4 — no per-user budget**
+**Trap 4 -- no per-user budget**
 *Symptom:* your quota gone in an afternoon.
 *Fix:* enforce before starting work.
 
-**Trap 5 — state in memory**
+**Trap 5 -- state in memory**
 *Symptom:* every deployment loses in-flight work.
 *Fix:* SQLite at minimum, and sweep stale jobs on startup.
 
-**Trap 6 — logging everything**
+**Trap 6 -- logging everything**
 *Symptom:* a permanent, growing file of user questions and document text.
 *Fix:* Day 15's rule. Ids and counts, not contents.
 
@@ -800,10 +800,10 @@ Known problems, left for Day 21:
 
 **1.** Because it takes minutes, and HTTP connections held open that long get closed by proxies, load balancers or the browser. The user sees an error and the completed work is lost. The job pattern returns a ticket immediately and lets them check on it.
 
-**2.** Because `research()` is synchronous. Inside an `async def` handler it blocks the event loop, so the entire server — every endpoint, every other user — freezes until it finishes. A plain `def` handler is run in a thread pool by FastAPI, leaving the loop free.
+**2.** Because `research()` is synchronous. Inside an `async def` handler it blocks the event loop, so the entire server -- every endpoint, every other user -- freezes until it finishes. A plain `def` handler is run in a thread pool by FastAPI, leaving the loop free.
 
 **3.** So the API key stays on the server. If the browser called Python directly, the key would be visible in the page source to anyone who looked. It also means the browser only ever talks to its own origin, which removes CORS.
 
 **4.** They must be marked failed. Those jobs died with the old process and will never progress, so a client polling them would wait forever with no explanation.
 
-**5.** The `.env` file, and anything else containing credentials — plus large local state like `chroma_db`, `logs` and `runs`, which do not belong in an image either. Secrets are injected at run time, never baked in.
+**5.** The `.env` file, and anything else containing credentials -- plus large local state like `chroma_db`, `logs` and `runs`, which do not belong in an image either. Secrets are injected at run time, never baked in.

@@ -1,14 +1,14 @@
-# Day 8 — Model Context Protocol (MCP)
+# Day 8 -- Model Context Protocol (MCP)
 
-**Module:** 02 — AI Agents
+**Module:** 02 -- AI Agents
 **Time:** about 1 hour
-**Builds on:** Day 4 — tool schemas; Day 7 — the agent loop
+**Builds on:** Day 4 -- tool schemas; Day 7 -- the agent loop
 
 ---
 
 ## 1. Today in one line
 
-Your tools move out of your Python file and become a standard plug that any AI app can use — including apps you did not write.
+Your tools move out of your Python file and become a standard plug that any AI app can use -- including apps you did not write.
 
 ---
 
@@ -25,11 +25,11 @@ Now try to use them anywhere else.
 
 And the reverse is worse. Someone has already written an excellent GitHub tool, a Postgres tool, a Slack tool. You cannot use any of them, because there is no shared shape. Every project builds its own tools from scratch, forever.
 
-There is a second problem, quieter but more interesting. Your agent knows its tools at **build time** — `TOOL_SCHEMAS` is a list you typed. It can never gain a new ability while running. To add a tool you edit code and restart.
+There is a second problem, quieter but more interesting. Your agent knows its tools at **build time** -- `TOOL_SCHEMAS` is a list you typed. It can never gain a new ability while running. To add a tool you edit code and restart.
 
 MCP fixes both. It is a standard way to describe and offer tools, so tools become things you *connect to* rather than things you *contain*.
 
-**A word of warning about today.** Day 8 often feels abstract, and that is normal. You are not gaining new powers — your tools already work. You are learning a plug shape. It properly clicks on Day 13. Today, aim to understand the shape and get one working.
+**A word of warning about today.** Day 8 often feels abstract, and that is normal. You are not gaining new powers -- your tools already work. You are learning a plug shape. It properly clicks on Day 13. Today, aim to understand the shape and get one working.
 
 ---
 
@@ -43,11 +43,11 @@ USB-C did not make charging better. It made it **shared**. One shape, so any cab
 
 MCP is that for tools:
 
-- An **MCP server** offers capabilities — tools, data, prompts.
+- An **MCP server** offers capabilities -- tools, data, prompts.
 - An **MCP client** connects and uses them.
 - Any client can talk to any server, because the shape is agreed.
 
-Your agent becomes a client. Your tools become a server. And suddenly your tools work in Claude Desktop, in your Node app, in anything that speaks MCP — and servers other people wrote work in yours.
+Your agent becomes a client. Your tools become a server. And suddenly your tools work in Claude Desktop, in your Node app, in anything that speaks MCP -- and servers other people wrote work in yours.
 
 **Where the comparison breaks:**
 
@@ -61,21 +61,21 @@ More importantly: **standardising the plug does nothing for the description**. Y
 
 **Three roles**
 
-- **Host** — the app the user sees. Claude Desktop, your `agent.py`.
-- **Client** — the part inside the host that speaks MCP. One per server.
-- **Server** — the thing offering tools. Usually a separate small program.
+- **Host** -- the app the user sees. Claude Desktop, your `agent.py`.
+- **Client** -- the part inside the host that speaks MCP. One per server.
+- **Server** -- the thing offering tools. Usually a separate small program.
 
 **Servers offer three kinds of thing**
 
-- **Tools** — functions the model can call. What you built on Day 4.
-- **Resources** — data the model can read. A file, a database row, a document.
-- **Prompts** — reusable prompt templates the user can pick.
+- **Tools** -- functions the model can call. What you built on Day 4.
+- **Resources** -- data the model can read. A file, a database row, a document.
+- **Prompts** -- reusable prompt templates the user can pick.
 
 Today is tools only. Day 13 covers the other two.
 
 **The conversation**
 
-MCP uses **JSON-RPC**: plain JSON messages with a method name, parameters and an id. Over **stdio** — the server's standard input and output — or over HTTP.
+MCP uses **JSON-RPC**: plain JSON messages with a method name, parameters and an id. Over **stdio** -- the server's standard input and output -- or over HTTP.
 
 Stdio surprises people, so be clear about it: your server is a normal program, launched as a subprocess, and messages travel down the pipe you would normally use for printing. That has one sharp consequence, which is trap 1 below and the single most common MCP mistake.
 
@@ -94,8 +94,8 @@ server -> result                        "here you go"
 
 MCP did not invent a new idea. It took the thing you already built and standardised two things around it:
 
-1. **Transport** — how the description travels between programs.
-2. **Discovery** — the client asks at runtime instead of being told at build time.
+1. **Transport** -- how the description travels between programs.
+2. **Discovery** -- the client asks at runtime instead of being told at build time.
 
 Discovery is the part that matters. Your agent no longer needs to know its tools in advance. Connect a server, ask what it has, offer that to the model. Add a tool to the server and the agent can use it without a single change to the agent's code.
 
@@ -113,7 +113,7 @@ pip freeze > requirements.txt
 mkdir -p mcp_servers
 ```
 
-MCP is async, so today has `async` and `await` in it. If those are new: `async def` marks a function that can pause while waiting, and `await` is where it pauses. You do not need a deep understanding today — follow the shape and read up later.
+MCP is async, so today has `async` and `await` in it. If those are new: `async def` marks a function that can pause while waiting, and `await` is where it pauses. You do not need a deep understanding today -- follow the shape and read up later.
 
 ---
 
@@ -121,7 +121,7 @@ MCP is async, so today has `async` and `await` in it. If those are new: `async d
 
 ---
 
-### Stage 1 — Build a server
+### Stage 1 -- Build a server
 
 `mcp_servers/my_tools.py`:
 
@@ -190,7 +190,7 @@ if __name__ == "__main__":
 
 Look at `current_time`. You wrote no JSON Schema. FastMCP reads the **type hints** (`timezone: str`) and the **docstring**, and generates the schema automatically.
 
-Compare that with your Day 4 version — twenty lines of nested JSON per tool. This is the same information in a form humans can actually maintain.
+Compare that with your Day 4 version -- twenty lines of nested JSON per tool. This is the same information in a form humans can actually maintain.
 
 **That docstring is now your tool description**, which means it is now a prompt. Everything from Day 3 applies: say *when* to use it, be specific about argument formats, name the model's weaknesses. The `maths` docstring keeps the "cannot do arithmetic reliably" line for exactly that reason. Vague docstrings mean a model that picks badly.
 
@@ -206,7 +206,7 @@ It will sit there doing nothing. **That is correct.** It is waiting for JSON on 
 
 ---
 
-### Stage 2 — Look at the raw protocol
+### Stage 2 -- Look at the raw protocol
 
 Before using a client library, see the actual messages. This is the Day 1 habit.
 
@@ -230,13 +230,13 @@ then:
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
 ```
 
-And there they are — your four tools, with descriptions and input schemas, as JSON.
+And there they are -- your four tools, with descriptions and input schemas, as JSON.
 
 **Read that output next to your Day 4 `TOOL_SCHEMAS`.** Slightly different key names, identical information. This is the moment MCP stops feeling mysterious: it is your own tool descriptions, sent down a pipe, with an agreed envelope around them.
 
 ---
 
-### Stage 3 — Write a client
+### Stage 3 -- Write a client
 
 `mcp_client.py`:
 
@@ -286,7 +286,7 @@ Result: 3312552
 
 ---
 
-### Stage 4 — Put MCP under your agent
+### Stage 4 -- Put MCP under your agent
 
 Now replace the hardcoded schemas in `agent.py` with discovered ones. `mcp_agent.py`:
 
@@ -375,7 +375,7 @@ if __name__ == "__main__":
 - `TOOL_SCHEMAS` is now fetched at runtime with `list_tools()` instead of being imported.
 - `AVAILABLE_TOOLS[name](**args)` became `await session.call_tool(name, args)`.
 
-Everything else — the loop, the appends, the step limit — is identical. The agent pattern did not change. Only where the tools live.
+Everything else -- the loop, the appends, the step limit -- is identical. The agent pattern did not change. Only where the tools live.
 
 **The `to_openai_schema` function is worth noticing.** MCP has its shape, the chat API has another. This small translator sits between them. Every framework you meet from Day 16 onwards has a version of this function. Now you know what it is doing.
 
@@ -398,7 +398,7 @@ Run `mcp_agent.py` again and ask it to count words in something.
 
 ---
 
-### Stage 5 — Use a server you did not write
+### Stage 5 -- Use a server you did not write
 
 This is where it stops being theory. There are MCP servers for filesystems, GitHub, Postgres, Slack, web fetching and much more.
 
@@ -424,9 +424,9 @@ When the model calls a tool, look up the owner and route the call there.
 
 **Two real warnings, which is why this stage is short:**
 
-**Name collisions.** Two servers can both offer `search`. The model sees two identical names and behaves unpredictably. Real clients prefix them — `files.search`, `mine.search`. If you build this, prefix.
+**Name collisions.** Two servers can both offer `search`. The model sees two identical names and behaves unpredictably. Real clients prefix them -- `files.search`, `mine.search`. If you build this, prefix.
 
-**Trust.** You just gave a program written by a stranger the ability to read and write files on your machine, and your agent decides when to call it. Note the `os.path.abspath("documents")` argument — that server is scoped to one folder deliberately. Read what a server can do before you connect it. Day 13 goes into this properly.
+**Trust.** You just gave a program written by a stranger the ability to read and write files on your machine, and your agent decides when to call it. Note the `os.path.abspath("documents")` argument -- that server is scoped to one folder deliberately. Read what a server can do before you connect it. Day 13 goes into this properly.
 
 ---
 
@@ -487,31 +487,31 @@ Put `tools/list` output side by side with your Day 4 `TOOL_SCHEMAS`.
 
 ## 9. Traps
 
-**Trap 1 — printing to stdout**
+**Trap 1 -- printing to stdout**
 *Symptom:* JSON parse errors, hangs, or a client that gets nothing.
 *Cause:* `print()` in a stdio server writes into the message channel.
 *Fix:* log to **stderr** (`print(..., file=sys.stderr)`) or to a file. Never stdout. This is the number one MCP bug.
 
-**Trap 2 — the server cannot import your modules**
+**Trap 2 -- the server cannot import your modules**
 *Symptom:* `ModuleNotFoundError: No module named 'tools'`.
 *Cause:* the server is launched as a separate process from a different working directory.
 *Fix:* the `sys.path.insert` line at the top, or absolute imports plus a proper package layout.
 
-**Trap 3 — forgetting await**
+**Trap 3 -- forgetting await**
 *Symptom:* `RuntimeWarning: coroutine was never awaited`, and a result object with nothing useful in it.
 *Cause:* async. `session.call_tool(...)` without `await` returns a coroutine, not a result.
 *Fix:* `await` every session method.
 
-**Trap 4 — name collisions between servers**
+**Trap 4 -- name collisions between servers**
 *Symptom:* the wrong tool runs, inconsistently.
 *Fix:* prefix tool names per server.
 
-**Trap 5 — trusting a stranger's server**
+**Trap 5 -- trusting a stranger's server**
 *Symptom:* nothing visible, which is the problem.
 *Cause:* an MCP server is a program with your permissions, called by a model that can be talked into things.
 *Fix:* read the source, scope it to a folder, prefer well-known servers. Day 13.
 
-**Trap 6 — expecting MCP to make tools better**
+**Trap 6 -- expecting MCP to make tools better**
 *Symptom:* disappointment. "I did all this and it behaves the same."
 *Reality:* correct. Same tools, same model, same choices. What changed is that the tools are now portable and discoverable.
 
@@ -605,12 +605,12 @@ Known problems, left for later:
 
 ## Answers
 
-**1.** Transport (how tool descriptions and calls travel between programs) and discovery (asking at runtime what tools exist). It does not touch how good the tool is, how well it is described, or whether the model chooses it sensibly — all of that is still Day 3 and Day 4 work.
+**1.** Transport (how tool descriptions and calls travel between programs) and discovery (asking at runtime what tools exist). It does not touch how good the tool is, how well it is described, or whether the model chooses it sensibly -- all of that is still Day 3 and Day 4 work.
 
 **2.** Because with stdio transport, standard output *is* the message channel. Anything printed lands in the middle of the JSON-RPC stream and corrupts it. Log to stderr or a file instead.
 
 **3.** Discovery is asking the server at runtime what tools it offers rather than knowing them at build time. After Stage 4 you can add a tool to the server and the agent uses it immediately, with no change to the agent's code. On Day 7 that required editing the agent.
 
-**4.** The tool name, description and input schema — exactly the contents of `TOOL_SCHEMAS` in `tools.py` from Day 4. MCP puts a standard envelope around the same information.
+**4.** The tool name, description and input schema -- exactly the contents of `TOOL_SCHEMAS` in `tools.py` from Day 4. MCP puts a standard envelope around the same information.
 
 **5.** It is a program running with your permissions, and a model that can be influenced by text decides when to call it. Reduce the risk by reading the source, scoping it to a single folder as with `abspath("documents")`, preferring well-known servers, and requiring approval for anything that changes data.

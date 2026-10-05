@@ -1,14 +1,14 @@
-# Day 14 — Multi-Agent Systems and Orchestration
+# Day 14 -- Multi-Agent Systems and Orchestration
 
-**Module:** 03 — Advanced Agent Systems
+**Module:** 03 -- Advanced Agent Systems
 **Time:** about 1 hour
-**Builds on:** Day 7 and 9 — agents; Day 10 — planning; Day 4 — tools
+**Builds on:** Day 7 and 9 -- agents; Day 10 -- planning; Day 4 -- tools
 
 ---
 
 ## 1. Today in one line
 
-You run several agents together — and you measure whether it was actually worth it, because often it is not.
+You run several agents together -- and you measure whether it was actually worth it, because often it is not.
 
 ---
 
@@ -42,9 +42,9 @@ Sometimes that trade is clearly right. Often it is not. By the end you will have
 
 Specialists do better work in their area. Work can happen in parallel. Someone can review someone else's output.
 
-**Where this comparison breaks — and all three breaks are today's real content:**
+**Where this comparison breaks -- and all three breaks are today's real content:**
 
-**Teams have overhead.** Every handoff is a meeting. In agent terms, every handoff is a model call, and the receiving agent starts with only what it was told — not what the first agent knew. Ask anyone who has explained a problem to a colleague: the explanation is always worse than the understanding.
+**Teams have overhead.** Every handoff is a meeting. In agent terms, every handoff is a model call, and the receiving agent starts with only what it was told -- not what the first agent knew. Ask anyone who has explained a problem to a colleague: the explanation is always worse than the understanding.
 
 **Handoffs lose things.** A researcher who read forty chunks passes a summary to the writer. The writer never sees the forty chunks. **Two agents almost always have less total context than one agent would have had.** This is the failure people do not anticipate, and it is the most common reason a multi-agent system produces worse output than the single agent it replaced.
 
@@ -94,7 +94,7 @@ source venv/bin/activate
 touch multi_agent.py
 ```
 
-**One practical warning before you start.** Groq free is about 30 requests per minute and 6,000 tokens per minute. Multi-agent multiplies calls, and the parallel stage fires several at once. You will hit limits today. That is part of the lesson — keep your backoff in place and keep `max_steps` low while experimenting.
+**One practical warning before you start.** Groq free is about 30 requests per minute and 6,000 tokens per minute. Multi-agent multiplies calls, and the parallel stage fires several at once. You will hit limits today. That is part of the lesson -- keep your backoff in place and keep `max_steps` low while experimenting.
 
 ---
 
@@ -102,7 +102,7 @@ touch multi_agent.py
 
 ---
 
-### Stage 1 — An agent as a tool
+### Stage 1 -- An agent as a tool
 
 `multi_agent.py`:
 
@@ -188,13 +188,13 @@ def agent(goal, system_prompt, tool_names, budget, max_steps=8, label="agent"):
 
 **Two design points that carry the whole day.**
 
-**`SharedBudget`.** Day 9's budget belonged to one run. Here every agent spends from the same pot. Give each agent its own budget and five agents cost five times as much — quietly, because each one looks reasonable on its own.
+**`SharedBudget`.** Day 9's budget belonged to one run. Here every agent spends from the same pot. Give each agent its own budget and five agents cost five times as much -- quietly, because each one looks reasonable on its own.
 
-**`tool_names` per agent.** This is Day 13's least privilege, made structural. The researcher will not get `save_note` — not because we asked it not to, but because it was never given it.
+**`tool_names` per agent.** This is Day 13's least privilege, made structural. The researcher will not get `save_note` -- not because we asked it not to, but because it was never given it.
 
 ---
 
-### Stage 2 — Specialists
+### Stage 2 -- Specialists
 
 ```python
 RESEARCHER = """You are a researcher. Find information and report what you found.
@@ -233,7 +233,7 @@ def writer(brief, findings, budget):
 
 ---
 
-### Stage 3 — The supervisor
+### Stage 3 -- The supervisor
 
 Now make agents into tools:
 
@@ -309,11 +309,11 @@ print(supervise("Find out what my documents say about project deadlines and "
 
 **Watch the `findings` argument when the supervisor delegates writing.** That string is the entire handoff. Everything the researcher read that did not make it into that string is gone forever.
 
-That is the lossy handoff, visible in your terminal. Make the supervisor careless about that argument and quality collapses — which is exactly what happens in real systems built by people who did not look at this.
+That is the lossy handoff, visible in your terminal. Make the supervisor careless about that argument and quality collapses -- which is exactly what happens in real systems built by people who did not look at this.
 
 ---
 
-### Stage 4 — Parallel fan-out
+### Stage 4 -- Parallel fan-out
 
 The one clear win.
 
@@ -348,13 +348,13 @@ Time it, then run the same three questions one after another. **The parallel ver
 
 **Two honest warnings.**
 
-You will hit Groq's rate limit. Three agents firing at once, each carrying its own context, can exceed 6,000 tokens per minute immediately. Your backoff handles it, but the speedup shrinks — on a free tier, parallelism is partly theoretical.
+You will hit Groq's rate limit. Three agents firing at once, each carrying its own context, can exceed 6,000 tokens per minute immediately. Your backoff handles it, but the speedup shrinks -- on a free tier, parallelism is partly theoretical.
 
 **The subtasks must be genuinely independent.** If question 2 needs question 1's answer, running them together produces two agents working with incomplete information. Splitting a task that does not split is worse than not splitting it.
 
 ---
 
-### Stage 5 — The critic
+### Stage 5 -- The critic
 
 Cheap, and it improves output more reliably than most of this page:
 
@@ -390,13 +390,13 @@ def write_with_critic(brief, findings, budget, rounds=2):
     return work
 ```
 
-**`rounds=2` is a hard cap, and it is not negotiable.** Without it, a critic finds something to improve forever — each round produces a slightly different draft with slightly different flaws. Two rounds captures nearly all of the gain.
+**`rounds=2` is a hard cap, and it is not negotiable.** Without it, a critic finds something to improve forever -- each round produces a slightly different draft with slightly different flaws. Two rounds captures nearly all of the gain.
 
 **Test whether it earns its cost.** Run the same brief with and without the critic, and read both outputs. Sometimes the improvement is obvious. Sometimes the critic invents requirements that were never in the brief and makes it worse. That is why `CRITIC` says "judge only against the brief".
 
 ---
 
-### Stage 6 — Measure it, and be willing to conclude "not worth it"
+### Stage 6 -- Measure it, and be willing to conclude "not worth it"
 
 The point of the day.
 
@@ -493,32 +493,32 @@ Fan out three questions where question 3 depends on question 1's answer.
 
 ## 9. Traps
 
-**Trap 1 — multi-agent when one would do**
+**Trap 1 -- multi-agent when one would do**
 *Symptom:* three times the cost, no better output.
 *Fix:* default to one agent. Reach for a team when you have a measured reason.
 
-**Trap 2 — per-agent budgets**
+**Trap 2 -- per-agent budgets**
 *Symptom:* quota gone in one run.
 *Cause:* five agents at 25 steps each. Each looks reasonable alone.
 *Fix:* `SharedBudget`. One pot.
 
-**Trap 3 — the lossy handoff**
+**Trap 3 -- the lossy handoff**
 *Symptom:* the multi version produces thinner work than the single one did.
 *Cause:* the receiving agent only got a summary.
 *Fix:* pass more, or restructure so the agent that needs the detail is the one that gathered it.
 
-**Trap 4 — critic loops**
+**Trap 4 -- critic loops**
 *Symptom:* it never finishes.
 *Fix:* hard round cap. Always.
 
-**Trap 5 — no trace id**
+**Trap 5 -- no trace id**
 *Symptom:* something went wrong and you cannot tell which agent.
 *Fix:* one run id, threaded through every agent, logged on every call, saved to `runs/`.
 
-**Trap 6 — injection reaching the whole team**
+**Trap 6 -- injection reaching the whole team**
 *Symptom:* a document manipulates the researcher, whose report manipulates the supervisor.
 *Cause:* Day 13, multiplied. Agent output is untrusted input to the next agent.
-*Fix:* wrap inter-agent messages the same way you wrap document text, and keep least privilege per worker — which is exactly why the writer has no tools.
+*Fix:* wrap inter-agent messages the same way you wrap document text, and keep least privilege per worker -- which is exactly why the writer has no tools.
 
 ---
 
@@ -536,7 +536,7 @@ Fan out three questions where question 3 depends on question 1's answer.
 
 - **Day 15** makes this operable: tracing across agents, cost per task, and evaluation over many runs rather than one.
 - **Day 16 (LangGraph)** gives you this as a graph. Supervisor, workers and handoffs become nodes and edges. You will recognise every piece.
-- **Day 17 (CrewAI)** is this with roles and goals as the main concept. Crews, tasks, delegation — today's ideas with different names.
+- **Day 17 (CrewAI)** is this with roles and goals as the main concept. Crews, tasks, delegation -- today's ideas with different names.
 - **Day 18** builds the research agent properly, and you will choose single or multi with evidence from Stage 6.
 - **Day 21** is where the choice matters commercially: three times the tokens for a marginal gain is a real cost.
 
@@ -639,7 +639,7 @@ Known problems, left for later:
 
 **2.** Because the handoff is a summary. The researcher read forty chunks and passes a paragraph; the writer never sees the forty chunks. A single agent would have had all of it in one context.
 
-**3.** Parallel fan-out. It requires the subtasks to be genuinely independent — if one needs another's answer, running them together just produces two agents working with incomplete information.
+**3.** Parallel fan-out. It requires the subtasks to be genuinely independent -- if one needs another's answer, running them together just produces two agents working with incomplete information.
 
 **4.** Because per-agent budgets multiply invisibly. Five agents with 25 steps each is 125 steps, and each individual budget looks perfectly reasonable when you set it.
 

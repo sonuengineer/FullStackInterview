@@ -1,14 +1,14 @@
-# Day 12 — Advanced RAG
+# Day 12 -- Advanced RAG
 
-**Module:** 03 — Advanced Agent Systems
+**Module:** 03 -- Advanced Agent Systems
 **Time:** about 1 hour
-**Builds on:** Day 5 — chunking; Day 6 — embeddings and the four failures you wrote down
+**Builds on:** Day 5 -- chunking; Day 6 -- embeddings and the four failures you wrote down
 
 ---
 
 ## 1. Today in one line
 
-You fix the four failures from Day 6 — and more importantly, you start **measuring** retrieval instead of guessing at it.
+You fix the four failures from Day 6 -- and more importantly, you start **measuring** retrieval instead of guessing at it.
 
 ---
 
@@ -16,10 +16,10 @@ You fix the four failures from Day 6 — and more importantly, you start **measu
 
 Open the list you wrote at the end of Day 6:
 
-1. **Exact codes** — `INV-2024-8871` finds the wrong invoice, because it looks nearly identical to `-8872`.
-2. **Negation** — "which projects are *not* delayed" retrieves chunks about delayed projects.
-3. **Counting** — "how many times is the budget mentioned" only ever sees three chunks.
-4. **Cross-document** — "compare the plan with the report" returns three chunks, all from one file.
+1. **Exact codes** -- `INV-2024-8871` finds the wrong invoice, because it looks nearly identical to `-8872`.
+2. **Negation** -- "which projects are *not* delayed" retrieves chunks about delayed projects.
+3. **Counting** -- "how many times is the budget mentioned" only ever sees three chunks.
+4. **Cross-document** -- "compare the plan with the report" returns three chunks, all from one file.
 
 There is a fifth problem you have been carrying since Day 6 without admitting it: **that `0.25` threshold is a guess.** So is `top_n=3`. So is `chunk_size=1000`. You have four numbers controlling the quality of every answer your system gives, and no idea whether any of them is right.
 
@@ -41,7 +41,7 @@ She is good. Ask for "something about company earnings" and she finds the revenu
 
 **Advanced RAG is a small team at the front desk:**
 
-- **The cataloguer** matches exact strings — codes, names, part numbers. Dumb and precise.
+- **The cataloguer** matches exact strings -- codes, names, part numbers. Dumb and precise.
 - **The topic librarian** is your Day 6 embeddings. Understands meaning, bad at exact.
 - **The reader** takes the shortlist of twenty and actually reads each one against your question, then re-orders them. Slow, so only ever used on a shortlist.
 - **The receptionist** turns your vague question into a good one before anyone starts looking.
@@ -50,7 +50,7 @@ Each is weak alone. Together they are much stronger than any one.
 
 **Where this comparison breaks:**
 
-Every person you add costs time and money. A four-stage pipeline is slower and more expensive than a single vector search, and **each stage can be wrong** — a bad query rewrite poisons everything downstream.
+Every person you add costs time and money. A four-stage pipeline is slower and more expensive than a single vector search, and **each stage can be wrong** -- a bad query rewrite poisons everything downstream.
 
 So the real skill is not knowing the four techniques. It is knowing which two your actual documents need. That is what measuring tells you, and nothing else will.
 
@@ -81,7 +81,7 @@ They fail in opposite directions. That is why you run both. That is **hybrid sea
 
 **Fusion, without the maths**
 
-You now have two ranked lists and the scores are not comparable — a BM25 score of 12.4 means nothing next to a cosine similarity of 0.71.
+You now have two ranked lists and the scores are not comparable -- a BM25 score of 12.4 means nothing next to a cosine similarity of 0.71.
 
 So ignore the scores and use only the **positions**. This is **Reciprocal Rank Fusion**:
 
@@ -95,11 +95,11 @@ That is the whole algorithm. Five lines of code, no tuning, and it works remarka
 
 **Reranking, and the real distinction**
 
-Your embedding model is a **bi-encoder**: it looks at the question and the chunk *separately* and compares two positions. Fast — chunks can be embedded once, in advance.
+Your embedding model is a **bi-encoder**: it looks at the question and the chunk *separately* and compares two positions. Fast -- chunks can be embedded once, in advance.
 
-A **cross-encoder** reads the question and the chunk *together* and scores how well one answers the other. Far more accurate, because it can see the interaction between them. Also far slower, because nothing can be precomputed — every pair must be run through the model.
+A **cross-encoder** reads the question and the chunk *together* and scores how well one answers the other. Far more accurate, because it can see the interaction between them. Also far slower, because nothing can be precomputed -- every pair must be run through the model.
 
-So you use both: cheap search to get 20 candidates, expensive reader to pick the best 3. This is usually the single biggest quality win available, and it is what improves the negation problem — a cross-encoder can actually notice the word "not".
+So you use both: cheap search to get 20 candidates, expensive reader to pick the best 3. This is usually the single biggest quality win available, and it is what improves the negation problem -- a cross-encoder can actually notice the word "not".
 
 **Lost in the middle**
 
@@ -109,8 +109,8 @@ Models attend most to the beginning and end of their context, least to the middl
 
 You need a **golden set**: questions paired with the chunk that should be found.
 
-- **Recall@k** — in what fraction of questions is the right chunk in the top k? This is the number that matters most.
-- **MRR** — Mean Reciprocal Rank. If the right chunk is at position 1 you score 1.0, position 2 scores 0.5, position 4 scores 0.25. Rewards being right *and* being first.
+- **Recall@k** -- in what fraction of questions is the right chunk in the top k? This is the number that matters most.
+- **MRR** -- Mean Reciprocal Rank. If the right chunk is at position 1 you score 1.0, position 2 scores 0.5, position 4 scores 0.25. Rewards being right *and* being first.
 
 Fifteen questions is enough to see real differences. It is not a research benchmark. It is a smoke alarm.
 
@@ -136,7 +136,7 @@ touch retrieval.py golden_set.py
 
 ---
 
-### Stage 1 — Measure what you already have
+### Stage 1 -- Measure what you already have
 
 **Do not skip this and do not do it second.** If you improve first and measure afterwards, you will never know which change helped.
 
@@ -157,7 +157,7 @@ GOLDEN = [
 Write fifteen, from your real files. Rules that make the difference between a useful set and a useless one:
 
 - **Use words the document does not use.** If every question shares vocabulary with its chunk, the set proves nothing and everything scores 100%.
-- **Include the hard cases** — the exact code, the negation, the cross-document comparison.
+- **Include the hard cases** -- the exact code, the negation, the cross-document comparison.
 - **`must_contain` should be a distinctive string** that appears in the right chunk and nowhere else.
 - **Include three questions with no answer in your documents.** A system that always returns something is not working; it is guessing.
 
@@ -209,7 +209,7 @@ vector only (Day 6)            recall@5: 9/15 (60%)   MRR: 0.412
 
 ---
 
-### Stage 2 — Add keyword search
+### Stage 2 -- Add keyword search
 
 ```python
 import re
@@ -255,7 +255,7 @@ It will probably score *worse* overall than vector search. **Look at which quest
 
 ---
 
-### Stage 3 — Hybrid, with RRF
+### Stage 3 -- Hybrid, with RRF
 
 ```python
 from vector_store import search as vector_search
@@ -289,13 +289,13 @@ keyword only (BM25)            recall@5: 7/15 (47%)   MRR: 0.351
 hybrid (RRF)                   recall@5: 12/15 (80%)  MRR: 0.556
 ```
 
-**The combination beats both parts.** Not by a little. This is usually the cheapest improvement available in RAG — no extra model, no meaningful extra latency, just running two searches and merging by position.
+**The combination beats both parts.** Not by a little. This is usually the cheapest improvement available in RAG -- no extra model, no meaningful extra latency, just running two searches and merging by position.
 
 The `text[:200]` key is a crude way to spot the same chunk appearing in both lists. Fine here; a real system would carry stable chunk ids.
 
 ---
 
-### Stage 4 — Rerank the shortlist
+### Stage 4 -- Rerank the shortlist
 
 ```python
 from sentence_transformers import CrossEncoder
@@ -331,7 +331,7 @@ First run downloads about 90 MB. Then measure:
 hybrid + rerank                recall@5: 13/15 (87%)  MRR: 0.781
 ```
 
-**Look at what moved.** Recall barely changed — the right chunk was already in the pool. **MRR jumped**, because the right chunk moved to position 1 instead of sitting at position 4.
+**Look at what moved.** Recall barely changed -- the right chunk was already in the pool. **MRR jumped**, because the right chunk moved to position 1 instead of sitting at position 4.
 
 That matters more than it sounds. The model reads the first chunk most carefully. Being right *and first* produces noticeably better answers than being right and fourth.
 
@@ -347,11 +347,11 @@ for name, fn in [("hybrid", hybrid_search), ("reranked", reranked_search)]:
     print(f"{name}: {(time.time()-start)*1000:.0f}ms")
 ```
 
-Reranking typically adds 200–500ms on CPU. That is why you only ever run it on a shortlist of 20. Reranking 500 chunks would take half a minute.
+Reranking typically adds 200-500ms on CPU. That is why you only ever run it on a shortlist of 20. Reranking 500 chunks would take half a minute.
 
 ---
 
-### Stage 5 — Fix the question before searching
+### Stage 5 -- Fix the question before searching
 
 Vague questions retrieve vaguely. Rewrite them first:
 
@@ -412,7 +412,7 @@ multi-query + hybrid + rerank  recall@5: 14/15 (93%)  MRR: 0.812
 
 ---
 
-### Stage 6 — Assemble the context properly
+### Stage 6 -- Assemble the context properly
 
 Retrieval is done. One last thing that costs nothing:
 
@@ -451,7 +451,7 @@ def search_documents(query):
     return build_context(hits)
 ```
 
-**That threshold is now measurable rather than guessed.** Print `rerank_score` for your three unanswerable golden questions and for your twelve answerable ones. The gap between them is where the line goes. Cross-encoder scores are logits, so negative usually means "not relevant" — but check on your own data rather than trusting that.
+**That threshold is now measurable rather than guessed.** Print `rerank_score` for your three unanswerable golden questions and for your twelve answerable ones. The gap between them is where the line goes. Cross-encoder scores are logits, so negative usually means "not relevant" -- but check on your own data rather than trusting that.
 
 **Your final table:**
 
@@ -463,7 +463,7 @@ hybrid + rerank                87%   MRR 0.781
 multi-query + hybrid + rerank  93%   MRR 0.812
 ```
 
-**One last caution, and it is important.** You measured *retrieval*, not *answers*. Better chunks usually mean better answers, but not always — the model can still misread a perfect chunk. The complete version of this measurement checks the final answer too, which is Day 15.
+**One last caution, and it is important.** You measured *retrieval*, not *answers*. Better chunks usually mean better answers, but not always -- the model can still misread a perfect chunk. The complete version of this measurement checks the final answer too, which is Day 15.
 
 ---
 
@@ -494,7 +494,7 @@ multi-query + hybrid + rerank  93%   MRR 0.812
 **1. Re-run all four Day 6 failures.**
 Exact code, negation, counting, cross-document.
 *You will see:* exact codes fixed by BM25. Negation improved by reranking. Counting still broken. Cross-document partly helped by multi-query.
-*It teaches:* which problems are retrieval problems and which are not. Counting is an agent problem — it needs several searches, which is Day 7's loop, not a better ranker.
+*It teaches:* which problems are retrieval problems and which are not. Counting is an agent problem -- it needs several searches, which is Day 7's loop, not a better ranker.
 
 **2. Make your golden set too easy.**
 Write five questions using the document's exact words. Measure.
@@ -519,35 +519,35 @@ Take a question you know the answer to. Send the right chunk first, then again w
 **6. Break the rewriter.**
 Change the rewrite prompt to produce deliberately odd rewordings. Measure.
 *You will see:* scores drop below plain hybrid.
-*It teaches:* every stage can make things worse. More pipeline is not more quality — which is why you measure each stage separately.
+*It teaches:* every stage can make things worse. More pipeline is not more quality -- which is why you measure each stage separately.
 
 ---
 
 ## 9. Traps
 
-**Trap 1 — improving without measuring**
+**Trap 1 -- improving without measuring**
 *Symptom:* four techniques added, no idea whether anything helped.
 *Fix:* golden set first. Always. Twenty minutes, and it is the whole day.
 
-**Trap 2 — a golden set that is too easy or too small**
+**Trap 2 -- a golden set that is too easy or too small**
 *Symptom:* everything scores 95% and nothing distinguishes methods.
 *Fix:* different vocabulary from the documents, the known-hard cases included, and some unanswerable questions.
 
-**Trap 3 — reranking everything**
+**Trap 3 -- reranking everything**
 *Symptom:* searches that take fifteen seconds.
 *Cause:* a cross-encoder run over every chunk.
 *Fix:* shortlist of 20 to 50, never more.
 
-**Trap 4 — changing chunking without re-indexing**
+**Trap 4 -- changing chunking without re-indexing**
 *Symptom:* results suddenly get much worse for no obvious reason.
 *Cause:* the BM25 index and the Chroma collection were built from different chunkings and no longer line up.
 *Fix:* rebuild both together. Consider one `index.py` that does everything, so this cannot happen.
 
-**Trap 5 — tuning RRF weights**
+**Trap 5 -- tuning RRF weights**
 *Symptom:* hours spent adjusting the 60, with no consistent gain.
 *Fix:* leave it at 60. The constant does very little. Effort belongs in reranking and in your golden set.
 
-**Trap 6 — measuring retrieval and calling it done**
+**Trap 6 -- measuring retrieval and calling it done**
 *Symptom:* retrieval scores 93% and answers are still poor.
 *Cause:* the model was given the right chunk and misread it.
 *Fix:* Day 15 measures the final answer. Retrieval quality is necessary, not sufficient.
@@ -567,10 +567,10 @@ Change the rewrite prompt to produce deliberately odd rewordings. Measure.
 ## 11. Where this goes
 
 - **Day 13** points out that everything you retrieve is untrusted text that ends up inside your prompt. Better retrieval means more of it.
-- **Day 14** can give each agent its own retrieval settings — a research agent with a wide pool, a fact-checker with a strict threshold.
+- **Day 14** can give each agent its own retrieval settings -- a research agent with a wide pool, a fact-checker with a strict threshold.
 - **Day 15** extends today's measurement from retrieval to answers, and turns your golden set into a proper evaluation run.
 - **Day 18 and 21** are built on this pipeline. A research agent is only as good as what it can find.
-- **Day 16 (LangGraph)** ships retrievers and rerankers as components. You will know exactly what each one does and — more usefully — whether it is worth its latency.
+- **Day 16 (LangGraph)** ships retrievers and rerankers as components. You will know exactly what each one does and -- more usefully -- whether it is worth its latency.
 
 ---
 
@@ -659,8 +659,8 @@ Known problems, left for later:
 
 **2.** A bi-encoder encodes the question and the chunk separately and compares positions, so chunks can be embedded in advance and search is fast. A cross-encoder reads both together and scores the interaction, which is far more accurate but cannot be precomputed. Only the shortlist gets the expensive treatment, because reranking every chunk would take tens of seconds.
 
-**3.** The right chunk was already in the top 5 — reranking moved it to position 1. It matters because models attend most to the first chunk, so being right *and first* produces better answers than being right and fourth.
+**3.** The right chunk was already in the top 5 -- reranking moved it to position 1. It matters because models attend most to the first chunk, so being right *and first* produces better answers than being right and fourth.
 
 **4.** It uses different vocabulary from the documents, it includes the cases you already know are hard, and it includes questions with no answer at all. Without the third, you cannot tell a working system from one that always returns something.
 
-**5.** Counting. "How many times is X mentioned" cannot be answered by any ranker, because the system only ever sees the top few chunks. It needs the agent to search repeatedly and accumulate — the Day 7 loop, not a better retriever.
+**5.** Counting. "How many times is X mentioned" cannot be answered by any ranker, because the system only ever sees the top few chunks. It needs the agent to search repeatedly and accumulate -- the Day 7 loop, not a better retriever.

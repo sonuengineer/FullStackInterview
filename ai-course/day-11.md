@@ -1,14 +1,14 @@
-# Day 11 — Memory Engineering
+# Day 11 -- Memory Engineering
 
-**Module:** 03 — Advanced Agent Systems
+**Module:** 03 -- Advanced Agent Systems
 **Time:** about 1 hour
-**Builds on:** Day 2 — the sliding window problem; Day 6 — embeddings; Day 7 and 9 — the scratchpad
+**Builds on:** Day 2 -- the sliding window problem; Day 6 -- embeddings; Day 7 and 9 -- the scratchpad
 
 ---
 
 ## 1. Today in one line
 
-You stop keeping what is **recent** and start keeping what **matters** — which fixes the problem Day 2 left open and the one Day 9 is about to hit.
+You stop keeping what is **recent** and start keeping what **matters** -- which fixes the problem Day 2 left open and the one Day 9 is about to hit.
 
 ---
 
@@ -16,7 +16,7 @@ You stop keeping what is **recent** and start keeping what **matters** — which
 
 Three open wounds, all from earlier days.
 
-**Day 2's.** Your sliding window keeps the last eight messages. Tell it your name, chat about something else for ten turns, ask your name. Gone. Keeping everything instead is not an option — the cost curve you watched climbing was real.
+**Day 2's.** Your sliding window keeps the last eight messages. Tell it your name, chat about something else for ten turns, ask your name. Gone. Keeping everything instead is not an option -- the cost curve you watched climbing was real.
 
 **Day 9's.** A thirty-step autonomous run accumulates thirty tool results in the scratchpad. Long runs overflow the context window, and you cannot trim them, because trimming splits the `tool_calls` / `tool` pairs and the API rejects it. You have been avoiding this by raising the limit. That stops working.
 
@@ -32,7 +32,7 @@ The right question is not *how do I keep more*. It is **what deserves to be kept
 
 **A transcript versus a notebook.**
 
-A transcript is everything that was said, in order. Complete, enormous, and almost useless — to find one fact you must search the whole thing.
+A transcript is everything that was said, in order. Complete, enormous, and almost useless -- to find one fact you must search the whole thing.
 
 A notebook holds what you decided was worth writing down. Facts, not conversations. "Rahul works in fintech, prefers short answers, based in Mumbai." Three lines that replace forty exchanges.
 
@@ -40,7 +40,7 @@ Your memory is a notebook, not a recording. You do not remember Tuesday's conver
 
 **Where this comparison breaks, in a way that matters:**
 
-**Human forgetting is graceful.** Things fade — you half-remember, you recognise when prompted, you know that you used to know. Systems forget catastrophically. A fact is either in the store or it is not, and when it is not, the assistant does not hesitate. It does not know that it does not know.
+**Human forgetting is graceful.** Things fade -- you half-remember, you recognise when prompted, you know that you used to know. Systems forget catastrophically. A fact is either in the store or it is not, and when it is not, the assistant does not hesitate. It does not know that it does not know.
 
 So a system's memory needs to be *deliberately* selective. Nothing fades on its own. Whatever you do not write down is gone completely and silently.
 
@@ -62,9 +62,9 @@ Most confusion about "AI memory" comes from mixing these up. "Should the assista
 
 **The three operations**
 
-**Writing.** After each turn, decide what is worth keeping. This needs judgement, so it is a model call — a small one. It is called **extraction**: turning a conversation into facts.
+**Writing.** After each turn, decide what is worth keeping. This needs judgement, so it is a model call -- a small one. It is called **extraction**: turning a conversation into facts.
 
-**Reading.** At the start of each turn, pull the *relevant* memories — not the recent ones. You already have the tool for this: embeddings, Day 6. Embed the memory, embed the incoming message, find what is close.
+**Reading.** At the start of each turn, pull the *relevant* memories -- not the recent ones. You already have the tool for this: embeddings, Day 6. Embed the memory, embed the incoming message, find what is close.
 
 **This is the central swap of the whole day.** Day 2 used recency because it was easy. Today you use relevance, because you have embeddings. "What's my name?" retrieves the name fact regardless of how many turns ago it was mentioned.
 
@@ -78,7 +78,7 @@ Every turn now costs an extra small call for extraction, plus an embedding looku
 
 ## 5. Setup
 
-Nothing new to install — Chroma and sentence-transformers are already there from Day 6.
+Nothing new to install -- Chroma and sentence-transformers are already there from Day 6.
 
 ```bash
 cd research-assistant/ai
@@ -93,7 +93,7 @@ touch memory.py
 
 ---
 
-### Stage 1 — Extract facts from conversation
+### Stage 1 -- Extract facts from conversation
 
 `memory.py`:
 
@@ -163,7 +163,7 @@ Run it:
 
 **Two things doing the real work here.**
 
-**The "do NOT keep" list is longer than the "keep" list, on purpose.** Without it, extraction saves everything — every question asked, every answer given — and within a week your memory is a worse transcript than the transcript.
+**The "do NOT keep" list is longer than the "keep" list, on purpose.** Without it, extraction saves everything -- every question asked, every answer given -- and within a week your memory is a worse transcript than the transcript.
 
 **"Each fact must make sense alone."** This is not a style note. Facts get retrieved one at a time, out of order, months later, with no surrounding conversation. "He mentioned it was important" is worthless on its own. This one rule is the difference between a memory store that works and one that produces confusing noise.
 
@@ -171,7 +171,7 @@ Returning `[]` for small talk is the correct and most common outcome.
 
 ---
 
-### Stage 2 — Store them
+### Stage 2 -- Store them
 
 ```python
 chroma = chromadb.PersistentClient(path="./chroma_db")
@@ -229,11 +229,11 @@ Test it:
     print(recall("how should you talk to me"))
 ```
 
-**Look at the third one.** "How should you talk to me" retrieves "Rahul prefers short answers" — no shared words at all. Day 6's embeddings, doing the thing keyword search could never do.
+**Look at the third one.** "How should you talk to me" retrieves "Rahul prefers short answers" -- no shared words at all. Day 6's embeddings, doing the thing keyword search could never do.
 
 ---
 
-### Stage 3 — Inject memories into the conversation
+### Stage 3 -- Inject memories into the conversation
 
 Now connect it. In `chat.py`:
 
@@ -265,7 +265,7 @@ And in the loop:
         remember(fact["text"], fact["kind"])
 ```
 
-**Read what just happened.** The system prompt is now **rebuilt every turn**, based on what the current question is about. Different question, different memories injected. Memory is not a block of text you carry around — it is a lookup, run fresh each turn.
+**Read what just happened.** The system prompt is now **rebuilt every turn**, based on what the current question is about. Different question, different memories injected. Memory is not a block of text you carry around -- it is a lookup, run fresh each turn.
 
 **Now the test Day 2 failed.** Run `chat.py`:
 
@@ -283,7 +283,7 @@ Assistant: Your name is Rahul.
 
 ---
 
-### Stage 4 — Handle contradictions
+### Stage 4 -- Handle contradictions
 
 Say this:
 
@@ -344,13 +344,13 @@ Swap `remember` for `remember_carefully` in `chat.py` and test the Mumbai/Pune s
 
 **Two things worth being honest about.**
 
-This costs an extra model call per fact. On Day 15 you will decide whether that is worth it — one reasonable answer is to only run conflict resolution for `identity` and `preference` facts, where contradictions actually matter, and skip it for `project` and `context`.
+This costs an extra model call per fact. On Day 15 you will decide whether that is worth it -- one reasonable answer is to only run conflict resolution for `identity` and `preference` facts, where contradictions actually matter, and skip it for `project` and `context`.
 
 And deletion is permanent. A better production design keeps superseded facts with an `active: false` flag, so you have a history and can recover from a wrong call. Your version deletes, which is simpler and less forgiving.
 
 ---
 
-### Stage 5 — Fix the agent scratchpad
+### Stage 5 -- Fix the agent scratchpad
 
 Now the Day 9 problem. A long run overflows, and you cannot trim naively because of tool pairs.
 
@@ -413,7 +413,7 @@ Now run a task with `max_steps=30`. It survives.
 
 ---
 
-### Stage 6 — Forgetting
+### Stage 6 -- Forgetting
 
 Three kinds, all necessary.
 
@@ -440,7 +440,7 @@ Register it as a tool so the user can say "forget that I live in Mumbai".
 
 **Decay.** Track `used` in the metadata, bump it on every recall, and periodically delete `context`-kind facts that are old and never retrieved. Identity and preference facts should not decay.
 
-**A cap.** Above a few hundred memories, injection starts getting noisy — the top 5 for any query becomes a loose collection of vaguely related things. Keep a ceiling and drop the least useful.
+**A cap.** Above a few hundred memories, injection starts getting noisy -- the top 5 for any query becomes a loose collection of vaguely related things. Keep a ceiling and drop the least useful.
 
 **Then test the noise directly.** Add 50 memories and check what `recall("what's my name")` returns. If facts with score 0.3 are creeping in, raise the threshold. Precision matters more than recall here: one wrong memory injected confidently is worse than five right ones missed.
 
@@ -503,27 +503,27 @@ Change the summary prompt to only keep findings, dropping "what did not work". R
 
 ## 9. Traps
 
-**Trap 1 — remembering everything**
+**Trap 1 -- remembering everything**
 *Symptom:* recall returns five vaguely related things, none useful.
 *Fix:* a strict extraction prompt. Returning `[]` should be the common case.
 
-**Trap 2 — facts with pronouns**
+**Trap 2 -- facts with pronouns**
 *Symptom:* "He said it was urgent" retrieved six weeks later, meaning nothing.
 *Fix:* enforce standalone sentences at extraction time. It cannot be fixed afterwards.
 
-**Trap 3 — no conflict handling**
+**Trap 3 -- no conflict handling**
 *Symptom:* the assistant confidently uses outdated information.
 *Fix:* Stage 4, at least for identity and preference facts.
 
-**Trap 4 — memory and documents in one collection**
+**Trap 4 -- memory and documents in one collection**
 *Symptom:* a chunk of a PDF is injected as a fact about the user.
 *Fix:* separate collections. Different lifetimes, different meanings.
 
-**Trap 5 — the extraction call on every single turn**
+**Trap 5 -- the extraction call on every single turn**
 *Symptom:* every turn costs an extra call, and rate limits arrive twice as fast.
 *Fix:* extract every few turns, or only when the message looks like it contains information about the user. Day 15.
 
-**Trap 6 — forgetting that this is personal data**
+**Trap 6 -- forgetting that this is personal data**
 *Symptom:* not a bug. A file full of personal facts, collected without anyone asking for it.
 *Fix:* let the user see it, let the user delete it, and do not collect what you would be uncomfortable showing them.
 
@@ -655,6 +655,6 @@ Known problems, left for later:
 
 **3.** Because facts are retrieved individually, out of order, long afterwards, with none of the surrounding conversation. "He said it was urgent" has no referent once the conversation is gone, so it is noise at best and misleading at worst.
 
-**4.** It stops the split landing between an assistant message containing `tool_calls` and the `tool` messages that answer it. That orphaned pair is rejected by the API — the error that has been lurking since Day 4.
+**4.** It stops the split landing between an assistant message containing `tool_calls` and the `tool` messages that answer it. That orphaned pair is rejected by the API -- the error that has been lurking since Day 4.
 
 **5.** Context rot: with many memories, the top 5 for any query includes things that are only loosely related, so the injected context is diluted. Fixes: raise the similarity threshold so weak matches are dropped, and cap the store by deleting old `context` facts that are never retrieved.
