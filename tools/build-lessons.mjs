@@ -61,6 +61,28 @@ const NEW_LESSONS = {
   '145': { title: 'libuv Thread Pool: What Is Really Async', category: 'Node.js Internals' },
   '146': { title: 'EventEmitter and Listener Leaks', category: 'Node.js Internals' },
   '147': { title: 'TypeScript at the Runtime Boundary', category: 'Node.js Internals' },
+  // ---- Frontend (joins the existing Frontend category)
+  '148': { title: 'Browser Rendering Pipeline', category: 'Frontend' },
+  '149': { title: 'Core Web Vitals: LCP, INP, CLS', category: 'Frontend' },
+  '150': { title: 'CSS Layout: Box Model, Flexbox vs Grid', category: 'Frontend' },
+  '151': { title: 'CSS Cascade, Specificity and z-index', category: 'Frontend' },
+  '152': { title: 'React Reconciliation and Keys', category: 'Frontend' },
+  '153': { title: 'useEffect and the Dependency Array', category: 'Frontend' },
+  '154': { title: 'State Architecture and the Context Trap', category: 'Frontend' },
+  '155': { title: 'Data Fetching Race Conditions', category: 'Frontend' },
+  '156': { title: 'Browser Storage and Frontend Auth', category: 'Frontend' },
+  '157': { title: 'Bundle Size and Code Splitting', category: 'Frontend' },
+  '158': { title: 'Accessibility and Semantic HTML', category: 'Frontend' },
+  '159': { title: 'Browser Event Loop vs Node', category: 'Frontend' },
+  // ---- Testing
+  '160': { title: 'Testing Strategy: What to Test and What Not To', category: 'Testing' },
+  '161': { title: 'Unit Tests: What Makes a Test Good', category: 'Testing' },
+  '162': { title: 'Mocking and Test Doubles', category: 'Testing' },
+  '163': { title: 'Async Tests, Fake Timers and Flaky Tests', category: 'Testing' },
+  '164': { title: 'Integration Tests With a Real Database', category: 'Testing' },
+  '165': { title: 'Testing HTTP APIs', category: 'Testing' },
+  '166': { title: 'Testing React Components', category: 'Testing' },
+  '167': { title: 'CI, Coverage and What Coverage Really Means', category: 'Testing' },
 };
 
 const attr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
