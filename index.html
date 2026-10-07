@@ -458,7 +458,6 @@
   }
 </style>
 <!--SW-HEAD-START-->
-<link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#f5f0e6">
 <style>
   /* Offline / update toast - same card + accent language as the toolbar buttons */
@@ -513,6 +512,18 @@
 // on "mermaid is not defined" at the top of the main script and renders nothing at
 // all - with it, lessons still render and diagrams degrade to their source text.
 (function () {
+  // The web app manifest is linked from here, not from the markup: a static
+  // <link rel="manifest"> makes Chrome fetch it on file:// too, where it is
+  // blocked as a cross-origin request and logs an error on every local read.
+  var h = location.hostname;
+  if (location.protocol === 'https:' || h === 'localhost' || h === '127.0.0.1' || h === '[::1]') {
+    try {
+      var link = document.createElement('link');
+      link.rel = 'manifest';
+      link.href = 'manifest.webmanifest';
+      document.head.appendChild(link);
+    } catch (e) {}
+  }
   if (typeof window.marked === 'undefined') {
     var esc = function (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); };
     window.marked = {

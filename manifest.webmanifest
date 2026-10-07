@@ -1,0 +1,19 @@
+{
+  "name": "Learning Dashboard",
+  "short_name": "Dashboard",
+  "description": "Backend, system design and AI engineering study notes -- readable offline.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#f5f0e6",
+  "background_color": "#f5f0e6",
+  "icons": [
+    {
+      "src": "icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

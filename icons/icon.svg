@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Learning Dashboard">
+  <!-- Full-bleed background: Android applies its own mask to a maskable icon, so the
+       square must be painted edge to edge and the glyph kept near the centre. -->
+  <rect width="512" height="512" fill="#a8631e"/>
+  <!-- Open book. Everything sits within ~150px of the centre, well inside the 80%
+       safe circle a maskable icon is cropped to. -->
+  <g fill="#f5f0e6">
+    <path d="M250 182 L150 160 Q138 157 138 170 L138 330 Q138 341 148 343 L250 365 Z"/>
+    <path d="M262 182 L362 160 Q374 157 374 170 L374 330 Q374 341 364 343 L262 365 Z"/>
+  </g>
+  <rect x="248" y="178" width="16" height="190" rx="6" fill="#7a4512"/>
+  <g stroke="#c98a45" stroke-width="10" stroke-linecap="round">
+    <path d="M168 205 L228 218"/>
+    <path d="M168 245 L228 258"/>
+    <path d="M168 285 L228 298"/>
+    <path d="M284 218 L344 205"/>
+    <path d="M284 258 L344 245"/>
+    <path d="M284 298 L344 285"/>
+  </g>
+</svg>
