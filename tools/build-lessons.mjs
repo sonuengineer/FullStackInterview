@@ -83,6 +83,8 @@ const NEW_LESSONS = {
   '165': { title: 'Testing HTTP APIs', category: 'Testing' },
   '166': { title: 'Testing React Components', category: 'Testing' },
   '167': { title: 'CI, Coverage and What Coverage Really Means', category: 'Testing' },
+  // ---- Production Debugging & Incidents (joins the existing category)
+  '168': { title: '1-in-1000 Bug You Cannot Reproduce Locally', category: 'Production Debugging & Incidents' },
 };
 
 const attr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
