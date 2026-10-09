@@ -569,6 +569,7 @@
     <button id="sidebar-toggle" aria-label="Toggle topics">&#9776; Topics</button>
     <button id="btn-home">Home</button>
     <button id="btn-prep" title="Private interview prep (password protected)">&#128274; Interview Prep</button>
+    <button id="btn-fde" title="Forward Deployed Engineer roadmap and progress">&#127919; FDE Portal</button>
     <button id="btn-links" title="Useful learning links">&#128279; Links</button>
     <button id="btn-images" title="System design diagrams with notes">&#128444;&#65039; Images</button>
     <button id="btn-sd" title="Full system design study material">&#127959;&#65039; System Design</button>
@@ -24278,6 +24279,7 @@ document.getElementById('btn-links').addEventListener('click', renderLinks);
 document.getElementById('btn-home').addEventListener('click', renderHome);
 // Relative link: works on GitHub Pages (/FullStackInterview/prep/) and when opened locally
 document.getElementById('btn-prep').addEventListener('click', () => { location.href = 'prep/index.html'; });
+document.getElementById('btn-fde').addEventListener('click', () => { location.href = 'FDE/portal/'; });
 document.getElementById('search').addEventListener('input', (e) => buildSidebar(e.target.value));
 readerEl.addEventListener('click', (e) => {
   const link = e.target.closest('.xref-link, .suggest-card, .suggest-nav button');

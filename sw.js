@@ -329,6 +329,13 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // FDE portal data (progress, encrypted private file, plan) changes every study
+  // session: a cached copy would show yesterday's progress, so network wins.
+  if (/\/FDE\/.*\.json$/i.test(url.pathname)) {
+    event.respondWith(networkFirst(request, event));
+    return;
+  }
+
   if (/\.(png|jpe?g|jfif|gif|webp|svg|ico|pdf|woff2?|ttf|otf|eot)$/i.test(url.pathname)) {
     event.respondWith(cacheFirst(request));
     return;
