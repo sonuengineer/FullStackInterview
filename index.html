@@ -23802,7 +23802,7 @@ readerEl.addEventListener('click', (e) => {
 // Each PDF/HTML file is loaded in a frame only when opened, so index.html stays small.
 let CS = { items: [] };
 try { CS = JSON.parse((document.getElementById('cs-manifest') || {}).textContent || '{"items":[]}'); } catch (e) {}
-let currentCS = null; currentSre = null;
+let currentCS = null;
 let csGroupOpen = false;
 
 function renderCheatsheets() {
@@ -24221,7 +24221,7 @@ const AIPAGES = [...document.querySelectorAll('script.ai-data')].map((el) => ({
   title: el.dataset.title,
   md: el.textContent.trim(),
 }));
-let currentAi = null; currentCS = null; currentSre = null;
+let currentAi = null;
 
 function renderAiList() {
   currentId = null; currentImage = null; currentSD = null; currentNet = null; currentAi = null; currentCS = null; currentAiTrack = null;
