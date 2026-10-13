@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-09",
+ "generated": "2026-10-13",
  "start": "2026-10-12",
  "tracks": {
   "fast": {
@@ -3185,7 +3185,10 @@
    "kind": "build",
    "title": "OmniGuard: Hybrid RAG v1 (BM25 + dense + RRF + reranker) over messy PDFs, with evals",
    "hours": 6,
-   "mod": null
+   "mod": null,
+   "briefs": [
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/01 - Hybrid RAG implementation.md"
+   ]
   },
   "B-OG-MM": {
    "id": "B-OG-MM",
@@ -3206,35 +3209,64 @@
    "kind": "build",
    "title": "OmniGuard: Dockerfile + GitHub Actions + deploy to AWS with health checks",
    "hours": 4,
-   "mod": null
+   "mod": null,
+   "briefs": [
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/07 - Dockerized FastAPI deployment on cloud.md"
+   ]
   },
   "B-OG-SQL": {
    "id": "B-OG-SQL",
    "kind": "build",
    "title": "OmniGuard: secure Text-to-SQL (read-only role, parameterized) + OAuth2 + RBAC + data-level permissions",
    "hours": 6,
-   "mod": null
+   "mod": null,
+   "briefs": [
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/02 - Secure Text-to-SQL.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/03 - OAuth 2.0 and RBAC.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/04 - SQL database integration.md"
+   ]
   },
   "B-OG-V1": {
    "id": "B-OG-V1",
    "kind": "build",
    "title": "OmniGuard v1.0: Presidio + NeMo guardrails wired in, consulting docs in /docs",
    "hours": 4,
-   "mod": null
+   "mod": null,
+   "briefs": [
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/05 - NeMo guardrails.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/06 - Presidio guardrails.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/08 - Technical discovery and scoping.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/09 - Data classification.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/10 - Architecture SOW.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/11 - ROI presentation for CISO and executives.md",
+    "Projects/Project 1 - OmniGuard - Secure AI Integration/12 - UAT runbook.md"
+   ]
   },
   "B-AM-CORE": {
    "id": "B-AM-CORE",
    "kind": "build",
    "title": "AuditMesh: LangGraph supervisor, Jira MCP server, HITL approval with checkpointing",
    "hours": 6,
-   "mod": null
+   "mod": null,
+   "briefs": [
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/01 - Supervisor-based agent architecture (LangGraph).md",
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/02 - Custom MCP server for secure Jira ticketing.md",
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/03 - Human-in-the-loop approval workflows.md"
+   ]
   },
   "B-AM-V1": {
    "id": "B-AM-V1",
    "kind": "build",
    "title": "AuditMesh v1.0: traces, token-cost dashboard, approval UI, SLAs, handoff doc",
    "hours": 5,
-   "mod": null
+   "mod": null,
+   "briefs": [
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/04 - Token cost and traceability dashboards.md",
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/05 - Defining trust boundaries.md",
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/06 - Drafting latency and cost SLAs.md",
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/07 - Operational handoffs.md",
+    "Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/08 - Interfaces for human approval.md"
+   ]
   },
   "G-EX": {
    "id": "G-EX",

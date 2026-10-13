@@ -2,7 +2,11 @@
 
 ## Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M06-10, M06-12, M06-13, M11-11, M11-12, M11-13, M11-14
+> **Core** | ~1.2 h | Slow: step 191/256, CP8 | Fast: CP6
+>
+> Before this: [M06-10 End-to-end basic retrieval](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>), [M06-12 Combining dense and sparse signals](<../06 - Vector Search & Core RAG/12 - Combining dense and sparse signals.md>), [M06-13 Implementing RRF algorithms](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>), [M11-11 Constructing safe parameterized queries to prevent SQL injection](<../11 - Legacy Systems & Integrations/11 - Constructing safe parameterized queries to prevent SQL injection.md>), [M11-12 Implementing read-only database roles](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>), [M11-13 Mapping complex database schemas to LLM context](<../11 - Legacy Systems & Integrations/13 - Mapping complex database schemas to LLM context.md>), [M11-14 Handling Text-to-SQL logic constraints and fallbacks](<../11 - Legacy Systems & Integrations/14 - Handling Text-to-SQL logic constraints and fallbacks.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Hybrid RAG implementation](<../Projects/Project 1 - OmniGuard - Secure AI Integration/01 - Hybrid RAG implementation.md>), [Secure Text-to-SQL](<../Projects/Project 1 - OmniGuard - Secure AI Integration/02 - Secure Text-to-SQL.md>), [SQL database integration](<../Projects/Project 1 - OmniGuard - Secure AI Integration/04 - SQL database integration.md>) (in `Projects/`).
 
 ### Kahani
 Kavach ki analyst Neha ka asli sawaal hota hai: "Claim C-1001 abhi kis status mein hai, aur kya knee surgery policy ke clause 7.3(b) ke under covered hai?"
@@ -12,7 +16,7 @@ MS SQL mein `LIMIT` hota hi nahi (`TOP` hota hai), aur `SELECT ... INTO` chupcha
 
 ### What it is
 Ek **router** sawaal ko `rag` (documents), `sql` (structured data) ya dono mein bhejta hai. RAG path = BM25 + dense + RRF + ACL filter; SQL path = schema context -> LLM writes T-SQL -> **guard** (T-SQL dialect) -> read-only login -> MS SQL replica.
-Is lesson ka runnable ek **acceptance harness** hai jo aapke guard aur `/v1/ask` ko test karta hai -- implementation aapki hai (M11-14 ka guard, T-SQL ke liye adapt karke).
+Is lesson ka runnable ek **acceptance harness** hai jo aapke guard aur `/v1/ask` ko test karta hai -- implementation aapki hai ([M11-14](<../11 - Legacy Systems & Integrations/14 - Handling Text-to-SQL logic constraints and fallbacks.md>) ka guard, T-SQL ke liye adapt karke).
 
 ### Why it matters for an FDE
 Customer ka DBA aapke code ko nahi, aapke test evidence ko approve karta hai. Ek repeatable harness = "ye saare attacks block hote hain, ye report hai" -- yahi replica access unlock karta hai.
@@ -20,9 +24,9 @@ Customer ka DBA aapke code ko nahi, aapke test evidence ko approve karta hai. Ek
 ### Key concepts
 - **Dialect matters** -- `sqlglot.parse(sql, read="tsql")`; row cap T-SQL mein `TOP n` hai, sqlglot ise `limit` arg mein rakhta hai.
 - **T-SQL specific dangers** -- `SELECT ... INTO` (creates table), `EXEC`/`xp_cmdshell`, `OPENROWSET`, multi-statement batches.
-- **Defense in depth** -- guard (parse) + read-only DB login (M11-12) + parameters (M11-11) + query timeout. Guard toota to bhi login write nahi kar sakta.
+- **Defense in depth** -- guard (parse) + read-only DB login ([M11-12](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>)) + parameters ([M11-11](<../11 - Legacy Systems & Integrations/11 - Constructing safe parameterized queries to prevent SQL injection.md>)) + query timeout. Guard toota to bhi login write nahi kar sakta.
 - **Router as a contract** -- response mein `route` aur `sources` -- tests aur UAT dono isi pe check karte hain.
-- **Exact-ID retrieval** -- "clause 7.3(b)" jaise IDs pe dense search kamzor, BM25 strong; isliye hybrid (M06-12/13).
+- **Exact-ID retrieval** -- "clause 7.3(b)" jaise IDs pe dense search kamzor, BM25 strong; isliye hybrid ([M06-12](<../06 - Vector Search & Core RAG/12 - Combining dense and sparse signals.md>)/13).
 
 Architecture:
 ```text
@@ -32,7 +36,7 @@ POST /v1/ask (JWT, M15-06) -> router --docs--> BM25 (M06-11) + dense (M06-10) ->
                                              -> read-only login (M11-12), timeout -> MS SQL replica -> rows -> answer
 ```
 
-Threat / failure list: write/DDL statements, `SELECT INTO`, `EXEC`, multi-statement batch, restricted table (`customers` with PAN, M15-02), unbounded result set, slow query (timeout), router misroute, RAG chunk above user's level.
+Threat / failure list: write/DDL statements, `SELECT INTO`, `EXEC`, multi-statement batch, restricted table (`customers` with PAN, [M15-02](<02 - Defining data classifications.md>)), unbounded result set, slow query (timeout), router misroute, RAG chunk above user's level.
 
 ### Code example
 `pip install fastapi httpx sqlglot`
@@ -150,7 +154,7 @@ with engine.connect() as conn:
 
 ### Mini-exercise (30-60 min)
 OmniGuard deliverables #1, #2, #4: `omniguard/tests/acceptance/test_rag_sql.py`.
-- Apna M11-14 guard T-SQL dialect pe port karo (`SELECT INTO`, `EXEC`, allowed tables per role, `TOP` cap). Harness ko `OMNIGUARD_SQL_GUARD` se usi pe chalao: zero failures.
+- Apna [M11-14](<../11 - Legacy Systems & Integrations/14 - Handling Text-to-SQL logic constraints and fallbacks.md>) guard T-SQL dialect pe port karo (`SELECT INTO`, `EXEC`, allowed tables per role, `TOP` cap). Harness ko `OMNIGUARD_SQL_GUARD` se usi pe chalao: zero failures.
 - `MUST_REJECT` mein 5 aur cases add karo (e.g. `OPENROWSET`, `WAITFOR`, nested subquery into restricted table). Unparseable SQL = reject.
 - `/v1/ask` ke liye 10 `ASK_CASES` (docs-only, data-only, both) aur ek case jahan underwriter ko RAG source restricted level ka na mile.
 - Acceptance: CI mein harness green; README mein "SQL guard evidence" table (attack -> blocked by -> test name) jo Rahul ko bheja ja sake.
@@ -167,16 +171,25 @@ OmniGuard deliverables #1, #2, #4: `omniguard/tests/acceptance/test_rag_sql.py`.
 - [ ] pyodbc connection string ke Encrypt/TrustServerCertificate/ApplicationIntent ka matlab samjha sakta hoon.
 
 ### Related
-- M06-10 End-to-end basic retrieval
-- M06-12 Combining dense and sparse signals
-- M06-13 Implementing RRF algorithms
-- M11-11 Constructing safe parameterized queries to prevent SQL injection
-- M11-12 Implementing read-only database roles
-- M11-13 Mapping complex database schemas to LLM context
-- M11-14 Handling Text-to-SQL logic constraints and fallbacks
+- [M06-10](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>) End-to-end basic retrieval
+- [M06-12](<../06 - Vector Search & Core RAG/12 - Combining dense and sparse signals.md>) Combining dense and sparse signals
+- [M06-13](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>) Implementing RRF algorithms
+- [M11-11](<../11 - Legacy Systems & Integrations/11 - Constructing safe parameterized queries to prevent SQL injection.md>) Constructing safe parameterized queries to prevent SQL injection
+- [M11-12](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>) Implementing read-only database roles
+- [M11-13](<../11 - Legacy Systems & Integrations/13 - Mapping complex database schemas to LLM context.md>) Mapping complex database schemas to LLM context
+- [M11-14](<../11 - Legacy Systems & Integrations/14 - Handling Text-to-SQL logic constraints and fallbacks.md>) Handling Text-to-SQL logic constraints and fallbacks
 
 ### Self-quiz
 1. `SELECT claim_id INTO claims_copy FROM claims` read query jaisa dikhta hai. Ye dangerous kyun hai aur kaunsi layer ise rokegi?
 2. Guard ke alawa do aur layers batao jo LLM-generated SQL ka damage limit karti hain.
 3. Neha ka sawaal (status + clause) router kaise handle kare? Response mein kya hona chahiye?
 4. `TrustServerCertificate=yes` dev mein convenient hai. Production mein kya risk hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 191 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 190: Executing mock OAuth 2.0 / RBAC flows](<06 - Executing mock OAuth 2.0  and  RBAC flows.md>)
+- Next -> [step 192: Implementing NeMo & Presidio guardrails](<08 - Implementing NeMo & Presidio guardrails.md>)

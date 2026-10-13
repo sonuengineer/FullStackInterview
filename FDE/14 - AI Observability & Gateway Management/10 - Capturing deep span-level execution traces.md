@@ -2,7 +2,9 @@
 
 ## Capturing deep span-level execution traces
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M14-01, M14-02, M13-14
+> **Core** | ~1.2 h | Slow: step 227/256, CP10 | Fast: CP8
+>
+> Before this: [M14-01 Idempotency keys for safe tool execution](<01 - Idempotency keys for safe tool execution.md>), [M14-02 Exponential backoff strategies](<02 - Exponential backoff strategies.md>), [M13-14 Safe logging (never log PII or prompts)](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)
 
 ### Kahani
 Ek pharma company ka compliance agent har night 200 SOP documents check karta hai: retrieve -> LLM reasoning -> Jira ticket tool -> summary.
@@ -20,8 +22,8 @@ Agent bugs aksar "kaunse step pe galat hua" waale hote hain. Span tree ke bina a
 ### Key concepts
 - **Context propagation** -- current span ek `contextvar` mein; naya span automatically uska child banta hai, asyncio tasks mein bhi.
 - **GenAI attributes** -- OpenTelemetry GenAI semantic conventions jaise `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` (names evolve hote hain -- check the spec).
-- **Status + events** -- exception pe span `ERROR` aur ek `exception` event; retries (M14-02) bhi events ke roop mein.
-- **No raw PII in attributes** -- prompt text, emails, patient names span mein nahi; ids, hashes, lengths, counts haan (M13-14).
+- **Status + events** -- exception pe span `ERROR` aur ek `exception` event; retries ([M14-02](<02 - Exponential backoff strategies.md>)) bhi events ke roop mein.
+- **No raw PII in attributes** -- prompt text, emails, patient names span mein nahi; ids, hashes, lengths, counts haan ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 - **Sampling** -- har trace store karna mehenga; errors 100%, baaki sample (head ya tail sampling).
 
 ### Code example
@@ -104,7 +106,7 @@ print("OK: one trace, correct parent tree across asyncio tasks, error status, no
 - `CURRENT` contextvar -- `asyncio.gather` har task ko context ki copy deta hai, isliye dono parallel tools ka parent `agent.run` hi hai; logs mix nahi hote.
 - `try/except/finally` -- exception pe `ERROR` + event, phir re-raise; span hamesha close hota hai (latency ke saath).
 - Root span pe `input.chars` hai, question text nahi -- email user ke input mein tha lekin trace mein nahi gaya. `bad` span PII guard se block hua.
-- `gen_ai.*` names OpenTelemetry GenAI conventions se -- dashboards (M14-11) inhi pe group karte hain.
+- `gen_ai.*` names OpenTelemetry GenAI conventions se -- dashboards ([M14-11](<11 - Monitoring granular token costs and endpoint latency.md>)) inhi pe group karte hain.
 - `return_exceptions=True` -- ek tool fail hone se agent crash nahi, lekin trace mein wo span laal dikhega.
 
 ```python
@@ -129,7 +131,7 @@ with tracer.start_as_current_span("llm.call") as s:
 
 ### Mini-exercise (30-60 min)
 AuditMesh v1.0 ke liye `auditmesh/obs/tracing.py` banao -- upar jaisa `span()` API, lekin exporter pluggable: `InMemoryExporter` (tests) aur `JsonlExporter` (`traces/YYYY-MM-DD.jsonl`).
-- Supervisor, har worker agent, har LLM call aur Jira tool (M16-07) apna span banaye; retries M14-02 se events banein.
+- Supervisor, har worker agent, har LLM call aur Jira tool ([M16-07](<../16 - AuditMesh - Multi-Agent Compliance System/07 - Deploying a custom MCP server for secure Jira ticketing.md>)) apna span banaye; retries [M14-02](<02 - Exponential backoff strategies.md>) se events banein.
 - Optional: local Langfuse (docker compose, free self-host) pe OTLP export.
 - Acceptance: pytest -- ek run = ek trace_id; parallel workers ka parent supervisor span; failing tool = `ERROR` span; koi attribute value email/SSN regex match na kare.
 
@@ -145,13 +147,22 @@ AuditMesh v1.0 ke liye `auditmesh/obs/tracing.py` banao -- upar jaisa `span()` A
 - [ ] Error span status aur exception event ke saath test kiya.
 
 ### Related
-- M14-11 Monitoring granular token costs and endpoint latency
-- M14-12 Debugging multi-step agent reasoning and tool inputs
-- M13-14 Safe logging (never log PII or prompts)
-- M16-08 Building comprehensive token cost and trace dashboards
+- [M14-11](<11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
+- [M14-12](<12 - Debugging multi-step agent reasoning and tool inputs.md>) Debugging multi-step agent reasoning and tool inputs
+- [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
+- [M16-08](<../16 - AuditMesh - Multi-Agent Compliance System/08 - Building comprehensive token cost and trace dashboards.md>) Building comprehensive token cost and trace dashboards
 
 ### Self-quiz
 1. Log line aur span mein kya farak hai? Kaunsa sawaal sirf span tree se answer hota hai?
 2. Parallel tool calls ke spans ka parent galat (ya naya trace) kyun ban sakta hai, aur contextvars isse kaise bachata hai?
 3. Customer chahta hai "trace mein prompt dikhe debugging ke liye" -- aap kya design propose karoge?
 4. Errors 100% aur baaki 5% sampling -- iska trade-off kya hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 227 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 226: Tracking evaluation scores across deployment runs](<09 - Tracking evaluation scores across deployment runs.md>)
+- Next -> [step 228: Monitoring granular token costs and endpoint latency](<11 - Monitoring granular token costs and endpoint latency.md>)

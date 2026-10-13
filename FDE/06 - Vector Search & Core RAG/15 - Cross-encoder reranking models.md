@@ -2,12 +2,14 @@
 
 ## Cross-encoder reranking models
 
-> Core | Fast CP3 / Slow CP4 | ~1.2 h | Builds on: M06-12, M06-13, M06-14
+> **Core** | ~1.2 h | Slow: step 079/256, CP4 | Fast: CP3
+>
+> Before this: [M06-12 Combining dense and sparse signals](<12 - Combining dense and sparse signals.md>), [M06-13 Implementing RRF algorithms](<13 - Implementing RRF algorithms.md>), [M06-14 Precision and recall metrics](<14 - Precision and recall metrics.md>)
 
 ### Kahani
 Electronics retailer ka store-staff bot. Sawaal: "Can I return opened electronics?" Hybrid retrieval ne sahi chunk ("Opened electronics cannot be returned...") top-5 mein laaya -- lekin rank 3 pe. Rank 1 pe ek vague, keyword-bhara "Electronics return policy" page tha.
 LLM ne top chunk pe zyada bharosa kiya aur bola "Yes, within 30 days". Store manager ne refund de diya. Customer ka loss.
-Recall theek tha (M06-14), order galat tha. Is gap ko reranker bharta hai.
+Recall theek tha ([M06-14](<14 - Precision and recall metrics.md>)), order galat tha. Is gap ko reranker bharta hai.
 
 ### What it is
 **Bi-encoder** (embeddings) query aur doc ko alag-alag vector banata hai -- fast, precompute ho sakta hai, lekin dono ek doosre ko "dekhte" nahi. **Cross-encoder** query aur doc ko ek saath model mein daalta hai aur ek relevance score deta hai -- word order, negation, exact relation samajhta hai, lekin har (query, doc) pair pe ek model call.
@@ -108,7 +110,7 @@ print("OK: retrieve wide and cheap, rerank narrow and precise")
 - `toy_bi_encoder` query aur doc ko alag embed karta hai -- keyword-heavy vague doc ("electronics" 3 baar) top pe aa gaya. Real bi-encoders bhi isi tarah "topic match" ko "answer" samajh lete hain.
 - `StubCrossEncoder.predict(pairs)` -- real `CrossEncoder.predict` jaisa interface. Ye stub hai: haath se likha scorer jo query bigrams ("opened electronics") doc mein dhoondta hai, kyunki ye query aur doc ko saath dekhta hai. Real model ye relation data se seekhta hai.
 - `rerank` sirf retrieve ke top-5 pe chalta hai -- poore corpus pe cross-encoder kabhi nahi.
-- MRR 0.75 -> 1.00 (M06-14 ka metric) -- reranker ka fayda number se prove karo, screenshot se nahi.
+- MRR 0.75 -> 1.00 ([M06-14](<14 - Precision and recall metrics.md>) ka metric) -- reranker ka fayda number se prove karo, screenshot se nahi.
 - `pairs` counter -- 2 queries x 5 candidates = 10 calls. Production mein yahi number latency aur cost decide karta hai.
 
 ```python
@@ -123,7 +125,7 @@ def rerank(query, candidates, top_n=5, batch_size=32):
     return [{**candidates[i], "rerank_score": float(scores[i])} for i in order]
 ```
 
-Model choice: ms-marco MiniLM fast aur English-only; multilingual ya domain-heavy customer ke liye bge-reranker jaise models ya hosted API (M06-16). Model card aur licence check karo.
+Model choice: ms-marco MiniLM fast aur English-only; multilingual ya domain-heavy customer ke liye bge-reranker jaise models ya hosted API ([M06-16](<16 - API integration for rerankers.md>)). Model card aur licence check karo.
 
 ### Mini-exercise (30-60 min)
 OmniGuard Hybrid RAG v1 ka stage 2: `omniguard/rag/rerank.py`.
@@ -134,7 +136,7 @@ OmniGuard Hybrid RAG v1 ka stage 2: `omniguard/rag/rerank.py`.
 
 ### Common pitfalls
 - 200 candidates rerank karna "quality ke liye" -- p95 latency seconds mein; top-20/50 + measure.
-- Rerank ke baad tenant filter lagana -- filter hamesha stage 1 pe (M06-08); reranker ko kabhi unauthorised chunk mat dikhao.
+- Rerank ke baad tenant filter lagana -- filter hamesha stage 1 pe ([M06-08](<08 - Metadata filtering.md>)); reranker ko kabhi unauthorised chunk mat dikhao.
 - Reranker score ko fixed threshold (0.5) se "relevant" maanna -- model badla, scale badla; eval se calibrate.
 
 ### Checklist before moving on
@@ -144,14 +146,23 @@ OmniGuard Hybrid RAG v1 ka stage 2: `omniguard/rag/rerank.py`.
 - [ ] Candidates count aur batch size config mein hain.
 
 ### Related
-- M06-13 Implementing RRF algorithms
-- M06-14 Precision and recall metrics
-- M06-16 API integration for rerankers
-- M14-07 Measuring context precision and recall
-- M14-11 Monitoring granular token costs and endpoint latency
+- [M06-13](<13 - Implementing RRF algorithms.md>) Implementing RRF algorithms
+- [M06-14](<14 - Precision and recall metrics.md>) Precision and recall metrics
+- [M06-16](<16 - API integration for rerankers.md>) API integration for rerankers
+- [M14-07](<../14 - AI Observability & Gateway Management/07 - Measuring context precision and recall.md>) Measuring context precision and recall
+- [M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
 
 ### Self-quiz
 1. Cross-encoder ko poore corpus pe kyun nahi chalate? 1 lakh chunks pe kya hoga?
 2. "Opened electronics cannot be returned" ko bi-encoder rank 3 pe kyun rakh sakta hai?
 3. Reranker lagane ke baad MRR badha lekin recall@5 same raha. Kyun?
 4. p95 latency budget 800 ms hai, rerank 50 candidates pe 600 ms leta hai. Kya knobs ghumaoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 079 of 256** -- [Syllabus CP4](<../SYLLABUS.md#cp4>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 078: Precision and recall metrics](<14 - Precision and recall metrics.md>)
+- Next -> [step 080: API integration for rerankers](<16 - API integration for rerankers.md>)

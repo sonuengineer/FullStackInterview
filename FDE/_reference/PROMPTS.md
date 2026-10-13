@@ -1,3 +1,5 @@
+> **OUTDATED -- kept for history only.** Start at [START_HERE.md](../START_HERE.md). The current plan is [MASTER_PLAN.md](../MASTER_PLAN.md); hour and topic numbers below are from the old 230-topic plan.
+
 # Ready-to-Use Prompts for the FDE Roadmap
 
 ## Prompt 1: Generate content for any subtopic file

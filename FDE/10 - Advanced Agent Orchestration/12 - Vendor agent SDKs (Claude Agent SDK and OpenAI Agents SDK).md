@@ -2,10 +2,12 @@
 
 ## Vendor agent SDKs (Claude Agent SDK and OpenAI Agents SDK)
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M05-14, M09-04, M10-10
+> **Core** | ~1.2 h | Slow: step 219/256, CP9 | Fast: CP7
+>
+> Before this: [M05-14 Processing tool results into chat history](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>), [M09-04 Supervisor and Router patterns](<../09 - Agentic Frameworks & LangGraph/04 - Supervisor and Router patterns.md>), [M10-10 Host and Client and Server architectures](<10 - Host and Client and Server architectures.md>)
 
 ### Kahani
-Ek healthcare SaaS ke kickoff mein teen engineers teen raaste lekar aaye. Ek bola "raw API pe apna tool loop likhte hain" (M05-14). Doosra: "LangGraph -- graph, checkpoints, HITL sab control mein." Teesra: "Vendor ka agent SDK le lo, handoffs aur guardrails built-in hain, ek hafte mein demo."
+Ek healthcare SaaS ke kickoff mein teen engineers teen raaste lekar aaye. Ek bola "raw API pe apna tool loop likhte hain" ([M05-14](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>)). Doosra: "LangGraph -- graph, checkpoints, HITL sab control mein." Teesra: "Vendor ka agent SDK le lo, handoffs aur guardrails built-in hain, ek hafte mein demo."
 Teen hafte debate chali. Phir pata chala ki use-case ke do alag hisse hain: ek code-repo pe kaam karne wala ops agent (files padho, scripts chalao), aur ek patient-intake triage jo sahi specialist agent ko handoff kare.
 Sahi sawaal "kaunsa framework best hai" nahi tha -- "is kaam ke liye loop kaun own kare: hum ya vendor?" tha.
 
@@ -15,13 +17,13 @@ Sahi sawaal "kaunsa framework best hai" nahi tha -- "is kaam ke liye loop kaun o
 **OpenAI Agents SDK** (`openai-agents`) -- lightweight primitives: `Agent`, `Runner`, function tools, **handoffs** (ek agent doosre ko control de), **guardrails** (input/output checks), built-in **tracing**.
 
 ### Why it matters for an FDE
-Customer aksar pehle hi kisi vendor se committed hota hai. FDE ko batana hai SDK kya free mein deta hai, kahan lock-in hai, aur kab LangGraph ya raw loop behtar hai -- aur security controls (M10-09/11) har option mein kahan lagenge.
+Customer aksar pehle hi kisi vendor se committed hota hai. FDE ko batana hai SDK kya free mein deta hai, kahan lock-in hai, aur kab LangGraph ya raw loop behtar hai -- aur security controls ([M10-09](<09 - Connecting agents to external tools safely.md>)/11) har option mein kahan lagenge.
 
 ### Key concepts
-- **Raw API loop (M05-14)** -- full control, zero magic, sab khud: retries, guards, state. Chhote single-agent tools ke liye best.
+- **Raw API loop ([M05-14](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>))** -- full control, zero magic, sab khud: retries, guards, state. Chhote single-agent tools ke liye best.
 - **Claude Agent SDK** -- "agent that works on a computer": files, shell, web, subagents, hooks (`PreToolUse` pe deny); permission mode aur allowed tools se blast radius control.
 - **OpenAI Agents SDK** -- multi-agent routing via handoffs, guardrail tripwires, tracing out of the box; graph/checkpoint ka control kam.
-- **LangGraph** -- tum graph own karte ho: durable checkpoints, `interrupt()` HITL (M10-01..04), multi-vendor models; zyada code.
+- **LangGraph** -- tum graph own karte ho: durable checkpoints, `interrupt()` HITL ([M10-01](<01 - Check-pointing graph states.md>)..04), multi-vendor models; zyada code.
 - **Common rule** -- SDK koi bhi ho, tool allow-list, secrets, approval aur logging policy tumhari hai.
 
 | Need | Raw loop | Claude Agent SDK | OpenAI Agents SDK | LangGraph |
@@ -120,7 +122,7 @@ print("OK: handoffs, guardrail tripwire, and a loop-ownership decision")
 
 - `Agent` + `Runner.run` stand-in ka shape OpenAI Agents SDK jaisa hai; real SDK mein model khud handoff "tool" call karta hai (`transfer_to_<agent>` jaisa), yahan `FakeRouterLLM` keywords se.
 - Guardrail input ko model se *pehle* check karta hai aur tripwire pe exception -- real SDK mein bhi tripwire exception raise hota hai (naam docs mein check karo).
-- `path` -- kaunse agents se request guzri; production mein ye tracing span hai (M14-10).
+- `path` -- kaunse agents se request guzri; production mein ye tracing span hai ([M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>)).
 - `choose()` jaan-bujh ke simple hai -- asli decision mein customer ka vendor contract, data residency aur team skills bhi aate hain.
 
 ```python
@@ -157,7 +159,7 @@ print(result.final_output)
 
 ### Mini-exercise (30-60 min)
 `fde-exercises/m10_sdks/`: AuditMesh ka ek chhota hissa teen tarah banao aur compare karo.
-- Task: "finding text lo -> KB search tool -> Jira draft tool". Version A: raw loop (M05-14) with FakeLLM. Version B: upar wala Agent/Runner stand-in with handoff (evidence -> ticketing). Version C (optional, agar install kar sako): real SDK with your own API key.
+- Task: "finding text lo -> KB search tool -> Jira draft tool". Version A: raw loop ([M05-14](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>)) with FakeLLM. Version B: upar wala Agent/Runner stand-in with handoff (evidence -> ticketing). Version C (optional, agar install kar sako): real SDK with your own API key.
 - `DECISION.md` -- 1 page: AuditMesh supervisor ke liye kaunsa aur kyon (HITL multi-day approval, Jira MCP, customer vendor), ek table ke saath.
 - Acceptance: A aur B dono same 5 scripted inputs pe same final output; guardrail test (card number) dono mein trip; decision doc mein kam se kam 3 trade-offs.
 
@@ -173,14 +175,24 @@ print(result.final_output)
 - [ ] AuditMesh ke liye apna choice justify kar sakta hoon.
 
 ### Related
-- M05-14 Processing tool results into chat history
-- M09-04 Supervisor and Router patterns
-- M10-07 Managed agent provisioning
-- M10-10 Host/Client/Server architectures
-- M14-10 Capturing deep span-level execution traces
+- [M05-14](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>) Processing tool results into chat history
+- [M09-04](<../09 - Agentic Frameworks & LangGraph/04 - Supervisor and Router patterns.md>) Supervisor and Router patterns
+- [M10-07](<07 - Managed agent provisioning.md>) Managed agent provisioning
+- [M10-10](<10 - Host and Client and Server architectures.md>) Host/Client/Server architectures
+- [M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>) Capturing deep span-level execution traces
 
 ### Self-quiz
 1. Customer ko 3 din tak pending approval chahiye aur Claude models. Claude Agent SDK ya LangGraph + Claude API? Kyon?
-2. Handoff aur "supervisor calls sub-agent as a tool" (M09-04) mein kya fark hai -- conversation control kiske paas rehta hai?
+2. Handoff aur "supervisor calls sub-agent as a tool" ([M09-04](<../09 - Agentic Frameworks & LangGraph/04 - Supervisor and Router patterns.md>)) mein kya fark hai -- conversation control kiske paas rehta hai?
 3. Vendor SDK ka version upgrade hua aur ek option ka naam badal gaya. Isse bachne ke liye apne code mein kya boundary banaoge?
 4. Claude Agent SDK ka bash tool customer ke laptop pe -- kaunse teen controls pehle lagaoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 219 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 218: Standardizing tool access boundaries](<11 - Standardizing tool access boundaries.md>)
+- Next -> step 220 BUILD: AuditMesh: LangGraph supervisor, Jira MCP server, HITL approval with checkpointing -- see [syllabus](<../SYLLABUS.md#cp9>)
+- then lesson: [step 222: Idempotency keys for safe tool execution](<../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>)

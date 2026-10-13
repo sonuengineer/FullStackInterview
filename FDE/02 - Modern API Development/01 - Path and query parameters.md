@@ -2,7 +2,9 @@
 
 ## Path and query parameters
 
-> Core | Fast CP2 / Slow CP2 | ~1.2 h | Builds on: M01-03, M01-04
+> **Core** | ~1.2 h | Slow: step 030/256, CP2 | Fast: CP2
+>
+> Before this: [M01-03 Object-oriented programming basics](<../01 - Python & Linux Foundations/03 - Object-oriented programming basics.md>), [M01-04 Exception handling](<../01 - Python & Linux Foundations/04 - Exception handling.md>)
 
 ### Kahani
 Ek private bank ke liye aap document search API bana rahe ho -- compliance team ko KYC aur AML policies dhoondhni hain.
@@ -25,6 +27,20 @@ Customer ke internal tools aapki API ko ajeeb inputs bhejenge. Boundary pe valid
 - **`Annotated[int, Query(ge=1, le=100)]`** -- validation rules type ke saath; ye zod ke `z.number().min(1).max(100)` jaisa, par OpenAPI schema mein bhi jaata hai.
 - **List query params** -- `?tag=a&tag=b` ke liye `Annotated[list[str], Query()]` chahiye; bina `Query()` ke FastAPI list ko body samajhta hai.
 - **Route order** -- `/documents/search` ko `/documents/{doc_id}` se PEHLE declare karo, warna "search" ko int parse karne ki koshish -> 422.
+
+### Picture it
+One URL, two kinds of input: the path says which resource, the query says how to show it. Bad input never reaches the handler.
+
+```mermaid
+flowchart TD
+    U["GET /documents/42?status=approved and limit=20"] --> R{"route match<br/>in declared order"}
+    R --> P["path param<br/>doc_id: int = 42<br/>WHICH resource, required"]
+    R --> Q["query params<br/>status, limit<br/>HOW to show it, optional"]
+    P --> V{"type hints +<br/>Path() / Query() rules"}
+    Q --> V
+    V -->|"valid"| H["handler runs"]
+    V -->|"doc_id=abc or limit=500"| E["422, handler never runs"]
+```
 
 ### Code example
 `pip install fastapi httpx`
@@ -109,16 +125,16 @@ print("OK: typed path + query params, 404 vs 422, list params, path converter")
 - `/openapi.json` check -- jo rules aapne likhe wahi docs mein dikhte hain; Express + swagger-jsdoc mein ye do jagah maintain karna padta.
 
 ### Mini-exercise (30-60 min)
-CP2 capstone shuru: apna `omniguard` repo banao (`omniguard/app/main.py`, `pyproject.toml` ya `requirements.txt`).
+CP2 capstone shuru: apna `omniguard` repo banao (`omniguard/main.py` -- layout: SETUP.md, `pyproject.toml` ya `requirements.txt`).
 - `GET /health` -> `{"status": "ok", "version": "0.1.0"}`.
 - `GET /documents` with `status` (Enum), `tag` (list), `limit` (1-100, default 20), `offset` (>= 0) -- abhi in-memory list se.
 - `GET /documents/{doc_id}` -- 404 agar nahi mila; `GET /documents/search?q=` route order sahi rakho.
-- Acceptance: `uvicorn app.main:app --reload` chalao, `/docs` mein saare params constraints ke saath dikhein; `curl "localhost:8000/documents/abc"` 422 de, `curl "localhost:8000/documents?limit=500"` 422 de. M02-02 mein in dicts ko Pydantic models se replace karoge.
+- Acceptance: `uvicorn omniguard.main:app --reload` chalao, `/docs` mein saare params constraints ke saath dikhein; `curl "localhost:8000/documents/abc"` 422 de, `curl "localhost:8000/documents?limit=500"` 422 de. [M02-02](<02 - Pydantic data validation.md>) mein in dicts ko Pydantic models se replace karoge.
 
 ### Common pitfalls
 - Mutable default se darr ke `tag: list[str] = None` likh dena aur phir `None` handle bhool jaana -- FastAPI defaults ko copy karta hai, `= []` yahan safe hai.
 - Sensitive data query string mein bhejna (`?api_key=...`, `?ssn=...`) -- query strings access logs, proxies aur browser history mein store hote hain. Secrets header mein, PII body mein.
-- `limit` ka cap na lagana ya `offset` ko unbounded chhodna -- ek scraper customer ka DB hila dega. Deep paging ke liye cursor pagination (M02-05).
+- `limit` ka cap na lagana ya `offset` ko unbounded chhodna -- ek scraper customer ka DB hila dega. Deep paging ke liye cursor pagination ([M02-05](<05 - Building scalable CRUD endpoints.md>)).
 
 ### Checklist before moving on
 - [ ] Main bata sakta hoon kab path param aur kab query param use karna hai.
@@ -127,13 +143,22 @@ CP2 capstone shuru: apna `omniguard` repo banao (`omniguard/app/main.py`, `pypro
 - [ ] Route order wali galti pehchaan sakta hoon.
 
 ### Related
-- M02-02 Pydantic data validation
-- M02-05 Building scalable CRUD endpoints
-- M02-10 Implementing URL-based vs Header-based API versioning
-- M13-14 Safe logging (never log PII or prompts)
+- [M02-02](<02 - Pydantic data validation.md>) Pydantic data validation
+- [M02-05](<05 - Building scalable CRUD endpoints.md>) Building scalable CRUD endpoints
+- [M02-10](<10 - Implementing URL-based vs Header-based API versioning.md>) Implementing URL-based vs Header-based API versioning
+- [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
 
 ### Self-quiz
 1. Express mein `req.params.id` aur FastAPI mein `doc_id: int` -- `"abc"` aane pe dono mein kya hota hai, aur kyun FastAPI wala behaviour production mein behtar hai?
 2. `/documents/search` route `/documents/{doc_id}` ke BAAD declare kiya to `GET /documents/search?q=kyc` ka kya response aayega? Kyun?
 3. Ek customer chahta hai ki "date range" se filter ho. Ise path mein rakhoge ya query mein? Validation kaise likhoge ki `from <= to`?
 4. `limit` pe `le=100` lagane ke baad bhi `?offset=5000000` slow kyun ho sakta hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 030 of 256** -- [Syllabus CP2](<../SYLLABUS.md#cp2>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: step 029 GATE: Gate: fde-exercises repo with the async exercise running (link the repo) -- see [syllabus](<../SYLLABUS.md#cp1>)
+- Next -> [step 031: Pydantic data validation](<02 - Pydantic data validation.md>)

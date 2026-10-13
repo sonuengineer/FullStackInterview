@@ -2,7 +2,9 @@
 
 ## Automating LLM-as-a-judge scoring pipelines
 
-> Core | Fast CP3 / Slow CP4 | ~1.2 h | Builds on: M05-06, M05-09, M06-10
+> **Core** | ~1.2 h | Slow: step 081/256, CP4 | Fast: CP3
+>
+> Before this: [M05-06 Enforcing strict JSON output schemas via APIs](<../05 - LLM Fundamentals & Prompting/06 - Enforcing strict JSON output schemas via APIs.md>), [M05-09 Handling and retrying output parsing errors gracefully](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>), [M06-10 End-to-end basic retrieval](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>)
 
 ### Kahani
 Ek insurance company ka claims-support RAG bot live hai. Har week prompt ya retriever mein chhota change hota hai, aur team "vibe check" karti hai -- 5 sawaal poocho, "theek lag raha hai", ship.
@@ -12,14 +14,14 @@ Aapka jawab: ek LLM-as-a-judge pipeline -- rubric, strict JSON verdict, cache, s
 
 ### What it is
 **LLM-as-a-judge** = ek doosra LLM call jo aapke system ke output ko ek fixed rubric pe grade karta hai aur structured verdict (score + reason) deta hai.
-Pipeline = dataset ya sampled traffic -> judge prompt -> validated verdict -> aggregate score -> report. Isse M14-06/07 ke RAG metrics bhi bante hain (wo bhi andar se judge calls hi hain).
+Pipeline = dataset ya sampled traffic -> judge prompt -> validated verdict -> aggregate score -> report. Isse [M14-06](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>)/07 ke RAG metrics bhi bante hain (wo bhi andar se judge calls hi hain).
 
 ### Why it matters for an FDE
 Customer site pe "accuracy kitni hai?" ka jawab bina eval pipeline ke sirf guess hai. Uncalibrated judge aur bhi khatarnak hai -- confident galat number, jispe release decisions ho jaate hain.
 
 ### Key concepts
 - **Rubric prompt** -- score levels ki explicit definition (5 = ..., 3 = ..., 1 = ...); vague "rate quality 1-10" se noise aata hai.
-- **Strict verdict** -- judge ka output Pydantic model se validate (M05-06); invalid verdict = retry ya "unscored", kabhi silently 0 nahi.
+- **Strict verdict** -- judge ka output Pydantic model se validate ([M05-06](<../05 - LLM Fundamentals & Prompting/06 - Enforcing strict JSON output schemas via APIs.md>)); invalid verdict = retry ya "unscored", kabhi silently 0 nahi.
 - **Pointwise vs pairwise** -- pointwise: ek answer ko absolute score; pairwise: A vs B mein kaun better (prompt v1 vs v2 compare karne ke liye zyada stable).
 - **Position bias** -- judges aksar pehle wale answer ko prefer karte hain; fix: dono order mein poocho, consistent ho to hi winner, warna tie.
 - **Calibration** -- ~20 human-labelled items pe judge vs human: agreement % aur **Cohen's kappa** (chance agreement hata ke). Kappa low = judge pe bharosa mat karo.
@@ -111,7 +113,7 @@ assert 350 < sampled < 650, sampled         # ~10% of traffic gets judged
 print("OK: rubric judge with strict verdicts, cache, swap-order pairwise, kappa calibration")
 ```
 
-- `Verdict` / `PairVerdict` -- judge ka output bhi untrusted hai; Pydantic validate karta hai ki score 1-5 hi ho. Real pipeline mein yahan M05-09 ka repair-retry lagao.
+- `Verdict` / `PairVerdict` -- judge ka output bhi untrusted hai; Pydantic validate karta hai ki score 1-5 hi ho. Real pipeline mein yahan [M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>) ka repair-retry lagao.
 - Cache key mein `RUBRIC_V` -- rubric badla to purane scores reuse nahi honge; same input pe dobara pay nahi karte (20 items, 4 calls).
 - `judge_pair` -- A,B aur B,A dono order; FakeJudge ka "A" bias near-tie pe dono baar pehle wale ko jitata hai, isliye inconsistent -> `tie`. Clear case pe winner stable rehta hai.
 - `cohens_kappa` -- 90% agreement accha lagta hai, lekin agar 70% items "pass" hi hain to random judge bhi kaafi agree karega; kappa wo chance hata deta hai (~0.6+ reasonable, < 0.4 judge rubric fix karo).
@@ -152,13 +154,22 @@ OmniGuard Hybrid RAG v1 ke liye `omniguard/evals/judge.py` banao.
 - [ ] 20 human labels pe agreement aur kappa calculate kar sakta hoon.
 
 ### Related
-- M05-06 Enforcing strict JSON output schemas via APIs
-- M05-09 Handling and retrying output parsing errors gracefully
-- M14-06 Calculating RAGAS faithfulness and answer relevance metrics
-- M14-09 Tracking evaluation scores across deployment runs
+- [M05-06](<../05 - LLM Fundamentals & Prompting/06 - Enforcing strict JSON output schemas via APIs.md>) Enforcing strict JSON output schemas via APIs
+- [M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>) Handling and retrying output parsing errors gracefully
+- [M14-06](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>) Calculating RAGAS faithfulness and answer relevance metrics
+- [M14-09](<09 - Tracking evaluation scores across deployment runs.md>) Tracking evaluation scores across deployment runs
 
 ### Self-quiz
 1. 90% agreement aur kappa 0.2 -- dono ek saath kaise possible hai? Aap kya conclude karoge?
 2. Pairwise judging pointwise se zyada stable kyun hota hai, aur position bias ko kaise neutralize karte ho?
 3. Cache key mein rubric version na ho to kya galat ho sakta hai?
 4. Customer kehta hai "judge ka cost kam karo" -- teen concrete levers batao.
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 081 of 256** -- [Syllabus CP4](<../SYLLABUS.md#cp4>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 080: API integration for rerankers](<../06 - Vector Search & Core RAG/16 - API integration for rerankers.md>)
+- Next -> [step 082: Calculating RAGAS faithfulness and answer relevance metrics](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>)

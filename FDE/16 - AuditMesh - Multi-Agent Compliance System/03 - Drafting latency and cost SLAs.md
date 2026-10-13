@@ -2,7 +2,11 @@
 
 ## Drafting latency/cost SLAs
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M16-01, M16-02, M14-11
+> **Core** | ~1.2 h | Slow: step 236/256, CP10 | Fast: CP8
+>
+> Before this: [M16-01 Mapping 5-step manual compliance workflows](<01 - Mapping 5-step manual compliance workflows.md>), [M16-02 Identifying Human-in-the-Loop bottlenecks](<02 - Identifying Human-in-the-Loop bottlenecks.md>), [M14-11 Monitoring granular token costs and endpoint latency](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Drafting latency and cost SLAs](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/06 - Drafting latency and cost SLAs.md>) (in `Projects/`).
 
 ### Kahani
 Kavach ka procurement SOW sign karne se pehle ek page maangta hai: "AuditMesh kitna fast, kitna sasta, kitna reliable hoga -- numbers mein."
@@ -19,9 +23,9 @@ Vague SLA = endless disputes. Agent latency aur human wait mix kar diya to aap u
 
 ### Key concepts
 - **p95, not average** -- average ek slow run chhupa deta hai; p95 batata hai 20 mein se 1 run kitna bura hai.
-- **Per-step SLO** -- collect/check/flag/draft alag; regression kis step mein hai turant dikhta hai (M14-10 spans se).
+- **Per-step SLO** -- collect/check/flag/draft alag; regression kis step mein hai turant dikhta hai ([M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>) spans se).
 - **Cost per audit run** -- tokens x price, per run; price ek config value hai (provider price page se, date ke saath).
-- **Scope the clock** -- human review queue ka apna SLO (M16-02), agent latency SLA se bahar.
+- **Scope the clock** -- human review queue ka apna SLO ([M16-02](<02 - Identifying Human-in-the-Loop bottlenecks.md>)), agent latency SLA se bahar.
 - **Measurement window** -- "last 200 runs" ya "rolling 30 days"; bina window ke p95 ka koi matlab nahi.
 
 Draft SLA table (illustrative inputs -- calibrate on your pilot data):
@@ -109,7 +113,7 @@ print("OK: SLA checker")
 
 ### Mini-exercise (30-60 min)
 AuditMesh deliverable "drafting latency and cost SLAs": `auditmesh/docs/sla.md` + `auditmesh/sla.yaml` + `auditmesh/tools/sla_check.py`.
-- SLA table apne pilot ke numbers se bharo (kam se kam 20 local runs ke traces, M14-11 se token counts).
+- SLA table apne pilot ke numbers se bharo (kam se kam 20 local runs ke traces, [M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) se token counts).
 - Checker ko apne real trace export pe chalao (JSON lines file); output weekly report ki tarah markdown mein.
 - Doc mein "out of scope" section: human wait, Jira downtime, customer network.
 - Acceptance: healthy data pe pass, ek deliberately slow step pe fail; har number ke saath "measured on <date>, N runs".
@@ -117,7 +121,7 @@ AuditMesh deliverable "drafting latency and cost SLAs": `auditmesh/docs/sla.md` 
 ### Common pitfalls
 - Demo ke 3 runs se SLA number banana -- pilot traffic pe calibrate karo, pehle SLO, SLA baad mein.
 - Token price hard-code karke bhool jaana -- price badalta hai; config + date rakho.
-- Retries ko latency se bahar rakhna -- user ko retry ke saath wala time dikhta hai (M14-02); wahi measure karo.
+- Retries ko latency se bahar rakhna -- user ko retry ke saath wala time dikhta hai ([M14-02](<../14 - AI Observability & Gateway Management/02 - Exponential backoff strategies.md>)); wahi measure karo.
 
 ### Checklist before moving on
 - [ ] SLI, SLO, SLA aur error budget ka fark Kavach example se samjha sakta hoon.
@@ -126,14 +130,23 @@ AuditMesh deliverable "drafting latency and cost SLAs": `auditmesh/docs/sla.md` 
 - [ ] Cost per run ka formula aur uske inputs ka source pata hai.
 
 ### Related
-- M14-10 Capturing deep span-level execution traces
-- M14-11 Monitoring granular token costs and endpoint latency
-- M14-02 Exponential backoff strategies
-- M16-02 Identifying Human-in-the-Loop bottlenecks
-- M16-08 Building comprehensive token cost/trace dashboards
+- [M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>) Capturing deep span-level execution traces
+- [M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
+- [M14-02](<../14 - AI Observability & Gateway Management/02 - Exponential backoff strategies.md>) Exponential backoff strategies
+- [M16-02](<02 - Identifying Human-in-the-Loop bottlenecks.md>) Identifying Human-in-the-Loop bottlenecks
+- [M16-08](<08 - Building comprehensive token cost and trace dashboards.md>) Building comprehensive token cost/trace dashboards
 
 ### Self-quiz
 1. Average latency 90 s hai par p95 600 s. Meera ko kya bologe aur kahan dekhoge?
 2. 200 runs, target 99%, 3 failures -- error budget used kitna hai aur ab kya karna chahiye?
 3. SLA mein "audit 1 ghante mein" kyun nahi likh sakte? Kya likhoge iski jagah?
 4. Naya model 30% sasta hai par `check` step 2x slow. SLA doc kaise decide karne mein madad karta hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 236 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 235: Identifying Human-in-the-Loop bottlenecks](<02 - Identifying Human-in-the-Loop bottlenecks.md>)
+- Next -> [step 237: Defining Model Context Protocol trust boundaries](<04 - Defining Model Context Protocol trust boundaries.md>)

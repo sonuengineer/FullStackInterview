@@ -2,7 +2,9 @@
 
 ## Configuring strict input and output filtering pipelines natively in Python
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M13-02, M13-03, M13-05, M05-08
+> **Core** | ~1.2 h | Slow: step 180/256, CP8 | Fast: CP6
+>
+> Before this: [M13-02 Prompt injection defenses](<02 - Prompt injection defenses.md>), [M13-03 Jailbreak prevention techniques](<03 - Jailbreak prevention techniques.md>), [M13-05 Redacting sensitive entities (SSN, credit cards, emails)](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>), [M05-08 Validating LLM responses natively against type hints](<../05 - LLM Fundamentals & Prompting/08 - Validating LLM responses natively against type hints.md>)
 
 ### Kahani
 Ek insurance customer ke paas ab 6 alag guardrail functions the: PII redact, injection check, jailbreak score, topic check, JSON validate, leak check. Har developer ne unhe `/ask` route mein alag order mein chipka diya.
@@ -22,7 +24,7 @@ Customer audit ke time aapko har request ka trail dikhana hai: kaunse checks cha
 - **Ordering** -- cheap + deterministic pehle (length, regex), mehenge (classifier, LLM judge) baad mein; PII redact injection check se pehle taaki logs mein bhi PII na jaaye.
 - **Fail-closed** -- exception ya timeout = block. Security path mein "error pe allow" kabhi nahi.
 - **Timing budget** -- poori pipeline ka latency budget (jaise 150 ms); budget cross = block + alert, chup-chaap skip nahi.
-- **Audit trail** -- har decision `(check, action, reason, ms)` list mein; ye structured log banta hai (M13-14), raw text nahi.
+- **Audit trail** -- har decision `(check, action, reason, ms)` list mein; ye structured log banta hai ([M13-14](<14 - Safe logging (never log PII or prompts).md>)), raw text nahi.
 
 ### Code example
 `pip install pydantic`
@@ -119,7 +121,7 @@ print("OK: ordered checks, typed decisions, fail-closed on error and budget")
 
 ### Mini-exercise (30-60 min)
 OmniGuard CP6: `omniguard/guardrails/pipeline.py`.
-- `Decision`, `run_checks`, `guarded_ask` upar jaise; checks import karo `pii.py` (M13-04/05), `injection.py` (M13-02), `topics.py` (M13-11).
+- `Decision`, `run_checks`, `guarded_ask` upar jaise; checks import karo `pii.py` ([M13-04](<04 - Implementing Microsoft Presidio analyzers and anonymizers.md>)/05), `injection.py` ([M13-02](<02 - Prompt injection defenses.md>)), `topics.py` ([M13-11](<11 - Enforcing topical boundaries to prevent off-topic chatter.md>)).
 - Pipeline config `config/guardrails.yaml` se: check names, order, budget_ms. Unknown check name = app start pe crash (fail fast).
 - FastAPI `/ask` mein wire karo; response mein `guardrail_trail` sirf debug mode mein, warna sirf `request_id`.
 - `tests/test_pipeline.py`: har check ka allow + block case, broken check -> fail-closed, budget exceeded -> block.
@@ -127,7 +129,7 @@ OmniGuard CP6: `omniguard/guardrails/pipeline.py`.
 ### Common pitfalls
 - `except: pass` ya "error pe allow" -- security pipeline ka sabse common aur sabse khatarnak bug.
 - Output check skip karna kyunki "input already checked" -- model khud PII ya off-policy text generate kar sakta hai (RAG context se).
-- Trail mein raw text log karna -- reason codes aur hashes log karo, text nahi (M13-14).
+- Trail mein raw text log karna -- reason codes aur hashes log karo, text nahi ([M13-14](<14 - Safe logging (never log PII or prompts).md>)).
 
 ### Checklist before moving on
 - [ ] Har check `Decision(action, reason, text)` return karta hai.
@@ -136,15 +138,24 @@ OmniGuard CP6: `omniguard/guardrails/pipeline.py`.
 - [ ] Input aur output dono pipelines hain.
 
 ### Related
-- M13-02 Prompt injection defenses
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
-- M13-11 Enforcing topical boundaries to prevent off-topic chatter
-- M13-14 Safe logging (never log PII or prompts)
-- M05-08 Validating LLM responses natively against type hints
-- M13-09 Writing programmable conversational rails using Colang
+- [M13-02](<02 - Prompt injection defenses.md>) Prompt injection defenses
+- [M13-05](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
+- [M13-11](<11 - Enforcing topical boundaries to prevent off-topic chatter.md>) Enforcing topical boundaries to prevent off-topic chatter
+- [M13-14](<14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
+- [M05-08](<../05 - LLM Fundamentals & Prompting/08 - Validating LLM responses natively against type hints.md>) Validating LLM responses natively against type hints
+- [M13-09](<09 - Writing programmable conversational rails using Colang.md>) Writing programmable conversational rails using Colang
 
 ### Self-quiz
 1. `transform` aur `block` mein fark kya hai? PII ke liye kab transform, kab block?
 2. PII service down hai. Fail-open vs fail-closed -- business aur security dono angle se trade-off batao.
 3. Checks ka order badal ke injection check ko PII redact se pehle kar diya. Kya problem ho sakti hai?
 4. Output pe pydantic schema validate karne se kaunsi class ka attack/bug rukta hai (OWASP mein kaunsa)?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 180 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 179: Writing programmable conversational rails using Colang](<09 - Writing programmable conversational rails using Colang.md>)
+- Next -> [step 181: Enforcing topical boundaries to prevent off-topic chatter](<11 - Enforcing topical boundaries to prevent off-topic chatter.md>)

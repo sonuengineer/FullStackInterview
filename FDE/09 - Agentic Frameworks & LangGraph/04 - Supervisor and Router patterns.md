@@ -2,11 +2,13 @@
 
 ## Supervisor and Router patterns
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M09-01, M09-02, M09-03
+> **Core** | ~1.2 h | Slow: step 199/256, CP9 | Fast: CP7
+>
+> Before this: [M09-01 Defining agency](<01 - Defining agency.md>), [M09-02 ReAct framework loops](<02 - ReAct framework loops.md>), [M09-03 Plan & Execute structures](<03 - Plan & Execute structures.md>)
 
 ### Kahani
 Ek healthcare SaaS customer ne ek "super agent" banaya tha: ek LLM, 14 tools -- evidence fetch, control check, Jira create, user disable, sab ek saath.
-Ek din prompt injection wale document (M13-02) ko padhte waqt model ne `disable_user` call kar diya -- evidence padhne wale step ke paas wo tool hona hi nahi chahiye tha.
+Ek din prompt injection wale document ([M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>)) ko padhte waqt model ne `disable_user` call kar diya -- evidence padhne wale step ke paas wo tool hona hi nahi chahiye tha.
 Saath hi 14 tools ki descriptions har call mein jaati thin -- tokens zyada, aur model galat tool chunta.
 Fix: kaam ko chhote **workers** mein baanto, har worker ko sirf uske tools do, aur upar ek **supervisor** ya **router** rakho jo decide kare kaunsa worker chalega.
 
@@ -14,14 +16,14 @@ Fix: kaam ko chhote **workers** mein baanto, har worker ko sirf uske tools do, a
 **Router** = ek LLM call request ko classify karke **ek** worker pe bhejta hai, phir khatam (one-shot). **Supervisor** = ek LLM node loop mein baar-baar decide karta hai "ab kaunsa worker?" -- worker kaam karke supervisor ko wapas report karta hai, jab tak supervisor `FINISH` na bole. Dono mein **worker isolation**: har worker ka apna tool allow-list.
 
 ### Why it matters for an FDE
-Multi-step compliance kaam (evidence -> check -> ticket) ke liye supervisor; simple request triage ke liye router -- sasta aur predictable. Worker isolation blast radius chhota karta hai: injected evidence worker Jira ya user-admin tools tak pahunch hi nahi sakta. AuditMesh (M16-06) isi supervisor pe bana hai.
+Multi-step compliance kaam (evidence -> check -> ticket) ke liye supervisor; simple request triage ke liye router -- sasta aur predictable. Worker isolation blast radius chhota karta hai: injected evidence worker Jira ya user-admin tools tak pahunch hi nahi sakta. AuditMesh ([M16-06](<../16 - AuditMesh - Multi-Agent Compliance System/06 - Developing a LangGraph Multi-Agent Supervisor.md>)) isi supervisor pe bana hai.
 
 ### Key concepts
 - **Router (one-shot)** -- 1 LLM call, 1 worker, END; jab request ka type hi kaam decide karta hai.
 - **Supervisor (loop)** -- har worker ke baad wapas supervisor; multi-step, order runtime pe decide hota hai.
 - **Worker isolation** -- har worker ka apna ToolBox; allow-list ke bahar call = `PermissionError`, execute nahi.
 - **Validate the supervisor's choice** -- LLM ne non-existent worker bola to safe exit (human), crash ya guess nahi.
-- **Bounded supervisor turns** -- max turns + recursion limit; supervisor bhi ek loop hai (M09-02).
+- **Bounded supervisor turns** -- max turns + recursion limit; supervisor bhi ek loop hai ([M09-02](<02 - ReAct framework loops.md>)).
 
 ### Code example
 stdlib only
@@ -148,10 +150,10 @@ out = graph.invoke({"vendor": "acme", "trail": []}, config={"recursion_limit": 1
 `Command(goto=...)` node se hi routing karta hai (conditional edges ka alternative); prebuilt supervisor helper libraries bhi hain -- check the docs for your langgraph version.
 
 ### Mini-exercise (30-60 min)
-`auditmesh/graph/supervisor.py` banao -- ye AuditMesh ka core hai (M16-06 isi ko extend karega).
-- Workers: `evidence_collector`, `control_checker`, `jira_writer` (abhi fake; real Jira MCP server M16-07), har ek `ToolBox` ke saath.
+`auditmesh/graph/supervisor.py` banao -- ye AuditMesh ka core hai ([M16-06](<../16 - AuditMesh - Multi-Agent Compliance System/06 - Developing a LangGraph Multi-Agent Supervisor.md>) isi ko extend karega).
+- Workers: `evidence_collector`, `control_checker`, `jira_writer` (abhi fake; real Jira MCP server [M16-07](<../16 - AuditMesh - Multi-Agent Compliance System/07 - Deploying a custom MCP server for secure Jira ticketing.md>)), har ek `ToolBox` ke saath.
 - Supervisor ka output Pydantic `Route` (Literal choices); unknown/invalid -> `human_approval` node.
-- `jira_writer` se pehle hamesha `human_approval` (abhi stub; M10-03/M10-04 mein interrupt + checkpoint).
+- `jira_writer` se pehle hamesha `human_approval` (abhi stub; [M10-03](<../10 - Advanced Agent Orchestration/03 - Interrupting graph execution.md>)/M10-04 mein interrupt + checkpoint).
 - Acceptance: pytest -- (a) happy path trail exact, (b) evidence worker ka `create_ticket` call `PermissionError`, (c) hallucinated worker -> human, (d) max 6 supervisor turns.
 
 ### Common pitfalls
@@ -166,13 +168,22 @@ out = graph.invoke({"vendor": "acme", "trail": []}, config={"recursion_limit": 1
 - [ ] Supervisor loop ko turns se bound karta hoon.
 
 ### Related
-- M09-07 Conditional routing logic
-- M09-10 Managing nested parent-child graph architectures
-- M10-11 Standardizing tool access boundaries
-- M16-06 Developing a LangGraph Multi-Agent Supervisor
+- [M09-07](<07 - Conditional routing logic.md>) Conditional routing logic
+- [M09-10](<10 - Managing nested parent-child graph architectures.md>) Managing nested parent-child graph architectures
+- [M10-11](<../10 - Advanced Agent Orchestration/11 - Standardizing tool access boundaries.md>) Standardizing tool access boundaries
+- [M16-06](<../16 - AuditMesh - Multi-Agent Compliance System/06 - Developing a LangGraph Multi-Agent Supervisor.md>) Developing a LangGraph Multi-Agent Supervisor
 
 ### Self-quiz
 1. Router aur supervisor mein LLM calls ki ginti kaise alag hoti hai? Ek example do jahan router kaafi hai.
 2. Worker isolation prompt injection ka risk kaise kam karta hai? Kya ye poora solution hai?
 3. Supervisor ne "sql_admin" worker bola jo exist nahi karta. Aapka graph kya karega aur kyun?
 4. AuditMesh mein `jira_writer` se pehle human approval kyun hona chahiye?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 199 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 198: Plan & Execute structures](<03 - Plan & Execute structures.md>)
+- Next -> [step 200: Defining graphs and state management](<05 - Defining graphs and state management.md>)

@@ -1,0 +1,13 @@
+[project]
+name = "fde-exercises"
+version = "0.1.0"
+description = "Mini-exercises from the FDE course, one folder per lesson (m01_event_loop/, m01_async_worker/, ...)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "."]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110

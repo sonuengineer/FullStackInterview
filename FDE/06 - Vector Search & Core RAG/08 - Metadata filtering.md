@@ -2,7 +2,9 @@
 
 ## Metadata filtering
 
-> Core | Fast CP3 / Slow CP4 | ~1.2 h | Builds on: M06-06, M06-07
+> **Core** | ~1.2 h | Slow: step 072/256, CP4 | Fast: CP3
+>
+> Before this: [M06-06 Index creation](<06 - Index creation.md>), [M06-07 Distance metrics (Cosine, Euclidean)](<07 - Distance metrics (Cosine, Euclidean).md>)
 
 ### Kahani
 Ek multi-tenant SaaS: ek hi vector index mein 200 customers ke support docs. Globex ka agent poochta hai "refund policy?" -- top-3 mein Acme ke documents aate hain, kyunki Acme ke paas 500 refund chunks hain.
@@ -14,7 +16,7 @@ Aur ek din kisi ne API mein `filter={"tenant": "acme"}` bhej diya Globex ke toke
 **Pre-filter** = pehle filter, phir us subset mein top-k (sahi). **Post-filter** = global top-k, phir filter (results kam ya zero, aur leak ka risk).
 
 ### Why it matters for an FDE
-Enterprise customer ka pehla sawaal: "Kya HR ka data sales wale ko dikhega?" Tenant aur role filters retrieval layer mein enforce na hon to LLM wahi bolega jo context mein aaya -- prompt mein "don't reveal" likhna security nahi hai (M12-07).
+Enterprise customer ka pehla sawaal: "Kya HR ka data sales wale ko dikhega?" Tenant aur role filters retrieval layer mein enforce na hon to LLM wahi bolega jo context mein aaya -- prompt mein "don't reveal" likhna security nahi hai ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)).
 
 ### Key concepts
 - **Server-side mandatory filters** -- tenant aur role hamesha verified auth token se aate hain, request body se kabhi nahi.
@@ -109,11 +111,11 @@ except ValueError as e:
 print("OK: tenant + role enforced server-side, pre-filter keeps k results")
 ```
 
-- `UserCtx` frozen dataclass -- tenant/role verified JWT se aata hai (M12-02); route handler isse request body se kabhi na banaye.
+- `UserCtx` frozen dataclass -- tenant/role verified JWT se aata hai ([M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>)); route handler isse request body se kabhi na banaye.
 - `ALLOWED_FILTER_FIELDS` -- client sirf `doc_type` filter kar sakta hai; `tenant` bhejne ki koshish `ValueError` -- log + 400, aur security alert.
 - `search_post_filter` ne Globex ko `[]` diya: Acme ke 8 refund chunks ne top-3 bhar diya. Bade corpus mein yahi "kabhi kabhi results nahi aate" bug hai.
 - `search_pre_filter` -- pehle allowed subset, phir ranking. Real vector DB yahi filter-aware ANN se karta hai.
-- Role assert -- staff ko `acme-hr` kabhi nahi milta, manager ko milta hai. Ye M12-07 ka seed hai: permissions retrieval layer mein, prompt mein nahi.
+- Role assert -- staff ko `acme-hr` kabhi nahi milta, manager ko milta hai. Ye [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) ka seed hai: permissions retrieval layer mein, prompt mein nahi.
 - Toy embedder sirf word overlap dekhta hai -- yahan focus filtering pe hai, ranking quality pe nahi.
 
 ```python
@@ -145,7 +147,7 @@ res = pc_index.query(vector=query_vec, top_k=5, namespace=user.tenant,
 ### Common pitfalls
 - Tenant filter frontend se bhejna "kyunki UI already jaanta hai" -- koi bhi curl se badal dega. Server-side, token se.
 - Filter fields pe payload index na banana -- 10 lakh chunks pe har query full scan, latency spike.
-- Doc permissions badle (employee ka role change) lekin chunk metadata purana -- ACL sync job aur re-index plan chahiye (M12-07).
+- Doc permissions badle (employee ka role change) lekin chunk metadata purana -- ACL sync job aur re-index plan chahiye ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)).
 
 ### Checklist before moving on
 - [ ] Pre-filter vs post-filter ka farak aur post-filter ka bug dikha sakta hoon.
@@ -154,13 +156,22 @@ res = pc_index.query(vector=query_vec, top_k=5, namespace=user.tenant,
 - [ ] Cross-tenant leak ke liye automated test hai.
 
 ### Related
-- M06-06 Index creation
-- M06-09 Cloud vector database provisioning
-- M12-06 Implementing Role-Based Access Control
-- M12-07 Enforcing data-level permissions in retrieval layers
+- [M06-06](<06 - Index creation.md>) Index creation
+- [M06-09](<09 - Cloud vector database provisioning.md>) Cloud vector database provisioning
+- [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
 
 ### Self-quiz
 1. Globex ko post-filter ke baad zero results kyun mile? Bade corpus pe ye kitna common hoga?
 2. Tenant filter request body se lene mein kya attack possible hai? Ek curl example socho.
 3. Namespace-per-tenant vs ek index + tenant filter -- kab kaunsa choose karoge?
 4. Employee ka role "manager" se "staff" hua. Uske baad bhi wo HR chunks dekh sakta hai -- kyun, aur fix kya?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 072 of 256** -- [Syllabus CP4](<../SYLLABUS.md#cp4>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 071: Distance metrics (Cosine, Euclidean)](<07 - Distance metrics (Cosine, Euclidean).md>)
+- Next -> [step 073: Cloud vector database provisioning](<09 - Cloud vector database provisioning.md>)

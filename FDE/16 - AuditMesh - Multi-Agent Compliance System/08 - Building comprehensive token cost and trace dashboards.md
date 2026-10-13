@@ -2,11 +2,15 @@
 
 ## Building comprehensive token cost/trace dashboards
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M14-10, M14-11, M14-12, M13-14, M16-03
+> **Core** | ~1.2 h | Slow: step 241/256, CP10 | Fast: CP8
+>
+> Before this: [M14-10 Capturing deep span-level execution traces](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>), [M14-11 Monitoring granular token costs and endpoint latency](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>), [M14-12 Debugging multi-step agent reasoning and tool inputs](<../14 - AI Observability & Gateway Management/12 - Debugging multi-step agent reasoning and tool inputs.md>), [M13-14 Safe logging (never log PII or prompts)](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>), [M16-03 Drafting latency and cost SLAs](<03 - Drafting latency and cost SLAs.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Token cost and traceability dashboards](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/04 - Token cost and traceability dashboards.md>) (in `Projects/`).
 
 ### Kahani
 AuditMesh ka pehla full quarterly run hua. Finance ka email aaya: "LLM bill pichhle mahine se 4x kyun hai?" Meera ka sawaal: "Kitne approvals pending hain?" Anil: "Kal raat wala run kitna slow tha?"
-Aapke paas traces the (M14-10), par jawab dene ke liye 3 alag tools mein 40 minute khodna pada -- aur pending approvals ka number galat nikla, kyunki aap "requested" events gin rahe the, decided wale minus nahi kiye.
+Aapke paas traces the ([M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>)), par jawab dene ke liye 3 alag tools mein 40 minute khodna pada -- aur pending approvals ka number galat nikla, kyunki aap "requested" events gin rahe the, decided wale minus nahi kiye.
 Upar se ek screenshot mein prompt text dikh gaya jismein ek PAN number tha.
 Aapko ek dashboard chahiye jiske numbers trace data se derive hon, ek fixed **data contract** follow karein, aur jinhe test kiya ja sake.
 
@@ -18,11 +22,11 @@ Dashboard ka **data contract** = backend function jo spans leke fixed shape ka J
 Cost spike ya SLA breach pe customer pehle dashboard dekhta hai. Galat number (jaise pending approvals) pe trust ek baar gaya to har report pe sawaal uthega -- aur PII leak hua to project band.
 
 ### Key concepts
-- **Spans -> metrics** -- har metric spans se derive ho, alag counters se nahi; ek source of truth (M14-10).
-- **Cost = tokens x price per model** -- price table config mein, date ke saath; cost by model se routing decisions (M14-16) dikhte hain (M14-11).
+- **Spans -> metrics** -- har metric spans se derive ho, alag counters se nahi; ek source of truth ([M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>)).
+- **Cost = tokens x price per model** -- price table config mein, date ke saath; cost by model se routing decisions ([M14-16](<../14 - AI Observability & Gateway Management/16 - Model selection and routing.md>)) dikhte hain ([M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>)).
 - **In-flight vs finished** -- p95 latency sirf finished runs pe; running runs alag panel mein.
 - **State from events** -- pending = requested minus decided; events gino, state nahi maano.
-- **No content on dashboards** -- prompt, ticket text, PII kabhi aggregate output mein nahi (M13-14); sirf ids, counts, hashes.
+- **No content on dashboards** -- prompt, ticket text, PII kabhi aggregate output mein nahi ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)); sirf ids, counts, hashes.
 
 ```text
  AuditMesh (supervisor, workers, MCP calls, approvals)
@@ -33,7 +37,7 @@ Cost spike ya SLA breach pe customer pehle dashboard dekhta hai. Galat number (j
  panels: cost today | cost by model | per-run table | p95 latency vs SLO (M16-03) | approvals pending | in flight
 ```
 
-Panels and alerts (feed M16-05 runbooks):
+Panels and alerts (feed [M16-05](<05 - Leading operations and training handoffs.md>) runbooks):
 
 | Panel | Source | Alert |
 |---|---|---|
@@ -147,12 +151,12 @@ LIMIT 20;
 AuditMesh deliverable #4 (token cost and traceability dashboards): `auditmesh/dashboard/data.py` + `tests/acceptance/test_dashboard.py` + ek UI.
 - Apne tracer ke real export format pe `build_dashboard` likho; harness ko us format ke synthetic spans pe adapt karo.
 - UI: Streamlit page ya Grafana/Langfuse dashboard -- jo bhi, contract JSON se hi render ho. Panels upar wali table se.
-- Ek "trace drill-down": run_id click -> us run ke spans ka timeline (M14-12 debugging ke liye).
-- Acceptance: harness green; naive pending bug pe red; dashboard screenshot README mein, koi prompt/PII nahi; har alert ka runbook link (M16-05).
+- Ek "trace drill-down": run_id click -> us run ke spans ka timeline ([M14-12](<../14 - AI Observability & Gateway Management/12 - Debugging multi-step agent reasoning and tool inputs.md>) debugging ke liye).
+- Acceptance: harness green; naive pending bug pe red; dashboard screenshot README mein, koi prompt/PII nahi; har alert ka runbook link ([M16-05](<05 - Leading operations and training handoffs.md>)).
 
 ### Common pitfalls
 - Price hard-coded aur purana -- cost panel chupke se galat. Price table + "last updated" date panel pe dikhao.
-- Average latency panel -- p95 dikhao aur SLO line saath mein (M16-03).
+- Average latency panel -- p95 dikhao aur SLO line saath mein ([M16-03](<03 - Drafting latency and cost SLAs.md>)).
 - Debugging ke liye prompt text dashboard pe -- trace UI mein access-controlled drill-down rakho, aggregate panels pe kabhi nahi.
 
 ### Checklist before moving on
@@ -162,14 +166,23 @@ AuditMesh deliverable #4 (token cost and traceability dashboards): `auditmesh/da
 - [ ] Mera dashboard data function harness pe green aur PII-free hai.
 
 ### Related
-- M14-10 Capturing deep span-level execution traces
-- M14-11 Monitoring granular token costs and endpoint latency
-- M14-12 Debugging multi-step agent reasoning and tool inputs
-- M13-14 Safe logging (never log PII or prompts)
-- M16-05 Leading operations and training handoffs
+- [M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>) Capturing deep span-level execution traces
+- [M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
+- [M14-12](<../14 - AI Observability & Gateway Management/12 - Debugging multi-step agent reasoning and tool inputs.md>) Debugging multi-step agent reasoning and tool inputs
+- [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
+- [M16-05](<05 - Leading operations and training handoffs.md>) Leading operations and training handoffs
 
 ### Self-quiz
 1. Finance kehta hai bill 4x hai. Dashboard ke kaunse do panels se aap 5 minute mein reason dhundhoge?
 2. Pending approvals "requested" events gin ke kyun nahi nikalte? Event-sourcing ka ye kaunsa principle hai?
 3. In-flight runs ko p95 mein include karne se number upar jaayega ya neeche? Kyun?
 4. Harness ka ground truth agar stand-in function hi se calculate karte to kya problem hoti?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 241 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 240: Deploying a custom MCP server for secure Jira ticketing](<07 - Deploying a custom MCP server for secure Jira ticketing.md>)
+- Next -> [step 242: Creating Streamlit/Gradio UIs for human approval workflows](<09 - Creating Streamlit and Gradio UIs for human approval workflows.md>)

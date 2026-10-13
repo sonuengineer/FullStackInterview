@@ -2,7 +2,9 @@
 
 ## Parsing and validating tool arguments
 
-> Core | Fast CP2 / Slow CP3 | ~1.2 h | Builds on: M05-08, M05-11
+> **Core** | ~1.2 h | Slow: step 059/256, CP3 | Fast: CP2
+>
+> Before this: [M05-08 Validating LLM responses natively against type hints](<08 - Validating LLM responses natively against type hints.md>), [M05-11 Defining precise function schemas for LLMs](<11 - Defining precise function schemas for LLMs.md>)
 
 ### Kahani
 Bank assistant ke `get_account_status` tool ko model ne `{"account_id": "ACC-004211 "}` (trailing space) bheja -- DB lookup "not found", user ko bola gaya "account exist nahi karta". Doosre din `{"account_id": "ACC-009999"}` aaya -- format bilkul sahi, lekin ye account kisi aur customer ka tha; ek email mein chhupe prompt injection ne model ko ye ID pakda di thi.
@@ -18,7 +20,7 @@ Tool = customer ke real systems pe action. Bina validation ke model ka typo outa
 
 ### Key concepts
 - **Normalise first** -- `input` dict ho ya JSON string, ek function `raw_args()` se dict banao; invalid JSON bhi ek error result hai.
-- **Validate with the same model** -- tool schema (M05-11) aur validator ek hi Pydantic class; `str_strip_whitespace` jaisi safe normalisation config mein.
+- **Validate with the same model** -- tool schema ([M05-11](<11 - Defining precise function schemas for LLMs.md>)) aur validator ek hi Pydantic class; `str_strip_whitespace` jaisi safe normalisation config mein.
 - **Authorize separately** -- schema "format" check karta hai, ownership nahi. `account_id in session.allowed_accounts` server side.
 - **Error as tool_result** -- `{"type": "tool_result", "tool_use_id": id, "is_error": True, "content": "account_id: must match ACC-######"}`; model ko fix karne ka mauka.
 - **Don't trust strict mode alone** -- strict/constrained decoding schema shape deta hai; business rules aur auth aapki zimmedari.
@@ -109,7 +111,7 @@ print("OK: parse -> validate -> authorize, errors returned as tool_result")
 - `str_strip_whitespace=True` -- "ACC-004211 " ka trailing space safe tareeke se hat gaya, phir pattern check pass.
 - t2 format mein valid hai lekin session ka account nahi -- "access denied", aur message mein ye nahi batate ki account exist karta hai ya nahi.
 - t4 -- ek hi error message mein dono problems (`top_k` bound, extra `debug` key); model ek baar mein fix kar sakta hai.
-- Har error ek `tool_result` with same `tool_use_id` -- M05-14 mein ye history mein jaata hai; crash kabhi nahi.
+- Har error ek `tool_result` with same `tool_use_id` -- [M05-14](<14 - Processing tool results into chat history.md>) mein ye history mein jaata hai; crash kabhi nahi.
 
 ```python
 # real version -- not run here, needs: pip install anthropic pydantic
@@ -128,13 +130,13 @@ for block in resp.content:
 ```
 
 ### Mini-exercise (30-60 min)
-`omniguard/tools/validate.py` mein `check_tool_call(block, session)` banao (M05-11 ke schemas reuse karo).
-- Session FastAPI dependency (M02-03) se aaye; `allowed_accounts` fake user store se.
+`omniguard/tools/validate.py` mein `check_tool_call(block, session)` banao ([M05-11](<11 - Defining precise function schemas for LLMs.md>) ke schemas reuse karo).
+- Session FastAPI dependency ([M02-03](<../02 - Modern API Development/03 - Dependency injection.md>)) se aaye; `allowed_accounts` fake user store se.
 - Har rejected call ka structured log: tool name, error type (`validation` / `auth` / `parse` / `unknown_tool`), `tool_use_id` -- args ki values nahi (PII).
 - Acceptance: pytest -- ek parametrized test 8 cases ke saath (valid, whitespace, other user's account, extra key, bound violation, JSON string, broken JSON, unknown tool); koi bhi case exception raise nahi karta.
 
 ### Common pitfalls
-- Validation pass = authorized samajhna -- prompt injection ka sabse common raasta (M13-02).
+- Validation pass = authorized samajhna -- prompt injection ka sabse common raasta ([M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>)).
 - Error message mein internal detail ("SELECT ... failed", stack trace) -- model ke through user tak, ya attacker tak, pahunchta hai.
 - Lax coercion pe bharosa jahan meaning badal jaaye (`"0"` -> `False`, float IDs) -- critical args pe `strict=True` fields.
 
@@ -145,13 +147,22 @@ for block in resp.content:
 - [ ] Har failure `is_error` tool_result banta hai, crash nahi.
 
 ### Related
-- M05-11 Defining precise function schemas for LLMs
-- M05-14 Processing tool results into chat history
-- M05-15 Managing hallucinated tool calls
-- M12-01 Authentication vs authorization
+- [M05-11](<11 - Defining precise function schemas for LLMs.md>) Defining precise function schemas for LLMs
+- [M05-14](<14 - Processing tool results into chat history.md>) Processing tool results into chat history
+- [M05-15](<15 - Managing hallucinated tool calls.md>) Managing hallucinated tool calls
+- [M12-01](<../12 - Identity & Access Management/01 - Authentication vs authorization.md>) Authentication vs authorization
 
 ### Self-quiz
 1. Strict tool mode on hai -- teen cheezein batao jo phir bhi aapko khud check karni padengi.
 2. "Access denied" message mein "account not found" kyun nahi likhna chahiye?
 3. `str_strip_whitespace` jaisi normalisation kab dangerous ho sakti hai?
 4. Model ne galat args bheje aur aapne error tool_result bheja. Model 5 baar same galti kare to kya hoga? Guard kahan lagaoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 059 of 256** -- [Syllabus CP3](<../SYLLABUS.md#cp3>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 058: Defining precise function schemas for LLMs](<11 - Defining precise function schemas for LLMs.md>)
+- Next -> [step 060: Handling multi-tool parallel execution](<13 - Handling multi-tool parallel execution.md>)

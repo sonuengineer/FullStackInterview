@@ -1,0 +1,18 @@
+[project]
+name = "omniguard"
+version = "0.1.0"
+description = "Secure enterprise AI integration: hybrid RAG, safe Text-to-SQL, SSO/RBAC, PII guardrails"
+requires-python = ">=3.12"
+dependencies = ["fastapi", "uvicorn", "pydantic"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "httpx", "ruff"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# CP2 gate (M02-13) raises this to --cov-fail-under=85
+addopts = "-q --cov=omniguard --cov-report=term-missing"
+
+[tool.ruff]
+line-length = 110

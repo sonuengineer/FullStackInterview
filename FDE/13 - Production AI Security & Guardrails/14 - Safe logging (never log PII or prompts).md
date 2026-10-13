@@ -2,7 +2,9 @@
 
 ## Safe logging (never log PII or prompts)
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M13-05, M13-10, M12-10, M14-10
+> **Core** | ~1.2 h | Slow: step 184/256, CP8 | Fast: CP6
+>
+> Before this: [M13-05 Redacting sensitive entities (SSN, credit cards, emails)](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>), [M13-10 Configuring strict input and output filtering pipelines natively in Python](<10 - Configuring strict input and output filtering pipelines natively in Python.md>), [M12-10 Audit logging](<../12 - Identity & Access Management/10 - Audit logging.md>), [M14-10 Capturing deep span-level execution traces](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>)
 
 ### Kahani
 Ek health-insurance customer ne bola: "Hamare guardrails perfect hain, PII provider tak nahi jaati." Phir audit team ne Datadog/CloudWatch khola.
@@ -21,8 +23,8 @@ DPDP Act / HIPAA / GDPR jaisi regulations mein logs bhi "personal data processin
 - **Log metadata, not content** -- `prompt_hash`, `input_tokens`, `output_tokens`, `latency_ms`, `guardrail_trail` (reason codes). Debugging ke liye ye kaafi hai zyada-tar.
 - **Keyed hash (HMAC)** -- plain SHA-256 of a short prompt guess karke reverse ho sakta hai; secret key ke saath HMAC karo. Same prompt = same hash, to duplicates dikh jaate hain.
 - **Redaction filter as safety net** -- `logging.Filter` message, args aur exception text sab scrub kare; primary control nahi, last line.
-- **Separate transcript store** -- raw transcripts sirf jab legally required: encrypted, restricted IAM role, access audited (M12-10), fixed retention + auto purge.
-- **Third-party traces** -- Langfuse/LangSmith jaise tools mein bhi same rule; masking config on karo (M14-10).
+- **Separate transcript store** -- raw transcripts sirf jab legally required: encrypted, restricted IAM role, access audited ([M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>)), fixed retention + auto purge.
+- **Third-party traces** -- Langfuse/LangSmith jaise tools mein bhi same rule; masking config on karo ([M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>)).
 
 ### Code example
 `stdlib only`
@@ -98,15 +100,15 @@ with tempfile.TemporaryDirectory() as d:
 ```
 
 - `log_llm_call` -- primary control: raw prompt kabhi field mein nahi. Hash se same prompt ke repeats correlate ho jaate hain.
-- `RedactingFilter` -- `getMessage()` se args merge karke scrub, phir `args=None`. Exception ka text bhi scrub (`exc_text`), kyunki tracebacks mein headers/PII aa jaate hain. Output mein "Patient Ravi" bacha hai -- naam regex se nahi pakde jaate, real filter mein Presidio NER (M13-04).
+- `RedactingFilter` -- `getMessage()` se args merge karke scrub, phir `args=None`. Exception ka text bhi scrub (`exc_text`), kyunki tracebacks mein headers/PII aa jaate hain. Output mein "Patient Ravi" bacha hai -- naam regex se nahi pakde jaate, real filter mein Presidio NER ([M13-04](<04 - Implementing Microsoft Presidio analyzers and anonymizers.md>)).
 - Filter **handler** pe laga hai -- logger pe lagaoge to child loggers (`omniguard.rag`) ke records bypass ho sakte hain; handler pe sab pakde jaate hain.
 - `prompt_hash` HMAC hai -- bina key ke koi "Patient Ravi..." guess karke hash match nahi kar sakta.
 - `TranscriptStore` -- alag directory (real: encrypted bucket + restricted IAM role), 30-day retention, purge test se proven.
 
 ### Mini-exercise (30-60 min)
 OmniGuard CP6: `omniguard/guardrails/logging_filter.py`.
-- `RedactingFilter` jo M13-05 ka `redact()` reuse kare (ek hi source of truth), plus secrets patterns (Bearer, `sk-`, AWS `AKIA...`).
-- `configure_logging()` JSON formatter ke saath; root handler pe filter. FastAPI request middleware har request ka ek `llm_call` event likhe (M14-11 ke fields).
+- `RedactingFilter` jo [M13-05](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>) ka `redact()` reuse kare (ek hi source of truth), plus secrets patterns (Bearer, `sk-`, AWS `AKIA...`).
+- `configure_logging()` JSON formatter ke saath; root handler pe filter. FastAPI request middleware har request ka ek `llm_call` event likhe ([M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) ke fields).
 - `tests/test_safe_logging.py`: 10 PII-heavy requests chalao (including ek forced exception), phir log file mein har PII value ke liye `assert value not in log_text`.
 - `docs/data-retention.md`: kya log hota hai, kahan, kitne din, kaun padh sakta hai -- customer ke DPO ke liye.
 
@@ -122,14 +124,23 @@ OmniGuard CP6: `omniguard/guardrails/logging_filter.py`.
 - [ ] Transcripts (agar zaroori) alag store, restricted access, retention purge ke saath.
 
 ### Related
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
-- M13-10 Configuring strict input and output filtering pipelines natively in Python
-- M12-10 Audit logging
-- M14-10 Capturing deep span-level execution traces
-- M14-11 Monitoring granular token costs and endpoint latency
+- [M13-05](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
+- [M13-10](<10 - Configuring strict input and output filtering pipelines natively in Python.md>) Configuring strict input and output filtering pipelines natively in Python
+- [M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>) Audit logging
+- [M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>) Capturing deep span-level execution traces
+- [M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
 
 ### Self-quiz
 1. Plain SHA-256 prompt hash aur HMAC mein security fark kya hai?
 2. Redaction filter ko "primary control" kyun nahi maanna chahiye?
 3. Filter logger pe vs handler pe lagane ka fark kya hai?
 4. Legal team bolti hai "7 saal ke transcripts rakho." Aap kaunse 3 controls maangoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 184 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 183: Testing rails against jailbreak libraries](<13 - Testing rails against jailbreak libraries.md>)
+- Next -> [step 185: Conducting technical discovery and scoping workshops](<../15 - OmniGuard - Secure AI Integration/01 - Conducting technical discovery and scoping workshops.md>)

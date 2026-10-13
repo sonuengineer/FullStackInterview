@@ -2,7 +2,9 @@
 
 ## Identifying document structures
 
-> Core | Fast CP3 / Slow CP5 | ~1.2 h | Builds on: M06-01, M06-08
+> **Core** | ~1.2 h | Slow: step 087/256, CP5 | Fast: CP3
+>
+> Before this: [M06-01 Fixed-size and semantic chunking](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>), [M06-08 Metadata filtering](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>)
 
 ### Kahani
 Ek private bank ne 400-page "Retail Lending Policy" PDF diya. Aapne `extract_text()` kiya, 500-char chunks banaye, RAG chala diya.
@@ -12,16 +14,16 @@ Problem retrieval nahi tha -- problem ye tha ki aapne document ko **flat string*
 
 ### What it is
 **Document structure identification** = PDF ke raw text spans (text + position + font) se ye pehchaanna ki kaunsa span heading hai, kaunsa body, list item, table cell, ya repeated header/footer -- aur phir ek **section tree** banana (H1 -> H2 -> content).
-Ye tree hi aapke chunker (M06-01) ka input banta hai: chunk boundaries sections pe, aur har chunk ke saath `section_path` metadata.
+Ye tree hi aapke chunker ([M06-01](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>)) ka input banta hai: chunk boundaries sections pe, aur har chunk ke saath `section_path` metadata.
 
 ### Why it matters for an FDE
-Customer PDFs ka 80% value headings aur tables mein hota hai. Structure ke bina chunks sections cross karte hain, headers har chunk ko pollute karte hain, aur metadata filter (M06-08) ke liye "section" field hi nahi hota.
+Customer PDFs ka 80% value headings aur tables mein hota hai. Structure ke bina chunks sections cross karte hain, headers har chunk ko pollute karte hain, aur metadata filter ([M06-08](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>)) ke liye "section" field hi nahi hota.
 
 ### Key concepts
 - **Spans with layout** -- sirf text nahi; har span ke saath `page, x, y, font size, bold`. pypdf ka `visitor_text` ye deta hai.
 - **Heading heuristics** -- bada font, bold, ALL CAPS, numbering ("2.3 ") -- in signals ka combo; ek akela signal kabhi kaafi nahi.
 - **Header/footer by repetition** -- page ke top/bottom band mein jo text (digits normalize karke) 60%+ pages pe repeat ho, wo boilerplate hai.
-- **Table detection (cheap)** -- ek hi baseline (same y) pe 3+ alag spans = table row; real tables ke liye M08-08.
+- **Table detection (cheap)** -- ek hi baseline (same y) pe 3+ alag spans = table row; real tables ke liye [M08-08](<08 - Extracting nested tabular data natively.md>).
 - **Section tree** -- stack-based: naya H1 aaya to stack H1 tak pop, H2 aaya to H2 tak; baaki content current node mein.
 
 ### Code example
@@ -144,13 +146,13 @@ Heuristics pehle kyun? Kyunki wo free, fast aur debuggable hain -- aur jab layou
 `omniguard/ingest/structure.py` banao (CP3 build "OmniGuard: Hybrid RAG v1 over messy PDFs" ka ingestion step).
 - `extract_spans(pdf_path) -> list[Span]` (pydantic model: page, x, y, size, bold, text).
 - `detect_structure(spans) -> SectionNode` -- header/footer removal + classify + tree. Thresholds (`h1_min_size`, `repeat_ratio`) config se, hardcode nahi.
-- `tree_to_sections(tree) -> list[{"section_path", "page_start", "text"}]` -- ye output M06-01 ke chunker ko jaata hai.
+- `tree_to_sections(tree) -> list[{"section_path", "page_start", "text"}]` -- ye output [M06-01](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>) ke chunker ko jaata hai.
 - Acceptance (pytest): fpdf2 se 3-page fixture; header/footer kisi section mein nahi; har section ka `section_path` sahi; table cells ek `table` block mein grouped.
 
 ### Common pitfalls
 - Font size ko absolute maan lena -- ek customer ka body 9pt hai, doosre ka 12pt. Har document ka **median body size** nikaalo aur heading = median se 1.3x+ bada.
 - Header/footer detection sirf exact match pe -- page numbers, dates ("Printed 12/03/2024") har page pe alag hote hain; normalize karo.
-- Scanned pages pe ye sab chalana -- text layer hi nahi hai, spans empty aayenge. Pehle triage (M08-10), phir OCR (M08-02).
+- Scanned pages pe ye sab chalana -- text layer hi nahi hai, spans empty aayenge. Pehle triage ([M08-10](<10 - Ingesting unstructured legacy enterprise PDFs.md>)), phir OCR ([M08-02](<02 - Optical character recognition pipelines.md>)).
 
 ### Checklist before moving on
 - [ ] pypdf `visitor_text` se span ka x, y, font size nikaal sakta hoon.
@@ -159,14 +161,23 @@ Heuristics pehle kyun? Kyunki wo free, fast aur debuggable hain -- aur jab layou
 - [ ] Bata sakta hoon kab heuristics kaafi hain aur kab docling/unstructured jaisa layout model chahiye.
 
 ### Related
-- M06-01 Fixed-size and semantic chunking
-- M06-08 Metadata filtering
-- M08-02 Optical character recognition pipelines
-- M08-08 Extracting nested tabular data natively
-- M08-10 Ingesting unstructured legacy enterprise PDFs
+- [M06-01](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>) Fixed-size and semantic chunking
+- [M06-08](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>) Metadata filtering
+- [M08-02](<02 - Optical character recognition pipelines.md>) Optical character recognition pipelines
+- [M08-08](<08 - Extracting nested tabular data natively.md>) Extracting nested tabular data natively
+- [M08-10](<10 - Ingesting unstructured legacy enterprise PDFs.md>) Ingesting unstructured legacy enterprise PDFs
 
 ### Self-quiz
 1. PDF coordinates ka origin kahan hota hai, aur reading order sort karte waqt iska kya asar hai?
 2. "Page 3 of 40" ko header/footer detect karne ke liye exact-match kyun fail hota hai? Aap kaise fix karoge?
 3. Ek document mein headings bold nahi hain, sirf numbered ("4.2 Collateral") hain. Aapka classifier kaise badlega?
 4. Section tree bina banaye seedha fixed-size chunking karne se retrieval aur citation dono kaise kharab hote hain?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 087 of 256** -- [Syllabus CP5](<../SYLLABUS.md#cp5>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: step 086 GATE: Gate: eval report in README -- faithfulness, context precision/recall (link README) -- see [syllabus](<../SYLLABUS.md#cp4>)
+- Next -> [step 088: Optical character recognition pipelines](<02 - Optical character recognition pipelines.md>)

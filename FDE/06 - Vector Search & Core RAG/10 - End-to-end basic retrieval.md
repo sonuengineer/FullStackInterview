@@ -2,7 +2,9 @@
 
 ## End-to-end basic retrieval
 
-> Core | Fast CP3 / Slow CP4 | ~1.2 h | Builds on: M06-01, M06-03, M06-06, M06-08
+> **Core** | ~1.2 h | Slow: step 074/256, CP4 | Fast: CP3
+>
+> Before this: [M06-01 Fixed-size and semantic chunking](<01 - Fixed-size and semantic chunking.md>), [M06-03 Understanding vector representations](<03 - Understanding vector representations.md>), [M06-06 Index creation](<06 - Index creation.md>), [M06-08 Metadata filtering](<08 - Metadata filtering.md>)
 
 ### Kahani
 Retail customer ne Friday ko bola: "Monday ko leadership demo hai -- hamare policy PDFs pe ek bot dikhao jo citations ke saath answer de." Aapke paas ab chunking, embeddings, index, filters -- sab alag-alag pieces hain.
@@ -117,9 +119,9 @@ print("OK: PDF -> clean -> chunk -> embed -> filter -> top-k -> cited prompt")
 
 - `make_messy_pdf` -- har page pe repeated header/footer, jaise customer ke real PDFs. `extract` unhe regex se hatata hai, warna har chunk mein "INTERNAL" embed hota.
 - `heading` prefix -- pehli try mein "Warranty." akela chunk ban gaya aur battery query pe wahi top pe aaya. Section title ko har sentence ke aage jodna is problem ka simple fix hai.
-- `Retriever.search` -- pehle tenant filter (M06-08), phir cosine, phir `min_score` floor. "gift cards" pe `[]` -- fake confident answer se behtar.
+- `Retriever.search` -- pehle tenant filter ([M06-08](<08 - Metadata filtering.md>)), phir cosine, phir `min_score` floor. "gift cards" pe `[]` -- fake confident answer se behtar.
 - `build_prompt` -- har context line pe `[doc pN]` tag; LLM ko citation format diya, invent karne ka mauka nahi.
-- `FakeLLM` -- real LLM call ka stand-in (no network). Toy embedder sirf word overlap dekhta hai; real pipeline mein M06-03 ka model aur neeche real call.
+- `FakeLLM` -- real LLM call ka stand-in (no network). Toy embedder sirf word overlap dekhta hai; real pipeline mein [M06-03](<03 - Understanding vector representations.md>) ka model aur neeche real call.
 
 ```python
 # real version -- not run here, needs: pip install anthropic sentence-transformers numpy pypdf
@@ -141,15 +143,15 @@ def answer(query, hits):
 
 ### Mini-exercise (30-60 min)
 OmniGuard Hybrid RAG v1 ka dense half: `omniguard/rag/pipeline.py`.
-- `ingest(pdf_paths, tenant) -> list[Chunk]` (pypdf + `clean_text` + M06-01 chunker + heading prefix) aur `retrieve(query, user_ctx, k) -> list[Hit]`.
+- `ingest(pdf_paths, tenant) -> list[Chunk]` (pypdf + `clean_text` + [M06-01](<01 - Fixed-size and semantic chunking.md>) chunker + heading prefix) aur `retrieve(query, user_ctx, k) -> list[Hit]`.
 - FastAPI `POST /ask` (M02): response `{"answer", "citations": [{"doc_id", "page"}], "retrieval_ms"}`; empty hits pe LLM call skip.
-- 3 messy PDFs (fpdf2 se generate ya real public policy PDFs) + 10 questions (2 unanswerable) ka `eval/questions.jsonl` -- M06-14 mein isi pe metrics chalenge.
+- 3 messy PDFs (fpdf2 se generate ya real public policy PDFs) + 10 questions (2 unanswerable) ka `eval/questions.jsonl` -- [M06-14](<14 - Precision and recall metrics.md>) mein isi pe metrics chalenge.
 - Acceptance: pytest -- har answer ki citation retrieved hits mein se hi ho; unanswerable questions pe "not found"; dusre tenant ka chunk kabhi nahi.
 
 ### Common pitfalls
 - Citations LLM se generate karwana instead of retrieved metadata se -- page numbers hallucinate hote hain. Citation list code se banao.
 - Ingest aur query mein alag cleaning/tokenizer -- query embedding aur chunk embeddings alag "language" bolte hain.
-- Retrieval latency log na karna -- slow answer pe pata nahi chalta embedding API slow hai, DB ya LLM (M14-11).
+- Retrieval latency log na karna -- slow answer pe pata nahi chalta embedding API slow hai, DB ya LLM ([M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>)).
 
 ### Checklist before moving on
 - [ ] Ingest aur query path alag-alag bata aur test kar sakta hoon.
@@ -158,14 +160,23 @@ OmniGuard Hybrid RAG v1 ka dense half: `omniguard/rag/pipeline.py`.
 - [ ] Citations code se aati hain, LLM se nahi.
 
 ### Related
-- M06-01 Fixed-size and semantic chunking
-- M06-08 Metadata filtering
-- M06-12 Combining dense and sparse signals
-- M06-14 Precision and recall metrics
-- M08-10 Ingesting unstructured legacy enterprise PDFs
+- [M06-01](<01 - Fixed-size and semantic chunking.md>) Fixed-size and semantic chunking
+- [M06-08](<08 - Metadata filtering.md>) Metadata filtering
+- [M06-12](<12 - Combining dense and sparse signals.md>) Combining dense and sparse signals
+- [M06-14](<14 - Precision and recall metrics.md>) Precision and recall metrics
+- [M08-10](<../08 - Multimodal RAG & Vision AI/10 - Ingesting unstructured legacy enterprise PDFs.md>) Ingesting unstructured legacy enterprise PDFs
 
 ### Self-quiz
 1. Ingest path aur query path ke stages list karo. Kaunsa stage galat ho to kaunsa symptom dikhega?
 2. "Warranty." heading akela chunk kyun nuksaan karta hai, aur heading prefix kaise fix karta hai?
 3. `min_score` bahut high rakha to kya hoga? Usse kaise tune karoge?
 4. Citations LLM se generate karwane mein kya risk hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 074 of 256** -- [Syllabus CP4](<../SYLLABUS.md#cp4>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 073: Cloud vector database provisioning](<09 - Cloud vector database provisioning.md>)
+- Next -> [step 075: Keyword-based search mechanisms](<11 - Keyword-based search mechanisms.md>)

@@ -1,3 +1,5 @@
+> **Data file -- do not delete.** `portal/plan.py` reads the module and topic titles from here. Topic numbers here = file numbers in each module folder. To study, start at [START_HERE.md](../START_HERE.md).
+
 # AI Forward Deployed Engineer 
 
 ## Prerequisites (00 - Prerequisites)

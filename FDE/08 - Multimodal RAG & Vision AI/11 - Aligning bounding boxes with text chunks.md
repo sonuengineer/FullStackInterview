@@ -2,12 +2,14 @@
 
 ## Aligning bounding boxes with text chunks
 
-> Core | Fast CP3 / Slow CP5 | ~1.2 h | Builds on: M08-01, M08-02, M08-10, M06-01
+> **Core** | ~1.2 h | Slow: step 097/256, CP5 | Fast: CP3
+>
+> Before this: [M08-01 Identifying document structures](<01 - Identifying document structures.md>), [M08-02 Optical character recognition pipelines](<02 - Optical character recognition pipelines.md>), [M08-10 Ingesting unstructured legacy enterprise PDFs](<10 - Ingesting unstructured legacy enterprise PDFs.md>), [M06-01 Fixed-size and semantic chunking](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>)
 
 ### Kahani
 Ek hospital ki compliance team RAG bot use kar rahi hai: "Discharge summary mein allergy kya likhi hai?" Bot jawab deta hai: "Penicillin -- source: discharge_2023.pdf".
 Doctor bolti hai: "38 pages hain, kahan likha hai? Main AI pe bina dekhe bharosa nahi karungi." Auditor bhi yahi poochta hai.
-Aapke chunks mein sirf `text` aur `filename` tha -- page number tak nahi. Chunking (M06-01) ne text ko kaat diya, aur position ki information wahin kho gayi.
+Aapke chunks mein sirf `text` aur `filename` tha -- page number tak nahi. Chunking ([M06-01](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>)) ne text ko kaat diya, aur position ki information wahin kho gayi.
 Customer ko chahiye: "page 3, ye wala region" -- click karo aur PDF us jagah highlight ho. Ye feature trust ka feature hai.
 
 ### What it is
@@ -109,7 +111,7 @@ print("OK: words -> lines -> blocks -> chunks with page + bbox, IoU", round(iou(
 ```
 
 - `pdf_words` -- pypdf ka `tm` baseline position deta hai (bottom-left origin); `H - y` se top-left mein convert. Width approximation hai (comment dekho) -- isliye IoU check 0.6 pe, 1.0 pe nahi.
-- OCR words (M08-02) ka shape bhi `{"page", "text", "bbox"}` hai -- scanned pages ke liye same `to_chunks` chalta hai, bas coords pixels mein (normalize karo).
+- OCR words ([M08-02](<02 - Optical character recognition pipelines.md>)) ka shape bhi `{"page", "text", "bbox"}` hai -- scanned pages ke liye same `to_chunks` chalta hai, bas coords pixels mein (normalize karo).
 - `group(..., same)` -- greedy grouping: line = same baseline + chhota x gap (isliye 2nd column alag line rehta hai); block = next line, same left edge, chhota vertical gap.
 - Column sort (`x0 > 300`) -- left column pehle, phir right; bina iske "Payment" aur "Penalty" lines interleave ho jaati.
 - Asserts -- containment (chunk box apne har word ko cover kare), alag chunks overlap na karein (IoU 0), aur ground-truth region se IoU > 0.6.
@@ -132,15 +134,15 @@ doc.save("contract.cited.pdf")
 
 ### Mini-exercise (30-60 min)
 `omniguard/ingest/chunks.py` -- OmniGuard CP3 ingestion ka last step: pdf -> pages -> sections -> **chunks with page + bbox**.
-- `Chunk` pydantic model: `doc_sha, page, section_path, text, bbox, bbox_norm, chunk_id`. `chunk_id = sha256(doc_sha + page + bbox)` -- re-run pe stable (M08-10 idempotency).
-- Bada block M06-01 chunker se split karo, lekin words list saath le jaao; har split ka apna union box.
+- `Chunk` pydantic model: `doc_sha, page, section_path, text, bbox, bbox_norm, chunk_id`. `chunk_id = sha256(doc_sha + page + bbox)` -- re-run pe stable ([M08-10](<10 - Ingesting unstructured legacy enterprise PDFs.md>) idempotency).
+- Bada block [M06-01](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>) chunker se split karo, lekin words list saath le jaao; har split ka apna union box.
 - Answer ke citation format: `{"file", "page", "bbox_norm"}`; ek chhota script jo PyMuPDF (agar installed) se cited region highlight karke PDF save kare.
 - Acceptance (pytest): fixture PDF pe containment + no-overlap + IoU > 0.6 asserts; OCR stub words aur pypdf words dono se chunks bante hain; same input pe chunk_ids identical.
 
 ### Common pitfalls
 - Coordinate systems mix karna -- pypdf bottom-left, OCR top-left, UI CSS pixels; ek bhi conversion bhoola to highlight ulta (page ke neeche) dikhega. Conversion ek jagah, tests ke saath.
-- Rotated pages (M08-10) pe box rotate na karna -- `/Rotate 90` page pe x/y swap hote hain; highlight galat jagah.
-- Chunk overlap (M06-02) se ek word do chunks mein -- theek hai, lekin citation box usi chunk ke words se banao, neighbour se nahi.
+- Rotated pages ([M08-10](<10 - Ingesting unstructured legacy enterprise PDFs.md>)) pe box rotate na karna -- `/Rotate 90` page pe x/y swap hote hain; highlight galat jagah.
+- Chunk overlap ([M06-02](<../06 - Vector Search & Core RAG/02 - Overlap optimization.md>)) se ek word do chunks mein -- theek hai, lekin citation box usi chunk ke words se banao, neighbour se nahi.
 
 ### Checklist before moving on
 - [ ] PDF bottom-left coords ko top-left mein convert kar sakta hoon aur normalize kar sakta hoon.
@@ -149,14 +151,23 @@ doc.save("contract.cited.pdf")
 - [ ] Har chunk ke paas page + bbox hai, aur answer "page N, region" cite karta hai.
 
 ### Related
-- M06-01 Fixed-size and semantic chunking
-- M06-02 Overlap optimization
-- M08-02 Optical character recognition pipelines
-- M08-10 Ingesting unstructured legacy enterprise PDFs
-- M08-12 Managing multi-page visual context
+- [M06-01](<../06 - Vector Search & Core RAG/01 - Fixed-size and semantic chunking.md>) Fixed-size and semantic chunking
+- [M06-02](<../06 - Vector Search & Core RAG/02 - Overlap optimization.md>) Overlap optimization
+- [M08-02](<02 - Optical character recognition pipelines.md>) Optical character recognition pipelines
+- [M08-10](<10 - Ingesting unstructured legacy enterprise PDFs.md>) Ingesting unstructured legacy enterprise PDFs
+- [M08-12](<12 - Managing multi-page visual context.md>) Managing multi-page visual context
 
 ### Self-quiz
 1. PDF mein y = 742 aur page height 842 hai. Top-left system mein y kya hoga, aur kyun?
 2. Do chunks ka IoU 0.4 aa raha hai. Ye kya bataata hai aapke line/block grouping ke baare mein?
 3. Normalized bbox store karna pixels/points store karne se better kyun hai jab OCR 300 DPI pe chala tha?
 4. Ek table cell ka answer cite karna hai, lekin poora table ek chunk hai. Region citation kaise precise banaoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 097 of 256** -- [Syllabus CP5](<../SYLLABUS.md#cp5>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 096: Ingesting unstructured legacy enterprise PDFs](<10 - Ingesting unstructured legacy enterprise PDFs.md>)
+- Next -> [step 098: Managing multi-page visual context](<12 - Managing multi-page visual context.md>)

@@ -2,10 +2,12 @@
 
 ## ThreadPoolExecutor integration
 
-> Core | Fast CP1 / Slow CP1 | ~1.2 h | Builds on: M01-06, M01-07, M01-09
+> **Core** | ~1.2 h | Slow: step 022/256, CP1 | Fast: CP1
+>
+> Before this: [M01-06 Event loop architecture](<06 - Event loop architecture.md>), [M01-07 Coroutines and tasks](<07 - Coroutines and tasks.md>), [M01-09 Concurrency vs parallelism](<09 - Concurrency vs parallelism.md>)
 
 ### Kahani
-Ek logistics customer ka async worker LLM se delivery notes classify karta hai -- woh hissa aapne M01-07 mein bana liya.
+Ek logistics customer ka async worker LLM se delivery notes classify karta hai -- woh hissa aapne [M01-07](<07 - Coroutines and tasks.md>) mein bana liya.
 Ab result unke purane Oracle/SOAP system mein likhna hai, aur unka official SDK sirf sync hai. Async version exist hi nahi karta.
 Pehli try: `async def` ke andar seedha `sdk.save(...)` -- har save 300 ms, loop freeze, LLM calls bhi serial ho gayi.
 Doosri try: har save ke liye naya `threading.Thread` -- 2,000 threads, customer ke DB pe 2,000 connections, DBA ka phone aaya.
@@ -24,6 +26,24 @@ Enterprise customers ke paas sync-only SDKs bahut hote hain (SOAP, ODBC, legacy 
 - **Timeout ka sach** -- `asyncio.timeout` sirf aapka `await` cancel karta hai; thread mein chal raha sync call rukta NAHI. Real timeout SDK/driver level pe bhi set karo.
 - **Thread safety** -- sync clients aksar thread-safe nahi hote (jaise `sqlite3` connection); har thread ka apna connection (`threading.local`) ya har call pe naya.
 - **Wapas loop pe** -- thread se coroutine chalani ho to `asyncio.run_coroutine_threadsafe(coro, loop)`.
+
+### Picture it
+The sync-only SDK runs in a bounded pool: the loop stays free and the customer DB never sees more than max_workers connections.
+
+```mermaid
+flowchart LR
+    subgraph LOOP["event loop thread"]
+        L1["await LLM classify"] --> L2["await loop.run_in_executor(pool, sdk.save, row)"]
+    end
+    L2 -->|"hand off"| P
+    subgraph P["ThreadPoolExecutor(max_workers=8)"]
+        T1["thread 1"]
+        T2["thread 2"]
+        T3["... thread 8"]
+    end
+    P -->|"at most 8 connections"| DB["Customer Oracle / SOAP<br/>sync-only SDK"]
+    P -->|"result back as an awaitable"| L2
+```
 
 ### Code example
 stdlib only
@@ -115,16 +135,16 @@ asyncio.run(main())
 - `thread_name_prefix="db"` -- logs aur `py-spy`/stack dumps mein turant dikhta hai kaunsa pool kya kar raha hai.
 
 ### Mini-exercise (30-60 min)
-CP1 capstone ka doosra hissa -- M01-07 wale `fde-exercises/m01_async_worker/worker.py` mein:
+CP1 capstone ka doosra hissa -- [M01-07](<07 - Coroutines and tasks.md>) wale `fde-exercises/m01_async_worker/worker.py` mein:
 - Har successful summary ko ek sync "legacy" store mein likho (`sqlite3`, ya ek fake `LegacySDK.save()` jo `time.sleep(0.2)` kare) -- `run_in_executor` + `ThreadPoolExecutor(max_workers=DB_WORKERS)` (env var).
 - Pool ko `main()` mein ek baar banao aur worker ko pass karo (har call pe naya pool mat banao).
 - Writes ko idempotent banao (`INSERT OR REPLACE` / primary key), kyunki timeout ke baad bhi write ho sakta hai.
-- Acceptance: pytest -- 50 jobs, DB mein 50 unique rows (dead letters ko chhod ke), peak concurrent DB calls <= DB_WORKERS, aur ek "heartbeat" task (M01-06) ka worst gap < 100 ms poore run mein. Repo README mein "how to run" + ek architecture diagram (ASCII) add karo -- yahi CP1 build deliverable hai.
+- Acceptance: pytest -- 50 jobs, DB mein 50 unique rows (dead letters ko chhod ke), peak concurrent DB calls <= DB_WORKERS, aur ek "heartbeat" task ([M01-06](<06 - Event loop architecture.md>)) ka worst gap < 100 ms poore run mein. Repo README mein "how to run" + ek architecture diagram (ASCII) add karo -- yahi CP1 build deliverable hai.
 
 ### Common pitfalls
 - `max_workers` bina soche bada rakhna -- customer DB/SOAP endpoint overload. Unke documented limit se chhota rakho.
 - Thread mein bina timeout ka sync network call -- hang hua thread pool ka slot hamesha ke liye kha jaata hai; 4 hangs = poora pool dead.
-- CPU-heavy kaam thread pool mein daalna -- GIL ki wajah se parallel nahi chalega (M01-09); uske liye `ProcessPoolExecutor`.
+- CPU-heavy kaam thread pool mein daalna -- GIL ki wajah se parallel nahi chalega ([M01-09](<09 - Concurrency vs parallelism.md>)); uske liye `ProcessPoolExecutor`.
 
 ### Checklist before moving on
 - [ ] Main sync SDK ko async service mein `run_in_executor` / `to_thread` se use kar sakta hoon.
@@ -133,13 +153,22 @@ CP1 capstone ka doosra hissa -- M01-07 wale `fde-exercises/m01_async_worker/work
 - [ ] Mera capstone worker async LLM calls + bounded sync DB writes dono karta hai.
 
 ### Related
-- M01-07 Coroutines and tasks
-- M01-09 Concurrency vs parallelism
-- M01-15 Environment variable configurations (pool sizes from env)
-- M11-10 Establishing secure connections using Python-native drivers (pyodbc, oracledb) and SQLAlchemy
+- [M01-07](<07 - Coroutines and tasks.md>) Coroutines and tasks
+- [M01-09](<09 - Concurrency vs parallelism.md>) Concurrency vs parallelism
+- [M01-15](<15 - Environment variable configurations.md>) Environment variable configurations (pool sizes from env)
+- [M11-10](<../11 - Legacy Systems & Integrations/10 - Establishing secure connections using Python-native drivers (pyodbc, oracledb) and SQLAlchemy.md>) Establishing secure connections using Python-native drivers (pyodbc, oracledb) and SQLAlchemy
 
 ### Self-quiz
 1. `asyncio.to_thread` aur `loop.run_in_executor(my_pool, ...)` mein kab kaunsa use karoge?
 2. `asyncio.timeout(1)` expire hua jab executor mein ek sync DB insert chal raha tha. Insert ka kya hua? Ye kyun dangerous hai?
 3. Customer DB 10 connections allow karta hai aur aapke 3 pods hain. `max_workers` kya rakhoge?
 4. Ek `sqlite3` connection ko sab threads mein share kyun nahi karna chahiye?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 022 of 256** -- [Syllabus CP1](<../SYLLABUS.md#cp1>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 021: Concurrency vs parallelism](<09 - Concurrency vs parallelism.md>)
+- Next -> [step 023: Navigating the file system](<11 - Navigating the file system.md>)

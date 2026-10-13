@@ -2,7 +2,9 @@
 
 ## GraphRAG and knowledge-graph-augmented retrieval
 
-> Core | Fast CP6 / Slow CP5 | ~1.2 h | Builds on: M06-10, M06-13 (and M07-01 on the slow track)
+> **Core** | ~1.2 h | Slow: step 110/256, CP5 | Fast: CP6
+>
+> Before this: [M06-10 End-to-end basic retrieval](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>), [M06-13 Implementing RRF algorithms](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>) (and [M07-01 Nodes, edges, and properties](<../07 - Enterprise Graph Architecture/01 - Nodes, edges, and properties.md>) on the slow track)
 
 ### Kahani
 Logistics customer ka RAG bot demo mein mast chal raha tha -- "SH-101 kahan hai?" turant answer. Phir ops head ne poocha: "Which suppliers of our delayed shipments also have open compliance tickets?"
@@ -10,7 +12,7 @@ Bot ne do policy documents quote kar diye aur bola "I could not find specific su
 Problem: answer kisi ek chunk mein nahi hai. Do chunks ko ek **relationship** (Acme Steel) jodta hai, aur vector search relationships follow nahi karta. Yahin graph ki zaroorat aati hai.
 
 ### 20-minute graph refresher
-Fast track pe Module 7 skip hai, toh pehle basics (slow track: M07-01, M07-05 mein detail hai).
+Fast track pe Module 7 skip hai, toh pehle basics (slow track: [M07-01](<../07 - Enterprise Graph Architecture/01 - Nodes, edges, and properties.md>), [M07-05](<../07 - Enterprise Graph Architecture/05 - Pattern matching syntax.md>) mein detail hai).
 - **Node** -- ek cheez: Customer, Order, Supplier. **Label** = uska type (`:Customer`), ek node pe multiple labels ho sakte hain.
 - **Edge (relationship)** -- do nodes ke beech directed, typed connection: `(c)-[:PLACED]->(o)`. SQL ka foreign key + join, lekin stored as first-class data.
 - **Properties** -- key-value pairs nodes aur edges dono pe: `{name: "Asha", status: "delayed"}`.
@@ -36,7 +38,7 @@ Enterprise questions aksar relationships pe hote hain (supplier-shipment-ticket,
 - **Multi-hop failure** -- vector search "jo question jaisa dikhe" laata hai; jo chunk sirf beech ke entity se juda hai (CT-9 ticket) woh question jaisa nahi dikhta.
 - **Extraction** -- LLM har chunk se `{entities, relations}` JSON nikaalta hai; har entity ke saath source chunk ids store karo (provenance).
 - **k-hop expansion** -- seeds se BFS, depth k (usually 1-2); zyada hops = noise aur token cost explode.
-- **Fusion** -- graph chunks aur vector chunks ko RRF (M06-13) se merge karo; graph relationships laata hai, vector paraphrase/semantic.
+- **Fusion** -- graph chunks aur vector chunks ko RRF ([M06-13](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>)) se merge karo; graph relationships laata hai, vector paraphrase/semantic.
 - **Community summaries** -- graph ko clusters mein todo (Leiden algorithm), har cluster ka summary pehle se likhwa lo; global question pe summaries ka map-reduce.
 
 ### Code example
@@ -146,7 +148,7 @@ print("OK: 2-hop question answered by graph expansion, missed by vector search")
 - `FakeLLM.extract` -- real version mein yeh LLM call hai (M08 structured outputs); output shape same: `{"entities": [...], "relations": [[src, REL, dst]]}`.
 - `node_chunks` -- provenance: har node yaad rakhta hai kis chunk se aaya. Isi se LLM ko citation-wale chunks milte hain, sirf graph facts nahi.
 - `k_hop` -- plain BFS with depth limit. SH-101 -> Acme Steel (hop 1) -> CT-9 (hop 2). Cyan Plastics kabhi visit nahi hota kyunki uska shipment on-time hai.
-- `vector_retrieve` -- policy/FAQ chunks question ke words se zyada match karte hain, isliye top-3 mein woh aate hain, CT-9 wala chunk nahi. Real embeddings mein bhi yahi pattern dikhta hai. `rrf` (M06-13) dono lists ko bina score-scale tension ke jodta hai.
+- `vector_retrieve` -- policy/FAQ chunks question ke words se zyada match karte hain, isliye top-3 mein woh aate hain, CT-9 wala chunk nahi. Real embeddings mein bhi yahi pattern dikhta hai. `rrf` ([M06-13](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>)) dono lists ko bina score-scale tension ke jodta hai.
 
 > Needs API key for the real version: ANTHROPIC_API_KEY (or OPENAI_API_KEY) for extraction, plus a graph DB.
 
@@ -169,7 +171,7 @@ with driver:
 
 **Microsoft-style GraphRAG (concept only):** poore corpus pe extraction -> graph -> community detection (Leiden) -> har community ka LLM summary, kai levels pe. Global question ("top 5 supplier risks across all regions?") pe summaries pe map-reduce hota hai. Cost warning: indexing = har chunk pe LLM call + summaries; bade corpus pe yeh vector indexing se kai guna mehenga hai. Pehle 1-5% sample pe cost measure karo. Library ka current CLI/config badalta rehta hai -- check the docs (github.com/microsoft/graphrag).
 
-**When NOT to use GraphRAG:** FAQ bot, policy QA, "manual mein kya likha hai" -- yeh single-chunk questions hain; hybrid + rerank (M06-12, M06-15) kaafi hai. Graph tab lao jab eval set (M06-10) mein multi-hop/relationship questions consistently fail ho rahe hon. Agar data already SQL tables mein structured hai, text-to-SQL ya ek normal join zyada sasta ho sakta hai.
+**When NOT to use GraphRAG:** FAQ bot, policy QA, "manual mein kya likha hai" -- yeh single-chunk questions hain; hybrid + rerank ([M06-12](<../06 - Vector Search & Core RAG/12 - Combining dense and sparse signals.md>), [M06-15](<../06 - Vector Search & Core RAG/15 - Cross-encoder reranking models.md>)) kaafi hai. Graph tab lao jab eval set ([M06-10](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>)) mein multi-hop/relationship questions consistently fail ho rahe hon. Agar data already SQL tables mein structured hai, text-to-SQL ya ek normal join zyada sasta ho sakta hai.
 
 ### Mini-exercise (30-60 min)
 `fde-exercises/graphrag/` mein:
@@ -179,7 +181,7 @@ with driver:
 ### Common pitfalls
 - Entity resolution bhool gaye -- "Acme Steel", "ACME Steel Ltd", "Acme" teen alag nodes ban gaye, aur 2-hop path toot gaya. Extraction ke baad normalise/merge step chahiye.
 - Pura corpus ek saath LLM extraction pe bhej diya -- bill aur rate limits (M08) dono phat gaye. Sample, cache, batch, aur retries with backoff.
-- Graph traversal mein tenant/ACL filter nahi lagaya -- hop karte-karte doosre customer ke node pe pahunch gaye (M12-07).
+- Graph traversal mein tenant/ACL filter nahi lagaya -- hop karte-karte doosre customer ke node pe pahunch gaye ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)).
 
 ### Checklist before moving on
 - [ ] Node, edge, label, property, path apne words mein bata sakta hoon aur ek simple Cypher MATCH padh sakta hoon.
@@ -188,13 +190,22 @@ with driver:
 - [ ] Community-summary GraphRAG kab chahiye, uska cost risk, aur kab GraphRAG NAHI chahiye -- customer ko bata sakta hoon.
 
 ### Related
-- M06-10 End-to-end basic retrieval
-- M06-12 Combining dense and sparse signals
-- M06-13 Implementing RRF algorithms
-- M07-01 Nodes, edges, and properties (slow track)
+- [M06-10](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>) End-to-end basic retrieval
+- [M06-12](<../06 - Vector Search & Core RAG/12 - Combining dense and sparse signals.md>) Combining dense and sparse signals
+- [M06-13](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>) Implementing RRF algorithms
+- [M07-01](<../07 - Enterprise Graph Architecture/01 - Nodes, edges, and properties.md>) Nodes, edges, and properties (slow track)
 
 ### Self-quiz
 1. "Which suppliers of delayed shipments have open tickets?" pe vector search ka top-3 kyun galat tha, jabki data corpus mein tha?
 2. k=1 aur k=3 hops pe is example mein kya badlega? Production mein k kaise choose karoge?
 3. Entity resolution na ho to graph retrieval kaise fail hota hai? Ek example do.
 4. Customer kehta hai "hamare 2 lakh PDFs pe GraphRAG lagao". Aap pehle kya measure karoge aur kyun?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 110 of 256** -- [Syllabus CP5](<../SYLLABUS.md#cp5>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 109: Graph-based retrieval logic for AI chatbot](<../07 - Enterprise Graph Architecture/11 - Graph-based retrieval logic for AI chatbot.md>)
+- Next -> [step 111: Study 10 real FDE job posts -> your own skill-gap table](<../18 - FDE Interview & Job Hunt/01 - Study 10 real FDE job posts.md>)

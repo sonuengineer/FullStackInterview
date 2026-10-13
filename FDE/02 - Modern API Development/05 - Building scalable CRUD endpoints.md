@@ -2,7 +2,9 @@
 
 ## Building scalable CRUD endpoints
 
-> Core | Fast CP2 / Slow CP2 | ~1.2 h | Builds on: M02-01, M02-02, M02-03
+> **Core** | ~1.2 h | Slow: step 034/256, CP2 | Fast: CP2
+>
+> Before this: [M02-01 Path and query parameters](<01 - Path and query parameters.md>), [M02-02 Pydantic data validation](<02 - Pydantic data validation.md>), [M02-03 Dependency injection](<03 - Dependency injection.md>)
 
 ### Kahani
 Ek logistics customer ki ops team aapke document service pe 4 lakh SOPs aur shipping manifests load karti hai.
@@ -13,7 +15,7 @@ Aapko CRUD chahiye jo bade data pe tez rahe, retries pe safe ho, aur har failure
 
 ### What it is
 **CRUD endpoints** = Create/Read/Update/Delete ke liye REST routes: `POST /documents` (201), `GET /documents` (list + pagination), `GET/PUT/DELETE /documents/{id}`.
-"Scalable" ka matlab: bounded pages (limit + cursor), DB constraints pe bharosa (unique -> 409), idempotent updates, aur har request ka apna short-lived DB session (DI se, M02-03).
+"Scalable" ka matlab: bounded pages (limit + cursor), DB constraints pe bharosa (unique -> 409), idempotent updates, aur har request ka apna short-lived DB session (DI se, [M02-03](<03 - Dependency injection.md>)).
 FastAPI + SQLAlchemy 2.0 style (`Mapped`, `mapped_column`, `select()`, `db.scalars()`) -- TypeORM/Prisma ka Python equivalent.
 
 ### Why it matters for an FDE
@@ -23,8 +25,25 @@ POC 100 rows pe chalta hai, customer ka production 10 lakh rows pe. Offset pagin
 - **Status codes as contract** -- 201 created, 404 not found, 409 conflict (unique violation), 422 invalid body, 412 precondition failed (If-Match mismatch). Clients inhi pe retry/no-retry decide karte hain.
 - **Offset vs cursor pagination** -- `OFFSET n` DB ko n rows padhke skip karwata hai (deep pages slow, beech mein insert hone pe rows duplicate/miss); cursor = `WHERE id > last_id ORDER BY id LIMIT n` index seek hai, har page same speed.
 - **`limit + 1` trick** -- ek extra row maango; mili to `next_cursor` do. Alag `COUNT(*)` query ki zaroorat nahi.
-- **Idempotent PUT** -- PUT full replace hai; same body do baar = same state. Content same hai to version mat badhao. POST idempotent nahi hota -- uske liye idempotency keys (M14-01).
+- **Idempotent PUT** -- PUT full replace hai; same body do baar = same state. Content same hai to version mat badhao. POST idempotent nahi hota -- uske liye idempotency keys ([M14-01](<../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>)).
 - **Optimistic concurrency** -- `ETag: "<version>"` response mein, client `If-Match` bheje; version alag ho to 412. Do log ek saath edit karein to "lost update" nahi hota.
+
+### Picture it
+Cursor pagination with the limit+1 trick: every page is an index seek, and no COUNT query is needed.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant D as DB
+    C->>A: GET /documents?limit=20
+    A->>D: SELECT ... ORDER BY id LIMIT 21
+    D-->>A: 21 rows, the extra one means another page exists
+    A-->>C: 20 items + next_cursor (id of item 20, say 120)
+    C->>A: GET /documents?limit=20 and cursor=120
+    A->>D: SELECT ... WHERE id > 120 ORDER BY id LIMIT 21
+    Note over A,D: Page 1000 is as fast as page 1.<br/>OFFSET 20000 would read and throw away 20000 rows.
+```
 
 ### Code example
 `pip install fastapi httpx sqlalchemy pydantic`
@@ -149,7 +168,7 @@ def replace(doc_id: int, data: DocIn, db: DB, response: Response,
 ### Mini-exercise (30-60 min)
 `omniguard` ke in-memory store ko SQLAlchemy se replace karo.
 - `app/db.py` (engine `OMNIGUARD_DB_URL` se, default `sqlite:///./omniguard.db`), `app/models.py` (`Document`: id, tenant, title, classification, body, version, created_at; unique `(tenant, title)`), lifespan mein `create_all`.
-- Routes: `POST /documents` (201/409/422), `GET /documents` (limit 1-100 + offset + cursor, sirf current user ke tenant ke docs -- M02-03 ka `get_current_user`), `GET /documents/{id}` (404 + `ETag`), `PUT` (idempotent + `If-Match` -> 412), `DELETE` (204; dobara delete pe bhi 204 -- decide karke README mein likho).
+- Routes: `POST /documents` (201/409/422), `GET /documents` (limit 1-100 + offset + cursor, sirf current user ke tenant ke docs -- [M02-03](<03 - Dependency injection.md>) ka `get_current_user`), `GET /documents/{id}` (404 + `ETag`), `PUT` (idempotent + `If-Match` -> 412), `DELETE` (204; dobara delete pe bhi 204 -- decide karke README mein likho).
 - Acceptance: 1000 docs seed karke cursor se saare pages walk karo -- koi duplicate/missing id nahi; tenant A ka token tenant B ka doc GET kare to 404 (403 nahi -- existence leak mat karo).
 
 ### Common pitfalls
@@ -165,14 +184,23 @@ def replace(doc_id: int, data: DocIn, db: DB, response: Response,
 - [ ] Lifespan se startup/shutdown handle karta hoon, `on_event` se nahi.
 
 ### Related
-- M02-03 Dependency injection
-- M02-08 Handling N+1 query problems
-- M02-12 Fixtures and mocking
-- M14-01 Idempotency keys for safe tool execution
-- M12-07 Enforcing data-level permissions in retrieval layers
+- [M02-03](<03 - Dependency injection.md>) Dependency injection
+- [M02-08](<08 - Handling N+1 query problems.md>) Handling N+1 query problems
+- [M02-12](<12 - Fixtures and mocking.md>) Fixtures and mocking
+- [M14-01](<../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>) Idempotency keys for safe tool execution
+- [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
 
 ### Self-quiz
 1. Page 1 padhne ke baad kisi ne 3 naye documents insert kiye (id chhote nahi, bade). Offset pagination aur cursor pagination mein page 2 pe kya fark dikhega?
 2. "Pehle `SELECT` karke dekho title exist karta hai, phir `INSERT` karo" -- ye 409 ke liye kaafi kyun nahi hai?
 3. PUT idempotent hai, POST nahi. Mobile app ka `POST /documents` timeout pe retry hua -- kya hoga, aur kaise fix karoge?
 4. Tenant B ke document pe tenant A ko 404 dena behtar hai ya 403? Kyun?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 034 of 256** -- [Syllabus CP2](<../SYLLABUS.md#cp2>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 033: CORS middleware](<04 - CORS middleware.md>)
+- Next -> [step 035: Designing GraphQL schemas and object types using Python frameworks like Strawberry or Graphene](<06 - Designing GraphQL schemas and object types using Python frameworks like Strawberry or Graphene.md>)

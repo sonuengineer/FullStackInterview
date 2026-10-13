@@ -3,6 +3,8 @@
 ## Presidio guardrails
 
 > Deliverable 06 of 12 | Built in: Fast CP6 / Slow CP8 | Time box: 6 h
+>
+> **BUILD brief.** You ship this in your own repo. Learn first: [Implementing NeMo & Presidio guardrails](<../../15 - OmniGuard - Secure AI Integration/08 - Implementing NeMo & Presidio guardrails.md>).
 
 ### Goal
 Make sure personal data never reaches the LLM provider unmasked, never appears in answers to the wrong person, and never lands in logs, including error logs. Detection must handle Indian identifiers and must not over-mask business IDs that users need to see.
@@ -24,17 +26,17 @@ Analysts paste PAN numbers, mobile numbers and emails into questions. Source PDF
 Config keys: `PII_BACKEND` (`standin` | `presidio`), `PII_POLICY`, `PII_SCORE_THRESHOLD`, `LOG_LEVEL`.
 
 ### Inputs: lessons to (re)read
-- M13-04 Implementing Microsoft Presidio analyzers and anonymizers
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
-- M13-06 Customizing regex patterns for domain-specific PII
-- M13-07 Reversing masks safely post-generation
-- M13-08 Evaluating false-positive redaction rates
-- M13-14 Safe logging (never log PII or prompts)
-- M15-02 Defining data classifications
-- M15-08 Implementing NeMo & Presidio guardrails (the harness)
+- [M13-04](<../../13 - Production AI Security & Guardrails/04 - Implementing Microsoft Presidio analyzers and anonymizers.md>) Implementing Microsoft Presidio analyzers and anonymizers
+- [M13-05](<../../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
+- [M13-06](<../../13 - Production AI Security & Guardrails/06 - Customizing regex patterns for domain-specific PII.md>) Customizing regex patterns for domain-specific PII
+- [M13-07](<../../13 - Production AI Security & Guardrails/07 - Reversing masks safely post-generation.md>) Reversing masks safely post-generation
+- [M13-08](<../../13 - Production AI Security & Guardrails/08 - Evaluating false-positive redaction rates.md>) Evaluating false-positive redaction rates
+- [M13-14](<../../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
+- [M15-02](<../../15 - OmniGuard - Secure AI Integration/02 - Defining data classifications.md>) Defining data classifications
+- [M15-08](<../../15 - OmniGuard - Secure AI Integration/08 - Implementing NeMo & Presidio guardrails.md>) Implementing NeMo & Presidio guardrails (the harness)
 
 ### Acceptance checks
-Automated by the M15-08 harness (`omniguard/tests/acceptance/test_guardrails.py`, `OMNIGUARD_APP=omniguard.main:app`):
+Automated by the [M15-08](<../../15 - OmniGuard - Secure AI Integration/08 - Implementing NeMo & Presidio guardrails.md>) harness (`omniguard/tests/acceptance/test_guardrails.py`, `OMNIGUARD_APP=omniguard.main:app`):
 1. Question containing a PAN and an email -> no PII in the response (harness uses its own independent detector).
 2. Question about C-1001 where the source chunk holds a PAN and mobile -> `route == "rag"` and no PII in the answer.
 3. Captured logs for all attacks contain no PAN, email, mobile or Aadhaar-shaped values.
@@ -43,8 +45,8 @@ Automated by the M15-08 harness (`omniguard/tests/acceptance/test_guardrails.py`
 6. Policy number `KVF-2026-001234` appears unmasked in the answer (false-positive check).
 7. Fault injection: add a `log.info(question)` in a branch -> CI red.
 Supporting unit suites:
-8. With FakeLLM, assert the prompt the provider received contains no email/phone/card/PAN for 10 sample notes (M13-04).
-9. 20 positive samples: recall 100%; 20 hard negatives (tracking ids, invoice numbers, dates): false positives <= 1/20 (M13-05, M13-08).
+8. With FakeLLM, assert the prompt the provider received contains no email/phone/card/PAN for 10 sample notes ([M13-04](<../../13 - Production AI Security & Guardrails/04 - Implementing Microsoft Presidio analyzers and anonymizers.md>)).
+9. 20 positive samples: recall 100%; 20 hard negatives (tracking ids, invoice numbers, dates): false positives <= 1/20 ([M13-05](<../../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>), [M13-08](<../../13 - Production AI Security & Guardrails/08 - Evaluating false-positive redaction rates.md>)).
 
 ### Proof for the gate
 Part of the CP6 v1.0 tag: README "Guardrail evidence" table rows for PII (attack -> control -> test name), CI run link, and the PAN-in-question segment of the demo video.
@@ -55,9 +57,15 @@ Part of the CP6 v1.0 tag: README "Guardrail evidence" table rows for PII (attack
 - `docs/data-retention.md` exists and matches the logging code.
 
 ### Out of scope
-Jailbreak, topical and injection rails (Deliverable 05), encryption at rest, DPDP legal interpretation (confirm with the customer's compliance team), reversible masking in the UI unless done per M13-07.
+Jailbreak, topical and injection rails (Deliverable 05), encryption at rest, DPDP legal interpretation (confirm with the customer's compliance team), reversible masking in the UI unless done per [M13-07](<../../13 - Production AI Security & Guardrails/07 - Reversing masks safely post-generation.md>).
 
 ### Stretch goals
-- Safe unmasking of placeholders for authorised roles only, after generation (M13-07).
+- Safe unmasking of placeholders for authorised roles only, after generation ([M13-07](<../../13 - Production AI Security & Guardrails/07 - Reversing masks safely post-generation.md>)).
 - Per-entity precision/recall report in CI output.
 - Hinglish and mixed-script test samples.
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+[Project README](<README.md>) | [Syllabus](<../../SYLLABUS.md>) | [START_HERE](<../../START_HERE.md>)

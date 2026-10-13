@@ -2,7 +2,11 @@
 
 ## Defining Model Context Protocol trust boundaries
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M10-10, M10-11, M13-02, M12-06
+> **Core** | ~1.2 h | Slow: step 237/256, CP10 | Fast: CP8
+>
+> Before this: [M10-10 Host and Client and Server architectures](<../10 - Advanced Agent Orchestration/10 - Host and Client and Server architectures.md>), [M10-11 Standardizing tool access boundaries](<../10 - Advanced Agent Orchestration/11 - Standardizing tool access boundaries.md>), [M13-02 Prompt injection defenses](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>), [M12-06 Implementing Role-Based Access Control](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Defining trust boundaries](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/05 - Defining trust boundaries.md>) (in `Projects/`).
 
 ### Kahani
 Anil (Kavach IT) ne AuditMesh ka architecture dekha aur ek hi sawaal poocha: "Ye agent hamare Jira mein kya-kya kar sakta hai?"
@@ -18,11 +22,11 @@ Rule of thumb: LLM ka output ek **proposal** hai, command nahi; Jira ka text **d
 Bina boundaries ke, ek injected ticket = agent ke paas customer ke Jira ka admin access. Ye page hi decide karta hai ki security review pass hoga ya project ruk jaayega.
 
 ### Key concepts
-- **Host / client / server** (M10-10) -- host LLM aur policy chalata hai; server sirf apne tools expose karta hai aur apne credentials rakhta hai; LLM ko kabhi Jira token nahi milta.
-- **Least-privilege tool surface** -- server pe sirf allow-listed tools (read, create in `COMP`, comment); delete/close/transition exist hi nahi karte (M10-11).
+- **Host / client / server** ([M10-10](<../10 - Advanced Agent Orchestration/10 - Host and Client and Server architectures.md>)) -- host LLM aur policy chalata hai; server sirf apne tools expose karta hai aur apne credentials rakhta hai; LLM ko kabhi Jira token nahi milta.
+- **Least-privilege tool surface** -- server pe sirf allow-listed tools (read, create in `COMP`, comment); delete/close/transition exist hi nahi karte ([M10-11](<../10 - Advanced Agent Orchestration/11 - Standardizing tool access boundaries.md>)).
 - **Scopes per call** -- client ka token scopes carry karta hai (`jira:read`, `jira:write:COMP`); server har call pe check kare. HTTP transport ke auth details apne MCP spec version ke docs mein check karo.
 - **Approval binding** -- write call tabhi chale jab approval record ke args ka hash exactly match kare; approval ke baad args badle -> deny.
-- **Untrusted content** -- ticket text, comments, attachments LLM ko data ki tarah jaayein (delimited, labelled); defenses M13-02 se. Asli safety: dangerous tool hi nahi hai.
+- **Untrusted content** -- ticket text, comments, attachments LLM ko data ki tarah jaayein (delimited, labelled); defenses [M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>) se. Asli safety: dangerous tool hi nahi hai.
 
 ```text
  [LLM]  --proposed tool call-->  [AuditMesh host: policy + approvals]  --MCP client, token{scopes}-->
@@ -130,14 +134,14 @@ print("OK: MCP tool-permission policy checker")
 ### Mini-exercise (30-60 min)
 AuditMesh deliverable "defining trust boundaries": `auditmesh/docs/trust-boundaries.md` + `auditmesh/policy/mcp_policy.yaml`.
 - Diagram + boundary table apne architecture ke liye; har boundary pe owner (aap ya Kavach IT).
-- Ye checker apne repo mein rakho aur CI mein apne real Jira MCP server ke `tools/list` output pe chalao (M16-07 mein server banega).
+- Ye checker apne repo mein rakho aur CI mein apne real Jira MCP server ke `tools/list` output pe chalao ([M16-07](<07 - Deploying a custom MCP server for secure Jira ticketing.md>) mein server banega).
 - 5 injected tickets ka test set banao (close, other project, change severity, exfiltrate via comment, huge text).
 - Acceptance: manifest lint clean; saare injected cases deny + audit row; Anil ke liye 1-page "what the agent can and cannot do in Jira".
 
 ### Common pitfalls
 - Server ko user ka personal Jira token dena -- har action uske naam pe, revoke mushkil. Dedicated service account, project-scoped.
 - Sirf prompt mein "don't close tickets" likhna -- prompt control nahi hai; tool hi mat do.
-- Audit log mein poora ticket text/PII dalna (M13-14) -- args ka hash + ids kaafi hai.
+- Audit log mein poora ticket text/PII dalna ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)) -- args ka hash + ids kaafi hai.
 
 ### Checklist before moving on
 - [ ] Host, client, server ka role aur credentials kiske paas hain, bata sakta hoon.
@@ -146,14 +150,23 @@ AuditMesh deliverable "defining trust boundaries": `auditmesh/docs/trust-boundar
 - [ ] Mera checker injected cases deny karta hai aur har decision log karta hai.
 
 ### Related
-- M10-10 Host and Client and Server architectures
-- M10-11 Standardizing tool access boundaries
-- M13-02 Prompt injection defenses
-- M12-10 Audit logging
-- M16-07 Deploying a custom MCP server for secure Jira ticketing
+- [M10-10](<../10 - Advanced Agent Orchestration/10 - Host and Client and Server architectures.md>) Host and Client and Server architectures
+- [M10-11](<../10 - Advanced Agent Orchestration/11 - Standardizing tool access boundaries.md>) Standardizing tool access boundaries
+- [M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>) Prompt injection defenses
+- [M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>) Audit logging
+- [M16-07](<07 - Deploying a custom MCP server for secure Jira ticketing.md>) Deploying a custom MCP server for secure Jira ticketing
 
 ### Self-quiz
 1. Prompt injection ke against "best defense" yahan prompt mein nahi, tool surface mein kyun hai?
 2. LLM ko Jira token kyun nahi milna chahiye, chahe woh "read-only" ho?
 3. Approval ke baad severity P2 se P4 ho gayi -- kaunsa check pakdega aur log mein kya dikhega?
 4. Anil poochta hai "server compromise ho gaya to blast radius kya hai?" Aapka jawab kya hoga?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 237 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 236: Drafting latency/cost SLAs](<03 - Drafting latency and cost SLAs.md>)
+- Next -> [step 238: Leading operations and training handoffs](<05 - Leading operations and training handoffs.md>)

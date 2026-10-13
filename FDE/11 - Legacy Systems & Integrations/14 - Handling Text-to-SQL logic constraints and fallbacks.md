@@ -2,11 +2,13 @@
 
 ## Handling Text-to-SQL logic constraints and fallbacks
 
-> Core | Fast CP5 / Slow CP7 | ~1.2 h | Builds on: M11-11, M11-12, M11-13, M05-09
+> **Core** | ~1.2 h | Slow: step 157/256, CP7 | Fast: CP5
+>
+> Before this: [M11-11 Constructing safe parameterized queries to prevent SQL injection](<11 - Constructing safe parameterized queries to prevent SQL injection.md>), [M11-12 Implementing read-only database roles](<12 - Implementing read-only database roles.md>), [M11-13 Mapping complex database schemas to LLM context](<13 - Mapping complex database schemas to LLM context.md>), [M05-09 Handling and retrying output parsing errors gracefully](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>)
 
 ### Kahani
 Distributor customer ke sales head ne OmniGuard se poocha: "Top customers dikhao." Model ne `SELECT * FROM CUST_MST` likha -- 2 lakh rows, phone numbers ke saath, browser hang.
-Agle din: "orders saaf karo" pe `DELETE` (read-only role ne bachaya, M11-12), aur ek user ne prompt mein `; DROP TABLE` chhupaya.
+Agle din: "orders saaf karo" pe `DELETE` (read-only role ne bachaya, [M11-12](<12 - Implementing read-only database roles.md>)), aur ek user ne prompt mein `; DROP TABLE` chhupaya.
 Teesra case sabse subtle: "last quarter revenue" -- schema mein revenue column hi nahi tha, model ne `AMT * 1.18` invent karke ek number de diya. CFO ne wahi number board deck mein daala.
 Guard ka kaam sirf "dangerous SQL rokna" nahi -- "jab jawab pata nahi, to number mat banao" bhi hai.
 
@@ -19,10 +21,10 @@ Text-to-SQL demos 10 minute mein ban jaate hain; production mein galat-par-confi
 
 ### Key concepts
 - **Parse, don't regex** -- `sqlglot.parse()` se AST; `"DELETE"` string search CTE-with-DELETE ya comments se bypass hota hai.
-- **Allow-lists** -- tables (role ke hisaab se, M12-06) aur PII columns deny; `SELECT *` reject (kaunse columns aayenge pata nahi).
+- **Allow-lists** -- tables (role ke hisaab se, [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)) aur PII columns deny; `SELECT *` reject (kaunse columns aayenge pata nahi).
 - **LIMIT rewrite** -- missing ya bada limit -> cap (e.g. 200); results bhi row-capped.
 - **Structured LLM output** -- `{"sql": ...}` ya `{"clarify": ...}` ya `{"cannot_answer": ...}`; model ko "na" bolne ka rasta do.
-- **One repair attempt** -- guard error model ko wapas (M05-09), ek baar; phir bhi fail = fallback message. Defense in depth: read-only role + timeout (M11-12).
+- **One repair attempt** -- guard error model ko wapas ([M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>)), ek baar; phir bhi fail = fallback message. Defense in depth: read-only role + timeout ([M11-12](<12 - Implementing read-only database roles.md>)).
 
 ### Code example
 `pip install sqlalchemy sqlglot`
@@ -137,8 +139,8 @@ out_json = resp.content[0].text
 
 ### Mini-exercise (30-60 min)
 OmniGuard CP5 build: `omniguard/sql/guard.py` + `/sql/ask` endpoint.
-- `guard(sql, role) -> str` -- allowed tables/PII columns role se (RBAC, M12-06); data-level permission: non-admin ke liye `WHERE region = :user_region` filter AST mein inject karo (M12-07).
-- Endpoint flow: auth (OAuth2/JWT) -> schema context (M11-13) -> LLM -> guard -> read-only engine -> row cap -> response with `sql`, `rows`, `type`.
+- `guard(sql, role) -> str` -- allowed tables/PII columns role se (RBAC, [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)); data-level permission: non-admin ke liye `WHERE region = :user_region` filter AST mein inject karo ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)).
+- Endpoint flow: auth (OAuth2/JWT) -> schema context ([M11-13](<13 - Mapping complex database schemas to LLM context.md>)) -> LLM -> guard -> read-only engine -> row cap -> response with `sql`, `rows`, `type`.
 - Tests: 15+ adversarial cases (`DELETE`, CTE-delete, `;`, comments, `SELECT *`, EMP table, PII column, 10k limit, unparseable) -- har case mein zero execution.
 - **CP5 gate -- two-user demo:** analyst (Pune region) vs admin; same question -> alag rows; analyst ka EMP_MST sawaal -> `cannot_answer`; dono ka `DELETE` -> blocked.
 
@@ -154,14 +156,23 @@ OmniGuard CP5 build: `omniguard/sql/guard.py` + `/sql/ask` endpoint.
 - [ ] Guard ke peeche read-only role aur statement timeout hai.
 
 ### Related
-- M11-13 Mapping complex database schemas to LLM context
-- M11-12 Implementing read-only database roles
-- M11-11 Constructing safe parameterized queries to prevent SQL injection
-- M12-07 Enforcing data-level permissions in retrieval layers
-- M05-09 Handling and retrying output parsing errors gracefully
+- [M11-13](<13 - Mapping complex database schemas to LLM context.md>) Mapping complex database schemas to LLM context
+- [M11-12](<12 - Implementing read-only database roles.md>) Implementing read-only database roles
+- [M11-11](<11 - Constructing safe parameterized queries to prevent SQL injection.md>) Constructing safe parameterized queries to prevent SQL injection
+- [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
+- [M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>) Handling and retrying output parsing errors gracefully
 
 ### Self-quiz
 1. `WITH d AS (DELETE ... RETURNING *) SELECT * FROM d` -- regex guard isse kyun miss karega, aur AST guard kaise pakadta hai?
 2. Guard ne query reject ki. User ko kya dikhna chahiye, aur kya kabhi nahi hona chahiye?
 3. Model ne existing columns se "revenue" calculate kar diya jo business definition se match nahi karta. Ise kaise rokoge?
 4. Analyst aur admin same sawaal poochte hain -- data-level permission guard mein kahan enforce karoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 157 of 256** -- [Syllabus CP7](<../SYLLABUS.md#cp7>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 156: Mapping complex database schemas to LLM context](<13 - Mapping complex database schemas to LLM context.md>)
+- Next -> [step 158: Sandboxing and staging before legacy production changes](<15 - Sandboxing and staging before legacy production changes.md>)

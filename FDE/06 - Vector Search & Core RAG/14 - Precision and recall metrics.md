@@ -2,7 +2,9 @@
 
 ## Precision and recall metrics
 
-> Core | Fast CP3 / Slow CP4 | ~1.2 h | Builds on: M06-10, M06-12, M06-13
+> **Core** | ~1.2 h | Slow: step 078/256, CP4 | Fast: CP3
+>
+> Before this: [M06-10 End-to-end basic retrieval](<10 - End-to-end basic retrieval.md>), [M06-12 Combining dense and sparse signals](<12 - Combining dense and sparse signals.md>), [M06-13 Implementing RRF algorithms](<13 - Implementing RRF algorithms.md>)
 
 ### Kahani
 Logistics customer ka steering meeting. Aapne chunk size badla, hybrid lagaya, RRF add kiya -- aur slide pe likha "retrieval improved". VP Operations poochti hain: "Kitna? Kis cheez mein? Pichhle hafte se compare karke dikhao."
@@ -21,7 +23,7 @@ Labelled eval set (question -> relevant chunk ids) pe retriever ki ranked list k
 - **Precision@k = noise in context** -- low precision = prompt mein irrelevant chunks, tokens waste, hallucination risk.
 - **MRR = "how high is the first good hit"** -- single-answer FAQ style questions ke liye best signal.
 - **nDCG = graded + ordered** -- "perfect" vs "partial" chunks alag value; reranker evaluation ke liye useful.
-- **Unanswerable questions** -- recall undefined; inhe alag track karo ("not found" rate, M06-10).
+- **Unanswerable questions** -- recall undefined; inhe alag track karo ("not found" rate, [M06-10](<10 - End-to-end basic retrieval.md>)).
 
 ### Code example
 stdlib only
@@ -105,10 +107,10 @@ print("OK: metrics hand-checked; README-ready eval table printed")
 
 ### Mini-exercise (30-60 min)
 CP3 gate ka pehla hissa: `omniguard/eval/retrieval_eval.py`.
-- Input `eval/questions.jsonl`: `{"id", "question", "tenant", "relevant_chunk_ids": [...], "grades": {...}}` -- kam se kam 30 questions, 5 unanswerable, 5 ID-style. Labels customer SME ke saath verify karo (ya M14-08 se synthetic, phir spot-check).
+- Input `eval/questions.jsonl`: `{"id", "question", "tenant", "relevant_chunk_ids": [...], "grades": {...}}` -- kam se kam 30 questions, 5 unanswerable, 5 ID-style. Labels customer SME ke saath verify karo (ya [M14-08](<../14 - AI Observability & Gateway Management/08 - Creating synthetic benchmark datasets from source documents.md>) se synthetic, phir spot-check).
 - Har system config (bm25, dense, hybrid_minmax, hybrid_rrf, +reranker baad mein) ke liye precision@5, recall@5, MRR, nDCG@5 + not-found rate on unanswerable.
 - Output `eval/report.md` (markdown table + git commit hash + config) aur README ke "Eval report" section mein embed.
-- Acceptance: pytest -- hand-computed metric values match; report script deterministic (same input -> same table). Answer-level metrics (faithfulness, context precision/recall) M14-05..M14-08 mein add honge.
+- Acceptance: pytest -- hand-computed metric values match; report script deterministic (same input -> same table). Answer-level metrics (faithfulness, context precision/recall) [M14-05](<../14 - AI Observability & Gateway Management/05 - Automating LLM-as-a-judge scoring pipelines.md>)..[M14-08](<../14 - AI Observability & Gateway Management/08 - Creating synthetic benchmark datasets from source documents.md>) mein add honge.
 
 ### Common pitfalls
 - Eval questions khud likhna jo exactly docs ke words copy karte hain -- BM25 artificially jeet-ta hai; real user wording (tickets, chat logs) se lo.
@@ -122,15 +124,24 @@ CP3 gate ka pehla hissa: `omniguard/eval/retrieval_eval.py`.
 - [ ] Har retrieval change ke saath before/after table banata hoon.
 
 ### Related
-- M06-13 Implementing RRF algorithms
-- M06-15 Cross-encoder reranking models
-- M14-05 Automating LLM-as-a-judge scoring pipelines
-- M14-06 Calculating RAGAS faithfulness and answer relevance metrics
-- M14-07 Measuring context precision and recall
-- M14-08 Creating synthetic benchmark datasets from source documents
+- [M06-13](<13 - Implementing RRF algorithms.md>) Implementing RRF algorithms
+- [M06-15](<15 - Cross-encoder reranking models.md>) Cross-encoder reranking models
+- [M14-05](<../14 - AI Observability & Gateway Management/05 - Automating LLM-as-a-judge scoring pipelines.md>) Automating LLM-as-a-judge scoring pipelines
+- [M14-06](<../14 - AI Observability & Gateway Management/06 - Calculating RAGAS faithfulness and answer relevance metrics.md>) Calculating RAGAS faithfulness and answer relevance metrics
+- [M14-07](<../14 - AI Observability & Gateway Management/07 - Measuring context precision and recall.md>) Measuring context precision and recall
+- [M14-08](<../14 - AI Observability & Gateway Management/08 - Creating synthetic benchmark datasets from source documents.md>) Creating synthetic benchmark datasets from source documents
 
 ### Self-quiz
 1. Ranked list [d3, d1, d2, d7], relevant {d3, d2, d9}. Precision@4, recall@4 aur RR nikalo.
 2. Recall@5 = 0.6 aur precision@5 = 0.9 -- RAG answers pe iska kya asar dikhega?
 3. VP ko ek number dikhana hai. Recall@k, MRR ya nDCG -- kaunsa aur kyun?
 4. Chunking change ke baad recall gira. Kaise pata karoge ki retrieval kharab hua ya labels toot gaye?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 078 of 256** -- [Syllabus CP4](<../SYLLABUS.md#cp4>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 077: Implementing RRF algorithms](<13 - Implementing RRF algorithms.md>)
+- Next -> [step 079: Cross-encoder reranking models](<15 - Cross-encoder reranking models.md>)

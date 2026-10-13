@@ -2,7 +2,9 @@
 
 ## Audit logging
 
-> Core | Fast CP5 / Slow CP7 | ~1.2 h | Builds on: M12-01, M12-06, M12-07
+> **Core** | ~1.2 h | Slow: step 168/256, CP7 | Fast: CP5
+>
+> Before this: [M12-01 Authentication vs authorization](<01 - Authentication vs authorization.md>), [M12-06 Implementing Role-Based Access Control](<06 - Implementing Role-Based Access Control.md>), [M12-07 Enforcing data-level permissions in retrieval layers](<07 - Enforcing data-level permissions in retrieval layers.md>)
 
 ### Kahani
 Hospital ka regulator audit. Sawaal simple tha: "Pichhle 90 din mein patient P-2291 ka record AI assistant ke through kisne dekha, aur kisko deny hua?"
@@ -14,13 +16,13 @@ Audit log alag cheez hai: structured, har security decision ka, append-only, tam
 **Tamper-evident** = har event pichhle event ka hash include karta hai (hash chain); beech ki koi line badli ya hatai to verification toot jaata hai.
 
 ### Why it matters for an FDE
-Enterprise deal mein security questionnaire ka ek poora section audit logging pe hota hai. AI app mein extra sawaal: "LLM ne kaunse documents user ko dikhaye?" -- iska jawab chunk ids ke audit events se aata hai (M12-07), prompts se nahi.
+Enterprise deal mein security questionnaire ka ek poora section audit logging pe hota hai. AI app mein extra sawaal: "LLM ne kaunse documents user ko dikhaye?" -- iska jawab chunk ids ke audit events se aata hai ([M12-07](<07 - Enforcing data-level permissions in retrieval layers.md>)), prompts se nahi.
 
 ### Key concepts
 - **Event schema** -- `ts`, `request_id`, `actor` (sub + type user/key/service), `action`, `resource`, `decision`, `reason`, `source_ip`. Fixed schema, JSON, ek line per event.
 - **Log denies too** -- allow aur deny dono. Denies ka spike = attack ya broken role mapping.
 - **Append-only + hash chain** -- app sirf append kar sake; `hash = sha256(prev_hash + canonical_json(event))`. Production mein WORM storage (S3 Object Lock, immutable blob) ya SIEM pe ship karo.
-- **No secrets, no PII, no raw prompts** -- tokens, API keys, prompt/answer text kabhi nahi. Prompt ka `sha256` + length + chunk ids chalega (M13-14).
+- **No secrets, no PII, no raw prompts** -- tokens, API keys, prompt/answer text kabhi nahi. Prompt ka `sha256` + length + chunk ids chalega ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 - **Retention + access** -- kitne din (customer/regulation decide karta hai), aur audit log padhne ki permission bhi audited (`audit:read`).
 
 ### Code example
@@ -109,7 +111,7 @@ with tempfile.TemporaryDirectory() as d:
 print("OK: structured events, allow + deny, no PII, hash chain detects edits and deletions")
 ```
 
-- Schema `record(*, request_id, actor, action, resource, decision, reason, **extra)` -- keyword-only, taaki koi field bhool na sake; `actor.type` se user, API key (M12-09) aur service alag dikhte hain.
+- Schema `record(*, request_id, actor, action, resource, decision, reason, **extra)` -- keyword-only, taaki koi field bhool na sake; `actor.type` se user, API key ([M12-09](<09 - API keys vs service accounts.md>)) aur service alag dikhte hain.
 - `FORBIDDEN_KEYS` -- token/prompt/password field aaya to exception. Galti code review mein nahi, runtime pe pakdi jaati hai.
 - `prompt_fingerprint` -- prompt ka chhota hash + length. Same prompt dobara aaya to correlate kar sakte ho, padh nahi sakte. Hash ko reversible maan ke chalo agar input chhota/guessable ho -- isliye identifiers (patient id) `resource` mein, free text kahin nahi.
 - `hash = sha256(prev + canonical(event))` -- `sort_keys` + fixed separators se canonical JSON; warna same event ka hash alag aayega.
@@ -118,13 +120,13 @@ print("OK: structured events, allow + deny, no PII, hash chain detects edits and
 ### Mini-exercise (30-60 min)
 OmniGuard: `omniguard/audit/log.py`.
 - Middleware jo har request ko `request_id` de (incoming `X-Request-ID` ya naya uuid), response header mein wapas bheje.
-- Audit events: login, token refresh/reuse (M12-08), har `require_permission` deny (M12-06), har `/ask` retrieval (chunk ids + allow/deny counts, M12-07), API key create/rotate/revoke (M12-09).
+- Audit events: login, token refresh/reuse ([M12-08](<08 - Session and token lifecycle.md>)), har `require_permission` deny ([M12-06](<06 - Implementing Role-Based Access Control.md>)), har `/ask` retrieval (chunk ids + allow/deny counts, [M12-07](<07 - Enforcing data-level permissions in retrieval layers.md>)), API key create/rotate/revoke ([M12-09](<09 - API keys vs service accounts.md>)).
 - `scripts/verify_audit.py` jo chain verify kare aur exit code 1 de agar toota; CI mein ek tamper test.
 - Acceptance: two-user demo (CP5 gate) chalane ke baad audit file se ek command mein jawab: "HR doc `hr-7` kisko dikha, kisko deny hua?"
 
 ### Common pitfalls
 - App logs aur audit logs ek hi stream -- debug noise mein evidence kho jaata hai, aur retention alag-alag chahiye. Alag sink.
-- `logger.info(f"request {request.headers}")` -- Authorization header, cookies, sab audit/log mein. Allow-list fields, kabhi poora object dump nahi (M13-14).
+- `logger.info(f"request {request.headers}")` -- Authorization header, cookies, sab audit/log mein. Allow-list fields, kabhi poora object dump nahi ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 - Audit write fail ho to request ka kya? High-risk actions (export, admin) ke liye fail closed; baaki ke liye buffered queue + alert. Ye decision customer ke saath likho.
 
 ### Checklist before moving on
@@ -134,14 +136,24 @@ OmniGuard: `omniguard/audit/log.py`.
 - [ ] Tokens, keys, prompts, answers audit log mein nahi jaate -- test se proven.
 
 ### Related
-- M12-06 Implementing Role-Based Access Control
-- M12-07 Enforcing data-level permissions in retrieval layers
-- M12-08 Session and token lifecycle
-- M13-14 Safe logging (never log PII or prompts)
-- M14-10 Capturing deep span-level execution traces
+- [M12-06](<06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M12-07](<07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
+- [M12-08](<08 - Session and token lifecycle.md>) Session and token lifecycle
+- [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
+- [M14-10](<../14 - AI Observability & Gateway Management/10 - Capturing deep span-level execution traces.md>) Capturing deep span-level execution traces
 
 ### Self-quiz
 1. App log aur audit log mein teen farak batao.
 2. Regulator poochta hai "kisne patient X ka data dekha". Kaunse fields chahiye aur prompt text kyun nahi?
 3. Hash chain kya pakadti hai aur kya nahi? Gap kaise band karoge?
 4. Audit storage down hai. `/export` request allow karoge ya deny? Aur `/ask`?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 168 of 256** -- [Syllabus CP7](<../SYLLABUS.md#cp7>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 167: API keys vs service accounts](<09 - API keys vs service accounts.md>)
+- Next -> step 169 BUILD: OmniGuard: secure Text-to-SQL (read-only role, parameterized) + OAuth2 + RBAC + data-level permissions -- see [syllabus](<../SYLLABUS.md#cp7>)
+- then lesson: [step 171: Identifying major LLM vulnerabilities](<../13 - Production AI Security & Guardrails/01 - Identifying major LLM vulnerabilities.md>)

@@ -1,3 +1,5 @@
+> **OUTDATED -- kept for history only.** Start at [START_HERE.md](../START_HERE.md). The current plan is [MASTER_PLAN.md](../MASTER_PLAN.md); hour and topic numbers below are from the old 230-topic plan.
+
 # Using Claude Max for the FDE Roadmap
 
 ## 1. Making content (fill the 230 subtopic .md files)

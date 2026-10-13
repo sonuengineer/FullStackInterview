@@ -2,7 +2,9 @@
 
 ## Measuring context precision and recall
 
-> Core | Fast CP3 / Slow CP4 | ~1.2 h | Builds on: M06-14, M14-06
+> **Core** | ~1.2 h | Slow: step 083/256, CP4 | Fast: CP3
+>
+> Before this: [M06-14 Precision and recall metrics](<../06 - Vector Search & Core RAG/14 - Precision and recall metrics.md>), [M14-06 Calculating RAGAS faithfulness and answer relevance metrics](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>)
 
 ### Kahani
 Ek bank ka KYC assistant. Faithfulness 0.95 aa raha hai, phir bhi branch staff complain karta hai ki answers "adhoore" hain -- address proof wali rule aksar missing.
@@ -11,13 +13,13 @@ Faithfulness yahan blind hai -- model ne jo kaha wo context mein tha. Problem ge
 
 ### What it is
 **Context precision** (RAGAS-style) = relevant chunks top pe ranked hain ya nahi. Top-K mein har relevant position k pe precision@k lo, aur unka average: `sum(precision@k * v_k) / (relevant chunks in top K)`, jahan v_k = 1 agar chunk k relevant hai. Ranking-aware hai.
-**Context recall** = ground-truth (reference) answer ke kitne claims retrieved context se attribute ho sakte hain: `covered reference claims / total reference claims`. Isko reference answer chahiye (M14-08 ka dataset).
+**Context recall** = ground-truth (reference) answer ke kitne claims retrieved context se attribute ho sakte hain: `covered reference claims / total reference claims`. Isko reference answer chahiye ([M14-08](<08 - Creating synthetic benchmark datasets from source documents.md>) ka dataset).
 
 ### Why it matters for an FDE
-Customer ko "answer galat hai" se aage le jaana hai: "retriever ne zaroori chunk laaya hi nahi (recall)" ya "laaya lekin neeche dafna diya (precision)". Pehle ka fix chunking/hybrid search, doosre ka fix reranker (M06-15).
+Customer ko "answer galat hai" se aage le jaana hai: "retriever ne zaroori chunk laaya hi nahi (recall)" ya "laaya lekin neeche dafna diya (precision)". Pehle ka fix chunking/hybrid search, doosre ka fix reranker ([M06-15](<../06 - Vector Search & Core RAG/15 - Cross-encoder reranking models.md>)).
 
 ### Key concepts
-- **Plain retrieval P/R (M06-14)** -- labelled relevant doc IDs chahiye; precision@k ranking ke andar order ignore karta hai. Context precision order ko reward karta hai.
+- **Plain retrieval P/R ([M06-14](<../06 - Vector Search & Core RAG/14 - Precision and recall metrics.md>))** -- labelled relevant doc IDs chahiye; precision@k ranking ke andar order ignore karta hai. Context precision order ko reward karta hai.
 - **Relevance without ID labels** -- RAGAS-style mein LLM judge decide karta hai ki chunk reference/question ke liye useful hai; chunk-level labelling ki zaroorat nahi.
 - **Claim-level recall** -- recall doc IDs pe nahi, reference answer ke facts pe; ek fact do chunks mein split ho to bhi chalta hai.
 - **Diagnosis matrix** -- low recall -> retrieval/chunking; high recall + low precision -> reranking; dono high + low faithfulness -> generation/prompt.
@@ -114,15 +116,15 @@ print(result)
 
 ### Mini-exercise (30-60 min)
 CP3 gate ka core: OmniGuard Hybrid RAG v1 ke `omniguard/evals/run_eval.py` mein ye dono metrics add karo.
-- `dataset.jsonl` ki har row (`question`, `reference`, optional `relevant_ids`) pe apna retriever chalao, top-K contexts lo, phir context precision, context recall, faithfulness (M14-06) compute karo.
-- Teen configs compare karo: dense only, hybrid RRF (M06-13), hybrid + reranker (M06-15). `report.md` mein table: config | K | ctx_precision | ctx_recall | faithfulness.
+- `dataset.jsonl` ki har row (`question`, `reference`, optional `relevant_ids`) pe apna retriever chalao, top-K contexts lo, phir context precision, context recall, faithfulness ([M14-06](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>)) compute karo.
+- Teen configs compare karo: dense only, hybrid RRF ([M06-13](<../06 - Vector Search & Core RAG/13 - Implementing RRF algorithms.md>)), hybrid + reranker ([M06-15](<../06 - Vector Search & Core RAG/15 - Cross-encoder reranking models.md>)). `report.md` mein table: config | K | ctx_precision | ctx_recall | faithfulness.
 - Wahi table README ke "Eval report" section mein -- ye CP3 gate hai.
 - Acceptance: pytest -- relevant chunk ko neeche move karne pe precision girta hai, recall same; ek chunk hatane pe recall girta hai.
 
 ### Common pitfalls
-- Reference answer khud retrieved context se generate karna -- recall hamesha ~1.0 aayega; reference independent source ya human-reviewed honi chahiye (M14-08).
+- Reference answer khud retrieved context se generate karna -- recall hamesha ~1.0 aayega; reference independent source ya human-reviewed honi chahiye ([M14-08](<08 - Creating synthetic benchmark datasets from source documents.md>)).
 - K report na karna -- K=3 vs K=10 ke numbers compare karke "reranker ne recall badhaya" bolna galat conclusion hai.
-- Har chunk x har claim pe judge call bina cap ke -- K=20 aur 10 claims = 200 calls per row; batch prompts aur sampling use karo (M14-05).
+- Har chunk x har claim pe judge call bina cap ke -- K=20 aur 10 claims = 200 calls per row; batch prompts aur sampling use karo ([M14-05](<05 - Automating LLM-as-a-judge scoring pipelines.md>)).
 
 ### Checklist before moving on
 - [ ] Context precision ka formula haath se ek ranking pe calculate kar sakta hoon.
@@ -131,13 +133,22 @@ CP3 gate ka core: OmniGuard Hybrid RAG v1 ke `omniguard/evals/run_eval.py` mein 
 - [ ] Low recall vs low precision ke liye kaunsa fix, ye bata sakta hoon.
 
 ### Related
-- M06-14 Precision and recall metrics
-- M06-15 Cross-encoder reranking models
-- M14-06 Calculating RAGAS faithfulness and answer relevance metrics
-- M14-08 Creating synthetic benchmark datasets from source documents
+- [M06-14](<../06 - Vector Search & Core RAG/14 - Precision and recall metrics.md>) Precision and recall metrics
+- [M06-15](<../06 - Vector Search & Core RAG/15 - Cross-encoder reranking models.md>) Cross-encoder reranking models
+- [M14-06](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>) Calculating RAGAS faithfulness and answer relevance metrics
+- [M14-08](<08 - Creating synthetic benchmark datasets from source documents.md>) Creating synthetic benchmark datasets from source documents
 
 ### Self-quiz
 1. Do retrievers ka P@5 same hai lekin context precision alag. Kya hua hoga, aur user ke liye kaunsa better hai?
 2. Context recall ko reference answer kyun chahiye, jabki faithfulness ko nahi?
 3. Recall 0.95, precision 0.30, faithfulness 0.90 -- aap customer ko kya fix recommend karoge?
 4. K ko 5 se 20 karne pe teeno metrics aur cost pe kya asar padega?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 083 of 256** -- [Syllabus CP4](<../SYLLABUS.md#cp4>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 082: Calculating RAGAS faithfulness and answer relevance metrics](<06 - Calculating RAGAS faithfulness and answer relevance metrics.md>)
+- Next -> [step 084: Creating synthetic benchmark datasets from source documents](<08 - Creating synthetic benchmark datasets from source documents.md>)

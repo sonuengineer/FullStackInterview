@@ -2,11 +2,15 @@
 
 ## Executing mock OAuth 2.0 / RBAC flows
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M12-02, M12-03, M12-06, M12-07
+> **Core** | ~1.2 h | Slow: step 190/256, CP8 | Fast: CP6
+>
+> Before this: [M12-02 Understanding JWT tokens](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>), [M12-03 OAuth grant types](<../12 - Identity & Access Management/03 - OAuth grant types.md>), [M12-06 Implementing Role-Based Access Control](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>), [M12-07 Enforcing data-level permissions in retrieval layers](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [OAuth 2.0 and RBAC](<../Projects/Project 1 - OmniGuard - Secure AI Integration/03 - OAuth 2.0 and RBAC.md>) (in `Projects/`).
 
 ### Kahani
 Kavach ka Azure AD tenant UAT ke 3 din pehle tak nahi milega -- Anil ki team change ticket approve kar rahi hai.
-Par UAT-07 (M15-05) kehta hai: "underwriter ko claim medical notes kabhi nahi dikhne chahiye." Ye test real IdP ke bina bhi aaj pass hona chahiye, warna week 5 mein surprise.
+Par UAT-07 ([M15-05](<05 - Delivering User Acceptance Testing (UAT) runbooks.md>)) kehta hai: "underwriter ko claim medical notes kabhi nahi dikhne chahiye." Ye test real IdP ke bina bhi aaj pass hona chahiye, warna week 5 mein surprise.
 Solution: ek **mock IdP** jo bilkul real jaise RS256 JWT banaye (sahi `iss`, `aud`, `exp`, roles), aur ek acceptance-test harness jo OmniGuard ko baahar se attack kare -- bina token, expired token, doosre app ka token, forged token, aur do alag users se same sawaal.
 Jis din real Azure AD aaye, sirf issuer/JWKS config badle; harness wahi rahe.
 
@@ -18,10 +22,10 @@ Yahan aap OmniGuard ka **auth acceptance harness** banate ho -- woh tests jo CP5
 Customer ka IdP access hamesha late aata hai. Mock flow ke bina aap ya to auth ko "baad mein" chhod dete ho (sabse risky part untested) ya UAT mein pehli baar test karte ho.
 
 ### Key concepts
-- **Factory + injected key** -- `create_app(jwt_public_key_pem)` taaki tests apni key de sakein; prod mein JWKS URL (M12-02).
+- **Factory + injected key** -- `create_app(jwt_public_key_pem)` taaki tests apni key de sakein; prod mein JWKS URL ([M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>)).
 - **Negative tests first** -- no token, expired, wrong `aud`, wrong signer, `alg=none` -- sab 401. Ek bhi 200 = Sev1.
-- **401 vs 403** -- 401 = "tum kaun ho, pata nahi"; 403 = "pata hai, par permission nahi" (M12-06).
-- **Two-user test** -- same question, do roles, alag allowed answers; aur har user ke answer mein doosre ka data *absent* (M12-07).
+- **401 vs 403** -- 401 = "tum kaun ho, pata nahi"; 403 = "pata hai, par permission nahi" ([M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)).
+- **Two-user test** -- same question, do roles, alag allowed answers; aur har user ke answer mein doosre ka data *absent* ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)).
 - **Harness, not solution** -- harness sirf HTTP contract test karta hai; andar kya hai (aapka code) uski parwah nahi.
 
 Architecture (auth slice of OmniGuard):
@@ -34,7 +38,7 @@ Architecture (auth slice of OmniGuard):
             -> retrieve(principal, q) with ACL filter (M12-07) -> LLM -> answer + sources
 ```
 
-Threat / failure list the harness covers: missing token, expired token, token for another app (`aud`), forged signature, `alg=none` downgrade, role without permission, cross-role data leak in answer. Not covered here (add later): token replay after logout (M12-08), audit events (M12-10).
+Threat / failure list the harness covers: missing token, expired token, token for another app (`aud`), forged signature, `alg=none` downgrade, role without permission, cross-role data leak in answer. Not covered here (add later): token replay after logout ([M12-08](<../12 - Identity & Access Management/08 - Session and token lifecycle.md>)), audit events ([M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>)).
 
 ### Code example
 `pip install fastapi httpx pyjwt cryptography`
@@ -121,7 +125,7 @@ print("OK: mock OAuth + RBAC acceptance harness")
 ### Mini-exercise (30-60 min)
 OmniGuard deliverable #3 (OAuth 2.0 + RBAC): `omniguard/tests/acceptance/test_auth.py`.
 - Is harness ko pytest mein convert karo (har check ek test, `MARKERS` aapke seed data se). Apne `omniguard.main:create_app(jwt_public_key_pem)` pe chalao.
-- Mock IdP ko M12-03 ke `tests/fake_idp.py` se jodo (code + PKCE flow se token), harness wale direct-mint tokens ke saath.
+- Mock IdP ko [M12-03](<../12 - Identity & Access Management/03 - OAuth grant types.md>) ke `tests/fake_idp.py` se jodo (code + PKCE flow se token), harness wale direct-mint tokens ke saath.
 - Acceptance: saare 8 checks green; ek PR jisme `verify_aud` band karo -> CI red (screenshot README mein); UAT-07 isi test ko reference kare.
 
 ### Common pitfalls
@@ -136,14 +140,23 @@ OmniGuard deliverable #3 (OAuth 2.0 + RBAC): `omniguard/tests/acceptance/test_au
 - [ ] Harness mere real OmniGuard pe green hai aur broken config pe red.
 
 ### Related
-- M12-02 Understanding JWT tokens
-- M12-03 OAuth grant types
-- M12-06 Implementing Role-Based Access Control
-- M12-07 Enforcing data-level permissions in retrieval layers
-- M15-05 Delivering User Acceptance Testing (UAT) runbooks
+- [M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>) Understanding JWT tokens
+- [M12-03](<../12 - Identity & Access Management/03 - OAuth grant types.md>) OAuth grant types
+- [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
+- [M15-05](<05 - Delivering User Acceptance Testing (UAT) runbooks.md>) Delivering User Acceptance Testing (UAT) runbooks
 
 ### Self-quiz
 1. Harness app ko public key kyun deta hai, private key kyun nahi? Real Azure AD mein ye kaise hota hai?
 2. "wrong aud" token ka attack scenario Kavach ke context mein batao.
 3. Two-user test mein sirf "must" check karte to kaunsa bug miss ho jaata?
 4. Real IdP aane ke baad kaunse 2 config values badlenge aur harness mein kya nahi badlega?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 190 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 189: Delivering User Acceptance Testing (UAT) runbooks](<05 - Delivering User Acceptance Testing (UAT) runbooks.md>)
+- Next -> [step 191: Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases](<07 - Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases.md>)

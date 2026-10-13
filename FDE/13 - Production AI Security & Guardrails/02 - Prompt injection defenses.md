@@ -2,7 +2,9 @@
 
 ## Prompt injection defenses
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M13-01, M12-07, M10-09, M05-11
+> **Core** | ~1.2 h | Slow: step 172/256, CP8 | Fast: CP6
+>
+> Before this: [M13-01 Identifying major LLM vulnerabilities](<01 - Identifying major LLM vulnerabilities.md>), [M12-07 Enforcing data-level permissions in retrieval layers](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>), [M10-09 Connecting agents to external tools safely](<../10 - Advanced Agent Orchestration/09 - Connecting agents to external tools safely.md>), [M05-11 Defining precise function schemas for LLMs](<../05 - LLM Fundamentals & Prompting/11 - Defining precise function schemas for LLMs.md>)
 
 ### Kahani
 Ek logistics customer ka support agent: inbox ke emails padhta hai, RAG se SOP nikalta hai, aur `send_email` + `lookup_shipment` tools use karta hai.
@@ -19,10 +21,10 @@ Honest baat: aaj koi filter ya prompt injection ko **fully prevent nahi** karta.
 Jaise hi agent ke paas tools hain, injection ek chat bug nahi -- data exfiltration aur unauthorized actions ban jaata hai. Customer ke saath design karte waqt maan ke chalo: model compromise ho sakta hai.
 
 ### Key concepts
-- **Privilege separation** -- LLM ke paas kabhi credentials nahi. Tool code user ke principal se authz check karta hai (M12-07), model ke kehne se nahi.
+- **Privilege separation** -- LLM ke paas kabhi credentials nahi. Tool code user ke principal se authz check karta hai ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)), model ke kehne se nahi.
 - **Retrieved text = data** -- delimiters / **spotlighting**: untrusted content ko tags mein wrap karo aur model ko batao ye data hai. Ye risk kam karta hai, khatam nahi.
 - **Tool allow-list + argument policy** -- har request type ke liye kaunse tools allowed, aur args (jaise email recipient domain) code mein validate.
-- **Human approval** -- irreversible / outbound actions (email, payment, delete) ke liye human-in-the-loop (M10-04).
+- **Human approval** -- irreversible / outbound actions (email, payment, delete) ke liye human-in-the-loop ([M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>)).
 - **Canary token** -- system prompt mein random secret; output mein dikha to prompt leak / injection ka signal, block + alert.
 
 ### Code example
@@ -101,7 +103,7 @@ print("OK: injection reached the model but the policy layer stopped the action")
 - `spotlight` -- untrusted chunks ko tags mein, aur `<` escape taaki attacker `</untrusted>` likh ke delimiter tod na sake. Helpful, par akela kaafi nahi.
 - `policy` -- model ke bahar ka gate: intent-wise allow-list, risky tools ke liye domain check + human approval. Fail = block, default deny.
 - `CANARY` -- har deploy pe naya random token. Output mein mila = system prompt leak; block karo aur security alert bhejo.
-- Real system mein `lookup_shipment` bhi apne andar user ka principal check karega (M12-07) -- model jo ID maange, wo nahi, jo user dekh sakta hai wahi.
+- Real system mein `lookup_shipment` bhi apne andar user ka principal check karega ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)) -- model jo ID maange, wo nahi, jo user dekh sakta hai wahi.
 
 ```python
 # real version -- not run here, needs: pip install anthropic   (model id from env var LLM_MODEL)
@@ -125,7 +127,7 @@ OmniGuard CP6: `omniguard/guardrails/injection.py`.
 
 ### Common pitfalls
 - "Better system prompt" ko fix maanna -- prompt wording risk thoda kam karti hai, guarantee nahi deti. Control code mein rakho.
-- Agent ko service account ke admin credentials dena -- injection = admin action. Tool user ke token se chale (M12-09).
+- Agent ko service account ke admin credentials dena -- injection = admin action. Tool user ke token se chale ([M12-09](<../12 - Identity & Access Management/09 - API keys vs service accounts.md>)).
 - Tool results ko trusted maanna -- web fetch / email read ka output bhi untrusted hai, usse bhi spotlight karo.
 
 ### Checklist before moving on
@@ -136,15 +138,24 @@ OmniGuard CP6: `omniguard/guardrails/injection.py`.
 - [ ] Main customer ko honestly bata sakta hoon ki injection 100% preventable nahi hai, aur hamara design damage kaise limit karta hai.
 
 ### Related
-- M13-01 Identifying major LLM vulnerabilities
-- M13-03 Jailbreak prevention techniques
-- M12-07 Enforcing data-level permissions in retrieval layers
-- M10-04 Requesting manual state approval
-- M10-09 Connecting agents to external tools safely
-- M13-13 Testing rails against jailbreak libraries
+- [M13-01](<01 - Identifying major LLM vulnerabilities.md>) Identifying major LLM vulnerabilities
+- [M13-03](<03 - Jailbreak prevention techniques.md>) Jailbreak prevention techniques
+- [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
+- [M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) Requesting manual state approval
+- [M10-09](<../10 - Advanced Agent Orchestration/09 - Connecting agents to external tools safely.md>) Connecting agents to external tools safely
+- [M13-13](<13 - Testing rails against jailbreak libraries.md>) Testing rails against jailbreak libraries
 
 ### Self-quiz
 1. Indirect injection mein attacker kabhi chat use hi nahi karta. To attack model tak pahunchta kaise hai? 3 raaste batao.
 2. Spotlighting kya karta hai, aur ye akela kaafi kyun nahi?
 3. Agar model 100% fool ho jaaye, to bhi data exfiltrate na ho -- iske liye kaunse 2 controls sabse important hain?
 4. Canary token leak hone ka kya matlab hai, aur aap kya action loge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 172 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 171: Identifying major LLM vulnerabilities](<01 - Identifying major LLM vulnerabilities.md>)
+- Next -> [step 173: Jailbreak prevention techniques](<03 - Jailbreak prevention techniques.md>)

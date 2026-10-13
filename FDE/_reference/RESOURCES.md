@@ -1,3 +1,5 @@
+> **Data file -- do not delete.** `portal/plan.py` reads the "1 reading per module" table and links from here. The "Time math" section is from the old 230-topic plan; current numbers are in [MASTER_PLAN.md](../MASTER_PLAN.md). To study, start at [START_HERE.md](../START_HERE.md).
+
 # RESOURCES.md — Best Existing Content (No Reinventing the Wheel)
 
 ## Minimum Viable Reading (do THIS, not everything)

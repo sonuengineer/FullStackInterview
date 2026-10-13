@@ -2,25 +2,29 @@
 
 ## Creating Streamlit/Gradio UIs for human approval workflows
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M10-03, M10-04, M12-06, M12-10, M16-02, M16-06
+> **Core** | ~1.2 h | Slow: step 242/256, CP10 | Fast: CP8
+>
+> Before this: [M10-03 Interrupting graph execution](<../10 - Advanced Agent Orchestration/03 - Interrupting graph execution.md>), [M10-04 Requesting manual state approval](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>), [M12-06 Implementing Role-Based Access Control](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>), [M12-10 Audit logging](<../12 - Identity & Access Management/10 - Audit logging.md>), [M16-02 Identifying Human-in-the-Loop bottlenecks](<02 - Identifying Human-in-the-Loop bottlenecks.md>), [M16-06 Developing a LangGraph Multi-Agent Supervisor](<06 - Developing a LangGraph Multi-Agent Supervisor.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Human-in-the-loop approval workflows](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/03 - Human-in-the-loop approval workflows.md>), [Interfaces for human approval](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/08 - Interfaces for human approval.md>) (in `Projects/`).
 
 ### Kahani
-AuditMesh ka graph approval pe ruk jaata hai (M16-06), par Meera ki team ke paas approve karne ki jagah sirf ek curl command thi.
+AuditMesh ka graph approval pe ruk jaata hai ([M16-06](<06 - Developing a LangGraph Multi-Agent Supervisor.md>)), par Meera ki team ke paas approve karne ki jagah sirf ek curl command thi.
 Unki maang: "Ek page jahan pending list dikhe, approve/reject ek click mein ho, aur reason likhna zaroori ho."
 Internal audit ne shart jodi: "Jisne finding raise ki, woh khud approve na kar sake, aur har decision ka log ho." Pilot mein Priya ne galti se apna hi raised item approve kar diya tha. UI 1 din mein ban jaata hai; asli kaam hai woh **backend contract** jo UI ke peeche hai -- kyunki rules button pe nahi, API pe enforce hote hain.
 
 ### What it is
-**Human approval UI** = Streamlit ya Gradio ka chhota internal app jo approval API (M10-04) call karta hai: pending list, action ke exact args, approve/reject with reason.
+**Human approval UI** = Streamlit ya Gradio ka chhota internal app jo approval API ([M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>)) call karta hai: pending list, action ke exact args, approve/reject with reason.
 Rules API mein, UI sirf client hai -- isliye acceptance harness API ko test karta hai, UI ko nahi.
 
 ### Why it matters for an FDE
 HITL tabhi valid hai jab approver authorized ho, requester se alag ho, aur decision logged ho. Check UI mein lagaya aur API mein nahi = koi bhi curl se bypass kar dega.
 
 ### Key concepts
-- **Thin UI, strict API** -- har rule API pe (401/403/409/422), UI sirf dikhata hai (M12-06).
+- **Thin UI, strict API** -- har rule API pe (401/403/409/422), UI sirf dikhata hai ([M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)).
 - **Segregation of duties** -- `requested_by == current user` -> 403.
-- **Show exact args** -- approver wahi dekhe jo execute hoga (M16-04 approval binding), summary nahi.
-- **Reason mandatory + audit event** -- who, what, decision, reason, time (M12-10).
+- **Show exact args** -- approver wahi dekhe jo execute hoga ([M16-04](<04 - Defining Model Context Protocol trust boundaries.md>) approval binding), summary nahi.
+- **Reason mandatory + audit event** -- who, what, decision, reason, time ([M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>)).
 - **Streamlit vs Gradio** -- Streamlit: script-rerun model, internal forms/dashboards. Gradio: component events, quick demos. Jo team maintain kar sake woh chuno.
 
 ```text
@@ -160,8 +164,8 @@ demo.launch()
 
 ### Mini-exercise (30-60 min)
 AuditMesh deliverables #3 + #8 (HITL workflows, interfaces for human approval) + **CP8 gate**.
-- `auditmesh/approvals/api.py` (aapka, graph resume ke saath) + ye harness as `tests/acceptance/test_approvals.py`; ek UI jo sirf API call kare. Saare harnesses ek command se: `pytest tests/acceptance -q` (M16-06, M16-07, M16-08, M16-09) + M16-03 SLA check + M16-05 handoff validator.
-- `auditmesh/docs/`: process map, HITL capacity, SLA, trust boundaries, handoff package (M16-01..05). Release: `git tag -a v1.0 -m "AuditMesh v1.0"` aur `git push origin v1.0`; release notes mein harness results.
+- `auditmesh/approvals/api.py` (aapka, graph resume ke saath) + ye harness as `tests/acceptance/test_approvals.py`; ek UI jo sirf API call kare. Saare harnesses ek command se: `pytest tests/acceptance -q` ([M16-06](<06 - Developing a LangGraph Multi-Agent Supervisor.md>), [M16-07](<07 - Deploying a custom MCP server for secure Jira ticketing.md>), [M16-08](<08 - Building comprehensive token cost and trace dashboards.md>), M16-09) + [M16-03](<03 - Drafting latency and cost SLAs.md>) SLA check + [M16-05](<05 - Leading operations and training handoffs.md>) handoff validator.
+- `auditmesh/docs/`: process map, HITL capacity, SLA, trust boundaries, handoff package ([M16-01](<01 - Mapping 5-step manual compliance workflows.md>)..05). Release: `git tag -a v1.0 -m "AuditMesh v1.0"` aur `git push origin v1.0`; release notes mein harness results.
 - 5-min demo video (English). Script outline:
   1. 0:00-0:30 -- problem: Kavach (fictional) quarterly access review, 3 weeks, ~100 analyst hours, sign-off waits.
   2. 0:30-1:15 -- architecture: supervisor + workers, approval interrupt, Jira MCP server, traces.
@@ -169,7 +173,7 @@ AuditMesh deliverables #3 + #8 (HITL workflows, interfaces for human approval) +
   4. 2:30-3:15 -- live: self-approval blocked, injected ticket text does nothing, runaway worker stops at step limit.
   5. 3:15-4:15 -- dashboard: cost per run, p95 vs SLO, pending approvals; `pytest tests/acceptance` green.
   6. 4:15-5:00 -- business: hours saved, risk-tiered review, handoff (RACI, runbooks); close with phase 2.
-- Full mock interview loop (4 rounds) with Claude, scored -- Module 18 in the portal (M18-07 project deep-dive, M18-10 demo critique, M18-12 full mock loop).
+- Full mock interview loop (4 rounds) with Claude, scored -- Module 18 in the portal ([M18-07](<../18 - FDE Interview & Job Hunt/07 - Project deep-dive STAR stories.md>) project deep-dive, [M18-10](<../18 - FDE Interview & Job Hunt/10 - Demo skills.md>) demo critique, [M18-12](<../18 - FDE Interview & Job Hunt/12 - Full mock interview loop.md>) full mock loop).
 
 ### Presenting both capstones in an FDE interview
 - Customer problem aur measured result se shuru karo, stack se nahi: "3-week review -> agent pass in minutes, humans see only high-risk items."
@@ -183,18 +187,27 @@ AuditMesh deliverables #3 + #8 (HITL workflows, interfaces for human approval) +
 ### Checklist before moving on (CP8 gate)
 - [ ] `pytest tests/acceptance -q` green: supervisor, Jira MCP, dashboard, approvals; SLA + handoff checks pass.
 - [ ] Approval UI (Streamlit ya Gradio) sirf API ke through kaam karta hai; self-approval 403.
-- [ ] `auditmesh/docs/` mein M16-01..05 ke documents; `v1.0` tag pushed, GitHub release with notes; 5-min demo video (English) README mein linked.
+- [ ] `auditmesh/docs/` mein [M16-01](<01 - Mapping 5-step manual compliance workflows.md>)..05 ke documents; `v1.0` tag pushed, GitHub release with notes; 5-min demo video (English) README mein linked.
 - [ ] Module 18 full mock loop done aur scored; dono capstones ki STAR stories ready.
 
 ### Related
-- M10-04 Requesting manual state approval
-- M12-06 Implementing Role-Based Access Control
-- M12-10 Audit logging
-- M16-06 Developing a LangGraph Multi-Agent Supervisor
-- M15-09 Finalizing Dockerized FastAPI cloud deployments
+- [M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) Requesting manual state approval
+- [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>) Audit logging
+- [M16-06](<06 - Developing a LangGraph Multi-Agent Supervisor.md>) Developing a LangGraph Multi-Agent Supervisor
+- [M15-09](<../15 - OmniGuard - Secure AI Integration/09 - Finalizing Dockerized FastAPI cloud deployments.md>) Finalizing Dockerized FastAPI cloud deployments
 
 ### Self-quiz
 1. Self-approval check UI mein hai, API mein nahi. Ek reviewer ise kaise bypass karega?
 2. Approver ko action ka summary ke bajaye exact args kyun dikhane chahiye?
 3. Do reviewers ne ek saath approve dabaya. Kise kaunsa response code mile aur graph kitni baar resume ho?
 4. Interview mein 2 minute mein AuditMesh explain karo: problem, design, kya toota, kaise prove kiya.
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 242 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 241: Building comprehensive token cost/trace dashboards](<08 - Building comprehensive token cost and trace dashboards.md>)
+- Next -> [step 243: Agent-to-Agent (A2A) protocol and agent interoperability](<../17 - Advanced & Emerging Tech (Optional)/10 - Agent-to-Agent (A2A) protocol and agent interoperability.md>)

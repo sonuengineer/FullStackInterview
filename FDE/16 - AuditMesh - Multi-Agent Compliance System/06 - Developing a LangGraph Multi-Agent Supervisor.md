@@ -2,7 +2,11 @@
 
 ## Developing a LangGraph Multi-Agent Supervisor
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M09-04, M09-05, M09-07, M09-08, M09-11, M10-01, M10-03, M10-04, M10-05
+> **Core** | ~1.2 h | Slow: step 239/256, CP10 | Fast: CP8
+>
+> Before this: [M09-04 Supervisor and Router patterns](<../09 - Agentic Frameworks & LangGraph/04 - Supervisor and Router patterns.md>), [M09-05 Defining graphs and state management](<../09 - Agentic Frameworks & LangGraph/05 - Defining graphs and state management.md>), [M09-07 Conditional routing logic](<../09 - Agentic Frameworks & LangGraph/07 - Conditional routing logic.md>), [M09-08 Compiling graphs](<../09 - Agentic Frameworks & LangGraph/08 - Compiling graphs.md>), [M09-11 Aggregating parallel outputs with map-reduce patterns](<../09 - Agentic Frameworks & LangGraph/11 - Aggregating parallel outputs with map-reduce patterns.md>), [M10-01 Check-pointing graph states](<../10 - Advanced Agent Orchestration/01 - Check-pointing graph states.md>), [M10-03 Interrupting graph execution](<../10 - Advanced Agent Orchestration/03 - Interrupting graph execution.md>), [M10-04 Requesting manual state approval](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>), [M10-05 Detecting infinite ReAct loops](<../10 - Advanced Agent Orchestration/05 - Detecting infinite ReAct loops.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Supervisor-based agent architecture (LangGraph)](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/01 - Supervisor-based agent architecture (LangGraph).md>) (in `Projects/`).
 
 ### Kahani
 Ab AuditMesh ka dil banana hai: ek **supervisor** jo Kavach ke quarterly review ke kaam ko sahi agent ko de -- evidence collector, policy checker, ticket writer, reporter.
@@ -18,9 +22,9 @@ Is lesson mein aap supervisor ka **contract** fix karte ho aur use test karne wa
 Multi-agent demo 10 min mein ban jaata hai; production mein woh loop, galat routing aur bina approval ke action se fail hota hai. Harness hi customer ko dikhata hai ki ye teen cheezein nahi hongi.
 
 ### Key concepts
-- **Pieces you already have** -- supervisor/router pattern (M09-04), typed state (M09-05), conditional edges (M09-07), compile with checkpointer (M09-08, M10-01), parallel evidence collection via map-reduce (M09-11).
-- **Approval as interrupt** -- `ticket_writer` se pehle `human_approval` node interrupt karta hai (M10-03), decision approval API se aata hai (M10-04, M16-09).
-- **Step cap** -- `recursion_limit` + loop detection (M10-05); limit hit = status `step_limit`, crash nahi.
+- **Pieces you already have** -- supervisor/router pattern ([M09-04](<../09 - Agentic Frameworks & LangGraph/04 - Supervisor and Router patterns.md>)), typed state ([M09-05](<../09 - Agentic Frameworks & LangGraph/05 - Defining graphs and state management.md>)), conditional edges ([M09-07](<../09 - Agentic Frameworks & LangGraph/07 - Conditional routing logic.md>)), compile with checkpointer ([M09-08](<../09 - Agentic Frameworks & LangGraph/08 - Compiling graphs.md>), [M10-01](<../10 - Advanced Agent Orchestration/01 - Check-pointing graph states.md>)), parallel evidence collection via map-reduce ([M09-11](<../09 - Agentic Frameworks & LangGraph/11 - Aggregating parallel outputs with map-reduce patterns.md>)).
+- **Approval as interrupt** -- `ticket_writer` se pehle `human_approval` node interrupt karta hai ([M10-03](<../10 - Advanced Agent Orchestration/03 - Interrupting graph execution.md>)), decision approval API se aata hai ([M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>), [M16-09](<09 - Creating Streamlit and Gradio UIs for human approval workflows.md>)).
+- **Step cap** -- `recursion_limit` + loop detection ([M10-05](<../10 - Advanced Agent Orchestration/05 - Detecting infinite ReAct loops.md>)); limit hit = status `step_limit`, crash nahi.
 - **Unknown = human** -- unknown task type kabhi "closest worker" ko nahi; `human_triage` pe jaata hai.
 - **Harness contract** -- `run(task, step_limit) -> {"trace": [node names], "status": ...}`; ek chhota adapter aapke graph ko is shape mein laata hai.
 
@@ -35,7 +39,7 @@ Multi-agent demo 10 min mein ban jaata hai; production mein woh loop, galat rout
 ```
 
 Request flow: trigger -> supervisor reads `task.type` -> worker updates state -> supervisor decides again -> approval interrupt (graph paused, checkpoint saved) -> approval API resumes -> ticket writer -> report.
-Failure list the harness covers: wrong routing, worker leakage (do workers ek task pe), unknown type auto-routed, ticket without approval, ticket after reject, runaway loop. Not covered here: checkpoint resume after crash (add a test with your checkpointer), parallel fan-out conflicts (M09-12).
+Failure list the harness covers: wrong routing, worker leakage (do workers ek task pe), unknown type auto-routed, ticket without approval, ticket after reject, runaway loop. Not covered here: checkpoint resume after crash (add a test with your checkpointer), parallel fan-out conflicts ([M09-12](<../09 - Agentic Frameworks & LangGraph/12 - Handling state conflicts during concurrent node execution.md>)).
 
 ### Code example
 stdlib only (the real adapter below needs `pip install langgraph`)
@@ -156,8 +160,8 @@ AuditMesh deliverable #1 (supervisor-based architecture): `auditmesh/graph.py` (
 
 ### Common pitfalls
 - Supervisor LLM ko free-text routing dena -- structured output (enum of worker names) do, aur unknown pe `human_triage`.
-- Recursion limit bahut bada rakhna "safe side" -- cost cap hi to wahi hai; SLA (M16-03) ke hisaab se rakho.
-- Approval node ke baad graph mein args dobara LLM se banwana -- approved args hi use karo (M16-04 approval binding).
+- Recursion limit bahut bada rakhna "safe side" -- cost cap hi to wahi hai; SLA ([M16-03](<03 - Drafting latency and cost SLAs.md>)) ke hisaab se rakho.
+- Approval node ke baad graph mein args dobara LLM se banwana -- approved args hi use karo ([M16-04](<04 - Defining Model Context Protocol trust boundaries.md>) approval binding).
 
 ### Checklist before moving on
 - [ ] Supervisor ka routing, approval interrupt aur step cap -- teeno ka diagram bana sakta hoon.
@@ -166,14 +170,23 @@ AuditMesh deliverable #1 (supervisor-based architecture): `auditmesh/graph.py` (
 - [ ] Restart ke baad resume wala test likh chuka hoon.
 
 ### Related
-- M09-04 Supervisor and Router patterns
-- M09-07 Conditional routing logic
-- M10-03 Interrupting graph execution
-- M10-05 Detecting infinite ReAct loops
-- M16-07 Deploying a custom MCP server for secure Jira ticketing
+- [M09-04](<../09 - Agentic Frameworks & LangGraph/04 - Supervisor and Router patterns.md>) Supervisor and Router patterns
+- [M09-07](<../09 - Agentic Frameworks & LangGraph/07 - Conditional routing logic.md>) Conditional routing logic
+- [M10-03](<../10 - Advanced Agent Orchestration/03 - Interrupting graph execution.md>) Interrupting graph execution
+- [M10-05](<../10 - Advanced Agent Orchestration/05 - Detecting infinite ReAct loops.md>) Detecting infinite ReAct loops
+- [M16-07](<07 - Deploying a custom MCP server for secure Jira ticketing.md>) Deploying a custom MCP server for secure Jira ticketing
 
 ### Self-quiz
 1. Unknown task type ko "closest worker" ko dena kyun dangerous hai Kavach ke context mein?
 2. `recursion_limit` hit hone pe graph crash karne ke bajaye `step_limit` status kyun return kare?
 3. Routing test mein `must_not` ke bina kaunsa bug miss hota?
 4. Approval ke baad process crash ho gaya. Ticket do baar na bane, iske liye kaunse do pieces chahiye?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 239 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 238: Leading operations and training handoffs](<05 - Leading operations and training handoffs.md>)
+- Next -> [step 240: Deploying a custom MCP server for secure Jira ticketing](<07 - Deploying a custom MCP server for secure Jira ticketing.md>)

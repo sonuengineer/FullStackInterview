@@ -2,7 +2,9 @@
 
 ## Dependency injection
 
-> Core | Fast CP2 / Slow CP2 | ~1.2 h | Builds on: M02-01, M02-02, M01-15
+> **Core** | ~1.2 h | Slow: step 032/256, CP2 | Fast: CP2
+>
+> Before this: [M02-01 Path and query parameters](<01 - Path and query parameters.md>), [M02-02 Pydantic data validation](<02 - Pydantic data validation.md>), [M01-15 Environment variable configurations](<../01 - Python & Linux Foundations/15 - Environment variable configurations.md>)
 
 ### Kahani
 Ek logistics SaaS customer ke liye aapki API mein 14 routes hain. Har route ke top pe wahi 6 lines copy-paste hain: header se API key padho, tenant nikalo, DB session kholo, settings load karo.
@@ -22,7 +24,20 @@ Customer ke paas har environment alag hota hai (SSO, DB, vault). DI se auth/DB/s
 - **`yield` dependency** -- `yield` se pehle setup (session kholo), baad mein teardown (close) -- `finally` mein rakho to error pe bhi chalega. Nest mein ye request-scoped provider + lifecycle hook jaisa.
 - **Per-request caching** -- ek request mein `get_db` do jagah maanga to ek hi baar chalta hai (`use_cache=True` default).
 - **Router/app level dependencies** -- `APIRouter(dependencies=[Depends(require_api_key)])` -- Express ka `router.use(authMiddleware)`, lekin typed aur docs mein dikhta hai.
-- **`app.dependency_overrides[real] = fake`** -- tests mein real dependency ko fake se badlo; Nest ka `overrideProvider()`. M02-12 isi pe build karta hai.
+- **`app.dependency_overrides[real] = fake`** -- tests mein real dependency ko fake se badlo; Nest ka `overrideProvider()`. [M02-12](<12 - Fixtures and mocking.md>) isi pe build karta hai.
+
+### Picture it
+FastAPI builds the dependency graph for each request; tests swap one node without touching the route.
+
+```mermaid
+flowchart TD
+    REQ["request: GET /documents"] --> RT["list_documents(db=Depends(get_db),<br/>user=Depends(current_user))"]
+    RT --> DB["get_db: yield session<br/>closed after the response"]
+    RT --> U["current_user"]
+    U --> K["require_api_key"]
+    U -->|"same request: cached, runs once"| DB
+    T["tests: app.dependency_overrides[get_db] = fake_db"] -.->|"replaces"| DB
+```
 
 ### Code example
 `pip install fastapi httpx pydantic`
@@ -108,15 +123,15 @@ print("OK: Depends graph, yield teardown, per-request cache, dependency_override
 
 ### Mini-exercise (30-60 min)
 `omniguard` mein `app/deps.py` banao.
-- `get_settings()` (`@lru_cache`, `pydantic-settings` ya env vars se `OMNIGUARD_API_KEYS`), `get_db()` (abhi in-memory store, M02-05 mein SQLAlchemy session), `get_current_user()` -- auth stub: `Authorization: Bearer <token>` header, fake token table se `User(id, tenant, roles)` return, warna 401 + `WWW-Authenticate: Bearer`.
+- `get_settings()` (`@lru_cache`, `pydantic-settings` ya env vars se `OMNIGUARD_API_KEYS`), `get_db()` (abhi in-memory store, [M02-05](<05 - Building scalable CRUD endpoints.md>) mein SQLAlchemy session), `get_current_user()` -- auth stub: `Authorization: Bearer <token>` header, fake token table se `User(id, tenant, roles)` return, warna 401 + `WWW-Authenticate: Bearer`.
 - `/documents` router pe `dependencies=[Depends(get_current_user)]`; `/health` public rahe.
 - `tests/test_auth.py`: override `get_current_user` se `User(roles=["admin"])` inject karke ek test, aur bina override ke 401 wala test.
-- Acceptance: `pytest -q` green, koi test network ya env var pe depend nahi karta. M12 mein yahi stub real JWT validation (M12-02) ban jaayega.
+- Acceptance: `pytest -q` green, koi test network ya env var pe depend nahi karta. M12 mein yahi stub real JWT validation ([M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>)) ban jaayega.
 
 ### Common pitfalls
 - `Depends(get_db())` likhna (call kar diya) -- `Depends` ko function chahiye, result nahi. Galti pe ajeeb errors ya ek hi object sab requests mein share.
 - `yield` dependency mein `finally` na lagana -- route exception pe teardown skip, connections leak. Aur teardown mein slow kaam (emails, uploads) mat karo -- wo background task hai.
-- Module-level global client (`db = connect()` import time pe) -- tests override nahi kar sakte aur import pe hi real DB hit. Lifespan (M02-05) mein banao, dependency se do.
+- Module-level global client (`db = connect()` import time pe) -- tests override nahi kar sakte aur import pe hi real DB hit. Lifespan ([M02-05](<05 - Building scalable CRUD endpoints.md>)) mein banao, dependency se do.
 
 ### Checklist before moving on
 - [ ] `Depends`, sub-dependency aur `yield` dependency ka flow bata sakta hoon.
@@ -125,14 +140,23 @@ print("OK: Depends graph, yield teardown, per-request cache, dependency_override
 - [ ] `dependency_overrides` se test mein fake inject karke `clear()` karna yaad hai.
 
 ### Related
-- M01-15 Environment variable configurations
-- M02-05 Building scalable CRUD endpoints
-- M02-12 Fixtures and mocking
-- M12-02 Understanding JWT tokens
-- M12-09 API keys vs service accounts
+- [M01-15](<../01 - Python & Linux Foundations/15 - Environment variable configurations.md>) Environment variable configurations
+- [M02-05](<05 - Building scalable CRUD endpoints.md>) Building scalable CRUD endpoints
+- [M02-12](<12 - Fixtures and mocking.md>) Fixtures and mocking
+- [M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>) Understanding JWT tokens
+- [M12-09](<../12 - Identity & Access Management/09 - API keys vs service accounts.md>) API keys vs service accounts
 
 ### Self-quiz
 1. Ek request mein `get_db` ko route aur `get_current_user` dono maangte hain. Kitne sessions khulenge, aur kyun?
 2. `yield` dependency mein `finally` hata do aur route `HTTPException` raise kare -- kya hoga?
 3. Express middleware (`app.use(auth)`) aur FastAPI router dependency mein kya fark hai -- route ko auth ka result kaise milta hai?
 4. Test mein `dependency_overrides` set karke `clear()` bhool gaye. Kaunsa doosra test aur kaise galat pass/fail hoga?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 032 of 256** -- [Syllabus CP2](<../SYLLABUS.md#cp2>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 031: Pydantic data validation](<02 - Pydantic data validation.md>)
+- Next -> [step 033: CORS middleware](<04 - CORS middleware.md>)

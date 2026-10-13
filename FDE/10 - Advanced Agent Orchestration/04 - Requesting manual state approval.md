@@ -2,16 +2,18 @@
 
 ## Requesting manual state approval
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M10-03, M02-05, M12-06
+> **Core** | ~1.2 h | Slow: step 211/256, CP9 | Fast: CP7
+>
+> Before this: [M10-03 Interrupting graph execution](<03 - Interrupting graph execution.md>), [M02-05 Building scalable CRUD endpoints](<../02 - Modern API Development/05 - Building scalable CRUD endpoints.md>), [M12-06 Implementing Role-Based Access Control](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)
 
 ### Kahani
-M10-03 ke baad AuditMesh ruk-ke-resume karna seekh gaya. Ab compliance team ka next sawaal: "Approve kaun karega, kahan se, aur auditor ko kaise prove karein ki kisne kya approve kiya?"
+[M10-03](<03 - Interrupting graph execution.md>) ke baad AuditMesh ruk-ke-resume karna seekh gaya. Ab compliance team ka next sawaal: "Approve kaun karega, kahan se, aur auditor ko kaise prove karein ki kisne kya approve kiya?"
 Pehla version: Slack mein bot message, koi bhi "yes" likh de to resume. Ek din agent ne khud ka ticket raise kiya aur usi on-call engineer ne approve kar diya jisne finding banayi thi -- SOX auditor ne isse "segregation of duties" violation likha.
 Ek reviewer ne severity P1 se P2 karni chahi -- system mein sirf approve/reject tha, to usne reject karke manually ticket banaya. Audit trail toot gaya.
 
 ### What it is
 **Manual state approval** = interrupted graph ka pending action ek **approval record** banta hai (action, args, reason, requester, expiry), jise authorized insaan API/UI se **approve, edit ya reject** karta hai; decision validate hoke graph ko resume value ki tarah jaata hai aur poora decision audit log mein likha jaata hai.
-Interrupt (M10-03) mechanism hai; approval workflow uske upar ka product + policy layer hai.
+Interrupt ([M10-03](<03 - Interrupting graph execution.md>)) mechanism hai; approval workflow uske upar ka product + policy layer hai.
 
 ### Why it matters for an FDE
 Regulated customer ke liye "human in the loop" tabhi count hota hai jab wo human authorized ho, requester se alag ho, aur decision tamper-evident log mein ho. Bina iske HITL sirf theatre hai.
@@ -19,9 +21,9 @@ Regulated customer ke liye "human in the loop" tabhi count hota hai jab wo human
 ### Key concepts
 - **Approval record** -- `id, thread_id, action, args, status, requested_by, decided_by, expires_at`; ek pending action = ek row.
 - **Approve / edit / reject** -- edit ke args wahi Pydantic schema se validate hon jo tool use karta hai; reject ke saath reason mandatory.
-- **Segregation of duties** -- requester (ya agent ka owner) apna khud ka action approve nahi kar sakta; role check (M12-06).
+- **Segregation of duties** -- requester (ya agent ka owner) apna khud ka action approve nahi kar sakta; role check ([M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)).
 - **Single decision + expiry** -- pending se hi decide ho sakta hai (409 warna), expired pe 410; double-click se double resume nahi.
-- **Audit trail** -- kisne, kab, kya decide kiya, original vs edited args -- append-only (M12-10).
+- **Audit trail** -- kisne, kab, kya decide kiya, original vs edited args -- append-only ([M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>)).
 
 ### Code example
 `pip install fastapi httpx pydantic`
@@ -109,7 +111,7 @@ assert db.execute("SELECT COUNT(*) FROM audit").fetchone()[0] == 1 and len(RESUM
 print("OK: role check, SoD, edit validation, single decision, expiry, audit")
 ```
 
-- `x_user` header ek stand-in hai -- real mein JWT verify karke `sub` + role claim lo (M12-02); header pe bharosa kabhi nahi.
+- `x_user` header ek stand-in hai -- real mein JWT verify karke `sub` + role claim lo ([M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>)); header pe bharosa kabhi nahi.
 - `edit` ke args usi `CreateIssueArgs` se validate -- reviewer bhi "P0" jaisi invalid value nahi bhej sakta.
 - `UPDATE ... WHERE status='pending'` + `rowcount` -- do approvers ek saath click karein to sirf ek jeetega (optimistic concurrency).
 - Status update aur audit row ek hi transaction mein -- "approved hua par log nahi hua" state possible hi nahi.
@@ -126,7 +128,7 @@ def resume_after_decision(thread_id: str, decision: dict) -> None:
 ```
 
 ### Mini-exercise (30-60 min)
-CP7 capstone gate: `auditmesh/approvals.py` (FastAPI router) + `auditmesh/checkpoint.py` (M10-01) + interrupt runtime (M10-03) ko jodo.
+CP7 capstone gate: `auditmesh/approvals.py` (FastAPI router) + `auditmesh/checkpoint.py` ([M10-01](<01 - Check-pointing graph states.md>)) + interrupt runtime ([M10-03](<03 - Interrupting graph execution.md>)) ko jodo.
 - Graph P1 finding pe interrupt kare -> `request_approval()` row bane -> `POST /approvals/{id}/decision` -> graph resume -> fake Jira client mein ticket.
 - `GET /approvals` mein evidence links aur agent ka reason dikhao (reviewer ko context chahiye).
 - Acceptance (gate): ek test jo run start kare, `status == "interrupted"` assert kare, naya TestClient/app instance bana ke approve kare, aur final state mein `ticket` assert kare. Reject path pe ticket count 0.
@@ -134,7 +136,7 @@ CP7 capstone gate: `auditmesh/approvals.py` (FastAPI router) + `auditmesh/checkp
 ### Common pitfalls
 - Approval UI mein sirf "Approve?" button, bina args/evidence ke -- reviewer rubber-stamp karta hai; diff-style "agent kya karega" dikhao.
 - Resume ko HTTP request ke andar synchronously chalana -- lamba graph = request timeout, retry = double resume; queue/worker + idempotency key use karo.
-- Audit log mein poora prompt/PII dump karna -- log bhi data store hai; sirf IDs, args aur decision (M13-14).
+- Audit log mein poora prompt/PII dump karna -- log bhi data store hai; sirf IDs, args aur decision ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 
 ### Checklist before moving on
 - [ ] Approve/edit/reject teeno paths tested hain, edit schema-validated hai.
@@ -144,10 +146,10 @@ CP7 capstone gate: `auditmesh/approvals.py` (FastAPI router) + `auditmesh/checkp
 - [ ] CP7 gate: run pause hota hai aur approval ke baad resume hota hai.
 
 ### Related
-- M10-03 Interrupting graph execution
-- M12-06 Implementing Role-Based Access Control
-- M12-10 Audit logging
-- M14-01 Idempotency keys for safe tool execution
+- [M10-03](<03 - Interrupting graph execution.md>) Interrupting graph execution
+- [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>) Audit logging
+- [M14-01](<../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>) Idempotency keys for safe tool execution
 - M16 AuditMesh capstone
 
 ### Self-quiz
@@ -155,3 +157,12 @@ CP7 capstone gate: `auditmesh/approvals.py` (FastAPI router) + `auditmesh/checkp
 2. Do approvers ne same second pe approve dabaya. Is code mein kya hota hai, aur bina `WHERE status='pending'` ke kya hota?
 3. Reviewer ne args edit kiye. Agent ko ye pata chalna chahiye ya nahi -- aur kyon (agle steps ke reasoning ke liye socho)?
 4. Kaunse actions ko approval chahiye aur kaunse nahi -- ye policy code mein kahan rakhoge taaki customer badal sake?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 211 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 210: Interrupting graph execution](<03 - Interrupting graph execution.md>)
+- Next -> [step 212: Detecting infinite ReAct loops](<05 - Detecting infinite ReAct loops.md>)

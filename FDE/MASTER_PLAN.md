@@ -3,8 +3,10 @@
 One goal: get hired as a **Forward Deployed Engineer (AI)**. Nothing in this plan
 exists unless it moves you toward that.
 
+Start at [START_HERE.md](START_HERE.md). This file is the "why" behind the plan.
+
 This is the single plan. It **replaces ai-switch Track A** (the ai-switch ebook stays as
-reading material). curriculum.md / PLAN.md / RESOURCES.md stay as reference.
+reading material). The old docs (curriculum.md, PLAN.md, RESOURCES.md...) are in `_reference/`.
 The portal is built from this file.
 
 ---

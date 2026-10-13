@@ -2,17 +2,19 @@
 
 ## Model selection and routing
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M14-04, M14-05, M14-11, M14-15
+> **Core** | ~1.2 h | Slow: step 233/256, CP10 | Fast: CP8
+>
+> Before this: [M14-04 Configuring rate limiting and fallback routing](<04 - Configuring rate limiting and fallback routing.md>), [M14-05 Automating LLM-as-a-judge scoring pipelines](<05 - Automating LLM-as-a-judge scoring pipelines.md>), [M14-11 Monitoring granular token costs and endpoint latency](<11 - Monitoring granular token costs and endpoint latency.md>), [M14-15 Prompt caching strategies](<15 - Prompt caching strategies.md>)
 
 ### Kahani
 Ek telecom customer ka support assistant har request pe sabse bada model use karta hai -- "password reset kaise karoon?" bhi, aur "mere 3 bills mein roaming charges ka dispute, contract clause 7 ke hisaab se" bhi.
-Cost dashboard (M14-11) dikhata hai: 70% traffic simple FAQ hai, lekin bill ka 70% bhi wahi.
+Cost dashboard ([M14-11](<11 - Monitoring granular token costs and endpoint latency.md>)) dikhata hai: 70% traffic simple FAQ hai, lekin bill ka 70% bhi wahi.
 Kisi ne sab kuch chhote model pe switch kar diya -- bill 80% gira, aur do hafte baad dispute cases mein galat answers ki complaints aa gayi.
 Customer bolta hai: "Sasta bhi chahiye, sahi bhi. Aur agli baar switch se pehle proof chahiye."
 
 ### What it is
 **Model routing** = har request ke liye model choose karna -- task difficulty, latency budget aur cost ke hisaab se. Do common patterns: **router** (pehle ek cheap classifier decide kare small ya large) aur **cascade** (pehle small model, confidence kam ho to large pe escalate).
-Har routing change pehle **offline eval** (M14-05..08) pe prove hota hai, phir traffic pe.
+Har routing change pehle **offline eval** ([M14-05](<05 - Automating LLM-as-a-judge scoring pipelines.md>)..08) pe prove hota hai, phir traffic pe.
 
 ### Why it matters for an FDE
 Cost cut karna customer ka sabse common ask hai, aur galat routing quality regression ka sabse common cause. Aapka kaam hai numbers ke saath trade-off dikhana: "itna saving, itna quality loss, ye threshold."
@@ -90,11 +92,11 @@ print("models from config:", MODELS)
 print("OK: classifier router + cascade compared offline; gate blocks the all-small switch")
 ```
 
-- `MODELS` env se -- code mein koi model id "sach" nahi; gateway alias (M14-03) ho to aur better.
+- `MODELS` env se -- code mein koi model id "sach" nahi; gateway alias ([M14-03](<03 - Centralizing provider API keys via LiteLLM and Portkey.md>)) ho to aur better.
 - `classify()` -- cheap regex/length heuristic; real mein ek chhota classifier ya small-model call, lekin pehle simple shuru karo aur eval se prove karo.
 - `FakeModel("small")` hard items pe 40% sahi, aur kuch galat answers bhi confidence 0.9 ke saath -- isliye cascade ka accuracy router se kam aaya.
 - `gate()` -- all-small 80%+ sasta hai lekin accuracy drop limit se zyada, isliye blocked; Kahani wali galti yahin pakdi jaati.
-- p95 -- cascade mein escalated requests do calls ka latency dete hain; latency SLA (M16-03) tight ho to cascade nuksaan kar sakta hai.
+- p95 -- cascade mein escalated requests do calls ka latency dete hain; latency SLA ([M16-03](<../16 - AuditMesh - Multi-Agent Compliance System/03 - Drafting latency and cost SLAs.md>)) tight ho to cascade nuksaan kar sakta hai.
 
 ```python
 # real version -- not run here, needs: pip install anthropic
@@ -109,14 +111,14 @@ def route_and_answer(question):
 ```
 
 ### Mini-exercise (30-60 min)
-AuditMesh v1.0 mein `auditmesh/obs/routing.py`: supervisor-level decisions `supervisor-large` pe, simple field extraction workers `worker-small` pe (gateway aliases, M14-03).
+AuditMesh v1.0 mein `auditmesh/obs/routing.py`: supervisor-level decisions `supervisor-large` pe, simple field extraction workers `worker-small` pe (gateway aliases, [M14-03](<03 - Centralizing provider API keys via LiteLLM and Portkey.md>)).
 - `evals/routing_set.jsonl` -- 40 labelled AuditMesh tasks (easy/hard, expected output). `run_eval.py --routing` har strategy ka acc, cost, p95 table banaye.
 - Gate rule `evals/gates.yaml` mein; CI fail ho agar routing change gate cross na kare.
-- Acceptance: report mein "confident but wrong" count; route decision har LLM span ka attribute ho (`route=small|large`) taaki dashboard (M16-08) per-route cost dikhaye.
+- Acceptance: report mein "confident but wrong" count; route decision har LLM span ka attribute ho (`route=small|large`) taaki dashboard ([M16-08](<../16 - AuditMesh - Multi-Agent Compliance System/08 - Building comprehensive token cost and trace dashboards.md>)) per-route cost dikhaye.
 
 ### Common pitfalls
 - Routing change direct production pe bina offline eval -- quality regression complaints se pata chalta hai, metrics se nahi.
-- Cascade mein small model ka self-reported confidence pe andha bharosa -- calibrate karo (M14-05 jaisa), ya schema/judge check use karo.
+- Cascade mein small model ka self-reported confidence pe andha bharosa -- calibrate karo ([M14-05](<05 - Automating LLM-as-a-judge scoring pipelines.md>) jaisa), ya schema/judge check use karo.
 - Classifier khud ek mehenga LLM call -- routing ka overhead saving kha jaata hai. Router ka cost aur latency bhi measure karo.
 
 ### Checklist before moving on
@@ -126,13 +128,22 @@ AuditMesh v1.0 mein `auditmesh/obs/routing.py`: supervisor-level decisions `supe
 - [ ] Model ids config/env se aate hain.
 
 ### Related
-- M14-04 Configuring rate limiting and fallback routing
-- M14-05 Automating LLM-as-a-judge scoring pipelines
-- M14-08 Creating synthetic benchmark datasets from source documents
-- M14-11 Monitoring granular token costs and endpoint latency
+- [M14-04](<04 - Configuring rate limiting and fallback routing.md>) Configuring rate limiting and fallback routing
+- [M14-05](<05 - Automating LLM-as-a-judge scoring pipelines.md>) Automating LLM-as-a-judge scoring pipelines
+- [M14-08](<08 - Creating synthetic benchmark datasets from source documents.md>) Creating synthetic benchmark datasets from source documents
+- [M14-11](<11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
 
 ### Self-quiz
 1. Cascade router se kab better hai, aur kab worse? Latency aur accuracy dono ke hisaab se batao.
 2. Small model "confident but wrong" hai -- ye eval mein kaise pakdoge aur production mein kaise mitigate karoge?
 3. Customer bolta hai "sab small pe daal do, 80% bachat". Aap kaunsa data dikhaoge?
 4. Model ids hard-code karne se kya break hota hai jab provider purana model retire kare?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 233 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 232: Prompt caching strategies](<15 - Prompt caching strategies.md>)
+- Next -> [step 234: Mapping 5-step manual compliance workflows](<../16 - AuditMesh - Multi-Agent Compliance System/01 - Mapping 5-step manual compliance workflows.md>)

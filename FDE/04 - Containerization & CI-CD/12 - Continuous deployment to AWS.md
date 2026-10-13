@@ -2,7 +2,9 @@
 
 ## Continuous deployment to AWS
 
-> Core | Fast CP4 / Slow CP6 | ~1.2 h | Builds on: M04-06, M04-09, M04-11, M03-11, M03-13
+> **Core** | ~1.2 h | Slow: step 128/256, CP6 | Fast: CP4
+>
+> Before this: [M04-06 Configuring task definitions](<06 - Configuring task definitions.md>), [M04-09 Creating workflow YAML files](<09 - Creating workflow YAML files.md>), [M04-11 Managing GitHub secrets](<11 - Managing GitHub secrets.md>), [M03-11 Assuming cross-account roles](<../03 - Cloud Fundamentals & Networking/11 - Assuming cross-account roles.md>), [M03-13 Setting automated budget thresholds](<../03 - Cloud Fundamentals & Networking/13 - Setting automated budget thresholds.md>)
 
 ### Kahani
 Bank customer ka deploy process: ek engineer laptop pe `docker build`, `docker push`, phir console mein task definition ka image haath se edit. Friday shaam ko galat tag (`latest`, jo kisi ki feature branch ka tha) prod pe chala gaya.
@@ -16,7 +18,7 @@ Fail ho to ECS **deployment circuit breaker** pichhli working revision pe rollba
 CP4 gate = live URL + health check + CI badge. Customer ke liye traceability (commit -> image -> task revision) aur bina static keys ke deploy -- ye dono security review ke standard sawaal hain.
 
 ### Key concepts
-- **OIDC federation** -- GitHub short-lived token deta hai, AWS role (trust policy mein `aud` + `sub` condition) assume hota hai; koi key store nahi (M03-11 cross-account roles jaisa idea).
+- **OIDC federation** -- GitHub short-lived token deta hai, AWS role (trust policy mein `aud` + `sub` condition) assume hota hai; koi key store nahi ([M03-11](<../03 - Cloud Fundamentals & Networking/11 - Assuming cross-account roles.md>) cross-account roles jaisa idea).
 - **Immutable image** -- `omniguard:<git sha>`; task definition revision exact image point karti hai.
 - **Render + deploy** -- `amazon-ecs-render-task-definition` image badalta hai, `amazon-ecs-deploy-task-definition` register + service update karta hai.
 - **wait-for-service-stability** -- job tab tak green nahi jab tak naye tasks healthy na hon.
@@ -155,7 +157,7 @@ print("OK: deploy workflow + OIDC trust policy validated")
 ```
 
 - `ORDER` -- credentials -> ECR login -> push -> render -> deploy -> smoke test. Kisi bhi step ka order galat = broken deploy.
-- `cancel-in-progress: false` -- deploy beech mein cancel hua to service aadhe state mein reh sakti hai; deploys queue mein chalne do. `id-token: write` sirf deploy job pe (M04-09 least privilege).
+- `cancel-in-progress: false` -- deploy beech mein cancel hua to service aadhe state mein reh sakti hai; deploys queue mein chalne do. `id-token: write` sirf deploy job pe ([M04-09](<09 - Creating workflow YAML files.md>) least privilege).
 - Trust policy `sub` -- `repo:you/omniguard:environment:production` matlab sirf is repo ka production-environment job; `repo:you/*` = aapka koi bhi repo prod mein deploy kar sakta hai.
 
 **Rollback**: ECS service pe `deploymentConfiguration.deploymentCircuitBreaker = {enable: true, rollback: true}` -- naye tasks health check fail karein to ECS pichhli revision pe wapas. Manual rollback neeche.
@@ -173,13 +175,13 @@ aws ecs wait services-stable --cluster omniguard --services omniguard-api
 ### Mini-exercise (30-60 min)
 OmniGuard CP4 build (ye gate hai):
 - AWS: OIDC provider, `omniguard-github-deploy` role (trust policy upar wali, permissions: ECR push to one repo, `ecs:RegisterTaskDefinition`, `ecs:UpdateService`/`DescribeServices` on one service, `iam:PassRole` sirf do task roles pe).
-- `.github/workflows/deploy.yml` upar jaisa; `tools/lint_deploy.py` + test CI mein. ECS service: Fargate, ALB (M04-07), circuit breaker on, 1 task. Kaam ke baad desired count 0 (cost, M03-13).
+- `.github/workflows/deploy.yml` upar jaisa; `tools/lint_deploy.py` + test CI mein. ECS service: Fargate, ALB ([M04-07](<07 - Load balancer integration.md>)), circuit breaker on, 1 task. Kaam ke baad desired count 0 (cost, [M03-13](<../03 - Cloud Fundamentals & Networking/13 - Setting automated budget thresholds.md>)).
 - **Gate**: README mein LIVE URL, `curl <url>/readyz` = 200, CI badge green. Ek jaan-boojh ke broken commit (`/readyz` 503) push karo -- circuit breaker rollback dekho, phir fix.
 
 ### Common pitfalls
 - `iam:PassRole` `*` pe -- deploy role koi bhi role ECS ko pass kar sakta hai; sirf execution + task role ARNs do.
 - `wait-for-service-stability` ke bina workflow green, prod red -- CI pe bharosa khatam.
-- ALB health check `/` pe aur app `/` pe 404 -- har deploy circuit breaker rollback; path `/readyz` rakho (M04-13).
+- ALB health check `/` pe aur app `/` pe 404 -- har deploy circuit breaker rollback; path `/readyz` rakho ([M04-13](<13 - Health and readiness checks.md>)).
 
 ### Checklist before moving on
 - [ ] GitHub mein koi AWS key nahi; OIDC role trust policy repo + environment tak locked.
@@ -188,13 +190,22 @@ OmniGuard CP4 build (ye gate hai):
 - [ ] Rollback (automatic + manual) ek baar practice kiya; LIVE URL + health check + CI badge README mein.
 
 ### Related
-- M04-06 Configuring task definitions
-- M04-11 Managing GitHub secrets
-- M04-13 Health and readiness checks
-- M03-11 Assuming cross-account roles
+- [M04-06](<06 - Configuring task definitions.md>) Configuring task definitions
+- [M04-11](<11 - Managing GitHub secrets.md>) Managing GitHub secrets
+- [M04-13](<13 - Health and readiness checks.md>) Health and readiness checks
+- [M03-11](<../03 - Cloud Fundamentals & Networking/11 - Assuming cross-account roles.md>) Assuming cross-account roles
 
 ### Self-quiz
 1. OIDC deploy mein AWS ko kaise pata chalta hai ki request aapke repo ke production job se aa rahi hai?
 2. Circuit breaker rollback kab trigger hota hai, aur kab nahi bachayega (hint: health check kya check karta hai)?
 3. Deploy concurrency mein `cancel-in-progress: true` kyun galat hai?
 4. Prod pe bug mila. Commit SHA se running task revision tak ka trace kaise karoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 128 of 256** -- [Syllabus CP6](<../SYLLABUS.md#cp6>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 127: Managing GitHub secrets](<11 - Managing GitHub secrets.md>)
+- Next -> [step 129: Health and readiness checks](<13 - Health and readiness checks.md>)

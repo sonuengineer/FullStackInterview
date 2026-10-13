@@ -1,0 +1,27 @@
+# Everything the "# runnable" code blocks in the lessons import (CP1-CP10).
+# Install once:  pip install -r requirements-lessons.txt
+# Heavy/vendor libraries (langgraph, mcp, presidio, nemoguardrails, neo4j, anthropic, openai...)
+# are NOT here on purpose: lessons stub them and you install them when a lesson's "real version" needs it.
+fastapi
+uvicorn
+httpx
+pydantic
+jsonschema
+psutil
+pytest
+pytest-cov
+ruff
+sqlalchemy
+numpy
+pyyaml
+pypdf
+fpdf2
+rank-bm25
+pillow
+cryptography
+defusedxml
+pyjwt
+lxml
+requests
+sqlglot
+zeep

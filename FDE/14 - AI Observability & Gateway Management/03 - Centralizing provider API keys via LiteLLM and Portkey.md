@@ -2,7 +2,9 @@
 
 ## Centralizing provider API keys via LiteLLM/Portkey
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M04-11, M03-09, M14-02
+> **Core** | ~1.2 h | Slow: step 224/256, CP10 | Fast: CP8
+>
+> Before this: [M04-11 Managing GitHub secrets](<../04 - Containerization & CI-CD/11 - Managing GitHub secrets.md>), [M03-09 Principle of least privilege](<../03 - Cloud Fundamentals & Networking/09 - Principle of least privilege.md>), [M14-02 Exponential backoff strategies](<02 - Exponential backoff strategies.md>)
 
 ### Kahani
 Ek hospital group mein 6 teams AI features bana rahi hain. Har team ke paas apni OpenAI aur Anthropic key hai -- kuch `.env` mein, kuch CI secrets mein, ek Slack message mein bhi.
@@ -12,7 +14,7 @@ CISO ka order: "Provider keys ek jagah. Teams ko sirf apni scoped key milegi, bu
 
 ### What it is
 **LLM gateway** = ek proxy jo saari teams aur provider APIs ke beech baithta hai. Real provider keys sirf gateway ke paas; teams ko **virtual keys** milti hain jo team, allowed models aur budget se bandhi hoti hain.
-Gateway har call log karta hai (team, model, tokens, cost), routing/fallback karta hai (M14-04). **LiteLLM proxy** (open source, self-host) aur **Portkey** (hosted/OSS gateway) is pattern ke popular tools hain.
+Gateway har call log karta hai (team, model, tokens, cost), routing/fallback karta hai ([M14-04](<04 - Configuring rate limiting and fallback routing.md>)). **LiteLLM proxy** (open source, self-host) aur **Portkey** (hosted/OSS gateway) is pattern ke popular tools hain.
 
 ### Why it matters for an FDE
 Enterprise customer pe pehla security review yahi poochta hai: "keys kahan hain, kaun use karta hai, leak hui to blast radius kya hai?" Gateway ke bina rotation, chargeback aur audit -- teeno manual aur fragile hain.
@@ -21,7 +23,7 @@ Enterprise customer pe pehla security review yahi poochta hai: "keys kahan hain,
 - **Virtual key** -- team ka apna token; revoke/rotate karne se provider key chhedni nahi padti, aur leak hone pe sirf ek team ka budget risk mein.
 - **Model alias** -- teams `claude-default` bolti hain, gateway decide karta hai kaunsa provider + model id; model badalna = config change, code change nahi.
 - **Budget** -- per key/team spend limit; cross hone pe request reject, provider tak pahunchti hi nahi.
-- **Spend logging** -- team, model, tokens, cost per request; prompts nahi (M13-14).
+- **Spend logging** -- team, model, tokens, cost per request; prompts nahi ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 - **Single egress** -- network policy se sirf gateway ko provider domains tak jaane do; teams direct call kar hi na sakein.
 
 ### Code example
@@ -100,7 +102,7 @@ print("OK: virtual keys, model allow-list, budget cut-off, real key never leaves
 - `models` allow-list -- radiology team mehenga model use nahi kar sakti (403); cost control config mein hai, code review pe depend nahi.
 - Budget check provider call se *pehle* -- 429 wale requests `SPEND_LOG` mein nahi badhte, matlab provider tak gaye hi nahi.
 - `PRICES` input hai -- real prices provider pricing page se config mein daalo; hard-coded numbers jaldi purane hote hain.
-- `SPEND_LOG` mein tokens aur cost hai, prompt text nahi -- yahi M14-11 ka cost dashboard feed karega.
+- `SPEND_LOG` mein tokens aur cost hai, prompt text nahi -- yahi [M14-11](<11 - Monitoring granular token costs and endpoint latency.md>) ka cost dashboard feed karega.
 
 LiteLLM proxy config (keys `os.environ/...` se padhi jaati hain; field names check the docs for your version):
 
@@ -136,8 +138,8 @@ AuditMesh v1.0 ke liye `auditmesh/obs/gateway/config.yaml` likho (LiteLLM format
 - Acceptance: `grep -r "sk-" auditmesh/` khaali; yaml `python -c "import yaml; yaml.safe_load(open(...))"` pass; worker key se `supervisor-large` call = denied.
 
 ### Common pitfalls
-- Gateway khud single point of failure -- kam se kam 2 replicas, health check, aur timeout (M14-02) zaroori.
-- Gateway logs mein full prompts/responses on by default -- PII ka naya data lake ban jaata hai; logging config explicitly set karo (M13-14).
+- Gateway khud single point of failure -- kam se kam 2 replicas, health check, aur timeout ([M14-02](<02 - Exponential backoff strategies.md>)) zaroori.
+- Gateway logs mein full prompts/responses on by default -- PII ka naya data lake ban jaata hai; logging config explicitly set karo ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 - Virtual keys bana diye lekin network egress open -- teams purani direct key se bypass karti rahengi.
 
 ### Checklist before moving on
@@ -147,13 +149,22 @@ AuditMesh v1.0 ke liye `auditmesh/obs/gateway/config.yaml` likho (LiteLLM format
 - [ ] Spend log mein kya hona chahiye aur kya kabhi nahi, bata sakta hoon.
 
 ### Related
-- M12-01 Authentication vs authorization
-- M14-04 Configuring rate limiting and fallback routing
-- M14-11 Monitoring granular token costs and endpoint latency
-- M13-14 Safe logging (never log PII or prompts)
+- [M12-01](<../12 - Identity & Access Management/01 - Authentication vs authorization.md>) Authentication vs authorization
+- [M14-04](<04 - Configuring rate limiting and fallback routing.md>) Configuring rate limiting and fallback routing
+- [M14-11](<11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
+- [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
 
 ### Self-quiz
 1. Ek team ki virtual key leak hui. Gateway ke saath aur bina gateway ke -- response steps kaise alag hain?
 2. Model alias ka fayda kya hai jab provider naya model launch kare?
 3. Budget check provider call ke baad karne mein kya problem hai?
 4. Gateway ko "single point of failure" kehte hain -- aap isko kaise mitigate karoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 224 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 223: Exponential backoff strategies](<02 - Exponential backoff strategies.md>)
+- Next -> [step 225: Configuring rate limiting and fallback routing](<04 - Configuring rate limiting and fallback routing.md>)

@@ -2,7 +2,11 @@
 
 ## Implementing NeMo & Presidio guardrails
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M13-02, M13-04, M13-05, M13-09, M13-10, M13-14
+> **Core** | ~1.2 h | Slow: step 192/256, CP8 | Fast: CP6
+>
+> Before this: [M13-02 Prompt injection defenses](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>), [M13-04 Implementing Microsoft Presidio analyzers and anonymizers](<../13 - Production AI Security & Guardrails/04 - Implementing Microsoft Presidio analyzers and anonymizers.md>), [M13-05 Redacting sensitive entities (SSN, credit cards, emails)](<../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>), [M13-09 Writing programmable conversational rails using Colang](<../13 - Production AI Security & Guardrails/09 - Writing programmable conversational rails using Colang.md>), [M13-10 Configuring strict input and output filtering pipelines natively in Python](<../13 - Production AI Security & Guardrails/10 - Configuring strict input and output filtering pipelines natively in Python.md>), [M13-14 Safe logging (never log PII or prompts)](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [NeMo guardrails](<../Projects/Project 1 - OmniGuard - Secure AI Integration/05 - NeMo guardrails.md>), [Presidio guardrails](<../Projects/Project 1 - OmniGuard - Secure AI Integration/06 - Presidio guardrails.md>) (in `Projects/`).
 
 ### Kahani
 Kavach ke security team ne UAT se pehle ek "red team afternoon" rakha. Teen cheezein try ki:
@@ -18,9 +22,9 @@ Customer ka CISO "humne Presidio lagaya hai" se satisfy nahi hota; "ye 6 attack 
 
 ### Key concepts
 - **Order of rails** -- input rail -> mask user PII -> retrieve -> mask chunks -> LLM -> output rail -> response. Logging har step pe metadata-only.
-- **Retrieved text is data, not instructions** -- chunk ke andar likha "call tool X" kabhi tool call nahi banna chahiye; tools sirf user intent + allowlist se (M13-02).
-- **Output rail as last line** -- LLM ne kisi tarah PII generate kar diya (training data, unmask bug) to output scan pakde (M13-10).
-- **Logs are an exfiltration channel** -- prompt aur raw PII kabhi log nahi; request id, route, latency, entity counts log karo (M13-14).
+- **Retrieved text is data, not instructions** -- chunk ke andar likha "call tool X" kabhi tool call nahi banna chahiye; tools sirf user intent + allowlist se ([M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>)).
+- **Output rail as last line** -- LLM ne kisi tarah PII generate kar diya (training data, unmask bug) to output scan pakde ([M13-10](<../13 - Production AI Security & Guardrails/10 - Configuring strict input and output filtering pipelines natively in Python.md>)).
+- **Logs are an exfiltration channel** -- prompt aur raw PII kabhi log nahi; request id, route, latency, entity counts log karo ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 - **Black-box contract** -- response mein `route` aur `tools_called` -- harness inhi pe assert karta hai, internals pe nahi.
 
 Request flow:
@@ -32,7 +36,7 @@ question -> [NeMo input rails: jailbreak, topical (M13-09, M13-11)] --refuse--> 
 logs at every step: request_id, route, latency, entity_counts -- never text (M13-14)
 ```
 
-Threat / failure list: user-pasted PII sent to provider or logged, PII in source docs leaking into answer, indirect prompt injection via chunk, direct jailbreak, off-topic abuse (cost), PII in exception traces, false positives masking policy numbers (M13-08).
+Threat / failure list: user-pasted PII sent to provider or logged, PII in source docs leaking into answer, indirect prompt injection via chunk, direct jailbreak, off-topic abuse (cost), PII in exception traces, false positives masking policy numbers ([M13-08](<../13 - Production AI Security & Guardrails/08 - Evaluating false-positive redaction rates.md>)).
 
 ### Code example
 `pip install fastapi httpx`
@@ -129,14 +133,14 @@ rails = LLMRails(RailsConfig.from_path("omniguard/rails"))   # config.yml + *.co
 reply = rails.generate(messages=[{"role": "user", "content": mask(question)}])
 ```
 
-Presidio ke kuch versions mein India recognizers (PAN, Aadhaar) pehle se hain -- check the docs for your version; custom `PatternRecognizer` hamesha kaam karta hai (M13-06).
+Presidio ke kuch versions mein India recognizers (PAN, Aadhaar) pehle se hain -- check the docs for your version; custom `PatternRecognizer` hamesha kaam karta hai ([M13-06](<../13 - Production AI Security & Guardrails/06 - Customizing regex patterns for domain-specific PII.md>)).
 
 > Needs API key for the real version: ANTHROPIC_API_KEY (or OPENAI_API_KEY) for the NeMo rails LLM.
 
 ### Mini-exercise (30-60 min)
 OmniGuard deliverables #5 + #6: `omniguard/tests/acceptance/test_guardrails.py`.
-- Harness ko `OMNIGUARD_APP=omniguard.main:app` pe chalao (FakeLLM mode, M13-10). Seed corpus mein ek PII-wala chunk aur ek injection chunk daalo.
-- 10 aur attacks add karo: M13-13 ki jailbreak list se 5, ek Hinglish jailbreak, ek PII inside a stack trace (force an exception, check logs), ek policy number jo PII nahi hai (false positive -- answer mein dikhna chahiye, M13-08).
+- Harness ko `OMNIGUARD_APP=omniguard.main:app` pe chalao (FakeLLM mode, [M13-10](<../13 - Production AI Security & Guardrails/10 - Configuring strict input and output filtering pipelines natively in Python.md>)). Seed corpus mein ek PII-wala chunk aur ek injection chunk daalo.
+- 10 aur attacks add karo: [M13-13](<../13 - Production AI Security & Guardrails/13 - Testing rails against jailbreak libraries.md>) ki jailbreak list se 5, ek Hinglish jailbreak, ek PII inside a stack trace (force an exception, check logs), ek policy number jo PII nahi hai (false positive -- answer mein dikhna chahiye, [M13-08](<../13 - Production AI Security & Guardrails/08 - Evaluating false-positive redaction rates.md>)).
 - Acceptance: saare checks green; `log_prompts`-jaisa bug inject karo -> CI red; README mein "Guardrail evidence" table (attack -> rail -> test).
 
 ### Common pitfalls
@@ -151,16 +155,25 @@ OmniGuard deliverables #5 + #6: `omniguard/tests/acceptance/test_guardrails.py`.
 - [ ] Logs mein sirf metadata (request id, route, counts) jaata hai.
 
 ### Related
-- M13-02 Prompt injection defenses
-- M13-04 Implementing Microsoft Presidio analyzers and anonymizers
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
-- M13-09 Writing programmable conversational rails using Colang
-- M13-10 Configuring strict input and output filtering pipelines natively in Python
-- M13-14 Safe logging (never log PII or prompts)
-- M15-02 Defining data classifications
+- [M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>) Prompt injection defenses
+- [M13-04](<../13 - Production AI Security & Guardrails/04 - Implementing Microsoft Presidio analyzers and anonymizers.md>) Implementing Microsoft Presidio analyzers and anonymizers
+- [M13-05](<../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
+- [M13-09](<../13 - Production AI Security & Guardrails/09 - Writing programmable conversational rails using Colang.md>) Writing programmable conversational rails using Colang
+- [M13-10](<../13 - Production AI Security & Guardrails/10 - Configuring strict input and output filtering pipelines natively in Python.md>) Configuring strict input and output filtering pipelines natively in Python
+- [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging (never log PII or prompts)
+- [M15-02](<02 - Defining data classifications.md>) Defining data classifications
 
 ### Self-quiz
 1. Output rail kyun chahiye agar input aur chunks dono already masked hain?
 2. Harness ka PII detector app ke masker se independent kyun hona chahiye?
 3. Injected chunk "call delete_claim" ko black-box test mein kaise detect karoge? Do signals batao.
 4. Policy number `KVF-2026-001234` ko Presidio phone number samajh ke mask kar de to UAT pe kya asar? Kaise pakdoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 192 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 191: Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases](<07 - Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases.md>)
+- Next -> [step 193: Finalizing Dockerized FastAPI cloud deployments](<09 - Finalizing Dockerized FastAPI cloud deployments.md>)

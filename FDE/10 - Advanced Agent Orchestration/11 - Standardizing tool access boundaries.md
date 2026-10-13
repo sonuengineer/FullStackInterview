@@ -2,12 +2,14 @@
 
 ## Standardizing tool access boundaries
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M10-09, M10-10, M12-06
+> **Core** | ~1.2 h | Slow: step 218/256, CP9 | Fast: CP7
+>
+> Before this: [M10-09 Connecting agents to external tools safely](<09 - Connecting agents to external tools safely.md>), [M10-10 Host and Client and Server architectures](<10 - Host and Client and Server architectures.md>), [M12-06 Implementing Role-Based Access Control](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>)
 
 ### Kahani
 Ek bank mein ab 6 teams agents bana rahi hain aur 40 MCP tools hain. Har team ne apna "safe tool" pattern likha: kisi ne scopes `read/write` rakhe, kisi ne `viewer/editor`, kisi ne kuch nahi. Ek tool ka naam `update_customer` tha jo asal mein account *close* karta tha.
 Security review mein CISO ka sawaal: "Mujhe ek table do -- kaunsa agent kaunsa tool chala sakta hai, kis tenant ke data pe, aur kaunse tools destructive hain." Kisi ke paas jawab nahi tha; har team ke code mein alag logic tha.
-M10-09 mein humne ek agent ke liye safe executor banaya. Yahan problem scale ki hai: ek **standard** chahiye jo sab teams follow karein aur jo machine check kare.
+[M10-09](<09 - Connecting agents to external tools safely.md>) mein humne ek agent ke liye safe executor banaya. Yahan problem scale ki hai: ek **standard** chahiye jo sab teams follow karein aur jo machine check kare.
 
 ### What it is
 **Tool access boundary standard** = har tool ka ek declarative **manifest** (naam convention, version, scope, risk level, annotations, data classification, approval rule) + har agent ke liye short-lived **capability token** (allowed scopes, tenant, expiry) + ek central **deny-by-default policy check** jo har call pe chalta hai. Boundary ab har team ke code mein nahi, ek reviewable config + ek shared library mein hai.
@@ -101,15 +103,15 @@ print("OK: manifest lint, generated annotations, scoped tokens, deny-by-default 
 ```
 
 - `lint()` standard ko code banata hai -- `updateCustomer` jaisa misleading naam ya bina approval ka destructive tool CI mein hi fail.
-- `mcp_annotations()` manifest se generate -- MCP server (M10-10) ye hints `tools/list` mein bhejega; hints client ke UX ke liye hain, enforcement `decide()` mein hai.
+- `mcp_annotations()` manifest se generate -- MCP server ([M10-10](<10 - Host and Client and Server architectures.md>)) ye hints `tools/list` mein bhejega; hints client ke UX ke liye hain, enforcement `decide()` mein hai.
 - `issue_token()` -- agent ka token 15 minute ka, sirf uske scopes aur tenant; signing key test-only hai, prod mein KMS se.
 - `decide()` har check fail-closed: unknown tool, missing scope, tenant mismatch, expired token -- sab deny; destructive -> `needs_approval`.
 - `EXPECTED` matrix -- CISO wala table yahi hai, aur test bhi yahi hai. Naya tool ya scope change = matrix diff PR mein.
 
 ### Mini-exercise (30-60 min)
 CP7 AuditMesh: `auditmesh/policy/` -- `tools.yaml` manifest, `lint.py`, `tokens.py`, `decide.py`.
-- Supervisor har sub-agent ko spawn karte waqt `issue_token()` se scoped token de; M10-09 ka executor har call pe `decide()` chalaye.
-- `mcp_jira/server.py` (M10-10) tool annotations manifest se generate kare.
+- Supervisor har sub-agent ko spawn karte waqt `issue_token()` se scoped token de; [M10-09](<09 - Connecting agents to external tools safely.md>) ka executor har call pe `decide()` chalaye.
+- `mcp_jira/server.py` ([M10-10](<10 - Host and Client and Server architectures.md>)) tool annotations manifest se generate kare.
 - Acceptance: `tests/test_boundaries.py` mein poora agents x tools matrix; `python lint.py tools.yaml` CI step; cross-tenant aur expired token deny; `jira.close_issue` bina approval `needs_approval`.
 
 ### Common pitfalls
@@ -124,14 +126,23 @@ CP7 AuditMesh: `auditmesh/policy/` -- `tools.yaml` manifest, `lint.py`, `tokens.
 - [ ] Boundary matrix test PR mein review hota hai.
 
 ### Related
-- M10-09 Connecting agents to external tools safely
-- M10-10 Host/Client/Server architectures
-- M12-02 Understanding JWT tokens
-- M12-06 Implementing Role-Based Access Control
-- M12-10 Audit logging
+- [M10-09](<09 - Connecting agents to external tools safely.md>) Connecting agents to external tools safely
+- [M10-10](<10 - Host and Client and Server architectures.md>) Host/Client/Server architectures
+- [M12-02](<../12 - Identity & Access Management/02 - Understanding JWT tokens.md>) Understanding JWT tokens
+- [M12-06](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M12-10](<../12 - Identity & Access Management/10 - Audit logging.md>) Audit logging
 
 ### Self-quiz
 1. Tool annotations `readOnlyHint: true` keh raha hai par tool actually delete karta hai. Tumhare design mein ye kahan pakda jaayega?
 2. Agent token mein scopes hain, end-user ke permissions alag hain. Dono ka intersection kyon lena chahiye? Example do.
 3. Matrix mein naya agent add karna -- review process kya hona chahiye aur kaun approve kare?
 4. Token TTL 15 minute hai, par ek audit run 2 ghante chalta hai. Kya karoge?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 218 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 217: Host/Client/Server architectures](<10 - Host and Client and Server architectures.md>)
+- Next -> [step 219: NEW: one vendor agent SDK (Claude Agent SDK or OpenAI Agents SDK)](<12 - Vendor agent SDKs (Claude Agent SDK and OpenAI Agents SDK).md>)

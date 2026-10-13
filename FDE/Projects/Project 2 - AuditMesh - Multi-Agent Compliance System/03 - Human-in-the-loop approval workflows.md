@@ -3,6 +3,8 @@
 ## Human-in-the-loop approval workflows
 
 > Deliverable 03 of 8 | Built in: Fast CP7 / Slow CP9 | Time box: 6 h
+>
+> **BUILD brief.** You ship this in your own repo. Learn first: [Identifying Human-in-the-Loop bottlenecks](<../../16 - AuditMesh - Multi-Agent Compliance System/02 - Identifying Human-in-the-Loop bottlenecks.md>), [Creating Streamlit and Gradio UIs for human approval workflows](<../../16 - AuditMesh - Multi-Agent Compliance System/09 - Creating Streamlit and Gradio UIs for human approval workflows.md>).
 
 ### Goal
 Turn the graph's approval interrupt into a real workflow: a pending approval record, an authorized human decision through an API, a durable resume from checkpoint, and an append-only audit trail. This is the CP7 / CP9 gate: a run that pauses for human approval and resumes.
@@ -29,17 +31,17 @@ tests/acceptance/test_hitl_resume.py
 - Status codes: 401 no/invalid token, 403 not a reviewer, 403 own request, 404 unknown id, 409 already decided, 410 expired, 422 invalid edit or missing reason.
 - Edited args are validated with the same schema the Jira tool uses.
 - Status update and audit row commit in one transaction. Resume uses `Command(resume=decision)` on the stored `thread_id`, preferably from a worker rather than inside the HTTP request.
-- The ticket writer uses the approved args only; the args hash must match the approval (M16-04 approval binding).
+- The ticket writer uses the approved args only; the args hash must match the approval ([M16-04](<../../16 - AuditMesh - Multi-Agent Compliance System/04 - Defining Model Context Protocol trust boundaries.md>) approval binding).
 
 ### Inputs: lessons to (re)read
-- M10-01 Check-pointing graph states, M10-03 Interrupting graph execution, M10-04 Requesting manual state approval.
-- M12-02 JWT tokens, M12-06 RBAC, M12-10 Audit logging, M13-14 Safe logging.
-- M14-01 Idempotency keys (no double resume, no double ticket).
-- M16-02 HITL bottlenecks (risk tiers decide which findings need approval).
-- M16-06 supervisor harness and M16-09 approval API harness.
+- [M10-01](<../../10 - Advanced Agent Orchestration/01 - Check-pointing graph states.md>) Check-pointing graph states, [M10-03](<../../10 - Advanced Agent Orchestration/03 - Interrupting graph execution.md>) Interrupting graph execution, [M10-04](<../../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) Requesting manual state approval.
+- [M12-02](<../../12 - Identity & Access Management/02 - Understanding JWT tokens.md>) JWT tokens, [M12-06](<../../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>) RBAC, [M12-10](<../../12 - Identity & Access Management/10 - Audit logging.md>) Audit logging, [M13-14](<../../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>) Safe logging.
+- [M14-01](<../../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>) Idempotency keys (no double resume, no double ticket).
+- [M16-02](<../../16 - AuditMesh - Multi-Agent Compliance System/02 - Identifying Human-in-the-Loop bottlenecks.md>) HITL bottlenecks (risk tiers decide which findings need approval).
+- [M16-06](<../../16 - AuditMesh - Multi-Agent Compliance System/06 - Developing a LangGraph Multi-Agent Supervisor.md>) supervisor harness and [M16-09](<../../16 - AuditMesh - Multi-Agent Compliance System/09 - Creating Streamlit and Gradio UIs for human approval workflows.md>) approval API harness.
 
 ### Acceptance checks
-The M10-04 gate test (you write it), plus the rules the M10-04 example asserts:
+The [M10-04](<../../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) gate test (you write it), plus the rules the [M10-04](<../../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) example asserts:
 1. Start a run on a P1 finding; assert `status == "interrupted"` and ticket count 0.
 2. Create a new app/runtime instance (simulated restart), approve via the API, assert the final state has a `ticket` and ticket count is 1.
 3. Reject path: ticket count stays 0 and the reason is stored.
@@ -47,7 +49,7 @@ The M10-04 gate test (you write it), plus the rules the M10-04 example asserts:
 5. Edit with invalid args (`severity: P0`) -> 422; a valid edit resumes with the edited args.
 6. A second decision -> 409; an expired record -> 410.
 7. Exactly one audit row and one resume per decided approval.
-Also green: M16-06 checks for "approval before ticket" and "no ticket after reject".
+Also green: [M16-06](<../../16 - AuditMesh - Multi-Agent Compliance System/06 - Developing a LangGraph Multi-Agent Supervisor.md>) checks for "approval before ticket" and "no ticket after reject".
 
 ### Proof for the gate
 - Terminal recording or log: run pauses, process restarts, approval via curl, run resumes, one ticket in the fake Jira.
@@ -62,5 +64,11 @@ Also green: M16-06 checks for "approval before ticket" and "no ticket after reje
 - Slack/Teams interactive approval buttons.
 
 ### Stretch goals
-- Risk-tiered routing from M16-02: high risk -> approval, medium -> 1-in-10 sample, low -> auto-accept with an audit row.
+- Risk-tiered routing from [M16-02](<../../16 - AuditMesh - Multi-Agent Compliance System/02 - Identifying Human-in-the-Loop bottlenecks.md>): high risk -> approval, medium -> 1-in-10 sample, low -> auto-accept with an audit row.
 - Concurrency test: two reviewers decide at the same time, exactly one wins, the graph resumes once.
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+[Project README](<README.md>) | [Syllabus](<../../SYLLABUS.md>) | [START_HERE](<../../START_HERE.md>)

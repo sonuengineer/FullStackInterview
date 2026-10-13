@@ -2,7 +2,9 @@
 
 ## Enforcing data-level permissions in retrieval layers
 
-> Core | Fast CP5 / Slow CP7 | ~1.2 h | Builds on: M06-08, M06-10, M12-01, M12-06, M11-12
+> **Core** | ~1.2 h | Slow: step 165/256, CP7 | Fast: CP5
+>
+> Before this: [M06-08 Metadata filtering](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>), [M06-10 End-to-end basic retrieval](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>), [M12-01 Authentication vs authorization](<01 - Authentication vs authorization.md>), [M12-06 Implementing Role-Based Access Control](<06 - Implementing Role-Based Access Control.md>), [M11-12 Implementing read-only database roles](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>)
 
 ### Kahani
 Ek manufacturing customer ka HR + engineering knowledge bot. SharePoint ke saare docs ek vector index mein daale. Demo mein ek junior engineer ne poocha "what is the salary band for L5?" -- aur bot ne HR ka confidential compensation doc quote kar diya.
@@ -18,9 +20,9 @@ Enterprise RAG ka number one blocker yahi hai: "kya bot mera data galat logon ko
 
 ### Key concepts
 - **ACL at ingest** -- source system (SharePoint, Confluence, DB) ke permissions chunk metadata mein copy; doc ke permissions badle to re-sync job (stale ACL = leak).
-- **Pre-filter, not post-filter** -- filter search ke andar (M06-08 metadata filtering). Top-k ke baad filter karoge to ya to results khaali, ya galti se unfiltered path khula reh jaata hai.
-- **Never rely on the prompt** -- "don't reveal X" ek suggestion hai, security control nahi. Prompt injection (M13-02) use tod deta hai.
-- **Defense in depth** -- LLM call se pehle ek aur assert: har context chunk user ke liye allowed hai. Text-to-SQL ke liye same idea: read-only + row-level DB role (M11-12).
+- **Pre-filter, not post-filter** -- filter search ke andar ([M06-08](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>) metadata filtering). Top-k ke baad filter karoge to ya to results khaali, ya galti se unfiltered path khula reh jaata hai.
+- **Never rely on the prompt** -- "don't reveal X" ek suggestion hai, security control nahi. Prompt injection ([M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>)) use tod deta hai.
+- **Defense in depth** -- LLM call se pehle ek aur assert: har context chunk user ke liye allowed hai. Text-to-SQL ke liye same idea: read-only + row-level DB role ([M11-12](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>)).
 - **Permission-aware cache key** -- answer/retrieval cache key = query + tenant + hash(sorted groups + clearance). Warna admin ka cached answer intern ko milega.
 
 ### Code example
@@ -110,9 +112,9 @@ print("OK: same question, different allowed answers; filter before rank; cache k
 ```
 
 - `allowed()` -- teen checks: tenant, group overlap, classification <= clearance. Ye hi function retrieval aur defense-in-depth assert dono mein -- ek source of truth.
-- `retrieve` -- pehle filter, phir rank. Vector DB mein ye `filter=` parameter hota hai (M06-08); production mein filter server-side query mein, Python mein baad mein nahi.
+- `retrieve` -- pehle filter, phir rank. Vector DB mein ye `filter=` parameter hota hai ([M06-08](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>)); production mein filter server-side query mein, Python mein baad mein nahi.
 - `retrieve_wrong` + "Never reveal" prompt -- FakeLLM context echo karta hai; real model bhi injection pe yahi karega. Context mein aaya = leak possible.
-- `naive_key` vs `perm_key` -- cache key mein tenant + sorted groups + clearance. Kahani ka doosra leak path yahi hota hai jab team M14-15 caching add karti hai.
+- `naive_key` vs `perm_key` -- cache key mein tenant + sorted groups + clearance. Kahani ka doosra leak path yahi hota hai jab team [M14-15](<../14 - AI Observability & Gateway Management/15 - Prompt caching strategies.md>) caching add karti hai.
 - Asserts -- CP5 gate ka chhota version: Priya ko `hr-7`, Dev ko nahi, globex ka chunk kisi ko nahi.
 
 ```python
@@ -127,20 +129,20 @@ acl_filter = models.Filter(must=[
 hits = client.query_points(collection_name="docs", query=query_vector, query_filter=acl_filter, limit=8).points
 ```
 
-pgvector mein yahi `WHERE tenant = %s AND allowed_groups && %s AND classification_level <= %s` hai, aur Postgres Row-Level Security policy usko DB level pe enforce kar sakti hai (M11-12 jaisa read-only role + RLS).
+pgvector mein yahi `WHERE tenant = %s AND allowed_groups && %s AND classification_level <= %s` hai, aur Postgres Row-Level Security policy usko DB level pe enforce kar sakti hai ([M11-12](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>) jaisa read-only role + RLS).
 
 ### Mini-exercise (30-60 min)
 OmniGuard CP5 gate: ACL-filtered retrieval.
-- Ingest: har chunk pe `tenant`, `allowed_groups`, `classification` metadata (M15-02 data classifications se). Missing ACL = chunk index hi na ho (deny by default).
-- `omniguard/rag/retrieve.py`: `retrieve(principal, query)` jo filter search ke andar lagaye; `/ask` route `require_permission("ask:use")` (M12-06) ke peeche.
-- LLM call se pehle `assert_all_allowed(principal, chunks)`; violation pe 500 + audit event (M12-10), answer nahi.
-- `tests/test_two_user_demo.py`: do JWTs (M12-02), same question -> alag chunk ids, confidential text sirf HR user ke answer mein; cache on aur off dono mein pass.
+- Ingest: har chunk pe `tenant`, `allowed_groups`, `classification` metadata ([M15-02](<../15 - OmniGuard - Secure AI Integration/02 - Defining data classifications.md>) data classifications se). Missing ACL = chunk index hi na ho (deny by default).
+- `omniguard/rag/retrieve.py`: `retrieve(principal, query)` jo filter search ke andar lagaye; `/ask` route `require_permission("ask:use")` ([M12-06](<06 - Implementing Role-Based Access Control.md>)) ke peeche.
+- LLM call se pehle `assert_all_allowed(principal, chunks)`; violation pe 500 + audit event ([M12-10](<10 - Audit logging.md>)), answer nahi.
+- `tests/test_two_user_demo.py`: do JWTs ([M12-02](<02 - Understanding JWT tokens.md>)), same question -> alag chunk ids, confidential text sirf HR user ke answer mein; cache on aur off dono mein pass.
 - Demo script `scripts/two_user_demo.sh` jo dono users ke liye `curl /ask` chalaye -- yahi CP5 gate recording hai.
 
 ### Common pitfalls
 - ACL sirf doc level pe, chunks/summaries/embeddings cache pe nahi -- summary chunk ne confidential data copy kar liya. Derived data ko parent ka ACL inherit karna chahiye.
 - Source permissions badle, index re-sync nahi -- employee HR se nikla par 2 hafte tak HR docs dikhte rahe. ACL sync ka SLA customer ke saath likho.
-- Logs/traces mein retrieved chunk text -- permission filter sahi, par observability tool sab ko dikha raha hai (M13-14).
+- Logs/traces mein retrieved chunk text -- permission filter sahi, par observability tool sab ko dikha raha hai ([M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
 
 ### Checklist before moving on
 - [ ] Har chunk pe ACL metadata hai aur missing ACL = not indexed.
@@ -150,16 +152,25 @@ OmniGuard CP5 gate: ACL-filtered retrieval.
 - [ ] Main explain kar sakta hoon kyun "system prompt se chhupa do" security control nahi hai.
 
 ### Related
-- M06-08 Metadata filtering
-- M06-10 End-to-end basic retrieval
-- M11-12 Implementing read-only database roles
-- M12-06 Implementing Role-Based Access Control
-- M13-02 Prompt injection defenses
-- M14-15 Prompt caching strategies
-- M15-02 Defining data classifications
+- [M06-08](<../06 - Vector Search & Core RAG/08 - Metadata filtering.md>) Metadata filtering
+- [M06-10](<../06 - Vector Search & Core RAG/10 - End-to-end basic retrieval.md>) End-to-end basic retrieval
+- [M11-12](<../11 - Legacy Systems & Integrations/12 - Implementing read-only database roles.md>) Implementing read-only database roles
+- [M12-06](<06 - Implementing Role-Based Access Control.md>) Implementing Role-Based Access Control
+- [M13-02](<../13 - Production AI Security & Guardrails/02 - Prompt injection defenses.md>) Prompt injection defenses
+- [M14-15](<../14 - AI Observability & Gateway Management/15 - Prompt caching strategies.md>) Prompt caching strategies
+- [M15-02](<../15 - OmniGuard - Secure AI Integration/02 - Defining data classifications.md>) Defining data classifications
 
 ### Self-quiz
 1. Post-filter (top-k ke baad filter) mein do problems kya hain -- ek security, ek quality?
 2. CISO kehta hai "system prompt mein likh do confidential mat batana." Aap 2 line mein kya jawab doge?
 3. Answer cache add kiya aur ek intern ko HR data mila. Cache key mein kya missing tha?
 4. SharePoint mein ek doc ka access hata diya gaya. Aapke RAG system mein ye kab aur kaise reflect hoga?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 165 of 256** -- [Syllabus CP7](<../SYLLABUS.md#cp7>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 164: Implementing Role-Based Access Control](<06 - Implementing Role-Based Access Control.md>)
+- Next -> [step 166: Session and token lifecycle](<08 - Session and token lifecycle.md>)

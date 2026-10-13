@@ -2,7 +2,9 @@
 
 ## Unit testing fundamentals
 
-> Core | Fast CP2 / Slow CP2 | ~1.2 h | Builds on: M01-04, M02-02
+> **Core** | ~1.2 h | Slow: step 040/256, CP2 | Fast: CP2
+>
+> Before this: [M01-04 Exception handling](<../01 - Python & Linux Foundations/04 - Exception handling.md>), [M02-02 Pydantic data validation](<02 - Pydantic data validation.md>)
 
 ### Kahani
 Ek hospital customer ke liye aapki API LLM ko bhejne se pehle text se emails mask karti hai aur documents ko chunks mein todti hai.
@@ -15,14 +17,30 @@ Dono bugs ek 2-second unit test pakad leta. Ab customer har release se pehle "te
 Python mein standard tool **pytest** hai: `test_*.py` files mein `test_*` functions, aur plain `assert`. Jest se mapping: `test()/it()` -> `def test_...`, `expect(x).toBe(y)` -> `assert x == y`, `test.each` -> `@pytest.mark.parametrize`, `expect(fn).toThrow()` -> `pytest.raises`.
 
 ### Why it matters for an FDE
-Aap customer ke code mein jaldi-jaldi changes karte ho, aksar unke engineers ke saamne. Tests hi proof hain ki PII masking, validation aur business rules toote nahi -- aur CP2 gate pe coverage report (M02-13) inhi tests se banti hai.
+Aap customer ke code mein jaldi-jaldi changes karte ho, aksar unke engineers ke saamne. Tests hi proof hain ki PII masking, validation aur business rules toote nahi -- aur CP2 gate pe coverage report ([M02-13](<13 - Test coverage analysis.md>)) inhi tests se banti hai.
 
 ### Key concepts
 - **Arrange-Act-Assert** -- setup, ek action, phir check. Ek test = ek behaviour; naam se pata chale kya toota (`test_mask_handles_trailing_punctuation`).
 - **Plain `assert` + assertion rewriting** -- pytest `assert a == b` ko rewrite karke fail hone pe dono values ka diff dikhata hai; `assertEqual` jaise methods ki zaroorat nahi.
 - **`@pytest.mark.parametrize`** -- ek test, kai input/output rows; edge cases (empty, unicode, boundary) table mein add karna sasta ho jaata hai.
 - **`pytest.raises(ValueError, match=...)`** -- error path bhi behaviour hai; message regex se check karo.
-- **Test pyramid** -- bahut saare fast unit tests, kuch integration (TestClient + sqlite), bahut kam E2E (M02-17).
+- **Test pyramid** -- bahut saare fast unit tests, kuch integration (TestClient + sqlite), bahut kam E2E ([M02-17](<17 - End-to-end testing fundamentals.md>)).
+
+### Picture it
+Most tests are small, fast unit tests, and each one follows Arrange, Act, Assert.
+
+```mermaid
+flowchart TB
+    subgraph PYR["test pyramid"]
+        direction TB
+        E2E["E2E: few, slow, full stack"] --- INT["Integration: some, TestClient + sqlite"] --- UNIT["Unit: many, fast, no network, no real DB"]
+    end
+    subgraph ONE["one unit test"]
+        direction TB
+        A1["Arrange: build input"] --> A2["Act: call one function"] --> A3["Assert: plain assert, pytest shows the diff"]
+    end
+    UNIT --> ONE
+```
 
 ### Code example
 `pip install pytest`
@@ -111,13 +129,13 @@ print("OK: AAA, parametrize, raises, assertion rewriting")
 ### Mini-exercise (30-60 min)
 `omniguard` mein `tests/` folder setup karo (CP2 capstone ka test base).
 - `pyproject.toml` mein `[tool.pytest.ini_options]` -> `testpaths = ["tests"]`, `addopts = "-q"`.
-- `tests/test_schemas.py`: M02-02 ke `DocumentCreate` ke liye parametrize table -- 4 valid, 6 invalid inputs (extra field, short title, bad classification, wrong date order...), har invalid pe `pytest.raises(ValidationError)` aur `loc` check.
+- `tests/test_schemas.py`: [M02-02](<02 - Pydantic data validation.md>) ke `DocumentCreate` ke liye parametrize table -- 4 valid, 6 invalid inputs (extra field, short title, bad classification, wrong date order...), har invalid pe `pytest.raises(ValidationError)` aur `loc` check.
 - `tests/test_health.py`: `TestClient(app).get("/health")` -> 200 + `version` field.
 - `app/redact.py` mein `mask_emails` + `mask_phone` (Indian 10-digit) likho, pehle tests phir code (ek chhota TDD round).
 - Acceptance: `pytest` green, < 2 s, koi test network/env pe depend nahi karta; ek test jaan-boojh ke tod ke failure message padho, phir wapas theek karo.
 
 ### Common pitfalls
-- Tests jo ek dusre pe depend karte hain (module-level list mein state, order-dependent) -- alag order ya `-k` se chalane pe random fail. Har test apna data khud banaye (fixtures, M02-12).
+- Tests jo ek dusre pe depend karte hain (module-level list mein state, order-dependent) -- alag order ya `-k` se chalane pe random fail. Har test apna data khud banaye (fixtures, [M02-12](<12 - Fixtures and mocking.md>)).
 - Real LLM/HTTP call unit test mein -- slow, paid, flaky, aur CI mein API key leak ka risk. Fake/mock karo; real calls sirf alag marked integration suite mein.
 - Sirf happy path test karna -- PII masking jaise security code ke liye edge cases (punctuation, uppercase, unicode, empty) hi asli tests hain.
 
@@ -128,14 +146,23 @@ print("OK: AAA, parametrize, raises, assertion rewriting")
 - [ ] Production bug ko pehle failing test mein convert karta hoon, phir fix.
 
 ### Related
-- M02-12 Fixtures and mocking
-- M02-13 Test coverage analysis
-- M02-16 Contract testing
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
-- M04-09 Creating workflow YAML files
+- [M02-12](<12 - Fixtures and mocking.md>) Fixtures and mocking
+- [M02-13](<13 - Test coverage analysis.md>) Test coverage analysis
+- [M02-16](<16 - Contract testing.md>) Contract testing
+- [M13-05](<../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
+- [M04-09](<../04 - Containerization & CI-CD/09 - Creating workflow YAML files.md>) Creating workflow YAML files
 
 ### Self-quiz
 1. Unit test aur integration test mein fark kya hai? `TestClient` + in-memory sqlite wala test kis category mein aayega?
 2. `assert result == expected` fail hua -- pytest itna detailed diff kaise dikhata hai jabki ye plain Python `assert` hai?
 3. Chunking function ke liye exact output check karna behtar hai ya property check (jaise "koi text loss nahi")? Dono kab?
 4. Aapke test suite mein ek test kabhi pass kabhi fail hota hai. Teen possible causes batao.
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 040 of 256** -- [Syllabus CP2](<../SYLLABUS.md#cp2>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 039: Implementing URL-based vs Header-based API versioning](<10 - Implementing URL-based vs Header-based API versioning.md>)
+- Next -> [step 041: Fixtures and mocking](<12 - Fixtures and mocking.md>)

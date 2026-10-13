@@ -2,7 +2,9 @@
 
 ## Plan & Execute structures
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M09-02, M05-07, M05-09
+> **Core** | ~1.2 h | Slow: step 198/256, CP9 | Fast: CP7
+>
+> Before this: [M09-02 ReAct framework loops](<02 - ReAct framework loops.md>), [M05-07 Defining complex nested Pydantic models](<../05 - LLM Fundamentals & Prompting/07 - Defining complex nested Pydantic models.md>), [M05-09 Handling and retrying output parsing errors gracefully](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>)
 
 ### Kahani
 Ek bank ki internal audit team ka kaam: "S3 data retention policy ke against actual access logs check karo." ReAct agent se karwaya -- har step pe ek LLM call, 7 steps = 7 calls, aur beech mein model kabhi raasta bhool ke policy dobara fetch karta.
@@ -14,11 +16,11 @@ Plan & Execute isi ke liye hai: pehle ek reviewable plan, phir sasta execution, 
 **Plan & Execute** = (1) **planner** LLM ek structured plan deta hai (steps ki list), jise code **validate** karta hai; (2) **executor** steps ek-ek karke chalata hai (aksar bina LLM ke, ya chhote model se); (3) step fail ho to **replanner** sirf bache hue kaam ka naya plan deta hai. ReAct "har step pe socho", Plan & Execute "ek baar socho, phir karo".
 
 ### Why it matters for an FDE
-Regulated customers (bank, hospital) ko run se pehle plan approve karna hota hai (HITL, M10-04). Validated plan galat/khatarnak tools ko execution se pehle hi rok deta hai, aur LLM calls kam hone se cost predictable hoti hai.
+Regulated customers (bank, hospital) ko run se pehle plan approve karna hota hai (HITL, [M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>)). Validated plan galat/khatarnak tools ko execution se pehle hi rok deta hai, aur LLM calls kam hone se cost predictable hoti hai.
 
 ### Key concepts
 - **Plan as data** -- Pydantic `Plan(steps: list[Step])`; allowed tools `Literal[...]` se, max steps, unique ids -- validate before run.
-- **Retry with feedback** -- invalid plan pe validation error planner ko wapas (M05-09), limited attempts.
+- **Retry with feedback** -- invalid plan pe validation error planner ko wapas ([M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>)), limited attempts.
 - **Executor is mostly code** -- steps deterministic tools chalate hain; LLM calls sirf plan aur replan pe.
 - **Replan on failure** -- poora restart nahi; jo ho gaya wo results mein rehta hai, naya plan sirf remaining ka.
 - **vs ReAct** -- ReAct adaptive hai (har observation pe faisla); Plan & Execute sasta, auditable, lekin naye info pe tabhi badalta hai jab replan ho.
@@ -112,7 +114,7 @@ print("OK: validated plan, cheap execution, replan only the remaining work")
 ```
 
 - `Step.tool: Literal[...]` -- allow-list; planner ka `delete_bucket` validation pe hi reject, kabhi execute nahi hua.
-- `get_plan` -- invalid plan pe error message prompt mein jodke ek retry (M05-09); 2 baar fail = clear error.
+- `get_plan` -- invalid plan pe error message prompt mein jodke ek retry ([M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>)); 2 baar fail = clear error.
 - `executor` -- koi LLM call nahi; sirf plan ka next step. Failure `failed` mein, exception graph nahi todta.
 - `replanner` -- results rakhta hai, sirf "archive log + compare" ka naya plan; `replans < 1` replan ko bhi bound karta hai.
 - `llm.calls == 3` -- 4 tool steps ke liye; ReAct mein har step + final = 5+ calls, aur plan kabhi reviewable form mein nahi hota.
@@ -147,7 +149,7 @@ Structured output helper (`with_structured_output`) ka exact behaviour model/pro
 ### Mini-exercise (30-60 min)
 AuditMesh `auditmesh/graph/planner.py`: compliance request ("SOC 2 CC6.1 for vendor X") -> validated `AuditPlan`.
 - `Step` mein `tool: Literal[...]` (sirf read-only evidence tools), `depends_on: list[int]` jo sirf pehle ke ids ko point kare (validator).
-- Plan ko `docs/sample-plan.json` mein dump karo -- ye wahi cheez hai jo M10-04 mein human approve karega.
+- Plan ko `docs/sample-plan.json` mein dump karo -- ye wahi cheez hai jo [M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) mein human approve karega.
 - Acceptance: pytest -- (a) disallowed tool wala plan reject, (b) forward `depends_on` reject, (c) step 2 fail -> replan sirf remaining steps, (d) LLM call count assert.
 
 ### Common pitfalls
@@ -162,13 +164,22 @@ AuditMesh `auditmesh/graph/planner.py`: compliance request ("SOC 2 CC6.1 for ven
 - [ ] Replan ko bound karta hoon aur completed results nahi khota.
 
 ### Related
-- M09-02 ReAct framework loops
-- M05-09 Handling and retrying output parsing errors gracefully
-- M10-04 Requesting manual state approval
-- M09-11 Aggregating parallel outputs with map-reduce patterns
+- [M09-02](<02 - ReAct framework loops.md>) ReAct framework loops
+- [M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>) Handling and retrying output parsing errors gracefully
+- [M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>) Requesting manual state approval
+- [M09-11](<11 - Aggregating parallel outputs with map-reduce patterns.md>) Aggregating parallel outputs with map-reduce patterns
 
 ### Self-quiz
 1. Plan & Execute ReAct se sasta kyun hai? Kis situation mein ReAct better rahega?
 2. Planner ne `delete_bucket` step diya. Aapke code mein ye kahan aur kaise rukta hai?
 3. Replanner ko poore plan ki jagah sirf remaining steps kyun plan karne chahiye?
 4. Customer ka auditor run se pehle plan dekhna chahta hai. Is architecture mein wo hook kahan lagega?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 198 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 197: ReAct framework loops](<02 - ReAct framework loops.md>)
+- Next -> [step 199: Supervisor and Router patterns](<04 - Supervisor and Router patterns.md>)

@@ -2,7 +2,11 @@
 
 ## Finalizing Dockerized FastAPI cloud deployments
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M04-04, M04-12, M04-13, M15-06, M15-07, M15-08
+> **Core** | ~1.2 h | Slow: step 193/256, CP8 | Fast: CP6
+>
+> Before this: [M04-04 Containerizing FastAPI backends](<../04 - Containerization & CI-CD/04 - Containerizing FastAPI backends.md>), [M04-12 Continuous deployment to AWS](<../04 - Containerization & CI-CD/12 - Continuous deployment to AWS.md>), [M04-13 Health and readiness checks](<../04 - Containerization & CI-CD/13 - Health and readiness checks.md>), [M15-06 Executing mock OAuth 2.0  and  RBAC flows](<06 - Executing mock OAuth 2.0  and  RBAC flows.md>), [M15-07 Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases](<07 - Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases.md>), [M15-08 Implementing NeMo & Presidio guardrails](<08 - Implementing NeMo & Presidio guardrails.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Dockerized FastAPI deployment on cloud](<../Projects/Project 1 - OmniGuard - Secure AI Integration/07 - Dockerized FastAPI deployment on cloud.md>) (in `Projects/`).
 
 ### Kahani
 UAT ka go/no-go meeting kal hai. Aaj raat CI ne `main` ko AWS pe deploy kiya, health check green.
@@ -11,18 +15,18 @@ Health check green tha -- par "chal raha hai" aur "production-ready hai" alag ch
 Aur yahi aapke CP6 gate ka last step hai: v1.0 tag, demo video, aur docs repo mein.
 
 ### What it is
-**Deployment finalization** = Docker image (M04-04) ko hardened config ke saath deploy karna (M04-12) aur har deploy ke baad **smoke tests** chalana: liveness/readiness (M04-13), security headers, debug/docs off, safe errors, auth on.
+**Deployment finalization** = Docker image ([M04-04](<../04 - Containerization & CI-CD/04 - Containerizing FastAPI backends.md>)) ko hardened config ke saath deploy karna ([M04-12](<../04 - Containerization & CI-CD/12 - Continuous deployment to AWS.md>)) aur har deploy ke baad **smoke tests** chalana: liveness/readiness ([M04-13](<../04 - Containerization & CI-CD/13 - Health and readiness checks.md>)), security headers, debug/docs off, safe errors, auth on.
 Runnable block ek **deployment smoke harness** hai -- stand-in app pe yahan chalta hai, aur `OMNIGUARD_BASE_URL` set karke aapke live URL pe.
 
 ### Why it matters for an FDE
 Customer ka security team pehle din hi scan karta hai. Ek open `/docs` ya stack trace aapke poore guardrail kaam ki credibility gira deta hai -- aur usually Sev1 ban jaata hai.
 
 ### Key concepts
-- **Liveness vs readiness** -- `/healthz` = process zinda; `/readyz` = dependencies (DB replica, index, LLM gateway) reachable. Load balancer readiness pe route karta hai (M04-13).
+- **Liveness vs readiness** -- `/healthz` = process zinda; `/readyz` = dependencies (DB replica, index, LLM gateway) reachable. Load balancer readiness pe route karta hai ([M04-13](<../04 - Containerization & CI-CD/13 - Health and readiness checks.md>)).
 - **Prod config is different** -- `docs_url=None`, `openapi_url=None`, debug off, auth mandatory; ye env se aaye (`APP_ENV=prod`), code branch se nahi.
 - **Security headers** -- `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Strict-Transport-Security`; cheap, aur scanners sabse pehle yahi dekhte hain.
-- **Safe errors** -- client ko generic message + request id; stack trace sirf server logs mein (bina PII, M13-14).
-- **Image hygiene** -- pinned base tag, non-root `USER`, no `--reload`, secrets env/secret manager se, image mein nahi (M04-11).
+- **Safe errors** -- client ko generic message + request id; stack trace sirf server logs mein (bina PII, [M13-14](<../13 - Production AI Security & Guardrails/14 - Safe logging (never log PII or prompts).md>)).
+- **Image hygiene** -- pinned base tag, non-root `USER`, no `--reload`, secrets env/secret manager se, image mein nahi ([M04-11](<../04 - Containerization & CI-CD/11 - Managing GitHub secrets.md>)).
 
 Deployed architecture:
 ```text
@@ -111,7 +115,7 @@ print("OK: deployment smoke harness + Dockerfile lint")
 - `standin_app(prod=False)` -- dev config pe harness `/docs`, `/openapi.json` aur `/redoc` teeno pakadta hai (FastAPI teeno default on rakhta hai). Prod/dev ka fark env se aana chahiye.
 - `lint_dockerfile` -- `OMNIGUARD_DOCKERFILE=Dockerfile` se aapki real file; bad example pe chaaron rules fail.
 
-Post-deploy smoke step (CI ke deploy job ke baad, M04-12):
+Post-deploy smoke step (CI ke deploy job ke baad, [M04-12](<../04 - Containerization & CI-CD/12 - Continuous deployment to AWS.md>)):
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -125,9 +129,9 @@ OMNIGUARD_BASE_URL="$OMNIGUARD_BASE_URL" python tests/acceptance/smoke.py
 
 ### Mini-exercise (30-60 min)
 OmniGuard deliverable #7 + **CP6 gate**: `omniguard/tests/acceptance/smoke.py` + post-deploy CI step + release.
-- Smoke harness ko apne live URL pe chalao; fail pe deploy job red ho (rollback M04-12 se).
-- Saare acceptance harnesses (M15-06 auth, M15-07 RAG/SQL, M15-08 guardrails, M15-09 smoke) ek command se: `pytest tests/acceptance -q`.
-- `omniguard/docs/` mein: `discovery.md`, `data-classification.md`, `SOW.md`, `ROI.md`, `UAT-runbook.md` + filled UAT results (M15-01..05).
+- Smoke harness ko apne live URL pe chalao; fail pe deploy job red ho (rollback [M04-12](<../04 - Containerization & CI-CD/12 - Continuous deployment to AWS.md>) se).
+- Saare acceptance harnesses ([M15-06](<06 - Executing mock OAuth 2.0  and  RBAC flows.md>) auth, [M15-07](<07 - Constructing Hybrid RAG alongside secure Text-to-SQL for MS SQL databases.md>) RAG/SQL, [M15-08](<08 - Implementing NeMo & Presidio guardrails.md>) guardrails, M15-09 smoke) ek command se: `pytest tests/acceptance -q`.
+- `omniguard/docs/` mein: `discovery.md`, `data-classification.md`, `SOW.md`, `ROI.md`, `UAT-runbook.md` + filled UAT results ([M15-01](<01 - Conducting technical discovery and scoping workshops.md>)..05).
 - Release: `git tag -a v1.0 -m "OmniGuard v1.0"` aur `git push origin v1.0`; GitHub release notes mein harness results.
 - 5-min demo video (English -- public material is English, MASTER_PLAN section 8). Script outline:
   1. 0:00-0:30 -- problem: Kavach (fictional) claims analysts, 2-day answers, CISO constraints.
@@ -150,15 +154,25 @@ OmniGuard deliverable #7 + **CP6 gate**: `omniguard/tests/acceptance/smoke.py` +
 - [ ] 5-min demo video recorded (English) aur README mein link.
 
 ### Related
-- M04-04 Containerizing FastAPI backends
-- M04-12 Continuous deployment to AWS
-- M04-13 Health and readiness checks
-- M15-05 Delivering User Acceptance Testing (UAT) runbooks
-- M15-06 Executing mock OAuth 2.0 / RBAC flows
-- M15-08 Implementing NeMo & Presidio guardrails
+- [M04-04](<../04 - Containerization & CI-CD/04 - Containerizing FastAPI backends.md>) Containerizing FastAPI backends
+- [M04-12](<../04 - Containerization & CI-CD/12 - Continuous deployment to AWS.md>) Continuous deployment to AWS
+- [M04-13](<../04 - Containerization & CI-CD/13 - Health and readiness checks.md>) Health and readiness checks
+- [M15-05](<05 - Delivering User Acceptance Testing (UAT) runbooks.md>) Delivering User Acceptance Testing (UAT) runbooks
+- [M15-06](<06 - Executing mock OAuth 2.0  and  RBAC flows.md>) Executing mock OAuth 2.0 / RBAC flows
+- [M15-08](<08 - Implementing NeMo & Presidio guardrails.md>) Implementing NeMo & Presidio guardrails
 
 ### Self-quiz
 1. `/healthz` 200 de raha hai par `/readyz` 503. Load balancer kya karega aur kyun ye sahi behaviour hai?
 2. Prod mein `/docs` khula rehne ka actual risk kya hai, jab endpoints auth ke peeche hain?
 3. Bad JSON pe 422 aur 500 mein se kaunsa acceptable hai, aur 500 ke saath kya leak ho sakta hai?
 4. Demo video ke 5 minute mein business section kyun rakha? FDE interview mein iska kya signal jaata hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 193 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 192: Implementing NeMo & Presidio guardrails](<08 - Implementing NeMo & Presidio guardrails.md>)
+- Next -> step 194 BUILD: OmniGuard v1.0: Presidio + NeMo guardrails wired in, consulting docs in /docs -- see [syllabus](<../SYLLABUS.md#cp8>)
+- then lesson: [step 196: Defining agency](<../09 - Agentic Frameworks & LangGraph/01 - Defining agency.md>)

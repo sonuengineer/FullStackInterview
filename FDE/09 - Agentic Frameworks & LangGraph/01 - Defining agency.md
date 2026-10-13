@@ -2,7 +2,9 @@
 
 ## Defining agency
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M05-14, M05-15
+> **Core** | ~1.2 h | Slow: step 196/256, CP9 | Fast: CP7
+>
+> Before this: [M05-14 Processing tool results into chat history](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>), [M05-15 Managing hallucinated tool calls](<../05 - LLM Fundamentals & Prompting/15 - Managing hallucinated tool calls.md>)
 
 ### Kahani
 Ek logistics customer ka CFO bola: "Humein invoice exceptions ke liye ek AI **agent** chahiye." Team ne autonomous agent banaya -- LLM khud decide karta tha kaunsa tool, kitni baar.
@@ -19,7 +21,7 @@ Customer "agent" bolta hai, lekin unhe chahiye reliable outcome aur fixed bill. 
 ### Key concepts
 - **Single call** -- ek prompt, ek answer (summarise, extract); sabse sasta, sabse predictable.
 - **Workflow** -- steps code mein fixed, LLM sirf steps ke andar; testable, cost bounded.
-- **Router** -- LLM ek baar classify karke branch chunta hai; branches fixed (M09-04).
+- **Router** -- LLM ek baar classify karke branch chunta hai; branches fixed ([M09-04](<04 - Supervisor and Router patterns.md>)).
 - **Autonomous agent** -- LLM loop: tool chuno, result dekho, phir chuno, khud "done" bolo; tab use karo jab steps pehle se pata hi na hon.
 - **When NOT to build an agent** -- steps fixed hain, latency SLA tight hai, galti ki keemat badi hai (payments, deletes), ya audit trail chahiye -- workflow chuno, agency sirf jahan zaroori.
 
@@ -112,8 +114,8 @@ print("OK: same task, workflow is cheaper and bounded; agent needs guards")
 
 - `workflow()` -- edges fixed: classify -> lookup -> draft. Exactly 2 LLM calls, har invoice pe.
 - `agent()` -- `think` node LLM se poochta hai "tool ya answer?", router `act` ya `END` chunta hai. Steps ki ginti LLM decide karta hai -- yahan usne PO do baar lookup kiya.
-- Tokens -- agent har turn pe poori `history` bhejta hai, isliye tokens turn ke saath badhte hain (M05-04).
-- `looping` -- model kabhi "done" nahi bolta; sirf recursion limit ne roka, tab tak 4 calls jal chuki. Agent = guards zaroori (M10-05).
+- Tokens -- agent har turn pe poori `history` bhejta hai, isliye tokens turn ke saath badhte hain ([M05-04](<../05 - LLM Fundamentals & Prompting/04 - Sliding window techniques.md>)).
+- `looping` -- model kabhi "done" nahi bolta; sirf recursion limit ne roka, tab tak 4 calls jal chuki. Agent = guards zaroori ([M10-05](<../10 - Advanced Agent Orchestration/05 - Detecting infinite ReAct loops.md>)).
 - Dono ka answer same -- yahi point hai: jab steps fixed hain, agency sirf cost aur risk badhati hai.
 
 ```python
@@ -139,7 +141,7 @@ graph = builder.compile()
 out = graph.invoke({"po": "PO-881", "history": []}, config={"recursion_limit": 10})
 ```
 
-Agent version (tool-calling loop) M09-02 mein; LangGraph ke prebuilt agent helpers ka naam/location versions mein badla hai -- check the docs for your langgraph version.
+Agent version (tool-calling loop) [M09-02](<02 - ReAct framework loops.md>) mein; LangGraph ke prebuilt agent helpers ka naam/location versions mein badla hai -- check the docs for your langgraph version.
 
 ### Mini-exercise (30-60 min)
 AuditMesh ke liye ek `docs/agency-decision.md` + `auditmesh/graph/README.md` likho (apne repo mein).
@@ -149,8 +151,8 @@ AuditMesh ke liye ek `docs/agency-decision.md` + `auditmesh/graph/README.md` lik
 
 ### Common pitfalls
 - "Agent" by default -- fixed process ke liye bhi; 3-5x cost aur flaky latency bina fayde ke.
-- Agent ko irreversible tools (refund, delete, ticket close) bina human approval ke dena -- cost of error unbounded (M10-04).
-- Cost/latency ka estimate sirf happy path pe -- loop aur retries ke worst case ko SLA mein count karo (M16-03).
+- Agent ko irreversible tools (refund, delete, ticket close) bina human approval ke dena -- cost of error unbounded ([M10-04](<../10 - Advanced Agent Orchestration/04 - Requesting manual state approval.md>)).
+- Cost/latency ka estimate sirf happy path pe -- loop aur retries ke worst case ko SLA mein count karo ([M16-03](<../16 - AuditMesh - Multi-Agent Compliance System/03 - Drafting latency and cost SLAs.md>)).
 
 ### Checklist before moving on
 - [ ] Agency spectrum ke 4 levels ek-ek example ke saath bata sakta hoon.
@@ -159,13 +161,22 @@ AuditMesh ke liye ek `docs/agency-decision.md` + `auditmesh/graph/README.md` lik
 - [ ] Har agent loop ke liye limit aur stop condition rakhta hoon.
 
 ### Related
-- M05-14 Processing tool results into chat history
-- M09-02 ReAct framework loops
-- M09-04 Supervisor and Router patterns
-- M16-03 Drafting latency and cost SLAs
+- [M05-14](<../05 - LLM Fundamentals & Prompting/14 - Processing tool results into chat history.md>) Processing tool results into chat history
+- [M09-02](<02 - ReAct framework loops.md>) ReAct framework loops
+- [M09-04](<04 - Supervisor and Router patterns.md>) Supervisor and Router patterns
+- [M16-03](<../16 - AuditMesh - Multi-Agent Compliance System/03 - Drafting latency and cost SLAs.md>) Drafting latency and cost SLAs
 
 ### Self-quiz
 1. Customer bolta hai "agent chahiye". Kaunse 3 sawal poochke aap decide karoge ki workflow kaafi hai?
 2. Router aur autonomous agent mein exact farak kya hai -- control flow kaun decide karta hai?
 3. Agent ke tokens har turn pe kyun badhte hain, workflow ke kyun nahi?
 4. Ek kaam ka example do jahan agent sach mein zaroori hai, aur bataao kyun.
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 196 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: step 195 GATE: Gate: OmniGuard v1.0 tag + 5-min demo video + SOW/ROI/UAT docs (link release) -- see [syllabus](<../SYLLABUS.md#cp8>)
+- Next -> [step 197: ReAct framework loops](<02 - ReAct framework loops.md>)

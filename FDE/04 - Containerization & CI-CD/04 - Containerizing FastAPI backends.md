@@ -2,7 +2,9 @@
 
 ## Containerizing FastAPI backends
 
-> Core | Fast CP4 / Slow CP6 | ~1.2 h | Builds on: M04-01, M02-03, M01-13, M01-15
+> **Core** | ~1.2 h | Slow: step 120/256, CP6 | Fast: CP4
+>
+> Before this: [M04-01 Writing optimized Dockerfiles](<01 - Writing optimized Dockerfiles.md>), [M02-03 Dependency injection](<../02 - Modern API Development/03 - Dependency injection.md>), [M01-13 Process monitoring](<../01 - Python & Linux Foundations/13 - Process monitoring.md>), [M01-15 Environment variable configurations](<../01 - Python & Linux Foundations/15 - Environment variable configurations.md>)
 
 ### Kahani
 SaaS customer pe OmniGuard ECS pe live hai. Har deploy pe 20-30 users ko `502` milta hai, aur har deploy exactly 30 second extra leta hai.
@@ -10,7 +12,7 @@ Investigation: Dockerfile mein `CMD uvicorn app.main:app` (shell form). PID 1 `/
 Upar se `/health` endpoint har call pe LLM gateway ko ping karta tha -- gateway slow hua to ECS ne healthy containers bhi maar diye.
 
 ### What it is
-**Containerizing FastAPI** = app ko aisa banana ki container platform usse sahi chala sake: config env vars se (M01-15), ASGI server (uvicorn) exec form mein PID 1, `lifespan` mein startup/shutdown resources, aur do alag probes -- `/healthz` (liveness) aur `/readyz` (readiness).
+**Containerizing FastAPI** = app ko aisa banana ki container platform usse sahi chala sake: config env vars se ([M01-15](<../01 - Python & Linux Foundations/15 - Environment variable configurations.md>)), ASGI server (uvicorn) exec form mein PID 1, `lifespan` mein startup/shutdown resources, aur do alag probes -- `/healthz` (liveness) aur `/readyz` (readiness).
 
 ### Why it matters for an FDE
 Customer ka platform (ECS, Kubernetes, App Runner) sirf signals aur health endpoints se baat karta hai. Ye galat ho to har deploy pe errors aur random restarts -- aur blame aapki app pe aata hai.
@@ -101,7 +103,7 @@ assert is_exec_form('CMD ["uvicorn", "app.main:app"]') and not is_exec_form("CMD
 print("OK: liveness vs readiness, lifespan startup/shutdown, exec-form CMD")
 ```
 
-- `create_app(...)` factory -- tests aur prod dono same code; dependencies inject hoti hain (M02-03).
+- `create_app(...)` factory -- tests aur prod dono same code; dependencies inject hoti hain ([M02-03](<../02 - Modern API Development/03 - Dependency injection.md>)).
 - `with TestClient(app)` -- lifespan startup/shutdown chalata hai; bina `with` ke lifespan run nahi hota.
 - LLM gateway down -> `/readyz` 503 par `/healthz` 200: LB traffic hatata hai, container restart nahi hota.
 - Shutdown mein pehle `draining = True`, phir connections close -- graceful shutdown ka order yahi hai.
@@ -111,10 +113,10 @@ Runtime ke do common options:
 
 ```dockerfile
 # Option A (default): one uvicorn process per container, scale with more tasks
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "20"]
+CMD ["uvicorn", "omniguard.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "20"]
 
 # Option B: gunicorn as process manager (uvicorn worker class; package name differs by version -- check the uvicorn docs)
-# CMD ["gunicorn", "app.main:app", "-k", "uvicorn_worker.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000", "--graceful-timeout", "20"]
+# CMD ["gunicorn", "omniguard.main:app", "-k", "uvicorn_worker.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000", "--graceful-timeout", "20"]
 ```
 
 ```bash
@@ -128,7 +130,7 @@ docker logs og | tail -n 5
 ```
 
 ### Mini-exercise (30-60 min)
-OmniGuard `app/main.py`:
+OmniGuard `omniguard/main.py`:
 - `create_app()` factory + `lifespan` (DB pool, `httpx.AsyncClient` with timeout for the LLM gateway; dono shutdown pe close).
 - `/healthz` aur `/readyz` (DB `SELECT 1` + gateway ping, `503` on failure, `draining` flag).
 - `tests/test_health.py` -- TestClient se: normal 200, gateway down 503, healthz still 200, lifespan shutdown hook chala.
@@ -146,14 +148,23 @@ OmniGuard `app/main.py`:
 - [ ] Saara config env vars se, image mein koi environment-specific value nahi.
 
 ### Related
-- M04-01 Writing optimized Dockerfiles
-- M04-13 Health and readiness checks
-- M04-06 Configuring task definitions
-- M02-03 Dependency injection
-- M01-13 Process monitoring
+- [M04-01](<01 - Writing optimized Dockerfiles.md>) Writing optimized Dockerfiles
+- [M04-13](<13 - Health and readiness checks.md>) Health and readiness checks
+- [M04-06](<06 - Configuring task definitions.md>) Configuring task definitions
+- [M02-03](<../02 - Modern API Development/03 - Dependency injection.md>) Dependency injection
+- [M01-13](<../01 - Python & Linux Foundations/13 - Process monitoring.md>) Process monitoring
 
 ### Self-quiz
 1. Shell-form `CMD` se deploy pe 502 kyun aate hain? PID 1 aur SIGTERM se explain karo.
 2. LLM gateway 5 minute down hai. `/healthz` aur `/readyz` kya return karein, aur platform kya karega?
 3. Shutdown pe `draining = True` pehle aur DB close baad mein -- order ulta ho to kya hoga?
 4. Ek container mein 4 gunicorn workers vs 4 ECS tasks with 1 worker -- trade-off kya hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 120 of 256** -- [Syllabus CP6](<../SYLLABUS.md#cp6>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 119: Volume mounting and networking](<03 - Volume mounting and networking.md>)
+- Next -> [step 121: Serverless container concepts](<05 - Serverless container concepts.md>)

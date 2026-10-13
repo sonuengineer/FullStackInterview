@@ -2,12 +2,14 @@
 
 ## Detecting infinite ReAct loops
 
-> Core | Fast CP7 / Slow CP9 | ~1.2 h | Builds on: M09-02, M05-15
+> **Core** | ~1.2 h | Slow: step 212/256, CP9 | Fast: CP7
+>
+> Before this: [M09-02 ReAct framework loops](<../09 - Agentic Frameworks & LangGraph/02 - ReAct framework loops.md>), [M05-15 Managing hallucinated tool calls](<../05 - LLM Fundamentals & Prompting/15 - Managing hallucinated tool calls.md>)
 
 ### Kahani
 Ek hospital ka scheduling agent: "Dr. Rao ka next free slot dhundo". Calendar API ne `503` diya. Agent ne socha "retry karta hoon" -- phir `search_slots("Dr Rao")`, phir `search_slots("dr. rao")`, phir `search_slots("Rao, Dr")`...
 Weekend pe kisi ne nahi dekha. Monday ko bill aaya: ek hi conversation ne 2,100 LLM calls aur Rs 38,000 ke tokens jala diye. Logs mein har step "reasonable" lag raha tha -- bas kuch aage nahi badh raha tha.
-M05-15 mein humne exact duplicate calls pakde the. Yahan model har baar thoda alag query bana raha tha, isliye wo guard bach nikla.
+[M05-15](<../05 - LLM Fundamentals & Prompting/15 - Managing hallucinated tool calls.md>) mein humne exact duplicate calls pakde the. Yahan model har baar thoda alag query bana raha tha, isliye wo guard bach nikla.
 
 ### What it is
 **ReAct loop detection** = agent loop ke around guards jo pakadte hain ki agent progress nahi kar raha: hard **step/recursion limit**, normalized **(tool, args) fingerprint** repeat, **no-progress** (naya information nahi aa raha), aur **token/cost budget**. Trip hone pe agent ko rok ke **escalate** karo -- human, fallback answer, ya ticket.
@@ -21,7 +23,7 @@ Infinite loop = cost spike + hung request + customer ka "agent atak gaya". Custo
 - **Normalized fingerprint** -- args ko lowercase, punctuation-strip, sort karke hash; "Dr Rao" aur "dr. rao" same fingerprint.
 - **No-progress detection** -- observation hash pichhle N steps mein badla hi nahi (same error, same empty result) -> stuck.
 - **Budget** -- per-run tokens aur cost cap; model price env/config se, hardcode nahi.
-- **Escalation** -- reason code (`max_steps`, `repeat_call`, `no_progress`, `budget`) ke saath stop; metric + alert (M14-12).
+- **Escalation** -- reason code (`max_steps`, `repeat_call`, `no_progress`, `budget`) ke saath stop; metric + alert ([M14-12](<../14 - AI Observability & Gateway Management/12 - Debugging multi-step agent reasoning and tool inputs.md>)).
 
 ### Code example
 `stdlib only`
@@ -94,7 +96,7 @@ print("OK: four loop shapes caught, healthy run passes")
 - `fingerprint` -- punctuation/case hata ke words sort; model ke "creative" re-phrasings ek hi bucket mein.
 - `obs` deque -- last 3 observations same (`calendar 503`) = no progress, chahe call args alag hon.
 - `r2` har call alag aur observation bhi alag -- sirf `max_steps` pakadta hai. Isliye hard cap hamesha chahiye.
-- `r3` sirf 3 steps, lekin 27k tokens -- budget guard; real mein `usage.input_tokens + output_tokens` (M14-11) se gino.
+- `r3` sirf 3 steps, lekin 27k tokens -- budget guard; real mein `usage.input_tokens + output_tokens` ([M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>)) se gino.
 - `r4` -- guards healthy run ko nahi chhedte; thresholds ko apne eval traces se tune karo, guess se nahi.
 
 ```python
@@ -112,7 +114,7 @@ Custom guards (fingerprint, no-progress, budget) ko ek conditional edge ke andar
 
 ### Mini-exercise (30-60 min)
 CP7 AuditMesh: `auditmesh/guards.py` banao aur supervisor graph ke har tool step ke baad chalao.
-- `LoopGuard` with config from env (`AUDITMESH_MAX_STEPS`, `AUDITMESH_MAX_TOKENS`); stop pe `escalate` node jo ek approval-style record (M10-04) banaye with reason.
+- `LoopGuard` with config from env (`AUDITMESH_MAX_STEPS`, `AUDITMESH_MAX_TOKENS`); stop pe `escalate` node jo ek approval-style record ([M10-04](<04 - Requesting manual state approval.md>)) banaye with reason.
 - `evals/loop_cases.jsonl`: 8 scripted runs (exact repeat, rephrased repeat, same error 3x, varied-but-endless, token blowup, 3 healthy).
 - Acceptance: pytest -- har case ka expected reason; healthy runs ka `status == "ok"`; koi run 12 steps se zyada nahi.
 
@@ -128,14 +130,23 @@ CP7 AuditMesh: `auditmesh/guards.py` banao aur supervisor graph ke har tool step
 - [ ] Healthy runs guard se affect nahi hote (test hai).
 
 ### Related
-- M09-02 ReAct framework loops
-- M05-15 Managing hallucinated tool calls
-- M10-06 Self-correction prompting mechanisms
-- M14-11 Monitoring granular token costs and endpoint latency
-- M14-12 Debugging multi-step agent reasoning and tool inputs
+- [M09-02](<../09 - Agentic Frameworks & LangGraph/02 - ReAct framework loops.md>) ReAct framework loops
+- [M05-15](<../05 - LLM Fundamentals & Prompting/15 - Managing hallucinated tool calls.md>) Managing hallucinated tool calls
+- [M10-06](<06 - Self-correction prompting mechanisms.md>) Self-correction prompting mechanisms
+- [M14-11](<../14 - AI Observability & Gateway Management/11 - Monitoring granular token costs and endpoint latency.md>) Monitoring granular token costs and endpoint latency
+- [M14-12](<../14 - AI Observability & Gateway Management/12 - Debugging multi-step agent reasoning and tool inputs.md>) Debugging multi-step agent reasoning and tool inputs
 
 ### Self-quiz
 1. Model har baar alag doctor ka naam search kar raha hai (legit). Kaunsa guard galat trip kar sakta hai aur kaise bachoge?
 2. No-progress window 3 hai. Upstream API flaky hai (har 2nd call 503). Kya guard trip karega? Kya karna chahiye?
 3. Loop guard tool layer pe ho ya graph routing pe -- dono ke fayde batao.
 4. Budget trip hone pe user ko kya message jaana chahiye, aur on-call ko kya data?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 212 of 256** -- [Syllabus CP9](<../SYLLABUS.md#cp9>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 211: Requesting manual state approval](<04 - Requesting manual state approval.md>)
+- Next -> [step 213: Self-correction prompting mechanisms](<06 - Self-correction prompting mechanisms.md>)

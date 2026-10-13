@@ -2,7 +2,11 @@
 
 ## Leading operations and training handoffs
 
-> Core | Fast CP8 / Slow CP10 | ~1.2 h | Builds on: M16-03, M16-04, M15-05
+> **Core** | ~1.2 h | Slow: step 238/256, CP10 | Fast: CP8
+>
+> Before this: [M16-03 Drafting latency and cost SLAs](<03 - Drafting latency and cost SLAs.md>), [M16-04 Defining Model Context Protocol trust boundaries](<04 - Defining Model Context Protocol trust boundaries.md>), [M15-05 Delivering User Acceptance Testing (UAT) runbooks](<../15 - OmniGuard - Secure AI Integration/05 - Delivering User Acceptance Testing (UAT) runbooks.md>)
+>
+> **LEARN lesson.** You learn the skill here. What you ship with it: [Operational handoffs](<../Projects/Project 2 - AuditMesh - Multi-Agent Compliance System/07 - Operational handoffs.md>) (in `Projects/`).
 
 ### Kahani
 AuditMesh UAT pass ho gaya. Aapka engagement 3 hafte mein khatam hai, phir aap agle customer pe.
@@ -18,7 +22,7 @@ Handoff ek event nahi, ek **shadow period** hai: pehle aap lead, customer shadow
 FDE ka kaam "deploy" pe khatam nahi hota -- system tab successful hai jab aapke jaane ke baad bhi chale. Bura handoff = aapka next project bhi purane customer ke escalations mein doob jaata hai.
 
 ### Key concepts
-- **Runbook per alert** -- har alert ka link ek runbook pe: symptom, first 3 checks, safe action (e.g. checkpoint se rerun, M10-01), escalation.
+- **Runbook per alert** -- har alert ka link ek runbook pe: symptom, first 3 checks, safe action (e.g. checkpoint se rerun, [M10-01](<../10 - Advanced Agent Orchestration/01 - Check-pointing graph states.md>)), escalation.
 - **RACI** -- har activity: R (karta hai), A (accountable, exactly ek), C (consulted), I (informed). Do A = koi A nahi.
 - **On-call rota** -- primary + secondary, alag log, dono trained; FDE sirf shadow weeks mein secondary.
 - **Training plan by role** -- reviewer (approval UI, reject with reason), ops (dashboards, runbooks), admin (thresholds, access). Har session ke end pe hands-on exercise.
@@ -105,14 +109,14 @@ print("OK: handoff-readiness validator")
 ```
 
 - Poora handoff package ek YAML hai -- doc aur check ek hi source se; Confluence page isi se generate kar sakte ho.
-- Dashboard check SLOs (M16-03) se cross-reference karta hai -- "SLO hai par koi dekh nahi raha" pakda jaata hai.
+- Dashboard check SLOs ([M16-03](<03 - Drafting latency and cost SLAs.md>)) se cross-reference karta hai -- "SLO hai par koi dekh nahi raha" pakda jaata hai.
 - RACI rule: `A` ek string hona chahiye; list = do accountable = jhagde ke time koi nahi.
 - On-call check training se jodta hai -- untrained insaan on-call pe = runbook bekaar.
 - `shadow_incidents_handled_by_customer` -- exit criteria number mein; "lagta hai woh ready hain" nahi.
 
 ### Mini-exercise (30-60 min)
 AuditMesh deliverable "operational handoffs": `auditmesh/docs/handoff/` mein `handoff.yaml`, `runbooks.md`, `training-plan.md`, `raci.md`.
-- Apne real alerts (M16-08 dashboards se) ke liye 3 runbooks likho; har ek ko ek game day mein khud follow karke time karo.
+- Apne real alerts ([M16-08](<08 - Building comprehensive token cost and trace dashboards.md>) dashboards se) ke liye 3 runbooks likho; har ek ko ek game day mein khud follow karke time karo.
 - Validator ko CI mein `handoff.yaml` pe chalao; ek extra check add karo: har runbook step 15 words se kam aur ek command/link ke saath.
 - 15-min training video script (English) reviewers ke liye: approve, reject with reason, "cannot approve own request" dikhana.
 - Acceptance: validator 0 gaps; broken copy pe saare gaps; RACI Meera aur Anil ke naam ke saath (fictional), sign-off line ke saath.
@@ -129,14 +133,23 @@ AuditMesh deliverable "operational handoffs": `auditmesh/docs/handoff/` mein `ha
 - [ ] Mera validator complete package pe pass aur broken pe fail hota hai.
 
 ### Related
-- M15-05 Delivering User Acceptance Testing (UAT) runbooks
-- M10-01 Check-pointing graph states
-- M16-03 Drafting latency/cost SLAs
-- M16-08 Building comprehensive token cost/trace dashboards
-- M16-09 Creating Streamlit/Gradio UIs for human approval workflows
+- [M15-05](<../15 - OmniGuard - Secure AI Integration/05 - Delivering User Acceptance Testing (UAT) runbooks.md>) Delivering User Acceptance Testing (UAT) runbooks
+- [M10-01](<../10 - Advanced Agent Orchestration/01 - Check-pointing graph states.md>) Check-pointing graph states
+- [M16-03](<03 - Drafting latency and cost SLAs.md>) Drafting latency/cost SLAs
+- [M16-08](<08 - Building comprehensive token cost and trace dashboards.md>) Building comprehensive token cost/trace dashboards
+- [M16-09](<09 - Creating Streamlit and Gradio UIs for human approval workflows.md>) Creating Streamlit/Gradio UIs for human approval workflows
 
 ### Self-quiz
 1. RACI mein do log "A" hain -- incident ke time practically kya hota hai?
 2. Runbook RB-01 "rerun from checkpoint" kehta hai. Iske liye system mein pehle se kya hona zaroori hai?
 3. Meera kehti hai "training ho gayi, slides bhej di." Aap kaise prove karoge ki team ready hai?
 4. Aapke jaane ke 2 hafte baad cost spike alert aaya. Ideal handoff mein kaun kya karega?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 238 of 256** -- [Syllabus CP10](<../SYLLABUS.md#cp10>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 237: Defining Model Context Protocol trust boundaries](<04 - Defining Model Context Protocol trust boundaries.md>)
+- Next -> [step 239: Developing a LangGraph Multi-Agent Supervisor](<06 - Developing a LangGraph Multi-Agent Supervisor.md>)

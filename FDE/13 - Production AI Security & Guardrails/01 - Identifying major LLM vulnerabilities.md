@@ -2,7 +2,9 @@
 
 ## Identifying major LLM vulnerabilities
 
-> Core | Fast CP6 / Slow CP8 | ~1.2 h | Builds on: M12-06, M12-07, M10-09, M05-15
+> **Core** | ~1.2 h | Slow: step 171/256, CP8 | Fast: CP6
+>
+> Before this: [M12-06 Implementing Role-Based Access Control](<../12 - Identity & Access Management/06 - Implementing Role-Based Access Control.md>), [M12-07 Enforcing data-level permissions in retrieval layers](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>), [M10-09 Connecting agents to external tools safely](<../10 - Advanced Agent Orchestration/09 - Connecting agents to external tools safely.md>), [M05-15 Managing hallucinated tool calls](<../05 - LLM Fundamentals & Prompting/15 - Managing hallucinated tool calls.md>)
 
 ### Kahani
 Ek insurance customer ka claims assistant: RAG over policy PDFs, ek `create_ticket` tool, aur ek `send_email` tool. Go-live se do hafte pehle CISO ki security review hai.
@@ -28,16 +30,16 @@ Enterprise security review is list ke bina pass nahi hota. "Hum safe hain" ki ja
 
 | ID | Category | Where in our system | Control (outside the model) |
 |----|----------|--------------------|-----------------------------|
-| LLM01 | Prompt Injection | user chat, poisoned PDF chunk | treat retrieved text as data, tool allow-list, human approval (M13-02) |
-| LLM02 | Sensitive Information Disclosure | answers, logs | PII redaction in/out (M13-05), safe logging (M13-14), ACL retrieval (M12-07) |
+| LLM01 | Prompt Injection | user chat, poisoned PDF chunk | treat retrieved text as data, tool allow-list, human approval ([M13-02](<02 - Prompt injection defenses.md>)) |
+| LLM02 | Sensitive Information Disclosure | answers, logs | PII redaction in/out ([M13-05](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>)), safe logging ([M13-14](<14 - Safe logging (never log PII or prompts).md>)), ACL retrieval ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)) |
 | LLM03 | Supply Chain | pip packages, model weights, MCP servers | pinned deps, hash check, vetted model sources |
 | LLM04 | Data and Model Poisoning | ingest pipeline, fine-tune data | source allow-list, ingest review, provenance metadata |
-| LLM05 | Improper Output Handling | model output -> HTML/SQL/shell | schema validation, escaping, never `eval` output (M13-10) |
+| LLM05 | Improper Output Handling | model output -> HTML/SQL/shell | schema validation, escaping, never `eval` output ([M13-10](<10 - Configuring strict input and output filtering pipelines natively in Python.md>)) |
 | LLM06 | Excessive Agency | `send_email`, `create_ticket` | least-privilege tools, authz in tool, approval for risky actions |
 | LLM07 | System Prompt Leakage | system prompt with secrets/rules | no secrets in prompts, rules enforced in code |
-| LLM08 | Vector and Embedding Weaknesses | vector DB | tenant/ACL pre-filter (M12-07), no cross-tenant index |
-| LLM09 | Misinformation | answers about policy terms | grounding + citations, faithfulness eval (M14-06) |
-| LLM10 | Unbounded Consumption | public chat endpoint | rate limit, max tokens, cost budget (M14-04) |
+| LLM08 | Vector and Embedding Weaknesses | vector DB | tenant/ACL pre-filter ([M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>)), no cross-tenant index |
+| LLM09 | Misinformation | answers about policy terms | grounding + citations, faithfulness eval ([M14-06](<../14 - AI Observability & Gateway Management/06 - Calculating RAGAS faithfulness and answer relevance metrics.md>)) |
+| LLM10 | Unbounded Consumption | public chat endpoint | rate limit, max tokens, cost budget ([M14-04](<../14 - AI Observability & Gateway Management/04 - Configuring rate limiting and fallback routing.md>)) |
 
 ### Code example
 `stdlib only`
@@ -124,15 +126,24 @@ OmniGuard CP6: `docs/threat-model.md` + `omniguard/guardrails/threat_model.py`.
 - [ ] Har control ka ek test case hai.
 
 ### Related
-- M12-07 Enforcing data-level permissions in retrieval layers
-- M13-02 Prompt injection defenses
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
-- M13-10 Configuring strict input and output filtering pipelines natively in Python
-- M14-04 Configuring rate limiting and fallback routing
-- M15-02 Defining data classifications
+- [M12-07](<../12 - Identity & Access Management/07 - Enforcing data-level permissions in retrieval layers.md>) Enforcing data-level permissions in retrieval layers
+- [M13-02](<02 - Prompt injection defenses.md>) Prompt injection defenses
+- [M13-05](<05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
+- [M13-10](<10 - Configuring strict input and output filtering pipelines natively in Python.md>) Configuring strict input and output filtering pipelines natively in Python
+- [M14-04](<../14 - AI Observability & Gateway Management/04 - Configuring rate limiting and fallback routing.md>) Configuring rate limiting and fallback routing
+- [M15-02](<../15 - OmniGuard - Secure AI Integration/02 - Defining data classifications.md>) Defining data classifications
 
 ### Self-quiz
 1. Prompt Injection aur Excessive Agency mein kya rishta hai? Ek ko kam karne se doosre ka impact kaise kam hota hai?
 2. CISO poochta hai "system prompt leak ho gaya to kya hoga?" Aapka design aisa kyun hona chahiye ki jawab ho "kuch nahi"?
 3. Vector DB ko LLM security list mein kyun rakha gaya hai -- ek concrete attack batao.
 4. Ek threat table row mein "test case" column kyun zaroori hai?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 171 of 256** -- [Syllabus CP8](<../SYLLABUS.md#cp8>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: step 170 GATE: Gate: two-user demo -- same question, different allowed answers (link video) -- see [syllabus](<../SYLLABUS.md#cp7>)
+- Next -> [step 172: Prompt injection defenses](<02 - Prompt injection defenses.md>)

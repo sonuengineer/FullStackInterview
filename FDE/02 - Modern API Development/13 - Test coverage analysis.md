@@ -2,7 +2,9 @@
 
 ## Test coverage analysis
 
-> Core | Fast CP2 / Slow CP2 | ~1.2 h | Builds on: M02-11, M02-12
+> **Core** | ~1.2 h | Slow: step 042/256, CP2 | Fast: CP2
+>
+> Before this: [M02-11 Unit testing fundamentals](<11 - Unit testing fundamentals.md>), [M02-12 Fixtures and mocking](<12 - Fixtures and mocking.md>)
 
 ### Kahani
 Ek bank ka security team aapki document API ko production mein aane se pehle review kar raha hai.
@@ -18,11 +20,23 @@ Aapko chahiye ek report jo line-by-line bataye kya test hua, kya nahi -- aur CI 
 Customer ke security/QA reviewers number aur evidence maangte hain. Coverage report dikhati hai kahan test nahi hain -- khaas kar auth, validation aur PII paths mein -- aur CP2 gate ka proof yahi report hai.
 
 ### Key concepts
-- **`--cov=<package>`** -- sirf apna code measure karo (`--cov=app`), tests ya libraries nahi.
+- **`--cov=<package>`** -- sirf apna code measure karo (`--cov=omniguard`), tests ya libraries nahi.
 - **`--cov-report=term-missing`** -- table mein `Missing` column: missed line numbers (`6-8`) aur partial branches (`11->13` = line 11 se 13 pe kabhi jump nahi hua).
 - **`--cov-branch`** -- branch coverage on. Bina iske `if` jiska sirf true path chala wo bhi "100% lines" dikhta hai.
 - **`--cov-fail-under=N`** -- coverage N% se kam to pytest non-zero exit code -> CI fail. Ye "gate" hai.
 - **Coverage != correctness** -- 100% ka matlab sirf "har line chali", ye nahi ki asserts sahi hain. Low coverage pakka problem hai; high coverage guarantee nahi.
+
+### Picture it
+Coverage shows which lines and branches ran; the fail-under number turns it into a CI gate.
+
+```mermaid
+flowchart LR
+    T["pytest --cov=omniguard --cov-branch"] --> R["report: line % and branch %<br/>Missing: 6-8, 11->13"]
+    R --> G{"--cov-fail-under=85"}
+    G -->|"85 % or more"| OK["exit 0, CI green"]
+    G -->|"below 85 %"| F["non-zero exit, CI red"]
+    R -.-> W["read Missing: which branch<br/>did no test take?"]
+```
 
 ### Code example
 `pip install pytest pytest-cov`
@@ -117,10 +131,10 @@ Config ek jagah rakho (`pyproject.toml`) taaki local aur CI same chale:
 
 ```toml
 [tool.pytest.ini_options]
-addopts = "-q --cov=app --cov-branch --cov-report=term-missing --cov-report=html --cov-fail-under=85"
+addopts = "-q --cov=omniguard --cov-branch --cov-report=term-missing --cov-report=html --cov-fail-under=85"
 
 [tool.coverage.run]
-omit = ["app/__main__.py"]
+omit = ["omniguard/__main__.py"]
 
 [tool.coverage.report]
 exclude_also = ["if __name__ == .__main__.:", "raise NotImplementedError"]
@@ -128,15 +142,15 @@ exclude_also = ["if __name__ == .__main__.:", "raise NotImplementedError"]
 
 ### Mini-exercise (30-60 min)
 CP2 capstone gate: "OmniGuard: FastAPI skeleton, Pydantic models, DI, pytest + coverage".
-- `omniguard/pyproject.toml` mein upar wala config, `--cov=app`, `--cov-fail-under=85`.
+- `pyproject.toml` (omniguard repo root) mein upar wala config, `--cov=omniguard`, `--cov-fail-under=85`.
 - `pytest` chalao, `term-missing` padho, aur `htmlcov/index.html` browser mein kholo -- laal lines dekho.
-- Sabse pehle `app/deps.py` (auth stub: missing header, bad token, wrong tenant) aur `app/schemas.py` validators ke missing branches cover karo; phir CRUD ke 404/409/412 paths.
+- Sabse pehle `omniguard/deps.py` (auth stub: missing header, bad token, wrong tenant) aur `omniguard/schemas.py` validators ke missing branches cover karo; phir CRUD ke 404/409/412 paths.
 - Ek jagah jaan-boojh ke test hata ke dekho ki gate fail hota hai (exit code != 0), phir wapas lagao.
 - Acceptance (gate proof): `pytest` output ka coverage table screenshot/text `docs/cp2-coverage.txt` mein save karo -- total >= 85%, `app/deps.py` 100% branch coverage, aur ek line README mein: "kaunse paths jaan-boojh ke uncovered hain aur kyun".
 
 ### Common pitfalls
 - Coverage number ke liye assert-less tests likhna (`client.get("/x")` bina check) -- number badhta hai, safety nahi. Review mein dekho har test kuch assert karta hai.
-- `--cov` bina package naam ke ya tests folder ko include karke measure karna -- number fake-high dikhta hai. `--cov=app` explicit rakho.
+- `--cov` bina package naam ke ya tests folder ko include karke measure karna -- number fake-high dikhta hai. `--cov=omniguard` explicit rakho.
 - 100% ko target banana aur `# pragma: no cover` har jagah chhidakna -- gate realistic rakho (80-90%), lekin security-critical modules (auth, redaction) pe stricter.
 
 ### Checklist before moving on
@@ -146,14 +160,23 @@ CP2 capstone gate: "OmniGuard: FastAPI skeleton, Pydantic models, DI, pytest + c
 - [ ] `omniguard` ka coverage report CP2 gate ke liye save kiya.
 
 ### Related
-- M02-11 Unit testing fundamentals
-- M02-12 Fixtures and mocking
-- M02-14 Debugging configurations
-- M04-09 Creating workflow YAML files
-- M15-05 Delivering User Acceptance Testing (UAT) runbooks
+- [M02-11](<11 - Unit testing fundamentals.md>) Unit testing fundamentals
+- [M02-12](<12 - Fixtures and mocking.md>) Fixtures and mocking
+- [M02-14](<14 - Debugging configurations.md>) Debugging configurations
+- [M04-09](<../04 - Containerization & CI-CD/09 - Creating workflow YAML files.md>) Creating workflow YAML files
+- [M15-05](<../15 - OmniGuard - Secure AI Integration/05 - Delivering User Acceptance Testing (UAT) runbooks.md>) Delivering User Acceptance Testing (UAT) runbooks
 
 ### Self-quiz
 1. Ek function ki line coverage 100% hai lekin branch coverage 50%. Ye kaise possible hai? Code example do.
 2. Team bolti hai "coverage 95% hai, to bugs nahi honge." Is statement mein kya galat hai?
 3. `--cov-fail-under` ka number kaise choose karoge ek purane customer codebase mein jahan abhi coverage 30% hai?
 4. Kaunse code ko coverage se exclude karna theek hai aur kaunse ko kabhi nahi?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 042 of 256** -- [Syllabus CP2](<../SYLLABUS.md#cp2>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 041: Fixtures and mocking](<12 - Fixtures and mocking.md>)
+- Next -> [step 043: Debugging configurations](<14 - Debugging configurations.md>)

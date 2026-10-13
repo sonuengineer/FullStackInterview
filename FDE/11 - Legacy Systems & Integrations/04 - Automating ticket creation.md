@@ -2,7 +2,9 @@
 
 ## Automating ticket creation
 
-> Core | Fast CP5 / Slow CP7 | ~1.2 h | Builds on: M11-03, M14-01, M05-12
+> **Core** | ~1.2 h | Slow: step 147/256, CP7 | Fast: CP5
+>
+> Before this: [M11-03 Reading internal Jira pages](<03 - Reading internal Jira pages.md>), [M14-01 Idempotency keys for safe tool execution](<../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>), [M05-12 Parsing and validating tool arguments](<../05 - LLM Fundamentals & Prompting/12 - Parsing and validating tool arguments.md>)
 
 ### Kahani
 Bank ke ops team ne kaha: "Jab OmniGuard ko koi failed payment pattern dikhe, Jira mein ticket khol do." Agent ne kholna shuru kiya.
@@ -21,7 +23,7 @@ Duplicate tickets customer ke ops team ka trust turant khatam karte hain ("AI sp
 - **External id** -- incident ke stable fields (source, error code, account, date bucket) ka hash; LLM text se nahi, kyunki wo har baar badalta hai.
 - **Search-then-create** -- `labels = "og-<id>"` JQL se pehle check; mila to update/comment, nahi mila to create. Race window ke liye local DB unique constraint bhi.
 - **ADF description** -- v3 API plain string description nahi leta; `{"type":"doc","version":1,"content":[...]}` chahiye.
-- **Validate before send** -- Pydantic model with `Literal` priority, summary max length; LLM ka output M05-12 jaisa parse + validate.
+- **Validate before send** -- Pydantic model with `Literal` priority, summary max length; LLM ka output [M05-12](<../05 - LLM Fundamentals & Prompting/12 - Parsing and validating tool arguments.md>) jaisa parse + validate.
 - **Least privilege** -- service account ko sirf target project mein "Create issues" + "Add comments", delete nahi.
 
 ### Code example
@@ -105,14 +107,14 @@ print("OK: validated draft, ADF body, idempotent create via external-id label")
 ### Mini-exercise (30-60 min)
 OmniGuard `omniguard/integrations/jira.py` mein `JiraWriter.ensure_ticket(draft, ext_id)` add karo.
 - sqlite table `jira_tickets(external_id TEXT PRIMARY KEY, jira_key TEXT, created_at)`; insert-first pattern se race fix.
-- Agent tool `create_ticket` ka JSON schema `TicketDraft` se generate (M05-11); tool call validate fail ho to model ko error message wapas (M05-09), Jira call nahi.
-- Rate limit: per-hour max 20 tickets per project; limit cross = Slack alert (M11-01) instead of ticket.
+- Agent tool `create_ticket` ka JSON schema `TicketDraft` se generate ([M05-11](<../05 - LLM Fundamentals & Prompting/11 - Defining precise function schemas for LLMs.md>)); tool call validate fail ho to model ko error message wapas ([M05-09](<../05 - LLM Fundamentals & Prompting/09 - Handling and retrying output parsing errors gracefully.md>)), Jira call nahi.
+- Rate limit: per-hour max 20 tickets per project; limit cross = Slack alert ([M11-01](<01 - Webhooks and bot tokens for Slack and Teams.md>)) instead of ticket.
 - Tests: create, retry same id, reworded summary, invalid priority, Jira 400, Jira timeout (ticket row "pending" rahe, duplicate na bane).
 
 ### Common pitfalls
 - Timeout pe blind retry -- pehli request shayad succeed ho chuki thi; bina idempotency key ke duplicate ticket.
 - Custom fields ke ids (`customfield_10042`) hardcode -- har Jira instance mein alag; `/rest/api/3/field` se config time pe resolve karo.
-- Ticket description mein customer PII ya poora prompt daal dena -- Jira mein sab log padh sakte hain; redact karo (M13-05).
+- Ticket description mein customer PII ya poora prompt daal dena -- Jira mein sab log padh sakte hain; redact karo ([M13-05](<../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>)).
 
 ### Checklist before moving on
 - [ ] Create payload (project, issuetype, ADF description, labels) bina docs ke likh sakta hoon.
@@ -121,13 +123,22 @@ OmniGuard `omniguard/integrations/jira.py` mein `JiraWriter.ensure_ticket(draft,
 - [ ] Race condition ka DB-level guard samajh aata hai.
 
 ### Related
-- M11-03 Reading internal Jira pages
-- M14-01 Idempotency keys for safe tool execution
-- M05-12 Parsing and validating tool arguments
-- M13-05 Redacting sensitive entities (SSN, credit cards, emails)
+- [M11-03](<03 - Reading internal Jira pages.md>) Reading internal Jira pages
+- [M14-01](<../14 - AI Observability & Gateway Management/01 - Idempotency keys for safe tool execution.md>) Idempotency keys for safe tool execution
+- [M05-12](<../05 - LLM Fundamentals & Prompting/12 - Parsing and validating tool arguments.md>) Parsing and validating tool arguments
+- [M13-05](<../13 - Production AI Security & Guardrails/05 - Redacting sensitive entities (SSN, credit cards, emails).md>) Redacting sensitive entities (SSN, credit cards, emails)
 
 ### Self-quiz
 1. External id ko LLM summary se kyun nahi banana chahiye?
 2. Search-then-create mein race kaise hoti hai, aur DB unique constraint use kaise rokta hai?
 3. Jira ne create pe timeout diya. Aapka code agle retry pe kya karega?
 4. Agent ne 200 tickets ek ghante mein banane ki koshish ki. Kaunse guards isko rokte?
+
+<!-- nav: generated by portal/lessonnav.py, do not edit below -->
+
+---
+
+**Slow track, step 147 of 256** -- [Syllabus CP7](<../SYLLABUS.md#cp7>) | [START_HERE](<../START_HERE.md>)
+
+- <- Prev: [step 146: Reading internal Jira pages](<03 - Reading internal Jira pages.md>)
+- Next -> [step 148: Understanding WSDL document structures and types](<05 - Understanding WSDL document structures and types.md>)
